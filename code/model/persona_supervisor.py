@@ -421,14 +421,15 @@ class PersonaSupervisor:
                 request_timeout=int(getattr(conf, "LLM_REQUEST_TIMEOUT", 30)),
             )
             _system = (
-                "คุณคือ 'น้องสุดยอด' — AI ที่รู้จริงเรื่องกฎหมายธุรกิจร้านอาหารไทย\n"
+                "คุณคือ 'น้องสุดยอด' — ที่ปรึกษาธุรกิจร้านอาหารครบวงจร\n"
+                "ช่วยได้ทั้ง: กฎหมาย/ใบอนุญาต/ภาษี, การตลาด/กลยุทธ์, การเปิดร้าน/เบเกอรี่/คาเฟ่\n"
                 "พูดเป็นกันเอง ตรงไปตรงมา ไม่เป็นทางการ\n\n"
                 "กฎเด็ดขาด:\n"
                 "- ตอบเป็น plain text บรรทัดเดียว ห้ามขึ้นบรรทัดใหม่\n"
                 "- ไม่เกิน 40 คำ จบประโยคสมบูรณ์ก่อนหยุด\n"
                 "- ใช้ 'ผม' ลงท้าย 'ครับ'\n"
                 "- ห้ามสรุปหรือพูดถึงกฎที่ได้รับมา\n"
-                "- รับ vibe สั้นๆ แล้ว redirect ว่าช่วยได้เรื่องอะไร (ใบอนุญาต/ภาษี/กฎหมายร้านอาหาร)\n"
+                "- รับ vibe สั้นๆ แล้ว redirect ว่าช่วยได้เรื่องอะไร\n"
             )
             _reply = extract_llm_text(
                 llm_invoke(_llm, [SystemMessage(content=_system), HumanMessage(content=raw_input)],
@@ -438,7 +439,7 @@ class PersonaSupervisor:
             _reply = " ".join(_reply.splitlines()).strip()
         except Exception as _e:
             _LOG.warning("[Supervisor] deflect LLM failed: %s", _e)
-            _reply = "ผมช่วยเรื่องกฎหมายและใบอนุญาตธุรกิจร้านอาหารครับ มีอะไรอยากถามไหมครับ? 😊"
+            _reply = "ผมช่วยได้ทั้งเรื่องกฎหมาย/ใบอนุญาต การตลาด และการเปิดร้านครับ มีอะไรอยากถามไหมครับ? 😊"
         _reply = self._normalize_male(_reply)
         self._add_assistant(state, _reply)
         state.last_action = "unknown_deflect"
@@ -1379,18 +1380,25 @@ class PersonaSupervisor:
         _doc_chars = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700) or 700)
         # Token: cap long metadata fields before storing — prevent ×N token explosion
         _SUPERVISOR_META_WHITELIST = frozenset({
-            "license_type", "operation_topic", "chunk_type",
+            # Source type — lets downstream LLM know doc origin
+            "data_type",
+            # Regulatory fields
+            "license_type", "operation_topic",
             "entity_type_normalized", "registration_type", "department",
             "fees", "operation_duration", "service_channel",
             "legal_regulatory",           # บทลงโทษ ค่าปรับ ข้อกำหนดทางกฎหมาย
             "terms_and_conditions",       # หน้าที่และเงื่อนไขของผู้ประกอบการ
             "identification_documents",   # เอกสารที่ต้องใช้ — must reach LLM complete
             "operation_steps",            # ขั้นตอนการดำเนินการ
+            # Marketing / business_guide fields (data_loader_general.py)
+            "main_topic", "sub_topic", "answer_guideline",
         })
         _SUPERVISOR_FIELD_CAPS = {
             "operation_steps": 600, "identification_documents": 1500,
             "research_reference": 3200, "fees": 120, "service_channel": 200,
             "legal_regulatory": 2000, "terms_and_conditions": 800,
+            # marketing / business_guide content fields
+            "answer_guideline": 1500, "main_topic": 120, "sub_topic": 150,
         }
         for d in (docs or [])[:top_k]:
             raw_md = getattr(d, "metadata", {}) or {}
@@ -4816,17 +4824,19 @@ class PersonaSupervisor:
                 st2.last_action = "fallback_llm_elaborate"
                 return st2, reply
 
-        if fallback_intent == "legal_question":
+        if fallback_intent in ("legal_question", "business_question"):
             q_fb = (intent_res.get("query") or raw_stripped).strip()
-            _LOG.info("[Supervisor] fallback_llm→legal_question q=%r", q_fb[:40])
+            _LOG.info("[Supervisor] fallback_llm→%s q=%r", fallback_intent, q_fb[:40])
             state.context["last_user_legal_query"] = q_fb
             self._ensure_practical_retrieval_for_legal(state, q_fb)
+            # Slot queue only builds when retrieved docs have license_type (regulatory).
+            # For marketing/business_guide docs (no license_type) it exits early — no slot-fill.
             if not self._LINK_REQUEST_RE.search(raw_stripped):
                 self._maybe_build_slot_queue_from_docs(state, q_fb)
             st2, reply = self._practical.handle(state, q_fb, _internal=False)
             reply = self._normalize_male(reply)
             self._add_assistant(st2, reply)
-            st2.last_action = "fallback_llm_legal"
+            st2.last_action = "fallback_llm_business"
             return st2, reply
 
         if fallback_intent == "greeting":

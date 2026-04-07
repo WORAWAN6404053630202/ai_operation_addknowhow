@@ -15,13 +15,29 @@ if str(code_dir) not in sys.path:
     sys.path.insert(0, str(code_dir))
 
 from service.data_loader import DataLoader
+from service.data_loader_general import GeneralDataLoader
 from service.local_vector_store import ingest_documents
 from langchain_core.documents import Document
 
-SHEET_URL = (
+# ── Sheet URLs ──────────────────────────────────────────────────────────────
+# Sheet A: Regulatory / government procedures (original)
+SHEET_URL_REGULATORY = (
     "https://docs.google.com/spreadsheets/d/1YnLKV7gJXCu7jvcH1sUL9crMlBCJKOpQfp2wtulMszE/"
     "edit?gid=657201027#gid=657201027"
 )
+# Sheet B: Marketing strategy, SOP, pricing, product mix
+SHEET_URL_MARKETING = (
+    "https://docs.google.com/spreadsheets/d/1YnLKV7gJXCu7jvcH1sUL9crMlBCJKOpQfp2wtulMszE/"
+    "edit?gid=809205387#gid=809205387"
+)
+# Sheet C: Bakery / coffee-shop practical startup guide
+SHEET_URL_BAKERY = (
+    "https://docs.google.com/spreadsheets/d/1YnLKV7gJXCu7jvcH1sUL9crMlBCJKOpQfp2wtulMszE/"
+    "edit?gid=610069215#gid=610069215"
+)
+
+# Legacy alias kept for backward compatibility if anything else imports it
+SHEET_URL = SHEET_URL_REGULATORY
 
 # Data normalization (ingest-time)
 _WS_RE = re.compile(r"\s+", re.UNICODE)
@@ -135,24 +151,48 @@ def normalize_documents(docs: Iterable[Any]) -> None:
 
 
 def main():
-    dl = DataLoader(config={})
-    dl.load_from_google_sheet(SHEET_URL, source_name="google_sheet")
-    docs = dl.documents
+    all_docs: List[Document] = []
 
-    # Step 1: Normalize text before indexing
+    # ── Source A: Regulatory / government procedures ─────────────────────────
+    print("\n[Ingest] Loading Sheet A — Regulatory (กฎหมาย/ใบอนุญาต/ราชการ)...")
+    dl = DataLoader(config={})
+    dl.load_from_google_sheet(SHEET_URL_REGULATORY, source_name="regulatory")
+    all_docs.extend(dl.documents)
+    print(f"[Ingest]   → {len(dl.documents)} regulatory docs")
+
+    # ── Source B: Marketing strategy / SOP ──────────────────────────────────
+    print("\n[Ingest] Loading Sheet B — Marketing (การตลาด/กลยุทธ์/SOP)...")
+    dl_mkt = GeneralDataLoader(data_type="marketing")
+    dl_mkt.load_from_google_sheet(SHEET_URL_MARKETING, source_name="marketing")
+    all_docs.extend(dl_mkt.documents)
+    print(f"[Ingest]   → {len(dl_mkt.documents)} marketing docs")
+
+    # ── Source C: Bakery / coffee-shop startup guide ─────────────────────────
+    print("\n[Ingest] Loading Sheet C — Business Guide (เบเกอรี่/คาเฟ่/เปิดร้าน)...")
+    dl_biz = GeneralDataLoader(data_type="business_guide")
+    dl_biz.load_from_google_sheet(SHEET_URL_BAKERY, source_name="business_guide")
+    all_docs.extend(dl_biz.documents)
+    print(f"[Ingest]   → {len(dl_biz.documents)} business_guide docs")
+
+    # ── Normalize all docs ───────────────────────────────────────────────────
+    docs = all_docs
     normalize_documents(docs)
 
-    print(f"\n[Ingest] Indexing {len(docs)} documents...")
-    print("[Ingest] New schema: location + area_size + entity_type as explicit metadata")
+    print(f"\n[Ingest] Total docs to index: {len(docs)}")
     print("[Ingest] Model: multilingual-e5-large (better Thai retrieval accuracy)")
 
-    # Show parsed metadata stats
-    locs = [d.metadata.get("location") for d in docs if d.metadata.get("location")]
-    areas = [d.metadata.get("area_size") for d in docs if d.metadata.get("area_size")]
-    entities = [d.metadata.get("entity_type_normalized") for d in docs if d.metadata.get("entity_type_normalized")]
-    print(f"[Ingest]   location field populated: {len(locs)}/{len(docs)} docs")
-    print(f"[Ingest]   area_size field populated: {len(areas)}/{len(docs)} docs")
-    print(f"[Ingest]   entity_type_normalized populated: {len(entities)}/{len(docs)} docs")
+    # Show breakdown by data_type
+    reg_docs   = [d for d in docs if d.metadata.get("data_type") != "marketing"
+                                  and d.metadata.get("data_type") != "business_guide"]
+    mkt_docs   = [d for d in docs if d.metadata.get("data_type") == "marketing"]
+    biz_docs   = [d for d in docs if d.metadata.get("data_type") == "business_guide"]
+    locs       = [d for d in docs if d.metadata.get("location")]
+    entities   = [d for d in docs if d.metadata.get("entity_type_normalized")]
+    print(f"[Ingest]   regulatory docs : {len(reg_docs)}")
+    print(f"[Ingest]   marketing docs  : {len(mkt_docs)}")
+    print(f"[Ingest]   business_guide  : {len(biz_docs)}")
+    print(f"[Ingest]   location populated: {len(locs)}/{len(docs)}")
+    print(f"[Ingest]   entity_type populated: {len(entities)}/{len(docs)}")
 
     ingest_documents(docs, reset=True)  # wipe old local chroma before rebuild
     print('[Ingest] ✅ Done! Start server: python code/app.py')

@@ -1223,6 +1223,9 @@ class AcademicPersonaService:
         _MAX_DOCS_ACADEMIC = int(getattr(conf, "LLM_DOCS_MAX_ACADEMIC", 12))
         # 🎯 Whitelist + per-field caps — research_reference/operation_steps are long (~600-2285 chars)
         _ACADEMIC_META_WHITELIST = {
+            # Source type — lets LLM know if doc is regulatory/marketing/business_guide
+            "data_type",
+            # Regulatory fields
             "license_type", "operation_topic",
             "entity_type_normalized", "registration_type", "department",
             "fees", "operation_duration",
@@ -1230,6 +1233,8 @@ class AcademicPersonaService:
             "terms_and_conditions", "conditions",
             "legal_regulatory", "law", "regulation",
             "service_channel", "service_hours", "service_location",
+            # Marketing / business_guide fields (data_loader_general.py)
+            "main_topic", "sub_topic", "answer_guideline",
         }
         # research_reference is aggregated separately below (deduped) — skip from per-doc metadata
         _ACADEMIC_FIELD_CAPS = {
@@ -1239,6 +1244,8 @@ class AcademicPersonaService:
             "legal_regulatory": 600, "law": 400, "regulation": 400,
             "service_channel": 300, "service_hours": 150, "service_location": 150,
             "identification_documents": 1500,  # never truncate doc lists
+            # marketing / business_guide content cap
+            "answer_guideline": 600, "main_topic": 120, "sub_topic": 150,
         }
         # Long fields: send once (first doc that has them) to avoid ×N repetition
         # identification_documents is intentionally excluded — it varies by entity_type and must

@@ -153,8 +153,11 @@ def _parse_link_entries(text: str) -> list:
 # Token: Whitelist — ส่ง metadata keys ที่ LLM ต้องการโดยตรง
 # content ถูกตัดที่ LLM_DOC_CHARS_PRACTICAL (400 chars) ดังนั้น fields สำคัญต้องอยู่ใน metadata
 _LLM_METADATA_WHITELIST = frozenset({
+    "data_type",               # แหล่งข้อมูล: regulatory | marketing | business_guide
     "license_type",            # ประเภทใบอนุญาต
     "operation_topic",         # หัวข้อการดำเนินการ
+    "main_topic",              # หัวข้อหลัก (marketing/business_guide docs)
+    "sub_topic",               # หัวข้อย่อย (marketing/business_guide docs)
     "entity_type_normalized",  # ประเภทนิติบุคคล
     "registration_type",       # ประเภทการจดทะเบียน
     "department",              # หน่วยงาน
@@ -162,6 +165,7 @@ _LLM_METADATA_WHITELIST = frozenset({
     "operation_duration",      # ระยะเวลาดำเนินการ
     "service_channel",         # ช่องทางยื่น
     "research_reference",      # ลิงก์แบบฟอร์ม / คู่มือ / เว็บไซต์ราชการ
+    "answer_guideline",        # แนวคำตอบ (marketing/business_guide docs)
     "operation_steps",         # ขั้นตอนการดำเนินการ (สำคัญ — content อาจถูกตัดก่อนถึงส่วนนี้)
     "identification_documents",# รายการเอกสารที่ต้องใช้ (สำคัญ — ต้องเห็นทั้งหมด)
     "legal_regulatory",        # ข้อกำหนดทางกฎหมาย บทลงโทษ ค่าปรับ
@@ -1222,7 +1226,8 @@ class PracticalPersonaService:
         
         # Token: filter + cap metadata at retrieval time — prevents raw metadata accumulating in state
         _STORE_META_WHITELIST = frozenset({
-            "license_type", "operation_topic",
+            "data_type", "license_type", "operation_topic",
+            "main_topic", "sub_topic", "answer_guideline",
             "entity_type_normalized", "registration_type", "department",
             "fees", "operation_duration", "service_channel",
             "research_reference", "operation_steps", "identification_documents",
@@ -1236,6 +1241,8 @@ class PracticalPersonaService:
             "operation_steps": 1000, "identification_documents": 1500,
             "research_reference": 3100, "fees": 500, "service_channel": 500,
             "legal_regulatory": 2000, "terms_and_conditions": 800,
+            # marketing / business_guide content fields
+            "answer_guideline": 1500, "main_topic": 120, "sub_topic": 150,
         }
         results: List[Dict[str, Any]] = []
         for d in docs[:max_docs]:
