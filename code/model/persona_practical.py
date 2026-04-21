@@ -88,8 +88,12 @@ def _parse_link_entries(text: str) -> list:
 
     Handles URLs split across multiple lines (newline inside URL) by joining
     continuation lines that don't start a new entry (no bullet, not empty, not http).
+    Also handles URLs concatenated without any separator (e.g. "https://a.comhttps://b.com")
+    by inserting a newline before each https:// occurrence before splitting.
     Filters out truncated URLs that are clearly incomplete.
     """
+    # Pre-split concatenated URLs: "https://a.comhttps://b.com" → "https://a.com\nhttps://b.com"
+    text = re.sub(r"(https?://)", r"\n\1", text).lstrip("\n")
     lines = text.split("\n")
     # Step 1: re-join URL lines that were split mid-URL (no bullet prefix, not empty)
     merged: list = []
@@ -328,7 +332,7 @@ class PracticalPersonaService:
                     text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/greet")).strip()
                     
                 # Log สำเร็จ
-                logger.log_with_data("info", "💬 สร้างคำทักทายสำเร็จ", {
+                logger.log_with_data("info", "สร้างคำทักทายสำเร็จ", {
                     "action": "greet_generation",
                     "kind": kind,
                     "greet_streak": greet_streak,
@@ -337,7 +341,7 @@ class PracticalPersonaService:
                 })
             except Exception as e:
                 # Log error
-                logger.log_with_data("error", "❌ สร้างคำทักทายล้มเหลว", {
+                logger.log_with_data("error", "สร้างคำทักทายล้มเหลว", {
                     "action": "greet_generation",
                     "error": str(e),
                     "fallback": "empty_dict"
@@ -1086,7 +1090,7 @@ class PracticalPersonaService:
             "execution": {"answer": "ขออภัยครับ ระบบประมวลผลคำถามไม่สำเร็จ กรุณาลองถามใหม่อีกครั้งครับ", "context_update": {}},
         }
 
-    def _retrieve_docs(self, query: str, metadata_filter: Optional[Dict[str, Any]] = None, max_docs: Optional[int] = None) -> List[Dict[str, Any]]:
+    def _retrieve_docs(self, query: str, metadata_filter: Optional[Dict[str, Any]] = None, max_docs: Optional[int] = None, slot_context: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         import time
         start = time.time()
 
@@ -1096,12 +1100,15 @@ class PracticalPersonaService:
         # Query expansion: short/abbrev keywords → full Thai terms for better embedding match
         # e.g. "vat" alone has low cosine similarity to "ภาษีมูลค่าเพิ่ม ภพ.20"
         _EXPAND_PATTERNS = [
-            (r"\bvat\b", "ภาษีมูลค่าเพิ่ม ภพ.20 จด VAT กรมสรรพากร"),
-            (r"\bภพ\.?20\b", "ภาษีมูลค่าเพิ่ม ภพ.20 จด VAT กรมสรรพากร"),
-            (r"ภาษีมูลค่าเพิ่ม", "ภาษีมูลค่าเพิ่ม ภพ.20 จด VAT กรมสรรพากร"),
+            (r"\bvat\b|\bภพ\.?20\b|ภาษีมูลค่าเพิ่ม", "ภาษีมูลค่าเพิ่ม ภพ.20 จด VAT กรมสรรพากร"),
             (r"สุรา|เหล้า|ขายเหล้า", "ใบอนุญาตจำหน่ายสุรา สรรพสามิต ภส.08"),
             (r"ประกันสังคม", "ขึ้นทะเบียนประกันสังคม นายจ้าง ลูกจ้าง"),
             (r"ป้ายร้าน|ภาษีป้าย", "แบบแสดงรายการภาษีป้ายร้านอาหาร"),
+            (r"ใบอนุญาต.*อาหาร|สถานที่จำหน่ายอาหาร|bma.*oss|oss.*bma", "ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร สำนักงานเขต กรุงเทพมหานคร"),
+            (r"ทะเบียนพาณิชย์|จดพาณิชย์|\bdbd\b", "ใบทะเบียนพาณิชย์ กรมพัฒนาธุรกิจการค้า จดทะเบียนพาณิชย์"),
+            (r"qr.?pay|qr.?payment|พร้อมเพย์|promptpay", "ระบบชำระเงินออนไลน์ QR Payment พร้อมเพย์"),
+            (r"\bedc\b|รูดบัตร|เครื่องรูดบัตร", "เครื่องรูดบัตร EDC ชำระเงิน"),
+            (r"เปิดบัญชี.*ร้าน|บัญชีธนาคาร.*ร้าน|รับเงิน.*ร้าน", "บัญชีธนาคารรับเงิน ร้านอาหาร"),
         ]
         _expansions: list = []
         for pattern, expansion in _EXPAND_PATTERNS:
@@ -1110,6 +1117,19 @@ class PracticalPersonaService:
         expanded_query = (query + " " + " ".join(_expansions)).strip() if _expansions else query
         if _expansions:
             _LOG.info("[Practical] query expanded: %r → %r", query[:50], expanded_query[:80])
+
+        # Append collected slot values so embedding benefits from full user context.
+        # Only append values not already present in the expanded query (avoids duplication).
+        # Skip for calls from supervisor where enriched_q already carries slot context.
+        if slot_context:
+            _sc_parts = []
+            for _sc_key in ("entity_type", "registration_type"):
+                _sc_val = str(slot_context.get(_sc_key) or "").strip()
+                if _sc_val and _sc_val not in expanded_query:
+                    _sc_parts.append(_sc_val)
+            if _sc_parts:
+                expanded_query = (expanded_query + " " + " ".join(_sc_parts)).strip()
+                _LOG.info("[Practical] slot context appended to query: %r", expanded_query[:80])
 
         vectorstore = getattr(self.retriever, "vectorstore", None)
 
@@ -1129,7 +1149,12 @@ class PracticalPersonaService:
                     result.append(_d)
                 return result
             except Exception as _ex:
-                _LOG.debug("[Practical] scored_search failed (%s), falling back to basic", _ex)
+                _LOG.debug("[Practical] scored_search failed (%s), trying similarity_search with filter", _ex)
+                try:
+                    if flt:
+                        return vectorstore.similarity_search(q, k=k, filter=flt)
+                except Exception as _ex2:
+                    _LOG.debug("[Practical] similarity_search with filter also failed (%s), using basic", _ex2)
                 return list(self.retriever.invoke(q))
 
         top_k = int(getattr(conf, "RETRIEVAL_TOP_K", 8))
@@ -1139,7 +1164,7 @@ class PracticalPersonaService:
                 try:
                     docs = _scored_search(query, max_docs, metadata_filter)
                     _flt_str = " | ".join(f"{k}={v!r}" for k, v in (metadata_filter or {}).items())
-                    logger.log_with_data("info", f"🔍 retrieve(filtered) query={query[:50]!r} filter=[{_flt_str}] found={len(docs)}", {
+                    logger.log_with_data("info", f"retrieve(filtered) query={query[:50]!r} filter=[{_flt_str}] found={len(docs)}", {
                         "action": "filtered_retrieval",
                         "query": query[:60],
                         "filter": str(metadata_filter),
@@ -1152,13 +1177,14 @@ class PracticalPersonaService:
                         # irrelevant entity types into the result.
                         docs = _scored_search(query, top_k, metadata_filter)
                     if not docs:
-                        logger.log_with_data("warning", "⚠️ กรอง metadata แต่ไม่พบเอกสาร — ใช้การค้นหาปกติ", {
+                        logger.log_with_data("warning", "No documents matched metadata filter — falling back to unfiltered retrieval with expanded query", {
                             "action": "filtered_retrieval_empty_fallback",
                             "filter": str(metadata_filter),
+                            "fallback_query": expanded_query[:80],
                         })
-                        docs = _scored_search(query, top_k)
+                        docs = _scored_search(expanded_query, top_k)
                 except Exception as e:
-                    logger.log_with_data("warning", "⚠️ ค้นหาแบบกรองล้มเหลว ใช้วิธีปกติ", {
+                    logger.log_with_data("warning", "ค้นหาแบบกรองล้มเหลว ใช้วิธีปกติ", {
                         "action": "filtered_retrieval_failed",
                         "error": str(e),
                         "fallback": "standard_retrieval"
@@ -1187,7 +1213,7 @@ class PracticalPersonaService:
         
         # Safety: ถ้ากรองจนเหลือน้อยเกิน ให้เอาเอกสารเดิมมาใช้
         if len(filtered_docs) < 2:
-            logger.log_with_data("warning", "⚠️ Similarity filter เข้มเกิน fallback ใช้เอกสารทั้งหมด", {
+            logger.log_with_data("warning", "Similarity filter เข้มเกิน fallback ใช้เอกสารทั้งหมด", {
                 "filtered_count": len(filtered_docs),
                 "total_docs": len(docs),
                 "min_similarity": min_similarity
@@ -1264,9 +1290,9 @@ class PracticalPersonaService:
         _LOG.info("[Practical] retrieve done | docs=%d/%d time=%.0fms %s", len(results), max_docs, retrieval_ms, _sim_summary)
 
         if len(results) == 0:
-            _LOG.warning("[Practical] ⚠️ ไม่พบเอกสาร query=%r filter=%s", query[:80], metadata_filter)
+            _LOG.warning("[Practical] ไม่พบเอกสาร query=%r filter=%s", query[:80], metadata_filter)
         elif scores and max(scores) < 0.5:
-            _LOG.warning("[Practical] ⚠️ low similarity max=%.3f query=%r", max(scores), query[:60])
+            _LOG.warning("[Practical] low similarity max=%.3f query=%r", max(scores), query[:60])
         
         # Log รายละเอียดแต่ละเอกสาร
         _top_topics: list = []
@@ -1560,7 +1586,12 @@ class PracticalPersonaService:
         # If user picked topic -> always retrieve for that topic
         if (not _internal) and filled_topic_value:
             q = filled_topic_value
-            state.current_docs = self._retrieve_docs(q)
+            _topic_slot_ctx = None
+            try:
+                _topic_slot_ctx = state.get_collected_slots() or None
+            except Exception:
+                pass
+            state.current_docs = self._retrieve_docs(q, slot_context=_topic_slot_ctx)
             state.last_retrieval_query = q
             tmp = [
                 {"content": d.get("content", "")[:120], "metadata": d.get("metadata", {})}
@@ -1588,7 +1619,15 @@ class PracticalPersonaService:
 
         recent_msgs = state.messages[-6:]  # ส่งไป LLM 6 ล่าสุด
 
-        _prompt_max_docs = int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 3))
+        # Broad questions (e.g. "อยากเปิดร้านเบเกอรี่ ต้องทำอะไรบ้าง") need more docs
+        # to cover all license types (regulatory + business_guide + marketing).
+        # Standard cap of 3 docs/license misses rare license types for these queries.
+        _is_broad_q = bool((state.context or {}).get("_broad_question"))
+        _prompt_max_docs = (
+            int(getattr(conf, "LLM_DOCS_MAX_BROAD", 6))
+            if _is_broad_q
+            else int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 3))
+        )
         _FIELD_CAPS = {
             "operation_steps": 1000,
             "identification_documents": 1500,
@@ -1645,6 +1684,15 @@ class PracticalPersonaService:
                 elif _cat1 == "guide":
                     _link_guide.append((_desc1, _url1))
                 # ref → dropped always
+
+        # Flag: any retrieved doc has identification_documents content.
+        # When true, always inject FORM_LINKS + SERVICE_LINKS regardless of query phrasing,
+        # so users always get form links whenever a document list will be shown in the answer.
+        _docs_have_id_docs = any(
+            str((d.get("metadata") or {}).get("identification_documents") or "").strip()
+            not in ("", "nan", "None")
+            for d in _docs_to_process
+        )
 
         # Pass 2: build docs_json with per-license dedup for long fields
         # research_reference is now injected as labeled sections outside docs_json
@@ -1720,10 +1768,10 @@ class PracticalPersonaService:
         ))
 
         _link_section = ""
-        if _link_service and _user_wants_registration:
+        if _link_service and (_user_wants_registration or _docs_have_id_docs):
             _link_section += "\n🌐 SERVICE_LINKS — copy เหล่านี้ตรงๆ under section '🌐 เว็บลงทะเบียน':\n"
             _link_section += "\n".join(_fmt_prac_link(d, u) for d, u in _link_service) + "\n"
-        if _link_form and (_user_wants_forms or _user_wants_registration):
+        if _link_form and (_user_wants_forms or _user_wants_registration or _docs_have_id_docs):
             _link_section += "\n📄 FORM_LINKS — copy เหล่านี้ตรงๆ under section '📄 แบบฟอร์ม':\n"
             _link_section += "\n".join(_fmt_prac_link(d, u) for d, u in _link_form) + "\n"
         if _link_guide and _user_wants_links:
@@ -1796,6 +1844,37 @@ Rules:
 - Close with a 1-sentence summary: which items are MANDATORY vs optional
 """
 
+        # Broad-question instruction: injected directly into this call's prompt (not system prompt)
+        # so it only affects broad open-ended questions, not other query types.
+        # Tells LLM to treat legal/license section as mandatory named section, not a footnote.
+        _broad_instruction = ""
+        if _is_broad_q:
+            # Collect license_type names actually present in docs so the instruction is concrete
+            _license_names_in_docs: list = []
+            for _bd in _docs_to_process:
+                _blt = ((_bd.get("metadata") or {}).get("license_type") or "").strip()
+                if _blt and _blt not in _license_names_in_docs:
+                    _license_names_in_docs.append(_blt)
+            _license_list_str = (
+                "\n".join(f"  - {lt}" for lt in _license_names_in_docs)
+                if _license_names_in_docs
+                else "  (ดูจาก DOCUMENTS)"
+            )
+            _broad_instruction = f"""
+
+⚠️ BROAD QUESTION — LEGAL SECTION IS MANDATORY (strictly follow):
+- This is a broad open-ended question about opening a business.
+- Your answer MUST include a dedicated section with header "📋 ใบอนุญาตและกฎหมายที่เกี่ยวข้อง".
+- This section is NOT a footnote. It must appear as a full named section alongside other sections.
+- Inside this section: list EVERY license/permit found in DOCUMENTS as a numbered list.
+  Each item: license name + one line explaining what it is and when it is required.
+- The following license types appear in DOCUMENTS — do NOT skip any:
+{_license_list_str}
+- Do NOT merge multiple licenses into one bullet. Do NOT use "เช่น..." to abbreviate.
+- Do NOT move legal content to the last line of the response as a footnote.
+- Tone: write naturally, like a knowledgeable friend explaining what the person MUST do legally.
+"""
+
         prompt = f"""USER INPUT:
 {user_input}
 
@@ -1811,7 +1890,7 @@ CONTEXT:
 DOCUMENTS ({len(docs_json)} found):
 {json.dumps(docs_json, ensure_ascii=False)}
 {_link_section}
-ROUND: {int(getattr(state, "round", 0) or 0)}/{int(getattr(conf, "MAX_ROUNDS", 7) or 7)}{_topic_hint}{_multi_license_instruction}
+ROUND: {int(getattr(state, "round", 0) or 0)}/{int(getattr(conf, "MAX_ROUNDS", 7) or 7)}{_topic_hint}{_multi_license_instruction}{_broad_instruction}
 
 Your JSON response:
 """
@@ -1845,21 +1924,36 @@ Your JSON response:
             #       but LLM ignores rule 2 and returns action='retrieve' anyway)
             _pending_queue = (state.context or {}).get("topic_slot_queue") or []
             if state.current_docs and (_pending_queue or _internal):
+                # Track how many consecutive times retrieve has been blocked.
+                # If LLM keeps returning 'retrieve' despite blocked (e.g. sees wrong-entity docs
+                # and refuses to answer), force action='answer' after 2 blocks to break the loop.
+                _rblk = int((state.context or {}).get("_retrieve_blocked_count", 0)) + 1
+                state.context["_retrieve_blocked_count"] = _rblk
                 _LOG.info(
                     "[Practical] action='retrieve' blocked — docs already loaded (%d), "
-                    "internal=%s queue=%s",
+                    "internal=%s queue=%s (block#%d)",
                     len(state.current_docs),
                     _internal,
                     [s.get("key") for s in _pending_queue] if _pending_queue else [],
+                    _rblk,
                 )
+                if _rblk >= 2:
+                    # LLM is stuck in retrieve loop — break by forcing a non-internal call.
+                    # Setting _internal=False lets handle() call the LLM without the "retrieve blocked"
+                    # guard, so LLM is forced to answer with current docs on next turn.
+                    _LOG.warning(
+                        "[Practical] retrieve blocked %d times — breaking loop, forcing non-internal answer pass",
+                        _rblk,
+                    )
+                    state.context["_retrieve_blocked_count"] = 0
+                    return self.handle(state, user_input or "__auto_post_retrieve__", _internal=False)
                 return self.handle(state, "__auto_post_retrieve__", _internal=True)
 
             if action == "retrieve":
                 q = exec_.get("query") or user_text or user_input
-                # Retrieve unfiltered so entity='' (universal) docs like location variants are included.
-                # Post-filter: drop docs whose entity_type CONTRADICTS the collected entity_type.
-                # entity='' → keep (applies to all); entity=known → keep; entity=other → drop.
-                _retrieved_all = self._retrieve_docs(q)
+                # If entity_type is already known, retrieve with entity filter directly.
+                # This avoids the embedding imbalance where "แก้ไข ทะเบียนพาณิชย์ บุคคลธรรมดา"
+                # still retrieves นิติบุคคล docs because they outnumber บุคคลธรรมดา in the corpus.
                 _known_ent = (state.get_collected_slots() or {}).get("entity_type", "").strip()
                 if _known_ent:
                     try:
@@ -1868,14 +1962,22 @@ Your JSON response:
                     except Exception:
                         pass
                 if _known_ent:
-                    _filtered = [
-                        d for d in _retrieved_all
-                        if not ((d.get("metadata") or {}).get("entity_type_normalized") or "").strip()
-                        or ((d.get("metadata") or {}).get("entity_type_normalized") or "").strip() == _known_ent
-                    ]
-                    state.current_docs = _filtered if _filtered else _retrieved_all
+                    _retrieved_all = self._retrieve_docs(
+                        q, metadata_filter={"entity_type_normalized": _known_ent}
+                    )
+                    # Fallback: if filtered returns nothing, try unfiltered + post-filter
+                    if not _retrieved_all:
+                        _retrieved_all = self._retrieve_docs(q)
+                        _filtered = [
+                            d for d in _retrieved_all
+                            if not ((d.get("metadata") or {}).get("entity_type_normalized") or "").strip()
+                            or ((d.get("metadata") or {}).get("entity_type_normalized") or "").strip() == _known_ent
+                        ]
+                        state.current_docs = _filtered if _filtered else _retrieved_all
+                    else:
+                        state.current_docs = _retrieved_all
                 else:
-                    state.current_docs = _retrieved_all
+                    state.current_docs = self._retrieve_docs(q)
                 state.last_retrieval_query = q
                 tmp = [
                     {"content": d.get("content", "")[:120], "metadata": d.get("metadata", {})}

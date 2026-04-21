@@ -91,6 +91,29 @@ class StateManager:
         except Exception:
             pass
 
+    def cleanup_orphan_locks(self) -> int:
+        """
+        Remove all .lock files in the state directory whose modification time exceeds
+        the STATE_LOCK_STALE_S threshold. Safe to call at startup before any requests
+        are accepted. Returns the number of lock files removed.
+        """
+        stale_after = float(
+            getattr(conf, "STATE_LOCK_STALE_S", 15.0) if conf is not None else 15.0
+        )
+        removed = 0
+        try:
+            for lock_path in self.dir.glob("*.lock"):
+                try:
+                    age = time.time() - float(lock_path.stat().st_mtime)
+                    if age > stale_after:
+                        lock_path.unlink(missing_ok=True)
+                        removed += 1
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return removed
+
     def _trim_state_for_save(self, state: ConversationState) -> None:
         max_recent = None
         try:

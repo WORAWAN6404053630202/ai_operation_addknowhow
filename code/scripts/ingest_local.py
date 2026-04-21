@@ -125,6 +125,66 @@ def _normalize_metadata(md: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+_VALID_DATA_TYPES = {"regulatory", "marketing", "business_guide"}
+_VALID_ENTITY_TYPES = {"นิติบุคคล", "บุคคลธรรมดา", ""}
+
+
+def _validate_documents(docs: List[Document]) -> int:
+    """
+    Validate document metadata fields after normalization.
+
+    Prints a warning for each document that has a metadata issue which would
+    cause silent retrieval failures at query time (e.g. Chroma filter mismatches).
+    Does not remove documents — all are ingested regardless of issues.
+
+    Returns the total number of warnings emitted.
+    """
+    warnings_total = 0
+
+    for i, doc in enumerate(docs or []):
+        md = getattr(doc, "metadata", {}) or {}
+        issues: List[str] = []
+
+        # Validate entity_type_normalized — must be canonical value or empty.
+        # A non-canonical value (e.g. "บริษัท") will never match a Chroma filter
+        # and will silently return 0 results for filtered queries.
+        et = str(md.get("entity_type_normalized") or "").strip()
+        if et and et not in _VALID_ENTITY_TYPES:
+            issues.append(
+                f"entity_type_normalized={et!r} is not a canonical value "
+                f"({sorted(_VALID_ENTITY_TYPES - {''})}) — Chroma filter will not match"
+            )
+
+        # Validate data_type — must be one of the known source categories.
+        dt = str(md.get("data_type") or "").strip()
+        if dt and dt not in _VALID_DATA_TYPES:
+            issues.append(
+                f"data_type={dt!r} is not a recognised category "
+                f"({sorted(_VALID_DATA_TYPES)})"
+            )
+
+        # Validate page_content — very short content produces poor embeddings.
+        content = str(getattr(doc, "page_content", "") or "").strip()
+        if len(content) < 20:
+            issues.append(
+                f"page_content too short ({len(content)} chars) — embedding quality will be poor"
+            )
+
+        # Regulatory docs must have a license_type to enable slot-queue discovery.
+        if dt == "regulatory":
+            lt = str(md.get("license_type") or "").strip()
+            if not lt:
+                issues.append("license_type is empty on a regulatory doc — slot discovery will be skipped")
+
+        if issues:
+            row_ref = md.get("license_type") or md.get("operation_topic") or f"row {i + 1}"
+            for issue in issues:
+                print(f"[Ingest] WARN [{row_ref}] {issue}")
+                warnings_total += 1
+
+    return warnings_total
+
+
 def normalize_documents(docs: Iterable[Any]) -> None:
     """
     Mutates doc objects in-place:
@@ -178,6 +238,15 @@ def main():
     docs = all_docs
     normalize_documents(docs)
 
+    # ── Validate metadata fields ─────────────────────────────────────────────
+    print("\n[Ingest] Validating document metadata...")
+    warning_count = _validate_documents(docs)
+    if warning_count == 0:
+        print("[Ingest] Validation passed — no metadata issues found.")
+    else:
+        print(f"[Ingest] Validation complete — {warning_count} warning(s) above. "
+              f"Documents will still be ingested; fix the source sheet to suppress warnings.")
+
     print(f"\n[Ingest] Total docs to index: {len(docs)}")
     print("[Ingest] Model: multilingual-e5-large (better Thai retrieval accuracy)")
 
@@ -195,7 +264,7 @@ def main():
     print(f"[Ingest]   entity_type populated: {len(entities)}/{len(docs)}")
 
     ingest_documents(docs, reset=True)  # wipe old local chroma before rebuild
-    print('[Ingest] ✅ Done! Start server: python code/app.py')
+    print('[Ingest] Done! Start server: python code/app.py')
 
 
 if __name__ == "__main__":

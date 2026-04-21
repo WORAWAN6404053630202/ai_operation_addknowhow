@@ -61,10 +61,12 @@ except ImportError:
     logger = _ROOT_LOG
     _STRUCTURED_LOG = False
 
-# Token Management: ลด threshold เพื่อ trim history เร็วขึ้น
-# เดิม: 50,000 tokens (ยอมให้ใช้เยอะมาก)
-# ใหม่: 8,000 tokens (เตือนเมื่อใช้เกิน → trim ทันที)
-_TOKEN_WARN_THRESHOLD = 8_000  # warn when session total exceeds this
+# Token Management: session-level cumulative token threshold.
+# When session_total exceeds this value after an LLM call, auto-summarize or trim is triggered.
+# Raised from 8,000 → 30,000 so that normal multi-turn sessions (5–10 turns) do NOT trigger
+# premature summarization which strips context and degrades answer quality.
+# Auto-summarize is still triggered at 30,000 — this covers long test sessions gracefully.
+_TOKEN_WARN_THRESHOLD = 30_000  # trigger summarize/trim when session total exceeds this
 
 # Import metrics if available
 try:
@@ -89,7 +91,7 @@ def _check_token_budget(total: int, model: str) -> None:
     
     if total >= conf.TOKEN_BUDGET_CRITICAL:
         logger.error(
-            "🚨 CRITICAL: Token budget exceeded",
+            "CRITICAL: Token budget exceeded",
             extra={
                 "tokens": total,
                 "threshold": conf.TOKEN_BUDGET_CRITICAL,
@@ -100,7 +102,7 @@ def _check_token_budget(total: int, model: str) -> None:
         )
     elif total >= conf.TOKEN_BUDGET_WARNING:
         logger.warning(
-            "⚠️ WARNING: Token budget exceeded",
+            "WARNING: Token budget exceeded",
             extra={
                 "tokens": total,
                 "threshold": conf.TOKEN_BUDGET_WARNING,
@@ -112,7 +114,7 @@ def _check_token_budget(total: int, model: str) -> None:
         )
     elif total >= _TOKEN_WARN_THRESHOLD:
         logger.info(
-            "📊 INFO: Token usage within acceptable range",
+            "INFO: Token usage within acceptable range",
             extra={
                 "tokens": total,
                 "target": conf.TOKEN_BUDGET_PER_CALL,
@@ -289,7 +291,7 @@ def llm_invoke(
     
     # Enhanced structured logging for AI Engineers
     if _STRUCTURED_LOG:
-        _safe_log_with_data(log, "info", f"🤖 {label} สำเร็จ", {
+        _safe_log_with_data(log, "info", f"{label} สำเร็จ", {
             "action": "llm_call",
             "label": label,
             "model": model_name,
@@ -306,7 +308,7 @@ def llm_invoke(
         
         # Performance warning
         if elapsed > 2.0:
-            _safe_log_with_data(log, "warning", "🐌 LLM ช้าเกินไป", {
+            _safe_log_with_data(log, "warning", "LLM ช้าเกินไป", {
                 "label": label,
                 "duration_ms": round(elapsed * 1000, 2),
                 "threshold_ms": 2000,
@@ -349,22 +351,21 @@ def llm_invoke(
                     
                     summarized = auto_summarize_if_needed(
                         state,
-                        threshold=8,  # summarize ถ้ามี 8+ messages
-                        keep_recent=5  # เก็บ 5 messages ล่าสุด
+                        threshold=12,  # summarize only when 12+ messages accumulated
+                        keep_recent=8  # keep 8 most recent messages to preserve context
                     )
-                    
+
                     if summarized:
                         log.info("[%s] Auto-summarized old messages → token reduced", label)
                     else:
-                        # ถ้า summarize ไม่ได้ ใช้ trim แทน
+                        # ถ้า summarize ไม่ได้ ใช้ trim แทน — keep more messages to preserve context
                         log.info("[%s] Summarization not needed, using trim instead", label)
                         if hasattr(state, "trim_messages"):
-                            state.trim_messages(keep_last=8)
+                            state.trim_messages(keep_last=12)
                 except Exception as e:
                     log.warning("[%s] Summarization failed: %s, falling back to trim", label, e)
-                    # Fallback: trim ตามเดิม
                     if hasattr(state, "trim_messages"):
-                        state.trim_messages(keep_last=8)
+                        state.trim_messages(keep_last=12)
         except Exception:
             pass
 
@@ -475,7 +476,7 @@ async def llm_invoke_async(
     
     # Enhanced structured logging
     if _STRUCTURED_LOG:
-        _safe_log_with_data(log, "info", f"🤖 {label} สำเร็จ (async)", {
+        _safe_log_with_data(log, "info", f"{label} สำเร็จ (async)", {
             "action": "llm_call_async",
             "label": label,
             "model": model_name,
@@ -491,7 +492,7 @@ async def llm_invoke_async(
         })
         
         if elapsed > 2.0:
-            _safe_log_with_data(log, "warning", "🐌 LLM ช้าเกินไป (async)", {
+            _safe_log_with_data(log, "warning", "LLM ช้าเกินไป (async)", {
                 "label": label,
                 "duration_ms": round(elapsed * 1000, 2),
                 "threshold_ms": 2000,
@@ -528,23 +529,23 @@ async def llm_invoke_async(
                 
                 try:
                     from utils.conversation_summarizer import auto_summarize_if_needed
-                    
+
                     summarized = auto_summarize_if_needed(
                         state,
-                        threshold=8,
-                        keep_recent=5
+                        threshold=12,  # summarize only when 12+ messages accumulated
+                        keep_recent=8  # keep 8 most recent messages to preserve context
                     )
-                    
+
                     if summarized:
                         log.info("[%s] Auto-summarized old messages → token reduced", label)
                     else:
                         log.info("[%s] Summarization not needed, using trim instead", label)
                         if hasattr(state, "trim_messages"):
-                            state.trim_messages(keep_last=8)
+                            state.trim_messages(keep_last=12)
                 except Exception as e:
                     log.warning("[%s] Summarization failed: %s, falling back to trim", label, e)
                     if hasattr(state, "trim_messages"):
-                        state.trim_messages(keep_last=8)
+                        state.trim_messages(keep_last=12)
         except Exception:
             pass
 

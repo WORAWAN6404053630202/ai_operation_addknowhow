@@ -60,6 +60,13 @@ try:
     supervisor = PersonaSupervisor(retriever=retriever)
     state_manager = StateManager()
 
+    try:
+        _cleaned = state_manager.cleanup_orphan_locks()
+        if _cleaned:
+            logger.info("Startup: removed %d orphan lock file(s)", _cleaned)
+    except Exception:
+        logger.warning("Startup: cleanup_orphan_locks failed", exc_info=True)
+
     logger.info("Services initialized successfully")
 
 except Exception:
@@ -254,20 +261,56 @@ async def chat(request: ChatRequest):
             }
         )
     
-    logger.info(f"[{session_id}] ✅ Rate limit OK - {rate_info['remaining']}/{rate_info['limit']} remaining")
+    logger.info(f"[{session_id}] Rate limit OK - {rate_info['remaining']}/{rate_info['limit']} remaining")
 
     try:
         # Load state
         saved = state_manager.load(session_id)
         state = saved if saved else ConversationState(session_id=session_id, persona_id="practical", context={})
-        
-        # Check cache first — skip if pending_slot (stateful slot-filling)
+
+        # Session-level token budget check.
+        # Session-level token budget: monitor-only (no blocking).
+        # Logs a warning when the session exceeds TOKEN_BUDGET_PER_SESSION so the
+        # operator can identify high-usage sessions without interrupting the user.
+        _pre_tokens = (getattr(state, "total_prompt_tokens", 0) or 0) + (getattr(state, "total_completion_tokens", 0) or 0)
+        _session_budget = int(getattr(conf, "TOKEN_BUDGET_PER_SESSION", 0) or 0)
+        if _session_budget > 0 and _pre_tokens >= _session_budget:
+            logger.warning(
+                "[%s] Session token budget alert: used=%d limit=%d (continuing — monitoring only)",
+                session_id, _pre_tokens, _session_budget,
+            )
+
+        # Per-window token rate check (burst protection).
+        _window_token_limit = int(getattr(conf, "TOKEN_RATE_LIMIT_PER_WINDOW", 0) or 0)
+        if _window_token_limit > 0:
+            _token_rate_ok, _window_tokens_used = rate_limiter.is_token_rate_allowed(session_id, _window_token_limit)
+            if not _token_rate_ok:
+                logger.warning(
+                    "[%s] Token rate limit exceeded: window_tokens=%d limit=%d",
+                    session_id, _window_tokens_used, _window_token_limit,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Token rate limit exceeded. Please wait before sending more messages.",
+                    headers={"Retry-After": "60"},
+                )
+
+        # Skip cache if pending_slot (stateful slot-filling) or if slot-sensitive values
+        # are collected. entity_type and registration_type affect answer content, so a
+        # cached response from before those slots were filled must not be reused.
         cache = get_cache()
         has_pending_slot = bool((state.context or {}).get("pending_slot"))
-        cached_result = None if has_pending_slot else cache.get(session_id, request.message, state.persona_id)
+        _CACHE_SKIP_SLOTS = {"entity_type", "registration_type"}
+        _collected_slots = (state.context or {}).get("collected_slots") or {}
+        has_slot_context = bool(_CACHE_SKIP_SLOTS & set(_collected_slots.keys()))
+        cached_result = (
+            None
+            if (has_pending_slot or has_slot_context)
+            else cache.get(session_id, request.message, state.persona_id)
+        )
         
         if cached_result is not None:
-            logger.info(f"[{session_id}] 🎯 Cache HIT! Skipping LLM call (saved ${cached_result.get('cost', 0):.3f})")
+            logger.info(f"[{session_id}] Cache HIT! Skipping LLM call (saved ${cached_result.get('cost', 0):.3f})")
 
             # Update state with cached message (but don't call LLM)
             # Use dedup helpers to avoid duplicate messages when same question asked repeatedly
@@ -285,9 +328,15 @@ async def chat(request: ChatRequest):
             )
         
         # Cache miss - call LLM
-        logger.info(f"[{session_id}] ❌ Cache MISS - Calling LLM")
+        logger.info(f"[{session_id}] Cache MISS - Calling LLM")
         state, bot_reply = supervisor.handle(state, request.message)
         state_manager.save(session_id, state)
+
+        # Record token delta for window-level rate tracking.
+        _post_tokens = (getattr(state, "total_prompt_tokens", 0) or 0) + (getattr(state, "total_completion_tokens", 0) or 0)
+        _delta_tokens = max(0, _post_tokens - _pre_tokens)
+        if _delta_tokens > 0:
+            rate_limiter.record_token_usage(session_id, _delta_tokens)
         
         # Store in cache for future use
         cache.set(
@@ -337,14 +386,45 @@ async def _stream_reply(session_id: str, message: str) -> AsyncGenerator[str, No
             session_id=session_id, persona_id="practical", context={}
         )
 
-        # ตรวจ cache ก่อน — ข้าม cache ถ้ามี pending_slot (stateful slot-filling)
+        # Session-level token budget: monitor-only (no blocking).
+        _pre_tokens_st = (getattr(state, "total_prompt_tokens", 0) or 0) + (getattr(state, "total_completion_tokens", 0) or 0)
+        _session_budget_st = int(getattr(conf, "TOKEN_BUDGET_PER_SESSION", 0) or 0)
+        if _session_budget_st > 0 and _pre_tokens_st >= _session_budget_st:
+            logger.warning(
+                "[%s] Session token budget alert (stream): used=%d limit=%d (continuing — monitoring only)",
+                session_id, _pre_tokens_st, _session_budget_st,
+            )
+
+        # Per-window token rate check (burst protection).
+        _window_token_limit_st = int(getattr(conf, "TOKEN_RATE_LIMIT_PER_WINDOW", 0) or 0)
+        if _window_token_limit_st > 0:
+            _rl_st = get_rate_limiter()
+            _token_ok_st, _window_used_st = _rl_st.is_token_rate_allowed(session_id, _window_token_limit_st)
+            if not _token_ok_st:
+                logger.warning(
+                    "[%s] Token rate limit exceeded (stream): window_tokens=%d limit=%d",
+                    session_id, _window_used_st, _window_token_limit_st,
+                )
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Token rate limit exceeded. Please wait before sending more messages.'})}\n\n"
+                return
+
+        # Skip cache if pending_slot (stateful slot-filling) or if slot-sensitive values
+        # are collected. entity_type and registration_type affect answer content, so a
+        # cached response from before those slots were filled must not be reused.
         cache = get_cache()
         has_pending_slot = bool((state.context or {}).get("pending_slot"))
-        cached_result = None if has_pending_slot else cache.get(session_id, message, state.persona_id)
+        _CACHE_SKIP_SLOTS = {"entity_type", "registration_type"}
+        _collected_slots = (state.context or {}).get("collected_slots") or {}
+        has_slot_context = bool(_CACHE_SKIP_SLOTS & set(_collected_slots.keys()))
+        cached_result = (
+            None
+            if (has_pending_slot or has_slot_context)
+            else cache.get(session_id, message, state.persona_id)
+        )
 
         if cached_result is not None:
             # Cache hit → stream ตัวอักษรจาก cache ทีละ chunk เพื่อให้ดูเหมือน typewriter
-            logger.info(f"[{session_id}] 🎯 Cache HIT (stream)")
+            logger.info(f"[{session_id}] Cache HIT (stream)")
             full_text = cached_result["response"]
             # Use dedup helpers to avoid duplicate messages when same question asked repeatedly
             state.add_user_message_once(message)
@@ -362,7 +442,7 @@ async def _stream_reply(session_id: str, message: str) -> AsyncGenerator[str, No
             return
 
         # Cache miss → เรียก LLM จริง (blocking แต่ stream ผลลัพธ์หลังได้คำตอบ)
-        logger.info(f"[{session_id}] ❌ Cache MISS (stream) - Calling LLM")
+        logger.info(f"[{session_id}] Cache MISS (stream) - Calling LLM")
 
         # เรียก supervisor ใน thread pool ไม่บล็อก event loop
         loop = asyncio.get_running_loop()
@@ -370,6 +450,12 @@ async def _stream_reply(session_id: str, message: str) -> AsyncGenerator[str, No
             None, supervisor.handle, state, message
         )
         state_manager.save(session_id, state)
+
+        # Record token delta for window-level rate tracking.
+        _post_tokens_st = (getattr(state, "total_prompt_tokens", 0) or 0) + (getattr(state, "total_completion_tokens", 0) or 0)
+        _delta_tokens_st = max(0, _post_tokens_st - _pre_tokens_st)
+        if _delta_tokens_st > 0:
+            get_rate_limiter().record_token_usage(session_id, _delta_tokens_st)
 
         # เก็บ cache
         cache.set(

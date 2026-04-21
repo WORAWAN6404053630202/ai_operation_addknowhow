@@ -267,6 +267,30 @@ class AcademicPersonaService:
 
         state.context = state.context or {}
 
+        # When the user switches to Academic via a meta-request (e.g. "ขอแบบละเอียดมากกว่านี้",
+        # "รายละเอียดเพิ่มเติม"), the user_question carries no topical content.  Using it as the
+        # retrieval query would produce low keyword-overlap with the supervisor's
+        # last_retrieval_query → needs_fresh=True → fresh unfiltered retrieval that mixes in
+        # docs for other operations (แก้ไข/ยกเลิก).
+        # Fix: substitute last_user_legal_query / last_retrieval_query as the base query so that
+        # (a) _query_changed sees sufficient overlap → needs_fresh=False → reuse correctly-filtered
+        #     state.current_docs, and
+        # (b) even when fresh retrieval is forced, the embedding stays on the right topic.
+        _META_REQUEST_RE = re.compile(
+            r"ขอแบบละเอียด|แบบละเอียดกว่า|รายละเอียดเพิ่ม|เพิ่มเติม$|^เพิ่ม|^ละเอียด"
+            r"|ขอรายละเอียด|ขยายความ|บอกให้ครบ|บอกทุกอย่าง|อยากรู้ครบ|ให้ครบ|ต้องการข้อมูลเพิ่ม"
+        )
+        if _META_REQUEST_RE.search(q):
+            _ctx_lq = (state.context.get("last_user_legal_query") or "").strip()
+            _ctx_rq = (
+                (state.context.get("last_retrieval_query") or "").strip()
+                or (getattr(state, "last_retrieval_query", "") or "").strip()
+            )
+            _base = _ctx_lq or _ctx_rq
+            if _base:
+                _LOG.info("[Academic] Meta-request %r — using legal base query: %r", q[:40], _base[:60])
+                q = _base
+
         # Enrich query with entity type if already known (from practical slot memory)
         if hasattr(state, "get_collected_slots"):
             slots = state.get_collected_slots() or {}
@@ -335,22 +359,29 @@ class AcademicPersonaService:
                         "[Academic] Force fresh retrieve: entity_type=%r not in docs (docs have %s)",
                         _entity_val, _docs_entity,
                     )
-                # Force fresh when registration_type is known but not yet reflected in the
-                # last retrieval query (Chroma has no clean registration_type filter field,
-                # so we enrich the query string — but only if the retrieval hasn't done so yet).
+                # Force fresh when registration_type or operation_group is known but not yet
+                # reflected in the last retrieval query (Chroma has no clean filter field for
+                # these, so we enrich the query string — but only when not already done).
                 if not needs_fresh:
+                    _last_q = ""
+                    if hasattr(state, "get_last_retrieval_query"):
+                        _last_q = (state.get_last_retrieval_query() or "").lower()
+                    else:
+                        _last_q = (getattr(state, "last_retrieval_query", "") or "").lower()
                     _reg_val = _filter_slots.get("registration_type", "")
-                    if _reg_val:
-                        _last_q = ""
-                        if hasattr(state, "get_last_retrieval_query"):
-                            _last_q = (state.get_last_retrieval_query() or "").lower()
-                        else:
-                            _last_q = (getattr(state, "last_retrieval_query", "") or "").lower()
-                        if _reg_val.lower() not in _last_q:
+                    if _reg_val and _reg_val.lower() not in _last_q:
+                        needs_fresh = True
+                        _LOG.info(
+                            "[Academic] Force fresh retrieve: registration_type=%r not in last query %r",
+                            _reg_val, _last_q[:80],
+                        )
+                    if not needs_fresh:
+                        _op_val = _filter_slots.get("operation_group", "")
+                        if _op_val and _op_val.lower() not in _last_q:
                             needs_fresh = True
                             _LOG.info(
-                                "[Academic] Force fresh retrieve: registration_type=%r not in last query %r",
-                                _reg_val, _last_q[:80],
+                                "[Academic] Force fresh retrieve: operation_group=%r not in last query %r",
+                                _op_val, _last_q[:80],
                             )
 
         if not needs_fresh:
@@ -834,14 +865,18 @@ class AcademicPersonaService:
             needed = [s for s in needed if s.get("key") not in _LOCATION_KEYS]
 
         # Semantic dedup: if known_slots already has operation group/type info,
-        # drop any LLM-generated slot asking the same thing under a different key name
+        # drop any LLM-generated slot asking the same GROUP-level question under a different key.
+        # BUT keep "operation_topic" — it is a sub-level of operation_group (more specific),
+        # e.g. operation_group="แก้ไข/เปลี่ยนแปลงรายการ" still leaves operation_topic ambiguous
+        # ("แก้ไขชื่อ" vs "แก้ไขข้อบังคับ" vs "แก้ไขสินค้า" etc.)
         _OPERATION_GROUP_KEYS = {
             "operation_group", "operation_type", "operation_action",
             "operation_by_department", "action_type", "operation_mode",
         }
         _known_has_op_group = bool(known_slots.keys() & _OPERATION_GROUP_KEYS)
         if _known_has_op_group:
-            needed = [s for s in needed if s.get("key") not in _OPERATION_GROUP_KEYS]
+            needed = [s for s in needed if s.get("key") not in _OPERATION_GROUP_KEYS
+                      or s.get("key") == "operation_topic"]
 
         # Post-validate: only keep slots whose key is in diversity_data.
         # Prevents hallucinated keys (e.g. "shop_type", "employee_count") from reaching users.
@@ -983,6 +1018,7 @@ class AcademicPersonaService:
         # Fields that map cleanly to Chroma metadata keys for exact-match filtering
         _DIRECT_FILTER_FIELDS = frozenset({
             "entity_type_normalized", "location", "area_size", "registration_type",
+            "operation_topic",
         })
 
         filter_parts: List[Dict] = []
@@ -1229,6 +1265,9 @@ class AcademicPersonaService:
             "license_type", "operation_topic",
             "entity_type_normalized", "registration_type", "department",
             "fees", "operation_duration",
+            # Document list — critical for เอกสารที่ต้องใช้ section; varies per entity_type so
+            # must come from every doc (not deduplicated like operation_steps).
+            "identification_documents",
             # Section-backing fields: must be whitelisted so LLM can actually answer these sections
             "terms_and_conditions", "conditions",
             "legal_regulatory", "law", "regulation",
@@ -1264,6 +1303,10 @@ class AcademicPersonaService:
                 if k in _ACADEMIC_LONG_FIELDS and _academic_long_sent:
                     continue
                 v_str = str(v)
+                # service_channel: split concatenated URLs (e.g. "https://a.comhttps://b.com")
+                # into separate lines so LLM renders them correctly.
+                if k == "service_channel" and "https://" in v_str:
+                    v_str = re.sub(r"(https?://)", r"\n\1", v_str).strip()
                 cap = _ACADEMIC_FIELD_CAPS.get(k)
                 filtered_md[k] = v_str[:cap] if cap and len(v_str) > cap else v_str
             if any(k in filtered_md for k in _ACADEMIC_LONG_FIELDS):
@@ -1312,6 +1355,8 @@ class AcademicPersonaService:
             and (
                 selected.get("type") == "all"
                 or "research_reference" in (selected.get("keys") or [])
+                # "7) แบบฟอร์มและเอกสาร" maps to section key that may vary — also check label text
+                or any("แบบฟอร์ม" in str(k) or "เอกสาร" in str(k) for k in (selected.get("keys") or []))
             )
         )
 

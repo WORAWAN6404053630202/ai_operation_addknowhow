@@ -23,9 +23,26 @@ Example:
 """
 
 import logging
+import time
 from typing import List, Dict, Any, Optional
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
+
+try:
+    import openai as _openai
+    _OPENAI_AUTH_ERRORS = (
+        _openai.AuthenticationError,
+        _openai.PermissionDeniedError,
+    )
+    _OPENAI_RETRYABLE_ERRORS = (
+        _openai.APITimeoutError,
+        _openai.APIConnectionError,
+        _openai.RateLimitError,
+        _openai.InternalServerError,
+    )
+except ImportError:
+    _OPENAI_AUTH_ERRORS = ()
+    _OPENAI_RETRYABLE_ERRORS = ()
 
 # Import config and logger
 try:
@@ -109,12 +126,9 @@ class ConversationSummarizer:
         """
         if not messages:
             return None
-        
-        try:
-            # สร้าง prompt สำหรับ summarize
-            conversation_text = self._format_messages(messages)
-            
-            prompt = f"""สรุปการสนทนาต่อไปนี้เป็นภาษาไทย ให้สั้นกระชับ 2-3 ประโยค:
+
+        conversation_text = self._format_messages(messages)
+        prompt = f"""สรุปการสนทนาต่อไปนี้เป็นภาษาไทย ให้สั้นกระชับ 2-3 ประโยค:
 
 เน้น:
 - หัวข้อที่คุยกัน (topics)
@@ -131,36 +145,87 @@ class ConversationSummarizer:
 
 สรุป (2-3 ประโยค):"""
 
-            # เรียก LLM
-            response = self.llm.invoke([HumanMessage(content=prompt)])
-            summary = response.content.strip()
-            
-            # ตัดให้สั้นถ้ายาวเกิน
-            if len(summary) > max_length:
-                summary = summary[:max_length] + "..."
-            
-            # Log
-            if _HAS_LOGGER:
-                logger.log_with_data("info", "📝 สรุปการสนทนา", {
-                    "action": "conversation_summary",
-                    "messages_count": len(messages),
-                    "summary_length": len(summary),
-                    "model": self.llm.model
-                })
-            else:
-                logger.info(f"[Summarizer] Summarized {len(messages)} messages → {len(summary)} chars")
-            
-            return summary
-            
-        except Exception as e:
-            if _HAS_LOGGER:
-                logger.log_with_data("error", "❌ สรุปการสนทนาล้มเหลว", {
-                    "error": str(e),
-                    "fallback": "keep_all_messages"
-                })
-            else:
-                logger.error(f"[Summarizer] Failed: {e}")
-            return None
+        _max_attempts = 3  # 1 ครั้งแรก + retry อีก 2 ครั้ง
+        _retry_delay = 1.5  # วินาที
+
+        for _attempt in range(1, _max_attempts + 1):
+            try:
+                response = self.llm.invoke([HumanMessage(content=prompt)])
+                summary = response.content.strip()
+
+                if len(summary) > max_length:
+                    summary = summary[:max_length] + "..."
+
+                if _HAS_LOGGER:
+                    logger.log_with_data("info", "สรุปการสนทนา", {
+                        "action": "conversation_summary",
+                        "messages_count": len(messages),
+                        "summary_length": len(summary),
+                        "attempt": _attempt,
+                    })
+                else:
+                    logger.info(
+                        "[Summarizer] Summarized %d messages → %d chars (attempt %d)",
+                        len(messages), len(summary), _attempt,
+                    )
+                return summary
+
+            except _OPENAI_AUTH_ERRORS as e:
+                # ไม่มี API key หรือไม่มีเงิน — retry ไม่มีประโยชน์
+                if _HAS_LOGGER:
+                    logger.log_with_data("error", "สรุปการสนทนาล้มเหลว (auth/billing)", {
+                        "error": str(e), "attempt": _attempt,
+                    })
+                else:
+                    logger.error("[Summarizer] Auth/billing error — skipping retry: %s", e)
+                return None
+
+            except _OPENAI_RETRYABLE_ERRORS as e:
+                if _attempt < _max_attempts:
+                    if _HAS_LOGGER:
+                        logger.log_with_data("warning", "สรุปการสนทนา retry", {
+                            "error": str(e), "attempt": _attempt, "next_attempt": _attempt + 1,
+                        })
+                    else:
+                        logger.warning(
+                            "[Summarizer] Retryable error (attempt %d/%d): %s — retrying in %.1fs",
+                            _attempt, _max_attempts, e, _retry_delay,
+                        )
+                    time.sleep(_retry_delay)
+                else:
+                    if _HAS_LOGGER:
+                        logger.log_with_data("error", "สรุปการสนทนาล้มเหลวหลัง retry", {
+                            "error": str(e), "attempts": _max_attempts,
+                        })
+                    else:
+                        logger.error(
+                            "[Summarizer] Failed after %d attempts: %s", _max_attempts, e,
+                        )
+                    return None
+
+            except Exception as e:
+                # ไม่รู้ประเภท — retry ครั้งเดียว แล้วยอมแพ้
+                if _attempt < _max_attempts:
+                    if _HAS_LOGGER:
+                        logger.log_with_data("warning", "สรุปการสนทนา retry (unknown error)", {
+                            "error": str(e), "attempt": _attempt,
+                        })
+                    else:
+                        logger.warning(
+                            "[Summarizer] Unknown error (attempt %d/%d): %s — retrying",
+                            _attempt, _max_attempts, e,
+                        )
+                    time.sleep(_retry_delay)
+                else:
+                    if _HAS_LOGGER:
+                        logger.log_with_data("error", "สรุปการสนทนาล้มเหลว", {
+                            "error": str(e), "attempts": _max_attempts,
+                        })
+                    else:
+                        logger.error("[Summarizer] Failed: %s", e)
+                    return None
+
+        return None
     
     def _format_messages(self, messages: List[Dict[str, Any]]) -> str:
         """จัดรูป messages เป็น text ที่อ่านง่าย"""
@@ -227,7 +292,7 @@ def auto_summarize_if_needed(
         state.summarize_old_messages(summary, keep_recent)
         
         if _HAS_LOGGER:
-            logger.log_with_data("info", "✅ Auto-summarize completed", {
+            logger.log_with_data("info", "Auto-summarize completed", {
                 "before_count": len(state.messages) + len(old_messages),
                 "after_count": len(state.messages),
                 "saved_messages": len(old_messages) - 1,  # -1 เพราะแทนด้วย summary

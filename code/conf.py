@@ -68,6 +68,7 @@ RETRIEVAL_TOP_K = _safe_int("RETRIEVAL_TOP_K", 20)
 # เดิม: Practical=5/500, Academic=8/700 → ใช้ ~8,000-12,000 tokens
 # ใหม่: Practical=3/400, Academic=5/500 → ใช้ ~5,000-7,000 tokens (ประหยัด 40%!)
 LLM_DOCS_MAX_PRACTICAL = _safe_int("LLM_DOCS_MAX_PRACTICAL", 6)    # raised 4→6: more docs = richer, more complete answers
+LLM_DOCS_MAX_BROAD = _safe_int("LLM_DOCS_MAX_BROAD", 15)          # total docs cap for broad open-ended questions — must cover two-pass merged result (pass1=10 + pass2=8 = up to 18 unique)
 LLM_DOCS_MAX_ACADEMIC = _safe_int("LLM_DOCS_MAX_ACADEMIC", 12)    # raised: 5 → 12 (academic needs full coverage)
 
 LLM_DOC_CHARS_PRACTICAL = _safe_int("LLM_DOC_CHARS_PRACTICAL", 700)   # reduced 1200→700: metadata fields carry key info
@@ -157,10 +158,20 @@ if not OPENROUTER_API_KEY:
 COST_WARNING_THRESHOLD = float(os.getenv("COST_WARNING_THRESHOLD", "1.0"))  # Warn if single call > $1
 DAILY_BUDGET_USD = float(os.getenv("DAILY_BUDGET_USD", "50.0"))  # Daily spending limit
 
-# Token budget alerts
-TOKEN_BUDGET_PER_CALL = int(os.getenv("TOKEN_BUDGET_PER_CALL", "8000"))  # Target: 6,000-8,000 tokens
-TOKEN_BUDGET_WARNING = int(os.getenv("TOKEN_BUDGET_WARNING", "10000"))  # Warning at 10,000
-TOKEN_BUDGET_CRITICAL = int(os.getenv("TOKEN_BUDGET_CRITICAL", "15000"))  # Critical at 15,000
+# Token budget alerts (per-call thresholds — warning/logging only, not enforced)
+TOKEN_BUDGET_PER_CALL = int(os.getenv("TOKEN_BUDGET_PER_CALL", "8000"))
+TOKEN_BUDGET_WARNING = int(os.getenv("TOKEN_BUDGET_WARNING", "10000"))
+TOKEN_BUDGET_CRITICAL = int(os.getenv("TOKEN_BUDGET_CRITICAL", "15000"))
+
+# Session-level token budget: cumulative tokens across all LLM calls in one session.
+# Requests that would exceed this limit are rejected with HTTP 429.
+# Set to 0 to disable (default).
+TOKEN_BUDGET_PER_SESSION = _safe_int("TOKEN_BUDGET_PER_SESSION", 0)
+
+# Per-window token rate limit: max tokens consumed within RATE_LIMIT_WINDOW_SECONDS.
+# Complements the request-count rate limit with a cost-aware burst guard.
+# Set to 0 to disable (default).
+TOKEN_RATE_LIMIT_PER_WINDOW = _safe_int("TOKEN_RATE_LIMIT_PER_WINDOW", 0)
 
 
 def validate_config() -> None:

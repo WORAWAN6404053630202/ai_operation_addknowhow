@@ -457,50 +457,59 @@ class DataLoader:
             op_topic = self._get_row_value(row, colmap.get("operation_topic"))
             op_by_dept = self._get_row_value(row, colmap.get("operation_by_department"))
 
-            # Derived metadata: entity, location, area_size
-            entity_from_reg = self._normalize_entity_type(reg_type)
-            entity_from_topic = self._extract_entity_from_topic(op_topic, reg_type)
-            # Prefer reg-based entity; fill with topic-based if missing
-            entity_normalized = entity_from_reg or entity_from_topic
+            # Split compound registration_type values joined with " / "
+            # e.g. "ห้างหุ้นส่วนจำกัด / ห้างหุ้นส่วนสามัญ" → two separate docs so that
+            # Chroma metadata filters on exact registration_type values work correctly.
+            if reg_type and " / " in reg_type:
+                reg_type_values = [v.strip() for v in reg_type.split(" / ") if v.strip()]
+            else:
+                reg_type_values = [reg_type]
 
-            location = self._extract_location(op_topic, reg_type, op_by_dept)
-            area_size = self._extract_area_size(reg_type, op_topic)
-
-            metadata = {
-                "row_id": int(idx),
-                "department": dept,
-                "license_type": self._get_row_value(row, colmap.get("license_type")),
-                "operation_by_department": op_by_dept,
-                "operation_topic": op_topic,
-                "registration_type": reg_type,
-                "entity_type_normalized": entity_normalized,
+            for reg_type_single in reg_type_values:
                 # Derived metadata: entity, location, area_size
-                "location": location,          # 'กรุงเทพฯ' | 'ต่างจังหวัด' | None
-                "area_size": area_size,        # 'มากกว่า 200 ตารางเมตร' | 'ไม่เกิน 200 ตารางเมตร' | None
-                # Answer fields
-                "terms_and_conditions": self._get_row_value(row, colmap.get("terms_and_conditions")),
-                "service_channel": self._get_row_value(row, colmap.get("service_channel")),
-                "operation_steps": self._get_row_value(row, colmap.get("operation_steps")),
-                "identification_documents": self._get_row_value(row, colmap.get("identification_documents")),
-                "operation_duration": self._get_row_value(row, colmap.get("operation_duration")),
-                "fees": self._get_row_value(row, colmap.get("fees")),
-                "legal_regulatory": self._get_row_value(row, colmap.get("legal_regulatory")),
-                "restaurant_ai_document": self._get_row_value(row, colmap.get("restaurant_ai_document")),
-                "research_reference": self._get_row_value(row, colmap.get("research_reference")),
-                "answer_guideline": self._get_row_value(row, colmap.get("answer_guideline")),
-                "source": source,
-            }
+                entity_from_reg = self._normalize_entity_type(reg_type_single)
+                entity_from_topic = self._extract_entity_from_topic(op_topic, reg_type_single)
+                # Prefer reg-based entity; fill with topic-based if missing
+                entity_normalized = entity_from_reg or entity_from_topic
 
-            # Build page_content (high-signal embedding text)
-            page_content = self._build_page_content(metadata)
+                location = self._extract_location(op_topic, reg_type_single, op_by_dept)
+                area_size = self._extract_area_size(reg_type_single, op_topic)
 
-            # Skip rows with no procedural content — indexing boilerplate degrades search quality
-            if not page_content:
-                topic = metadata.get("operation_topic") or metadata.get("license_type") or f"row {idx}"
-                print(f"[DataLoader] WARNING: Skipping empty row (no content): {topic}")
-                continue
+                metadata = {
+                    "row_id": int(idx),
+                    "department": dept,
+                    "license_type": self._get_row_value(row, colmap.get("license_type")),
+                    "operation_by_department": op_by_dept,
+                    "operation_topic": op_topic,
+                    "registration_type": reg_type_single,
+                    "entity_type_normalized": entity_normalized,
+                    # Derived metadata: entity, location, area_size
+                    "location": location,          # 'กรุงเทพฯ' | 'ต่างจังหวัด' | None
+                    "area_size": area_size,        # 'มากกว่า 200 ตารางเมตร' | 'ไม่เกิน 200 ตารางเมตร' | None
+                    # Answer fields
+                    "terms_and_conditions": self._get_row_value(row, colmap.get("terms_and_conditions")),
+                    "service_channel": self._get_row_value(row, colmap.get("service_channel")),
+                    "operation_steps": self._get_row_value(row, colmap.get("operation_steps")),
+                    "identification_documents": self._get_row_value(row, colmap.get("identification_documents")),
+                    "operation_duration": self._get_row_value(row, colmap.get("operation_duration")),
+                    "fees": self._get_row_value(row, colmap.get("fees")),
+                    "legal_regulatory": self._get_row_value(row, colmap.get("legal_regulatory")),
+                    "restaurant_ai_document": self._get_row_value(row, colmap.get("restaurant_ai_document")),
+                    "research_reference": self._get_row_value(row, colmap.get("research_reference")),
+                    "answer_guideline": self._get_row_value(row, colmap.get("answer_guideline")),
+                    "source": source,
+                }
 
-            self.documents.append(Document(page_content=page_content, metadata=metadata))
+                # Build page_content (high-signal embedding text)
+                page_content = self._build_page_content(metadata)
+
+                # Skip rows with no procedural content — indexing boilerplate degrades search quality
+                if not page_content:
+                    topic = metadata.get("operation_topic") or metadata.get("license_type") or f"row {idx}"
+                    print(f"[DataLoader] WARNING: Skipping empty row (no content): {topic}")
+                    continue
+
+                self.documents.append(Document(page_content=page_content, metadata=metadata))
 
         return len(self.documents) - docs_before
 

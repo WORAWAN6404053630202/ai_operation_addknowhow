@@ -260,7 +260,7 @@ class PerformanceTracker:
     
     def __enter__(self):
         self.start_time = time.time()
-        self.logger.debug(f"⏱ Starting: {self.operation}")
+        self.logger.debug(f"Starting: {self.operation}")
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
