@@ -12,6 +12,8 @@ FastAPI Application Entry Point
 """
 
 import os
+import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -35,10 +37,31 @@ logger = get_logger(__name__)
 
 logger.info(f"Starting application with LOG_LEVEL={LOG_LEVEL}, LOG_FORMAT={LOG_FORMAT}")
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    import conf as _conf
+    if getattr(_conf, "RERANKER_ENABLED", False):
+        model_name = getattr(_conf, "RERANKER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
+
+        def _load():
+            try:
+                from utils.reranker import _get_reranker
+                _get_reranker(model_name)
+                logger.info("[Startup] Reranker model ready: %s", model_name)
+            except Exception as e:
+                logger.warning("[Startup] Reranker preload failed (will retry on first request): %s", e)
+
+        threading.Thread(target=_load, daemon=True, name="reranker-preload").start()
+        logger.info("[Startup] Reranker preload started in background (model=%s)", model_name)
+    yield
+
+
 app = FastAPI(
     title="Restbiz — น้องสุดยอด",
     description="Thai Regulatory AI Assistant for restaurant businesses",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 # Add monitoring middleware (before CORS)

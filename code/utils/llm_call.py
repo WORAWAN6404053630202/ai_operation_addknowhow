@@ -63,10 +63,66 @@ except ImportError:
 
 # Token Management: session-level cumulative token threshold.
 # When session_total exceeds this value after an LLM call, auto-summarize or trim is triggered.
-# Raised from 8,000 → 30,000 so that normal multi-turn sessions (5–10 turns) do NOT trigger
-# premature summarization which strips context and degrades answer quality.
-# Auto-summarize is still triggered at 30,000 — this covers long test sessions gracefully.
-_TOKEN_WARN_THRESHOLD = 30_000  # trigger summarize/trim when session total exceeds this
+# Set to 20,000 so that long slot-filling sequences (3-4 Q&A turns + prior topic history)
+# trigger early summarization before the final answer call accumulates a 20K+ token prompt.
+_TOKEN_WARN_THRESHOLD = 20_000  # trigger summarize/trim when session total exceeds this
+
+
+def _handle_post_call_token_budget(
+    state: Any,
+    prompt_tokens: int,
+    completion_tokens: int,
+    label: str,
+    log: logging.Logger,
+) -> None:
+    """Track cumulative token usage and auto-summarize/trim when session total is high.
+
+    Shared by llm_invoke (sync) and llm_invoke_async (async) — no async operations here.
+    Wrapped in a broad except so any failure is silent and never breaks the main call.
+    """
+    try:
+        state.add_token_usage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+        session_total = getattr(state, "total_tokens", 0)
+        if session_total <= _TOKEN_WARN_THRESHOLD:
+            return
+
+        log.warning(
+            "[%s] Session token budget exceeded %d (total=%d) — trying summarization first",
+            label, _TOKEN_WARN_THRESHOLD, session_total,
+        )
+        _academic_stage = (
+            (getattr(state, "context", None) or {})
+            .get("_academic_flow", {})
+            .get("stage", "")
+        )
+        _skip_summarize = _academic_stage in ("awaiting_slots", "awaiting_sections", "awaiting_topic")
+
+        try:
+            from utils.conversation_summarizer import auto_summarize_if_needed
+
+            if _skip_summarize:
+                log.info("[%s] Academic stage=%r — skipping summarize, using trim only", label, _academic_stage)
+                summarized = False
+            else:
+                summarized = auto_summarize_if_needed(
+                    state,
+                    threshold=6,   # summarize when 6+ messages (~3 Q&A turns)
+                    keep_recent=4  # keep last 4 messages (2 Q&A turns) + summary
+                )
+
+            if summarized:
+                log.info("[%s] Auto-summarized old messages → token reduced", label)
+            else:
+                log.info("[%s] Summarization not needed, using trim instead", label)
+                if hasattr(state, "trim_messages"):
+                    state.trim_messages(keep_last=6)
+        except Exception as e:
+            log.warning("[%s] Summarization failed: %s, falling back to trim", label, e)
+            if hasattr(state, "trim_messages"):
+                state.trim_messages(keep_last=6)
+    except Exception:
+        pass
+
 
 # Import metrics if available
 try:
@@ -127,17 +183,29 @@ def _check_token_budget(total: int, model: str) -> None:
 
 # Cost Estimation (ราคาโดยประมาณ - ตรวจสอบราคาจริงจาก OpenRouter)
 PRICING_USD_PER_MILLION_TOKENS = {
+    # Claude Sonnet family
+    "anthropic/claude-sonnet-4-5": {"input": 3.00, "output": 15.00},
     "anthropic/claude-sonnet-4": {"input": 3.00, "output": 15.00},
     "anthropic/claude-4-5-sonnet-20241022": {"input": 3.00, "output": 15.00},
+    # Claude Haiku family
+    "anthropic/claude-haiku-4-5": {"input": 0.80, "output": 4.00},
     "anthropic/claude-haiku-4": {"input": 0.25, "output": 1.25},
     "anthropic/claude-3.5-haiku-20241022": {"input": 0.25, "output": 1.25},
+    # GPT-5.x family (verify pricing at openrouter.ai/models)
+    "openai/gpt-5.1": {"input": 2.00, "output": 8.00},
+    # GPT-4o family
     "openai/gpt-4o": {"input": 5.00, "output": 15.00},
     "openai/chatgpt-4o-latest": {"input": 5.00, "output": 15.00},
 }
 
+_COST_LOG = logging.getLogger(__name__)
+
 def estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
     """คำนวณค่าใช้จ่ายโดยประมาณ (USD)"""
-    pricing = PRICING_USD_PER_MILLION_TOKENS.get(model, {"input": 0, "output": 0})
+    pricing = PRICING_USD_PER_MILLION_TOKENS.get(model)
+    if pricing is None:
+        _COST_LOG.warning("[Cost] Model %r not in pricing table — cost logged as $0. Add it to PRICING_USD_PER_MILLION_TOKENS.", model)
+        return 0.0
     cost = (prompt_tokens * pricing["input"] / 1_000_000) + (completion_tokens * pricing["output"] / 1_000_000)
     return cost
 
@@ -212,12 +280,8 @@ def llm_invoke(
     last_exc: Optional[Exception] = None
     
     # Extract model name for metrics
-    model_name = "unknown"
-    try:
-        model_name = getattr(llm, "model", getattr(llm, "model_name", "unknown"))
-    except:
-        pass
-    
+    model_name = getattr(llm, "model", getattr(llm, "model_name", "unknown"))
+
     for attempt in range(1 + _MAX_RETRIES):
         try:
             response = llm.invoke(messages)
@@ -286,7 +350,7 @@ def llm_invoke(
     # Calculate cost
     cost_usd = estimate_cost(model_name, prompt_tokens, completion_tokens)
     
-    # heck token budget and log warnings
+    # Check token budget and log warnings
     _check_token_budget(total_call, model_name)
     
     # Enhanced structured logging for AI Engineers
@@ -334,40 +398,7 @@ def llm_invoke(
         )
 
     if state is not None:
-        try:
-            state.add_token_usage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
-            session_total = getattr(state, "total_tokens", 0)
-            
-            # 🎯 Token Optimization: Auto-summarize ถ้าใช้ token เยอะ
-            if session_total > _TOKEN_WARN_THRESHOLD:
-                log.warning(
-                    "[%s] Session token budget exceeded %d (total=%d) — trying summarization first",
-                    label, _TOKEN_WARN_THRESHOLD, session_total,
-                )
-                
-                # ลอง summarize ก่อน
-                try:
-                    from utils.conversation_summarizer import auto_summarize_if_needed
-                    
-                    summarized = auto_summarize_if_needed(
-                        state,
-                        threshold=12,  # summarize only when 12+ messages accumulated
-                        keep_recent=8  # keep 8 most recent messages to preserve context
-                    )
-
-                    if summarized:
-                        log.info("[%s] Auto-summarized old messages → token reduced", label)
-                    else:
-                        # ถ้า summarize ไม่ได้ ใช้ trim แทน — keep more messages to preserve context
-                        log.info("[%s] Summarization not needed, using trim instead", label)
-                        if hasattr(state, "trim_messages"):
-                            state.trim_messages(keep_last=12)
-                except Exception as e:
-                    log.warning("[%s] Summarization failed: %s, falling back to trim", label, e)
-                    if hasattr(state, "trim_messages"):
-                        state.trim_messages(keep_last=12)
-        except Exception:
-            pass
+        _handle_post_call_token_budget(state, prompt_tokens, completion_tokens, label, log)
 
     return response
 
@@ -401,12 +432,8 @@ async def llm_invoke_async(
     last_exc: Optional[Exception] = None
     
     # Extract model name for metrics
-    model_name = "unknown"
-    try:
-        model_name = getattr(llm, "model", getattr(llm, "model_name", "unknown"))
-    except:
-        pass
-    
+    model_name = getattr(llm, "model", getattr(llm, "model_name", "unknown"))
+
     for attempt in range(1 + _MAX_RETRIES):
         try:
             # Use ainvoke for async call
@@ -517,36 +544,6 @@ async def llm_invoke_async(
         )
 
     if state is not None:
-        try:
-            state.add_token_usage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
-            session_total = getattr(state, "total_tokens", 0)
-            
-            if session_total > _TOKEN_WARN_THRESHOLD:
-                log.warning(
-                    "[%s] Session token budget exceeded %d (total=%d) — trying summarization first",
-                    label, _TOKEN_WARN_THRESHOLD, session_total,
-                )
-                
-                try:
-                    from utils.conversation_summarizer import auto_summarize_if_needed
-
-                    summarized = auto_summarize_if_needed(
-                        state,
-                        threshold=12,  # summarize only when 12+ messages accumulated
-                        keep_recent=8  # keep 8 most recent messages to preserve context
-                    )
-
-                    if summarized:
-                        log.info("[%s] Auto-summarized old messages → token reduced", label)
-                    else:
-                        log.info("[%s] Summarization not needed, using trim instead", label)
-                        if hasattr(state, "trim_messages"):
-                            state.trim_messages(keep_last=12)
-                except Exception as e:
-                    log.warning("[%s] Summarization failed: %s, falling back to trim", label, e)
-                    if hasattr(state, "trim_messages"):
-                        state.trim_messages(keep_last=12)
-        except Exception:
-            pass
+        _handle_post_call_token_budget(state, prompt_tokens, completion_tokens, label, log)
 
     return response

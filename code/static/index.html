@@ -5,11 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>RESTBIZ</title>
   <link rel="icon" href="https://supercoconut.co/wp-content/uploads/2025/04/cropped-Untitled-design-18.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@400;600;700;800&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/static/app.css" />
 </head>
 <body>
+  <div id="sidebarOverlay" class="sidebar-overlay"></div>
   <div class="app-shell">
-    <aside class="sidebar">
+    <aside id="sidebar" class="sidebar">
       <div class="sidebar-top">
         <button id="newChatBtn" class="new-chat-btn">+ New chat</button>
         <div class="retention-box">Session จะเก็บไว้ 7 วัน แล้วลบอัตโนมัติ</div>
@@ -24,6 +28,7 @@
     <main class="main-panel">
       <header class="topbar">
         <div class="topbar-left">
+          <button id="menuBtn" class="menu-btn" aria-label="เมนู">☰</button>
           <img class="brand-icon"
             src="https://supercoconut.co/wp-content/uploads/2025/04/cropped-Untitled-design-18.png"
             alt="logo" />
@@ -51,6 +56,7 @@
     </main>
   </div>
 
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

@@ -72,7 +72,7 @@ class ConversationSummarizer:
             api_key = conf.OPENROUTER_API_KEY
             base_url = conf.OPENROUTER_BASE_URL
             timeout = int(getattr(conf, 'LLM_REQUEST_TIMEOUT', 30))
-        except:
+        except Exception:
             # Fallback for testing
             model = 'anthropic/claude-haiku-4-5'
             api_key = 'dummy'
@@ -274,8 +274,7 @@ def auto_summarize_if_needed(
     if not summarizer.should_summarize(state.messages, threshold):
         return False
     
-    # แยก system messages กับ non-system
-    system_msgs = [m for m in state.messages if m.get('role') == 'system']
+    # แยก non-system messages
     non_system = [m for m in state.messages if m.get('role') != 'system']
     
     if len(non_system) <= keep_recent:

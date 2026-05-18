@@ -187,8 +187,8 @@ class DataLoader:
             "registration_type": self._resolve_col(
                 df,
                 primary="ประเภทการจดทะเบียน",
-                aliases=[],
-                contains_any=["ประเภทการจดทะเบียน", "ประเภท", "จดทะเบียน"],
+                aliases=["ประเภท การจดทะเบียน"],
+                contains_any=["ประเภทการจดทะเบียน"],
             ),
             "terms_and_conditions": self._resolve_col(
                 df,
@@ -283,6 +283,93 @@ class DataLoader:
             return None
         return self.to_json_safe(row.get(col_name))
 
+    # Structured metadata fields that LLM uses for section answers.
+    _STRUCTURED_ANSWER_FIELDS: List[str] = [
+        "service_channel", "operation_steps", "identification_documents",
+        "fees", "operation_duration", "terms_and_conditions", "legal_regulatory",
+    ]
+
+    # operation_topic keyword → structured field to populate from answer_guideline.
+    # Ordered: first match wins (so "ขั้นตอน" is checked before "เอกสาร" for topics
+    # that mention both, since step-focused topics should map to operation_steps).
+    _TOPIC_FIELD_INFERENCE_MAP: List[tuple] = [
+        ("ช่องทาง",      "service_channel"),
+        ("ขั้นตอน",      "operation_steps"),
+        ("ค่าธรรมเนียม", "fees"),
+        ("ระยะเวลา",     "operation_duration"),
+        ("เงื่อนไข",     "terms_and_conditions"),
+        ("หลักเกณฑ์",    "terms_and_conditions"),
+        ("กฎหมาย",       "legal_regulatory"),
+        ("บทลงโทษ",      "legal_regulatory"),
+        ("เอกสาร",       "identification_documents"),
+        ("หลักฐาน",      "identification_documents"),
+    ]
+
+    # topic_group mapping: (regex_pattern, group_name)
+    # Pattern matched against license_type (case-insensitive).
+    # First match wins. If nothing matches → group = "อื่นๆ".
+    # Keep groups broad enough that each has several docs, but narrow enough to
+    # prevent cross-topic contamination in retrieval (main goal of topic_group).
+    _LICENSE_TYPE_GROUP_PATTERNS: List[tuple] = [
+        # บัญชีและการเงิน — accounting / bookkeeping (must come before ชำระเงิน to avoid
+        # "จัดการการเงิน" being caught by a looser money pattern)
+        (r"จัดการการเงิน|จัดการเงิน|ปิดงบ|งบการเงิน|ทำบัญชี|ปิดบัญชี", "บัญชีและการเงิน"),
+        # ชำระเงิน — payment systems
+        (r"ระบบชำระเงิน|qr.?payment|qr.?pay|edc|รูดบัตร|pos\s*id|เครื่องรูดบัตร|บัญชีธนาคาร", "ชำระเงิน"),
+        # ภาษี — tax
+        (r"ภาษีมูลค่าเพิ่ม|ภพ\.?20|ภาษีป้าย|ป้ายร้าน|ภป\.?1", "ภาษี"),
+        # ทะเบียนธุรกิจ — business registration
+        (r"ทะเบียนพาณิชย์|จดทะเบียน.*พาณิชย์", "ทะเบียนธุรกิจ"),
+        # บุคลากร — staff/employee
+        (r"ประกันสังคม|กองทุนประกัน|ขึ้นทะเบียน.*แรงงาน|กองทุนเงินทดแทน|เงินทดแทน", "บุคลากร"),
+        # อาหารและสุขาภิบาล — food/health permits
+        (r"จัดตั้งสถานที่จำหน่าย|จำหน่ายอาหาร|สุขาภิบาล|จำหน่ายสุรา|ผู้สัมผัสอาหาร|"
+         r"ใบรับรองแพทย์|9\s*โรค|มาตรฐานร้านอาหาร|ใบรับรองมาตรฐาน", "อาหารและสุขาภิบาล"),
+    ]
+
+    @staticmethod
+    def _infer_structured_fields_from_guideline(metadata: dict) -> None:
+        """
+        For Q&A rows where answer_guideline is filled but ALL structured answer
+        fields are empty: copy answer_guideline into the field best matching the
+        operation_topic keywords. Modifies metadata in-place.
+
+        This ensures the LLM reads the correct metadata field (e.g. service_channel
+        for a "ช่องทาง" query) instead of falling back to unrelated docs that happen
+        to have that field populated.
+        """
+        ag = (metadata.get("answer_guideline") or "").strip()
+        if not ag or ag in ("nan", "None"):
+            return
+
+        # Only act on true Q&A rows: all structured fields empty
+        any_filled = any(
+            (metadata.get(f) or "").strip() not in ("", "nan", "None")
+            for f in DataLoader._STRUCTURED_ANSWER_FIELDS
+        )
+        if any_filled:
+            return
+
+        op_topic = (metadata.get("operation_topic") or "").strip()
+        if not op_topic:
+            return
+
+        for keyword, field in DataLoader._TOPIC_FIELD_INFERENCE_MAP:
+            if keyword in op_topic:
+                metadata[field] = ag
+                return  # fill first matching field only
+
+    @classmethod
+    def _assign_topic_group(cls, license_type: Optional[str]) -> str:
+        """Return topic_group string for a given license_type. Falls back to 'อื่นๆ'."""
+        if not license_type:
+            return ""
+        lt = license_type.strip()
+        for pattern, group in cls._LICENSE_TYPE_GROUP_PATTERNS:
+            if re.search(pattern, lt, re.IGNORECASE):
+                return group
+        return "อื่นๆ"
+
     @staticmethod
     def _normalize_entity_type(registration_type: Optional[str]) -> Optional[str]:
         """Map raw registration_type values to normalized category (บุคคลธรรมดา / นิติบุคคล)."""
@@ -290,7 +377,8 @@ class DataLoader:
             return None
         t = registration_type.strip()
         _JURISTIC = {
-            "นิติบุคคล", "บริษัท", "บริษัทจำกัด", "บริษัทมหาชน", "บริษัทมหาชนจำกัด",
+            "นิติบุคคล", "นิติบุคล",  # "นิติบุคล" is a common typo (missing ค)
+            "บริษัท", "บริษัทจำกัด", "บริษัทมหาชน", "บริษัทมหาชนจำกัด",
             "ห้างหุ้นส่วน", "ห้างหุ้นส่วนจำกัด", "ห้างหุ้นส่วนสามัญ",
             "ห้างหุ้นส่วนสามัญนิติบุคคล",
         }
@@ -302,8 +390,8 @@ class DataLoader:
             return "นิติบุคคล"
         if t in _INDIVIDUAL:
             return "บุคคลธรรมดา"
-        # Fuzzy: contains keyword
-        if any(kw in t for kw in ("บริษัท", "ห้างหุ้นส่วน", "นิติบุคคล")):
+        # Fuzzy: contains keyword (includes "นิติบุคล" typo via partial match)
+        if any(kw in t for kw in ("บริษัท", "ห้างหุ้นส่วน", "นิติบุคคล", "นิติบุคล")):
             return "นิติบุคคล"
         if "บุคคลธรรมดา" in t:
             return "บุคคลธรรมดา"
@@ -329,7 +417,8 @@ class DataLoader:
         combined = " ".join(sources)
         if "กรุงเทพ" in combined:
             return "กรุงเทพฯ"
-        if "ต่างหวัด" in combined or "ต่างจังหวัด" in combined or "ต่างจังหวัด" in combined:
+        # "ต่างหวัด" (missing จ) is intentional — catches common data-entry typos in source sheets.
+        if "ต่างหวัด" in combined or "ต่างจังหวัด" in combined:
             return "ต่างจังหวัด"
         return None
 
@@ -475,10 +564,13 @@ class DataLoader:
                 location = self._extract_location(op_topic, reg_type_single, op_by_dept)
                 area_size = self._extract_area_size(reg_type_single, op_topic)
 
+                _lt_val = self._get_row_value(row, colmap.get("license_type"))
                 metadata = {
                     "row_id": int(idx),
+                    "data_type": "regulatory",
                     "department": dept,
-                    "license_type": self._get_row_value(row, colmap.get("license_type")),
+                    "license_type": _lt_val,
+                    "topic_group": self._assign_topic_group(_lt_val),
                     "operation_by_department": op_by_dept,
                     "operation_topic": op_topic,
                     "registration_type": reg_type_single,
@@ -499,6 +591,21 @@ class DataLoader:
                     "answer_guideline": self._get_row_value(row, colmap.get("answer_guideline")),
                     "source": source,
                 }
+
+                # For Q&A rows: infer structured field from operation_topic + answer_guideline
+                # so the LLM reads the correct metadata field instead of falling back to
+                # unrelated docs that happen to have that field populated.
+                self._infer_structured_fields_from_guideline(metadata)
+
+                # Normalize flow-internal URLs in service_channel: pages like /termsconditions
+                # are mid-flow T&C screens — they only work inside an active session and cannot
+                # be navigated to directly. Replace them with the portal root so users get a
+                # working entry URL. e.g. https://edbr.dbd.go.th/termsconditions → https://edbr.dbd.go.th/
+                sc = (metadata.get("service_channel") or "").strip()
+                if sc and sc not in ("nan", "None"):
+                    sc_fixed = re.sub(r"(https?://[^/\s]+)/termsconditions\b", r"\1/", sc)
+                    if sc_fixed != sc:
+                        metadata["service_channel"] = sc_fixed
 
                 # Build page_content (high-signal embedding text)
                 page_content = self._build_page_content(metadata)

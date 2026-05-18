@@ -18,23 +18,12 @@ from service.data_loader import DataLoader
 from service.data_loader_general import GeneralDataLoader
 from service.local_vector_store import ingest_documents
 from langchain_core.documents import Document
+import conf
 
-# ── Sheet URLs ──────────────────────────────────────────────────────────────
-# Sheet A: Regulatory / government procedures (original)
-SHEET_URL_REGULATORY = (
-    "https://docs.google.com/spreadsheets/d/1YnLKV7gJXCu7jvcH1sUL9crMlBCJKOpQfp2wtulMszE/"
-    "edit?gid=657201027#gid=657201027"
-)
-# Sheet B: Marketing strategy, SOP, pricing, product mix
-SHEET_URL_MARKETING = (
-    "https://docs.google.com/spreadsheets/d/1YnLKV7gJXCu7jvcH1sUL9crMlBCJKOpQfp2wtulMszE/"
-    "edit?gid=809205387#gid=809205387"
-)
-# Sheet C: Bakery / coffee-shop practical startup guide
-SHEET_URL_BAKERY = (
-    "https://docs.google.com/spreadsheets/d/1YnLKV7gJXCu7jvcH1sUL9crMlBCJKOpQfp2wtulMszE/"
-    "edit?gid=610069215#gid=610069215"
-)
+# ── Sheet URLs (read from env.properties via conf) ───────────────────────────
+SHEET_URL_REGULATORY = conf.SHEET_URL_REGULATORY
+SHEET_URL_MARKETING  = conf.SHEET_URL_MARKETING
+SHEET_URL_BAKERY     = conf.SHEET_URL_BAKERY
 
 # Legacy alias kept for backward compatibility if anything else imports it
 SHEET_URL = SHEET_URL_REGULATORY
@@ -58,10 +47,12 @@ _DUP_TOKEN_WS_RE = re.compile(
 
 # Match "token" duplicated consecutively WITHOUT whitespace (typo like "เอกสารเอกสาร", "VATVAT").
 # Conservative:
-# - token length >= 3 (avoid breaking short syllables)
-# - Thai token OR latin/num token
+# - Thai token >= 6 chars: 3 was too low — "\u0e01าร" (3 chars) ends/starts compound words
+#   like จัดการการเงิน (จัดการ+การเงิน) and would be incorrectly stripped.
+#   6+ catches real typo-duplicates (เอกสาร=6, ทะเบียน=7) without breaking compounds.
+# - Latin/num token >= 3 chars (safe: short Latin tokens rarely form meaningful compounds)
 _DUP_TOKEN_NOSPACE_RE = re.compile(
-    r"((?:[\u0E00-\u0E7F]{3,}|[A-Za-z0-9]{3,}))\1",
+    r"((?:[\u0E00-\u0E7F]{6,}|[A-Za-z0-9]{3,}))\1",
     re.UNICODE,
 )
 
@@ -175,6 +166,13 @@ def _validate_documents(docs: List[Document]) -> int:
             lt = str(md.get("license_type") or "").strip()
             if not lt:
                 issues.append("license_type is empty on a regulatory doc — slot discovery will be skipped")
+            # topic_group must be set so 2-pass retrieval can scope by group
+            tg = str(md.get("topic_group") or "").strip()
+            if not tg:
+                issues.append(
+                    f"topic_group is empty on a regulatory doc (license_type={lt!r}) "
+                    "— 2-pass retrieval will not be able to scope by topic group"
+                )
 
         if issues:
             row_ref = md.get("license_type") or md.get("operation_topic") or f"row {i + 1}"
@@ -264,6 +262,15 @@ def main():
     print(f"[Ingest]   entity_type populated: {len(entities)}/{len(docs)}")
 
     ingest_documents(docs, reset=True)  # wipe old local chroma before rebuild
+
+    # Invalidate BM25 cache so hybrid search rebuilds from new docs on next query
+    try:
+        from utils.hybrid_retriever import invalidate_bm25_cache
+        invalidate_bm25_cache()
+        print("[Ingest] BM25 cache invalidated — will rebuild on next search.")
+    except Exception as _e:
+        print(f"[Ingest] BM25 cache invalidation skipped: {_e}")
+
     print('[Ingest] Done! Start server: python code/app.py')
 
 

@@ -49,8 +49,8 @@ def _safe_int(name: str, default: int) -> int:
     except (ValueError, TypeError):
         raise RuntimeError(f"Config error: {name}='{raw}' is not a valid integer")
 
-TEMPERATURE_ACADEMIC = _safe_float("TEMPERATURE_ACADEMIC", 0.3)
-TEMPERATURE_PRACTICAL = _safe_float("TEMPERATURE_PRACTICAL", 0.2)
+TEMPERATURE_ACADEMIC = _safe_float("TEMPERATURE_ACADEMIC", 0.0)
+TEMPERATURE_PRACTICAL = _safe_float("TEMPERATURE_PRACTICAL", 0.0)
 
 MAX_TOKENS_ACADEMIC = _safe_int("MAX_TOKENS_ACADEMIC", 8000)
 MAX_TOKENS_ACADEMIC_SLOTS = _safe_int("MAX_TOKENS_ACADEMIC_SLOTS", 3000)
@@ -61,22 +61,40 @@ EMBEDDING_MODEL = os.getenv(
     "intfloat/multilingual-e5-large"
 )
 
-MAX_ROUNDS = _safe_int("MAX_ROUNDS", 7)
+MAX_ROUNDS = _safe_int("MAX_ROUNDS", 15)
 RETRIEVAL_TOP_K = _safe_int("RETRIEVAL_TOP_K", 20)
 
 # Token Optimization: ลดจำนวนเอกสารและความยาว
 # เดิม: Practical=5/500, Academic=8/700 → ใช้ ~8,000-12,000 tokens
 # ใหม่: Practical=3/400, Academic=5/500 → ใช้ ~5,000-7,000 tokens (ประหยัด 40%!)
 LLM_DOCS_MAX_PRACTICAL = _safe_int("LLM_DOCS_MAX_PRACTICAL", 6)    # raised 4→6: more docs = richer, more complete answers
-LLM_DOCS_MAX_BROAD = _safe_int("LLM_DOCS_MAX_BROAD", 15)          # total docs cap for broad open-ended questions — must cover two-pass merged result (pass1=10 + pass2=8 = up to 18 unique)
+LLM_DOCS_MAX_BROAD = _safe_int("LLM_DOCS_MAX_BROAD", 20)          # total docs cap for broad open-ended questions — covers two-pass merged result (pass1=10 + pass2=8 = up to 18 unique)
 LLM_DOCS_MAX_ACADEMIC = _safe_int("LLM_DOCS_MAX_ACADEMIC", 12)    # raised: 5 → 12 (academic needs full coverage)
 
 LLM_DOC_CHARS_PRACTICAL = _safe_int("LLM_DOC_CHARS_PRACTICAL", 700)   # reduced 1200→700: metadata fields carry key info
 LLM_DOC_CHARS_ACADEMIC = _safe_int("LLM_DOC_CHARS_ACADEMIC", 700)    # raised: 500 → 700 (need full metadata fields)
+LLM_DOC_CHARS_BUSINESS_GUIDE = _safe_int("LLM_DOC_CHARS_BUSINESS_GUIDE", 3500)  # business_guide: answer_guideline is sole content field — needs full coverage
 PAGE_CONTENT_MAX_CHARS = _safe_int("PAGE_CONTENT_MAX_CHARS", 2500)    # raised 1800→2500: fit legal_regulatory into embedding
 
 # RAG Quality: Minimum similarity threshold
 RETRIEVAL_MIN_SIMILARITY = _safe_float("RETRIEVAL_MIN_SIMILARITY", 0.6)
+
+# Hybrid RAG: BM25 (sparse) + Dense (embedding) fused with RRF.
+# Set HYBRID_SEARCH_ENABLED=true to activate. Requires pythainlp + rank_bm25.
+# HYBRID_RRF_K: RRF smoothing constant (higher = less rank-sensitive, default 60).
+HYBRID_SEARCH_ENABLED = os.getenv("HYBRID_SEARCH_ENABLED", "false").lower() == "true"
+HYBRID_RRF_K = _safe_int("HYBRID_RRF_K", 60)
+
+# Cross-encoder reranker (Level 3 RAG quality improvement)
+# Set RERANKER_ENABLED=true in env.properties to activate.
+# Model: multilingual cross-encoder trained on MS-MARCO (supports Thai).
+# RERANKER_TOP_K: how many docs to keep after reranking (applied to both practical + academic).
+RERANKER_ENABLED = os.getenv("RERANKER_ENABLED", "false").lower() == "true"
+RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+RERANKER_TOP_K = _safe_int("RERANKER_TOP_K", 10)
+
+# Iterative Retrieval: minimum number of missing coverage fields that triggers Round 3 gap-fill.
+ITERATIVE_RETRIEVAL_MIN_MISSING_FIELDS = _safe_int("ITERATIVE_RETRIEVAL_MIN_MISSING_FIELDS", 2)
 
 RETRIEVAL_QUERY_MAX_CHARS = _safe_int("RETRIEVAL_QUERY_MAX_CHARS", 200)
 
@@ -101,6 +119,28 @@ LOCAL_VECTOR_DIR = os.getenv(
     "LOCAL_VECTOR_DIR",
     str(Path(__file__).parent.parent / "local_chroma_v3"),
 )
+
+# Google Sheets source URLs — override in env.properties when sheets move or change tabs
+SHEET_URL_REGULATORY = os.getenv(
+    "SHEET_URL_REGULATORY",
+    "https://docs.google.com/spreadsheets/d/1YnLKV7gJXCu7jvcH1sUL9crMlBCJKOpQfp2wtulMszE/edit?gid=657201027#gid=657201027",
+)
+SHEET_URL_MARKETING = os.getenv(
+    "SHEET_URL_MARKETING",
+    "https://docs.google.com/spreadsheets/d/1YnLKV7gJXCu7jvcH1sUL9crMlBCJKOpQfp2wtulMszE/edit?gid=809205387#gid=809205387",
+)
+SHEET_URL_BAKERY = os.getenv(
+    "SHEET_URL_BAKERY",
+    "https://docs.google.com/spreadsheets/d/1YnLKV7gJXCu7jvcH1sUL9crMlBCJKOpQfp2wtulMszE/edit?gid=610069215#gid=610069215",
+)
+
+# State manager configuration
+STATE_DIR = os.getenv("STATE_DIR") or None
+STATE_LOCK_TIMEOUT_S = _safe_float("STATE_LOCK_TIMEOUT_S", 2.0)
+STATE_LOCK_POLL_S = _safe_float("STATE_LOCK_POLL_S", 0.05)
+STATE_LOCK_STALE_S = _safe_float("STATE_LOCK_STALE_S", 15.0)
+MAX_RECENT_MESSAGES_SAVE = _safe_int("MAX_RECENT_MESSAGES_SAVE", 18)
+MAX_INTERNAL_MESSAGES_SAVE = _safe_int("MAX_INTERNAL_MESSAGES_SAVE", 40)
 
 # NEW: centralized default retrieval fallback query — single source of truth
 # All code should import this instead of hardcoding the Thai string
@@ -155,13 +195,13 @@ if not OPENROUTER_API_KEY:
     )
 
 # Cost & Budget Configuration
-COST_WARNING_THRESHOLD = float(os.getenv("COST_WARNING_THRESHOLD", "1.0"))  # Warn if single call > $1
-DAILY_BUDGET_USD = float(os.getenv("DAILY_BUDGET_USD", "50.0"))  # Daily spending limit
+COST_WARNING_THRESHOLD = _safe_float("COST_WARNING_THRESHOLD", 1.0)  # Warn if single call > $1
+DAILY_BUDGET_USD = _safe_float("DAILY_BUDGET_USD", 50.0)  # Daily spending limit
 
 # Token budget alerts (per-call thresholds — warning/logging only, not enforced)
-TOKEN_BUDGET_PER_CALL = int(os.getenv("TOKEN_BUDGET_PER_CALL", "8000"))
-TOKEN_BUDGET_WARNING = int(os.getenv("TOKEN_BUDGET_WARNING", "10000"))
-TOKEN_BUDGET_CRITICAL = int(os.getenv("TOKEN_BUDGET_CRITICAL", "15000"))
+TOKEN_BUDGET_PER_CALL = _safe_int("TOKEN_BUDGET_PER_CALL", 8000)
+TOKEN_BUDGET_WARNING = _safe_int("TOKEN_BUDGET_WARNING", 10000)
+TOKEN_BUDGET_CRITICAL = _safe_int("TOKEN_BUDGET_CRITICAL", 15000)
 
 # Session-level token budget: cumulative tokens across all LLM calls in one session.
 # Requests that would exceed this limit are rejected with HTTP 429.

@@ -16,6 +16,8 @@ services:
       # Production: ไม่ mount code (เพื่อความปลอดภัย)
       # Mount เฉพาะ env file
       - ./env.properties:/app/env.properties
+      # Persist HuggingFace model cache across container restarts/redeploys
+      - /opt/huggingface-cache:/root/.cache/huggingface
     environment:
       - PYTHONPATH=/app/code
     env_file:

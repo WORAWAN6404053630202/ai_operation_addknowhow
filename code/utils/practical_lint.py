@@ -44,13 +44,29 @@ class PracticalPolicyConfig:
         "ตามที่ท่านขอ",
         "ตามที่คุณขอ",
         "กล่าวคือ",
-        "ในฐานะ",
+        "ในฐานะ AI",
+        "ในฐานะผู้ช่วย",
+        "ในฐานะ assistant",
         "นโยบาย",
         "assistant",
-        "โดยสรุป",      # ไม่เหมาะกับ practical ที่ต้องตอบตรง
         "documents",    # LLM บางตัว reproduce prompt section header ออกมา
         "Documents",
         "DOCUMENTS",
+
+        # hedging / uncertainty phrases — bot should answer directly, never hedge
+        "เท่าที่รู้",
+        "เท่าที่ทราบ",
+        "เท่าที่ผมรู้",
+        "เท่าที่ผมทราบ",
+        "ตามที่ผมทราบ",
+        "ตามที่ผมรู้",
+        "ตามที่รู้",
+        "ข้อมูลที่ผมมี",
+        "ข้อมูลที่มีอยู่",
+        "ในข้อมูลที่มี",
+        "จากข้อมูลที่มี",
+        "ตามข้อมูลที่มี",
+        "ตามที่มีอยู่",
     )
 
     # “อ้อม/เมตา” patterns (behavior-level) — applies to NON-QUOTE lines only
@@ -139,14 +155,17 @@ def _count_bullets(lines: List[str]) -> int:
 _Q_ENDING_RE = re.compile(r"(ไหม|หรือไม่|หรือเปล่า)\s*$", re.IGNORECASE)
 _Q_MARK_RE = re.compile(r"\?", re.IGNORECASE)
 _Q_PREFIX_RE = re.compile(r"^\s*(ถาม|คำถาม)\s*[:：]", re.IGNORECASE)
-_Q_NUM_LINE_RE = re.compile(r"^\s*\d+\)\s+.*\?$", re.IGNORECASE)
 
 # A) Question line that contains conjunctions tends to mean "A and B?" => multi-question risk
 # FIX: tightened pattern — require a question marker on the SAME line to avoid false positives
 # on compound nouns like "ร้านอาหารและบาร์" or phrases with "กับ" that are not questions.
 # Removed "หรือ" (too broad as a question-forming particle) and "กับ" (too common in compound nouns).
+# NOTE: \b word-boundary is NOT used for "และ" because Thai letters are all \w in Python 3 Unicode,
+# so \b never fires between consecutive Thai characters (e.g. "ค่าธรรมเนียมและเอกสารไหม" has no
+# word boundary around "และ"). Bare "และ" is safe here because the pattern already requires
+# \s+ after the conjunction AND a question marker at the end.
 _MULTI_Q_CONJ_RE = re.compile(
-    r"(?:\bและ\b|พร้อมกับ|รวมถึง|ตลอดจน)\s+.+(?:ไหม|หรือไม่|หรือเปล่า|\?)",
+    r"(?:และ|พร้อมกับ|รวมถึง|ตลอดจน)\s+.+(?:ไหม|หรือไม่|หรือเปล่า|\?)",
     re.IGNORECASE,
 )
 
@@ -178,7 +197,6 @@ def _count_questions(text: str) -> int:
     - count '?'
     - count line endings with "ไหม/หรือไม่/หรือเปล่า"
     - count explicit question markers like "ถาม:"
-    - count numbered question lines like "1) ...?"
 
     NEW:
     - If a question line contains conjunctions that imply multiple asks (และ/หรือ/พร้อมกับ/รวมถึง/กับ),
@@ -208,9 +226,6 @@ def _count_questions(text: str) -> int:
         if _MULTI_Q_CONJ_RE.search(ln) and (("?" in ln) or bool(_Q_ENDING_RE.search(ln))):
             q += 1
 
-    # Extra explicit patterns (keep for backward compatibility)
-    q += len(re.findall(r"^\s*\d+\)\s+.*\?$", t, flags=re.MULTILINE))
-    # Avoid double-counting if the above already counted; but this is OK because it triggers strictness.
     return q
 
 

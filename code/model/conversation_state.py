@@ -58,6 +58,7 @@ class ConversationState(BaseModel):
 
     # Conversation history
     messages: List[Dict[str, Any]] = Field(default_factory=list, description="User-visible chat history")
+    display_messages: List[Dict[str, Any]] = Field(default_factory=list, description="Full chat history for UI display (not trimmed for LLM)")
     internal_messages: List[Dict[str, Any]] = Field(default_factory=list, description="Internal system / agent traces (hidden from user)")
 
     # Context & memory
@@ -81,10 +82,14 @@ class ConversationState(BaseModel):
 
     # Helpers (NO business logic)
     def add_user_message(self, content: str) -> None:
-        self.messages.append({"role": "user", "content": content})
+        msg = {"role": "user", "content": content}
+        self.messages.append(msg)
+        self.display_messages.append(msg)
 
     def add_assistant_message(self, content: str) -> None:
-        self.messages.append({"role": "assistant", "content": content})
+        msg = {"role": "assistant", "content": content}
+        self.messages.append(msg)
+        self.display_messages.append(msg)
 
     def add_user_message_once(self, content: str) -> None:
         # FIX: strip before compare to prevent whitespace-variant duplicates
@@ -97,7 +102,9 @@ class ConversationState(BaseModel):
             and (self.messages[-1].get("content") or "").strip() == c
         ):
             return
-        self.messages.append({"role": "user", "content": c})
+        msg = {"role": "user", "content": c}
+        self.messages.append(msg)
+        self.display_messages.append(msg)
 
     def add_assistant_message_once(self, content: str) -> None:
         c = (content or "").strip()
@@ -106,13 +113,23 @@ class ConversationState(BaseModel):
         if self.messages and self.messages[-1].get("role") == "assistant":
             if (self.messages[-1].get("content") or "").strip() == c:
                 return
-        self.messages.append({"role": "assistant", "content": c})
+        msg = {"role": "assistant", "content": c}
+        self.messages.append(msg)
+        self.display_messages.append(msg)
 
     def add_internal_message(self, content: str, meta: Optional[Dict[str, Any]] = None) -> None:
         msg = {"content": content}
         if meta:
             msg["meta"] = meta
         self.internal_messages.append(msg)
+
+    def sync_display_messages(self) -> None:
+        """
+        Sync display_messages with messages for backward compatibility.
+        Call this after loading old state that doesn't have display_messages.
+        """
+        if not self.display_messages and self.messages:
+            self.display_messages = self.messages.copy()
 
     # Locks (explicit supervisor contract)
     def set_persona_lock(self, persona_id: Optional[str]) -> None:
@@ -174,6 +191,10 @@ class ConversationState(BaseModel):
             for k, v in ctx_slots.items():
                 if k and v and str(k).strip() not in cs:
                     cs[str(k).strip()] = str(v).strip()
+        # Alias entity_type_normalized → entity_type so that Academic-collected slots
+        # are visible to Supervisor's cross-topic slot filter (which uses key "entity_type").
+        if "entity_type_normalized" in cs and "entity_type" not in cs:
+            cs["entity_type"] = cs["entity_type_normalized"]
         return cs
 
     def get_collected_slot(self, key: str) -> Optional[str]:
@@ -193,13 +214,13 @@ class ConversationState(BaseModel):
     # State trimming (NEW)
     def trim_messages(self, keep_last: int = 8) -> None:
         """
-        Keep only the last N messages to prevent unbounded memory growth.
-        System messages (role='system') are always preserved.
+        Keep only the last N user/assistant messages to prevent unbounded memory growth.
+        System messages (role='system') are always preserved and NOT counted in keep_last.
         """
-        if len(self.messages) <= keep_last:
-            return
         system_msgs = [m for m in self.messages if m.get("role") == "system"]
         non_system = [m for m in self.messages if m.get("role") != "system"]
+        if len(non_system) <= keep_last:
+            return
         trimmed = non_system[-keep_last:]
         self.messages = system_msgs + trimmed
     

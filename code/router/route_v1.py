@@ -20,6 +20,7 @@ from model.state_manager import StateManager
 from model.persona_supervisor import PersonaSupervisor
 from utils.simple_cache import get_cache
 from utils.rate_limiter import get_rate_limiter
+from utils.llm_call import estimate_cost
 
 import conf
 
@@ -32,7 +33,7 @@ SESSION_RETENTION_DAYS = 7
 
 
 class ChatRequest(BaseModel):
-    message: str = Field(..., description="User message to chatbot")
+    message: str = Field(..., max_length=5000, description="User message to chatbot")
     session_id: Optional[str] = Field(None, description="Session ID for conversation continuity")
 
 
@@ -47,6 +48,7 @@ class NewSessionRequest(BaseModel):
 logger.info("Initializing services...")
 
 try:
+    conf.validate_config()
     if conf.USE_ZILLIZ:
         from service.vector_store import VectorStoreManager
         vs_manager = VectorStoreManager()
@@ -76,7 +78,17 @@ except Exception:
     raise
 
 
+_CLEANUP_INTERVAL_S = 3600  # run at most once per hour
+_last_cleanup_ts: float = 0.0
+
+
 def _cleanup_old_sessions():
+    global _last_cleanup_ts
+    import time
+    now = time.time()
+    if now - _last_cleanup_ts < _CLEANUP_INTERVAL_S:
+        return
+    _last_cleanup_ts = now
     try:
         state_manager.purge_older_than_days(SESSION_RETENTION_DAYS)
     except Exception:
@@ -87,7 +99,7 @@ def _build_topics_from_state(state: ConversationState):
     topics_raw: list = (state.context or {}).get("last_menu_topics") or []
     descs_raw: list = (state.context or {}).get("last_menu_topic_descs") or []
 
-    selected = topics_raw[:2]
+    selected = topics_raw[:5]
     topics = [
         {
             "title": t,
@@ -112,8 +124,15 @@ async def start_session(payload: Optional[NewSessionRequest] = None):
     session_id = f"s_{uuid.uuid4().hex[:8]}"
     state = ConversationState(session_id=session_id, persona_id=persona_id, context={})
 
-    state, greeting_text = supervisor.handle(state, "")
-    state_manager.save(session_id, state)
+    try:
+        state, greeting_text = supervisor.handle(state, "")
+        state_manager.save(session_id, state)
+    except Exception as e:
+        logger.error(f"[{session_id}] Greeting failed", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Greeting failed: {str(e)}",
+        )
 
     topics = _build_topics_from_state(state)
 
@@ -137,8 +156,15 @@ async def reset_session(request: SessionRequest):
     session_id = request.session_id or f"s_{uuid.uuid4().hex[:8]}"
     state = ConversationState(session_id=session_id, persona_id="practical", context={})
 
-    state, greeting_text = supervisor.handle(state, "")
-    state_manager.save(session_id, state)
+    try:
+        state, greeting_text = supervisor.handle(state, "")
+        state_manager.save(session_id, state)
+    except Exception as e:
+        logger.error(f"[{session_id}] Reset failed", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Reset failed: {str(e)}",
+        )
 
     topics = _build_topics_from_state(state)
 
@@ -182,7 +208,7 @@ async def load_session(request: SessionRequest):
         message="Session loaded",
         session_id=state.session_id,
         persona_id=state.persona_id,
-        messages=state.messages or [],
+        messages=state.display_messages or [],
     )
 
 
@@ -213,7 +239,7 @@ async def health_check():
     return {
         "status": "ok",
         "timestamp": datetime.datetime.now().isoformat(),
-        "service": "Thai Regulatory AI - น้องโคโค่",
+        "service": "Thai Regulatory AI - น้องสุดยอด",
         "version": "1.0.0",
         "supervisor_initialized": supervisor is not None,
         "state_manager_initialized": state_manager is not None,
@@ -221,7 +247,7 @@ async def health_check():
         "collection_name": conf.COLLECTION_NAME,
         "session_retention_days": SESSION_RETENTION_DAYS,
         "cache": cache_stats,
-        "rate_limit": rate_stats
+        "rate_limit": rate_stats,
     }
 
 
@@ -272,7 +298,9 @@ async def chat(request: ChatRequest):
         # Session-level token budget: monitor-only (no blocking).
         # Logs a warning when the session exceeds TOKEN_BUDGET_PER_SESSION so the
         # operator can identify high-usage sessions without interrupting the user.
-        _pre_tokens = (getattr(state, "total_prompt_tokens", 0) or 0) + (getattr(state, "total_completion_tokens", 0) or 0)
+        _pre_prompt = getattr(state, "total_prompt_tokens", 0) or 0
+        _pre_completion = getattr(state, "total_completion_tokens", 0) or 0
+        _pre_tokens = _pre_prompt + _pre_completion
         _session_budget = int(getattr(conf, "TOKEN_BUDGET_PER_SESSION", 0) or 0)
         if _session_budget > 0 and _pre_tokens >= _session_budget:
             logger.warning(
@@ -300,7 +328,7 @@ async def chat(request: ChatRequest):
         # cached response from before those slots were filled must not be reused.
         cache = get_cache()
         has_pending_slot = bool((state.context or {}).get("pending_slot"))
-        _CACHE_SKIP_SLOTS = {"entity_type", "registration_type"}
+        _CACHE_SKIP_SLOTS = {"entity_type", "registration_type", "location", "area_size"}
         _collected_slots = (state.context or {}).get("collected_slots") or {}
         has_slot_context = bool(_CACHE_SKIP_SLOTS & set(_collected_slots.keys()))
         cached_result = (
@@ -337,14 +365,27 @@ async def chat(request: ChatRequest):
         _delta_tokens = max(0, _post_tokens - _pre_tokens)
         if _delta_tokens > 0:
             rate_limiter.record_token_usage(session_id, _delta_tokens)
-        
+
+        # Compute actual cost from token delta and persona-appropriate model
+        _post_prompt = getattr(state, "total_prompt_tokens", 0) or 0
+        _post_completion = getattr(state, "total_completion_tokens", 0) or 0
+        _model_for_cost = {
+            "academic": conf.OPENROUTER_MODEL_ACADEMIC,
+            "practical": conf.OPENROUTER_MODEL_PRACTICAL,
+        }.get(state.persona_id, conf.OPENROUTER_MODEL)
+        _actual_cost = estimate_cost(
+            _model_for_cost,
+            max(0, _post_prompt - _pre_prompt),
+            max(0, _post_completion - _pre_completion),
+        )
+
         # Store in cache for future use
         cache.set(
             session_id=session_id,
             question=request.message,
             value={
                 "response": bot_reply,
-                "cost": 0.033,  # Average cost (will be updated from actual metrics)
+                "cost": _actual_cost,
                 "persona": state.persona_id
             },
             persona=state.persona_id
@@ -387,7 +428,9 @@ async def _stream_reply(session_id: str, message: str) -> AsyncGenerator[str, No
         )
 
         # Session-level token budget: monitor-only (no blocking).
-        _pre_tokens_st = (getattr(state, "total_prompt_tokens", 0) or 0) + (getattr(state, "total_completion_tokens", 0) or 0)
+        _pre_prompt_st = getattr(state, "total_prompt_tokens", 0) or 0
+        _pre_completion_st = getattr(state, "total_completion_tokens", 0) or 0
+        _pre_tokens_st = _pre_prompt_st + _pre_completion_st
         _session_budget_st = int(getattr(conf, "TOKEN_BUDGET_PER_SESSION", 0) or 0)
         if _session_budget_st > 0 and _pre_tokens_st >= _session_budget_st:
             logger.warning(
@@ -413,7 +456,7 @@ async def _stream_reply(session_id: str, message: str) -> AsyncGenerator[str, No
         # cached response from before those slots were filled must not be reused.
         cache = get_cache()
         has_pending_slot = bool((state.context or {}).get("pending_slot"))
-        _CACHE_SKIP_SLOTS = {"entity_type", "registration_type"}
+        _CACHE_SKIP_SLOTS = {"entity_type", "registration_type", "location", "area_size"}
         _collected_slots = (state.context or {}).get("collected_slots") or {}
         has_slot_context = bool(_CACHE_SKIP_SLOTS & set(_collected_slots.keys()))
         cached_result = (
@@ -457,11 +500,24 @@ async def _stream_reply(session_id: str, message: str) -> AsyncGenerator[str, No
         if _delta_tokens_st > 0:
             get_rate_limiter().record_token_usage(session_id, _delta_tokens_st)
 
+        # Compute actual cost from token delta and persona-appropriate model
+        _post_prompt_st = getattr(state, "total_prompt_tokens", 0) or 0
+        _post_completion_st = getattr(state, "total_completion_tokens", 0) or 0
+        _model_for_cost_st = {
+            "academic": conf.OPENROUTER_MODEL_ACADEMIC,
+            "practical": conf.OPENROUTER_MODEL_PRACTICAL,
+        }.get(state.persona_id, conf.OPENROUTER_MODEL)
+        _actual_cost_st = estimate_cost(
+            _model_for_cost_st,
+            max(0, _post_prompt_st - _pre_prompt_st),
+            max(0, _post_completion_st - _pre_completion_st),
+        )
+
         # เก็บ cache
         cache.set(
             session_id=session_id,
             question=message,
-            value={"response": bot_reply, "cost": 0.033, "persona": state.persona_id},
+            value={"response": bot_reply, "cost": _actual_cost_st, "persona": state.persona_id},
             persona=state.persona_id,
         )
 

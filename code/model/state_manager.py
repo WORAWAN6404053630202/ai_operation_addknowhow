@@ -114,6 +114,14 @@ class StateManager:
             pass
         return removed
 
+    # Context keys that should never be persisted to disk — they are only valid within
+    # the single request that set them and become stale immediately after.
+    _EPHEMERAL_CTX_KEYS = frozenset({
+        "_broad_retrieval_docs",    # large doc list; set for Academic handoff, stale afterwards
+        "_broad_retrieval_query",   # companion query; same lifecycle as _broad_retrieval_docs
+        "_multi_topic_retrieval",   # flag for multi-topic DC suppression; per-turn only
+    })
+
     def _trim_state_for_save(self, state: ConversationState) -> None:
         max_recent = None
         try:
@@ -134,6 +142,12 @@ class StateManager:
         max_internal = self._default_max_internal
         if isinstance(state.internal_messages, list) and max_internal > 0 and len(state.internal_messages) > max_internal:
             state.internal_messages = state.internal_messages[-max_internal:]
+
+        # Strip ephemeral context keys before persisting — they must not survive across requests.
+        ctx = getattr(state, "context", None)
+        if isinstance(ctx, dict):
+            for _ek in self._EPHEMERAL_CTX_KEYS:
+                ctx.pop(_ek, None)
 
     def save(self, session_id: str, state: ConversationState) -> None:
         if not session_id:
@@ -185,7 +199,11 @@ class StateManager:
                 _ctx.pop("pending_slot", None)
                 data["context"] = _ctx
 
-        return ConversationState(**data)
+        state = ConversationState(**data)
+        # Backward compat: old sessions saved before display_messages field existed
+        # will have display_messages=[] — sync from messages so UI still shows history.
+        state.sync_display_messages()
+        return state
 
     def delete(self, session_id: str) -> None:
         if not session_id:

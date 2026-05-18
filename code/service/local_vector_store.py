@@ -157,21 +157,28 @@ class LocalVectorStoreManager:
         Build a fresh local Chroma vectorstore from documents.
 
         reset=True:
-          - delete persist_directory to avoid duplicate/old vectors
-          - guarantees stable count after ingest
+          - writes to a temp dir first, then atomically swaps it into place
+          - the live corpus is never deleted until the new one is fully written
+          - guarantees no data loss if the process crashes mid-ingest
         """
         self.initialize_embeddings()
 
         persist_dir = self._persist_dir()
         collection_name = self._collection_name()
 
+        p = Path(persist_dir)
+        p_new = Path(str(persist_dir) + "_new")
+        p_old = Path(str(persist_dir) + "_old")
+
         if reset:
-            # IMPORTANT: wipe the actual persist directory used by the app
-            p = Path(persist_dir)
-            if p.exists():
-                print(f"[VectorStore] Reset enabled -> removing persist dir: {p.resolve()}")
-                _safe_rmtree(p)
-            p.mkdir(parents=True, exist_ok=True)
+            # Clean up any leftover temp dir from a previous failed ingest
+            if p_new.exists():
+                print(f"[VectorStore] Removing leftover temp dir: {p_new.resolve()}")
+                _safe_rmtree(p_new)
+            p_new.mkdir(parents=True, exist_ok=True)
+            write_dir = str(p_new)
+        else:
+            write_dir = persist_dir
 
         docs = [
             Document(
@@ -182,20 +189,34 @@ class LocalVectorStoreManager:
         ]
 
         print(f"[VectorStore] Creating local Chroma ({len(docs)} docs)...")
-        print(f"[VectorStore] persist_directory = {Path(persist_dir).resolve()}")
+        print(f"[VectorStore] persist_directory = {Path(write_dir).resolve()}")
         print(f"[VectorStore] collection_name   = {collection_name}")
 
         self.vectorstore = Chroma.from_documents(
             documents=docs,
             embedding=self.embedding_model,
             collection_name=collection_name,
-            persist_directory=persist_dir,
+            persist_directory=write_dir,
         )
 
         try:
             self.vectorstore.persist()
         except Exception:
             pass
+
+        if reset:
+            # Atomic swap: promote _new to live; keep _old briefly then delete
+            if p_old.exists():
+                _safe_rmtree(p_old)
+            if p.exists():
+                p.rename(p_old)
+            p_new.rename(p)
+            print(f"[VectorStore] Atomic swap complete — new corpus is live")
+            try:
+                if p_old.exists():
+                    _safe_rmtree(p_old)
+            except Exception:
+                pass  # best-effort cleanup of old backup
 
         count = self._collection_count()
         print(f"[VectorStore] Created successfully | count={count}")

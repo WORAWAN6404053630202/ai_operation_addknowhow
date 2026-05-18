@@ -12,6 +12,7 @@ from model.conversation_state import ConversationState
 from model.persona_practical import _classify_link, _parse_link_entries
 from utils.llm_call import llm_invoke, extract_llm_text
 from utils.prompts_academic import SYSTEM_PROMPT as SYSTEM_PROMPT_ACADEMIC
+from utils.query_synonyms import SYNONYM_PATTERNS
 
 _LOG = logging.getLogger("restbiz.academic")
 
@@ -70,6 +71,7 @@ class AcademicPersonaService:
 
     def __init__(self, retriever):
         self.retriever = retriever
+        self._cached_main_topics: Optional[List[str]] = None  # populated lazily, same pattern as supervisor
         self._init_llm()
 
     def _init_llm(self):
@@ -127,6 +129,26 @@ class AcademicPersonaService:
             if last.get("role") == "assistant" and (last.get("content") or "").strip() == c:
                 return
         state.messages.append({"role": "assistant", "content": c})
+
+    # Store a compressed version of long Academic final answers in messages history.
+    # The full answer is returned to the caller (and user) unchanged — only history is compressed.
+    _HISTORY_MAX_CHARS = 800
+
+    def _summarize_for_history(self, ans: str) -> str:
+        """Return a shortened version of ans for storage in state.messages.
+
+        Keeps at most _HISTORY_MAX_CHARS characters, cutting at the last
+        sentence-ending punctuation (。.!?ๆ newline) to avoid mid-sentence
+        truncation.  Appends '[…]' so the LLM knows the message was trimmed.
+        """
+        if len(ans) <= self._HISTORY_MAX_CHARS:
+            return ans
+        chunk = ans[: self._HISTORY_MAX_CHARS]
+        # Try to cut at last Thai/ASCII sentence boundary
+        m = re.search(r"(.*[ๆ\.\!\?\n])", chunk, re.DOTALL)
+        if m and len(m.group(1)) >= 80:
+            chunk = m.group(1).rstrip()
+        return chunk + " […]"
 
     # Context helpers (flow)
     def _get_flow(self, state: ConversationState) -> Optional[Dict[str, Any]]:
@@ -206,29 +228,211 @@ class AcademicPersonaService:
 
         return False
 
+    # ── 2-pass topic_group detection (safety net C) ───────────────────────────
+    def _detect_topic_group(self, query: str, k: int = 10) -> Optional[List[str]]:
+        """
+        Pass-1: broad unfiltered retrieve of top-k docs, then score topic_group by count.
+        Returns a list of relevant groups (never empty — returns None when inconclusive):
+          - Single dominant group (≥ 60% of docs): returns [group]
+          - Cross-domain query (2+ groups each ≥ 30%): returns all qualifying groups
+            so the caller can use $in filter instead of locking to one group.
+          - Inconclusive (no group ≥ 30%): returns None
+        Used as a safety net so entity-filtered retrieval also scopes by topic_group,
+        preventing cross-topic contamination (e.g. "ปิดงบบัญชี" retrieving ใบทะเบียนพาณิชย์).
+        """
+        if not query:
+            return None
+        # Apply synonym expansion — same logic as _retrieve_docs
+        _q = query
+        for _pat, _exp in SYNONYM_PATTERNS:
+            if re.search(_pat, _q, re.IGNORECASE) and _exp not in _q:
+                _q += " " + _exp
+        _q = _q.strip()
+        try:
+            vectorstore = getattr(self.retriever, "vectorstore", None)
+            if vectorstore is None:
+                docs_broad = self.retriever.invoke(_q)[:k]
+            elif getattr(conf, "HYBRID_SEARCH_ENABLED", False):
+                from utils.hybrid_retriever import hybrid_scored_search
+                _rrf_k_tg = int(getattr(conf, "HYBRID_RRF_K", 60))
+                docs_broad = [d for d, _ in hybrid_scored_search(vectorstore, _q, k=k, rrf_k=_rrf_k_tg)]
+            else:
+                tmp_broad = vectorstore.as_retriever(search_kwargs={"k": k})
+                docs_broad = tmp_broad.invoke(_q)
+        except Exception as _e_broad:
+            _LOG.warning("[Academic] _detect_topic_group broad retrieve failed: %s", _e_broad)
+            return None
+
+        group_counts: Dict[str, int] = {}
+        for _d in (docs_broad or []):
+            _md = getattr(_d, "metadata", {}) or {}
+            _tg = (_md.get("topic_group") or "").strip()
+            if _tg and _tg != "อื่นๆ":
+                group_counts[_tg] = group_counts.get(_tg, 0) + 1
+
+        if not group_counts:
+            return None
+
+        total = sum(group_counts.values())
+        scored = sorted(group_counts.items(), key=lambda x: x[1], reverse=True)
+        best_group, best_count = scored[0]
+        best_conf = best_count / total if total else 0.0
+
+        # Dominant single group (≥ 60%) — narrow, focused query
+        if best_conf >= 0.60:
+            _LOG.info(
+                "[Academic] _detect_topic_group: dominant group=%r (%.0f%%) counts=%s",
+                best_group, best_conf * 100, group_counts,
+            )
+            return [best_group]
+
+        # Cross-domain: return all groups with ≥ 30% share so retrieval covers all topics
+        qualifying = [g for g, c in scored if (c / total) >= 0.30]
+        if qualifying:
+            _LOG.info(
+                "[Academic] _detect_topic_group: cross-domain groups=%r counts=%s",
+                qualifying, group_counts,
+            )
+            return qualifying
+
+        # Inconclusive — no group strong enough to constrain
+        _LOG.info(
+            "[Academic] _detect_topic_group: inconclusive (best=%.0f%% < 30%%) counts=%s",
+            best_conf * 100, group_counts,
+        )
+        return None
+
     # Retrieval (only once per intake)
     def _retrieve_docs(self, query: str, metadata_filter: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         max_docs = int(getattr(conf, "LLM_DOCS_MAX_ACADEMIC", 12) or 12)
         max_chars = int(getattr(conf, "LLM_DOC_CHARS_ACADEMIC", 700) or 700)
 
-        if metadata_filter:
+        # Chapter retrieval: when query explicitly names a known main_topic, retrieve ALL docs
+        # for that chapter via metadata filter instead of semantic search. Semantic top-K misses
+        # subtopics ranked below the cutoff — filter guarantees full chapter coverage.
+        # Only applies when no metadata_filter is already specified (avoid double-filtering).
+        if not metadata_filter:
+            try:
+                _vstore_ac = getattr(self.retriever, "vectorstore", None)
+                _coll_ac = getattr(_vstore_ac, "_collection", None) if _vstore_ac else None
+                if _coll_ac is not None:
+                    # Use cached main_topics list — built once, not on every retrieval call
+                    if self._cached_main_topics is None:
+                        _all_mt_res = _coll_ac.get(include=["metadatas"])
+                        self._cached_main_topics = list({
+                            (m.get("main_topic") or "").strip()
+                            for m in (_all_mt_res.get("metadatas") or [])
+                            if (m.get("main_topic") or "").strip() and len((m.get("main_topic") or "").strip()) >= 5
+                        })
+                        _LOG.info("[Academic] cached %d distinct main_topics from store", len(self._cached_main_topics))
+                    _q_lower_ac_ch = query.lower()
+                    _matched_mts_ac = [mt for mt in self._cached_main_topics if mt.lower() in _q_lower_ac_ch]
+                    if _matched_mts_ac:
+                        _target_mt_ac = max(_matched_mts_ac, key=len)
+                        _ch_res = _coll_ac.get(
+                            where={"main_topic": _target_mt_ac},
+                            include=["documents", "metadatas"],
+                        )
+                        _ch_docs_raw = list(zip(
+                            _ch_res.get("documents") or [],
+                            _ch_res.get("metadatas") or [],
+                        ))
+                        if _ch_docs_raw:
+                            _LOG.info(
+                                "[Academic] chapter retrieval: main_topic=%r → %d docs (bypassing semantic search)",
+                                _target_mt_ac, len(_ch_docs_raw),
+                            )
+                            return [
+                                {"content": (c or "")[:max_chars], "metadata": m or {}}
+                                for c, m in _ch_docs_raw
+                            ]
+            except Exception as _ch_ex:
+                _LOG.warning("[Academic] chapter retrieval failed (%s) — falling through to semantic search", _ch_ex)
+
+        # Query expansion: Thai/English synonym bridging — patterns defined in utils/query_synonyms.py
+        _expansions_ac: list = []
+        for _pat_ac, _exp_ac in SYNONYM_PATTERNS:
+            if re.search(_pat_ac, query, re.IGNORECASE) and _exp_ac not in _expansions_ac:
+                _expansions_ac.append(_exp_ac)
+        expanded_query = (query + " " + " ".join(_expansions_ac)).strip() if _expansions_ac else query
+        if _expansions_ac:
+            _LOG.info("[Academic] query expanded: %r → %r", query[:50], expanded_query[:80])
+
+        _hybrid_ac = getattr(conf, "HYBRID_SEARCH_ENABLED", False)
+        _rrf_k_ac = int(getattr(conf, "HYBRID_RRF_K", 60))
+
+        def _ac_search(q: str, k: int, flt=None) -> list:
+            """Hybrid or Dense retrieval for Academic — attaches _sim to metadata."""
             vectorstore = getattr(self.retriever, "vectorstore", None)
-            if vectorstore is not None:
+            if vectorstore is not None and _hybrid_ac:
+                from utils.hybrid_retriever import hybrid_scored_search
+                pairs = hybrid_scored_search(vectorstore, q, k=k, metadata_filter=flt, rrf_k=_rrf_k_ac)
+                result = []
+                for _d, _s in pairs:
+                    if _s is not None:
+                        _d.metadata["_sim"] = float(_s)
+                    result.append(_d)
+                return result
+            elif vectorstore is not None and flt:
                 try:
-                    tmp = vectorstore.as_retriever(search_kwargs={"k": max_docs, "filter": metadata_filter})
-                    docs = tmp.invoke(query)
-                    _LOG.info("[Academic] Filtered retrieval (filter=%s) got %d docs", metadata_filter, len(docs))
-                    if not docs:
-                        # Filter returned nothing — fall back to unfiltered
-                        _LOG.info("[Academic] Filter returned 0 docs — falling back to unfiltered retrieval")
-                        docs = self.retriever.invoke(query)
-                except Exception as e:
-                    _LOG.warning("[Academic] Filtered retrieval failed (%s), falling back to unfiltered", e)
-                    docs = self.retriever.invoke(query)
+                    tmp = vectorstore.as_retriever(search_kwargs={"k": k, "filter": flt})
+                    return tmp.invoke(q)
+                except Exception:
+                    return self.retriever.invoke(q)
             else:
-                docs = self.retriever.invoke(query)
+                return self.retriever.invoke(q)
+
+        if metadata_filter:
+            try:
+                docs = _ac_search(expanded_query, max_docs, metadata_filter)
+                _LOG.info("[Academic] Filtered retrieval (filter=%s) got %d docs", metadata_filter, len(docs))
+                if not docs:
+                    _LOG.info("[Academic] Filter returned 0 docs — falling back to unfiltered retrieval")
+                    docs = _ac_search(expanded_query, max_docs)
+            except Exception as e:
+                _LOG.warning("[Academic] Filtered retrieval failed (%s), falling back to unfiltered", e)
+                docs = _ac_search(expanded_query, max_docs)
         else:
-            docs = self.retriever.invoke(query)
+            docs = _ac_search(expanded_query, max_docs)
+
+        # ── Cross-encoder reranker (Level 3) ─────────────────────────────────
+        # Same as Practical — rerank raw retrieval results before metadata boost.
+        if getattr(conf, "RERANKER_ENABLED", False) and docs:
+            try:
+                from utils.reranker import rerank as _do_rerank
+                _rr_model_ac = getattr(conf, "RERANKER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
+                _rr_top_k_ac = int(getattr(conf, "RERANKER_TOP_K", len(docs)))
+                docs = _do_rerank(expanded_query, docs, model_name=_rr_model_ac, top_k=_rr_top_k_ac)
+            except Exception as _rr_exc_ac:
+                _LOG.warning("[Academic] reranker failed (%s) — continuing without rerank", _rr_exc_ac)
+
+        # ── Metadata-targeted boost ───────────────────────────────────────────
+        # Same logic as Practical — boost docs whose metadata fields match query keywords.
+        # Critical for Sheet A where near-duplicate rows share identical embedding vectors.
+        _BOOST_WEIGHT_AC = 0.25
+        _BOOST_FIELDS_AC = ("operation_topic", "sub_topic", "main_topic", "license_type", "book_name", "source_book")
+        _q_lower_ac = expanded_query.lower()
+        _boosted_ac: list = []
+        for _d_ac in (docs or []):
+            _md_ac = getattr(_d_ac, "metadata", {}) or {}
+            # Academic retriever may not attach _sim — use 0.5 as neutral baseline.
+            # Must check key existence (not truthiness) since 0.0 is a valid score.
+            _sim_ac = float(_md_ac["_sim"]) if "_sim" in _md_ac else 0.5
+            _hit_ac = 0.0
+            for _field_ac in _BOOST_FIELDS_AC:
+                _val_ac = str(_md_ac.get(_field_ac) or "").strip().lower()
+                if _val_ac and len(_val_ac) >= 3 and _val_ac in _q_lower_ac:
+                    _hit_ac = 1.0
+                    break
+            _md_ac["_blend"] = _sim_ac + _BOOST_WEIGHT_AC * _hit_ac
+            _boosted_ac.append((_d_ac, _md_ac["_blend"]))
+        _boosted_ac.sort(key=lambda x: x[1], reverse=True)
+        docs = [_d for _d, _ in _boosted_ac]
+        if _boosted_ac and any(_b[1] > float((_b[0].metadata or {}).get("_sim") or 0.5) for _b in _boosted_ac[:3]):
+            _LOG.info("[Academic] metadata boost applied — top doc: %r blend=%.3f",
+                      str((docs[0].metadata if docs else {}).get("operation_topic") or
+                          (docs[0].metadata if docs else {}).get("main_topic") or "?")[:60],
+                      _boosted_ac[0][1] if _boosted_ac else 0.0)
 
         results: List[Dict[str, Any]] = []
         for d in (docs or [])[:max_docs]:
@@ -280,27 +484,109 @@ class AcademicPersonaService:
             r"ขอแบบละเอียด|แบบละเอียดกว่า|รายละเอียดเพิ่ม|เพิ่มเติม$|^เพิ่ม|^ละเอียด"
             r"|ขอรายละเอียด|ขยายความ|บอกให้ครบ|บอกทุกอย่าง|อยากรู้ครบ|ให้ครบ|ต้องการข้อมูลเพิ่ม"
         )
-        if _META_REQUEST_RE.search(q):
-            _ctx_lq = (state.context.get("last_user_legal_query") or "").strip()
-            _ctx_rq = (
-                (state.context.get("last_retrieval_query") or "").strip()
-                or (getattr(state, "last_retrieval_query", "") or "").strip()
-            )
-            _base = _ctx_lq or _ctx_rq
-            if _base:
-                _LOG.info("[Academic] Meta-request %r — using legal base query: %r", q[:40], _base[:60])
-                q = _base
+        # Strip meta-words to check if there is a new topic remaining.
+        # e.g. "ขยายความ" alone → no topic → substitute base query (old behavior)
+        # e.g. "ขยายความส่วนประสมสินค้า ของกลยุทธ์ด้านผลิตภัณฑ์" → has topic → use q as-is
+        _META_WORD_STRIP_RE = re.compile(
+            r'(ขอแบบละเอียด|แบบละเอียดกว่า|รายละเอียดเพิ่ม|ขอรายละเอียด|'
+            r'ขยายความ|บอกให้ครบ|บอกทุกอย่าง|อยากรู้ครบ|ให้ครบ|ต้องการข้อมูลเพิ่ม|'
+            r'เพิ่มเติม|^เพิ่ม|^ละเอียด|กว่านี้|กว่าเดิม)',
+            re.IGNORECASE,
+        )
+        # Do not treat as a meta-request when the user specifies a concrete section —
+        # e.g. "ขอรายละเอียดค่าธรรมเนียม" is a specific query, not a vague "tell me more".
+        _SPECIFIC_SECTION_RE = re.compile(
+            r"ค่าธรรมเนียม|เอกสาร|ขั้นตอน|ช่องทาง|ระยะเวลา|เงื่อนไข|กฎหมาย|บทลงโทษ|แบบฟอร์ม"
+        )
+        if _META_REQUEST_RE.search(q) and not _SPECIFIC_SECTION_RE.search(q):
+            _q_remaining = _META_WORD_STRIP_RE.sub('', q).strip()
+            # Only substitute base query when there is no meaningful topic left in the input
+            _has_new_topic = len(_q_remaining) >= 5
+            if not _has_new_topic:
+                _ctx_lq = (state.context.get("last_user_legal_query") or "").strip()
+                _ctx_rq = (
+                    (state.context.get("last_retrieval_query") or "").strip()
+                    or (getattr(state, "last_retrieval_query", "") or "").strip()
+                )
+                _base = _ctx_lq or _ctx_rq
+                if _base:
+                    _LOG.info("[Academic] Meta-request %r — using legal base query: %r", q[:40], _base[:60])
+                    q = _base
+            else:
+                _LOG.info("[Academic] Meta-request %r has new topic %r — using input as-is", q[:40], _q_remaining[:40])
 
-        # Enrich query with entity type if already known (from practical slot memory)
+        # Enrich query with entity type if already known (from practical slot memory).
+        # Skip enrichment when the query EXPLICITLY names a DIFFERENT entity type —
+        # e.g. collected entity='นิติบุคคล' but user asks "ประเภทบุคคลธรรมดา".
+        # Appending the wrong entity contaminates academic_question → metadata_filter →
+        # retrieval → auto-fill → answer covers the wrong entity.
+        _NATURAL_ENTITY_RE = re.compile(r"บุคคลธรรมดา", re.IGNORECASE)
+        _JURISTIC_ENTITY_RE = re.compile(r"นิติบุคคล|บริษัท|ห้างหุ้นส่วน", re.IGNORECASE)
+        _query_says_natural = bool(_NATURAL_ENTITY_RE.search(q))
+        _query_says_juristic = bool(_JURISTIC_ENTITY_RE.search(q))
         if hasattr(state, "get_collected_slots"):
             slots = state.get_collected_slots() or {}
             for k, v in slots.items():
                 sv = str(v).strip()
                 if k == "entity_type" and sv and sv not in q:
+                    _slot_is_juristic = bool(_JURISTIC_ENTITY_RE.search(sv))
+                    _slot_is_natural = sv == "บุคคลธรรมดา"
+                    # Skip if query explicitly contradicts the slot
+                    if _slot_is_juristic and _query_says_natural and not _query_says_juristic:
+                        _LOG.info(
+                            "[Academic] Skipping entity enrichment %r — query explicitly says บุคคลธรรมดา",
+                            sv,
+                        )
+                        break
+                    if _slot_is_natural and _query_says_juristic and not _query_says_natural:
+                        _LOG.info(
+                            "[Academic] Skipping entity enrichment %r — query explicitly says นิติบุคคล",
+                            sv,
+                        )
+                        break
                     q = f"{q} {sv}"
                     break
 
         state.context["academic_question"] = q
+
+        # Fast path: supervisor preserved its broad two-pass retrieval docs specifically for
+        # Academic's topic menu (set when _broad_question=True in _silent_switch_to_academic).
+        # These docs cover ALL topics in the user's question — use them directly without re-retrieving.
+        _broad_docs = state.context.pop("_broad_retrieval_docs", None)
+        _broad_query = state.context.pop("_broad_retrieval_query", None)
+        if _broad_docs and isinstance(_broad_docs, list) and len(_broad_docs) >= 2:
+            # Guard: if entity_type is already collected, verify broad_docs reflect it.
+            # Broad docs are unfiltered (no entity filter applied by supervisor) — if the
+            # user's entity type is known but absent from docs, skip the fast path and let
+            # the normal freshness check below do entity-filtered retrieval instead.
+            # Without this guard, Academic reuses generic docs and re-asks entity_type
+            # even though it's already stored in collected_slots.
+            _broad_ok = True
+            if hasattr(state, "get_collected_slots"):
+                _broad_et = (state.get_collected_slots() or {}).get("entity_type", "").strip()
+                if _broad_et:
+                    _broad_entities = {
+                        (d.get("metadata") or {}).get("entity_type_normalized", "").strip()
+                        for d in _broad_docs
+                    }
+                    if _broad_et not in _broad_entities:
+                        _broad_ok = False
+                        _LOG.info(
+                            "[Academic] broad_docs fast-path skipped: entity_type=%r not in broad docs"
+                            " (docs have entity values: %s) — falling through to entity-filtered retrieval",
+                            _broad_et, _broad_entities,
+                        )
+            if _broad_ok:
+                state.current_docs = _broad_docs
+                if _broad_query:
+                    state.last_retrieval_query = _broad_query
+                _LOG.info(
+                    "[Academic] Using preserved broad retrieval docs (%d) — skipping fresh retrieve",
+                    len(_broad_docs),
+                )
+                return  # Skip the rest of _start_intake_with_retrieval
+            # _broad_ok=False: fall through to the normal freshness check below,
+            # which will force entity-filtered re-retrieval (needs_fresh=True path).
 
         # Decide whether to reuse pre-retrieved docs from supervisor or do a fresh retrieval.
         # Re-retrieve whenever:
@@ -331,6 +617,27 @@ class AcademicPersonaService:
             return changed
 
         needs_fresh = len(state.current_docs or []) < 2 or _query_changed(q, state)
+
+        # Bug 6: if topic changed (needs_fresh=True), clear stale academic_slots that belong to the
+        # OLD topic. Slot values like operation_by_department="แก้ไข / เปลี่ยนแปลงรายการ" from the
+        # previous session would otherwise contaminate retrieval enrichment for a completely new topic.
+        if needs_fresh and (state.context or {}).get("academic_slots"):
+            _old_aq = (state.context.get("academic_question") or "").strip()
+            _new_lts = {
+                str((d.get("metadata") or {}).get("license_type") or "").strip()
+                for d in (state.current_docs or [])
+            } - {"", "nan", "None"}
+            # Check if old academic_question's license types overlap with current docs — if not, clear
+            _old_slots_have_relevance = False
+            if _old_aq and _new_lts:
+                _old_lt_hint = (state.context or {}).get("academic_selected_license_type", "")
+                _old_slots_have_relevance = bool(_old_lt_hint and _old_lt_hint in _new_lts)
+            if not _old_slots_have_relevance:
+                _LOG.info(
+                    "[Academic] Bug6: topic changed (needs_fresh) and old slots not relevant to new lts=%s — clearing academic_slots",
+                    list(_new_lts),
+                )
+                state.context["academic_slots"] = {}
 
         # Force fresh retrieval when collected slots (entity_type, shop_area_type) were
         # not yet applied to the pre-retrieved docs. Supervisor retrieves unfiltered docs at
@@ -401,8 +708,33 @@ class AcademicPersonaService:
                     if not sv:
                         continue
                     if k == "entity_type":
+                        # Skip stale entity when query explicitly contradicts it.
+                        # Same guard as the query-enrichment block at _start_intake top.
+                        _slot_j = bool(_JURISTIC_ENTITY_RE.search(sv))
+                        _slot_n = sv == "บุคคลธรรมดา"
+                        if _slot_j and _query_says_natural and not _query_says_juristic:
+                            _LOG.info(
+                                "[Academic] Skipping entity filter %r — query explicitly says บุคคลธรรมดา", sv,
+                            )
+                            continue
+                        if _slot_n and _query_says_juristic and not _query_says_natural:
+                            _LOG.info(
+                                "[Academic] Skipping entity filter %r — query explicitly says นิติบุคคล", sv,
+                            )
+                            continue
                         _entity_val_for_filter = sv
                     elif k in ("shop_area_type", "location_type", "operation_group", "registration_type"):
+                        # Only enrich with registration_type when the value looks like an entity
+                        # discriminator (e.g. บุคคลธรรมดา, นิติบุคคล, บริษัทจำกัด).
+                        # Reject stale operational descriptors from prior topics
+                        # (e.g. "ระหว่างการใช้งาน QR PAYMENT") that contaminate retrieval.
+                        if k == "registration_type":
+                            _ENTITY_ENRICH_RE = re.compile(
+                                r"(บุคคลธรรมดา|นิติบุคคล|บริษัท|ห้างหุ้นส่วน|หจก\.?|บจก\.?|มหาชน|สหกรณ์)",
+                                re.IGNORECASE,
+                            )
+                            if not _ENTITY_ENRICH_RE.search(sv):
+                                continue  # Skip non-entity registration_type values
                         if sv not in q:
                             _q_enrichments.append(sv)
                 # Use $or so shared docs (entity_type_normalized='') are always included
@@ -413,9 +745,87 @@ class AcademicPersonaService:
                             {"entity_type_normalized": ""},
                         ]
                     }
+            _q_before_enrichment = q  # preserve original for topic_group detection (Safety net C)
             if _q_enrichments:
                 q = f"{q} {' '.join(_q_enrichments)}".strip()
                 _LOG.info("[Academic] Query enriched with slots: %r", _q_enrichments)
+
+            # For marketing/business_guide topics: narrow fresh retrieval with main_topic filter
+            # when pre-retrieved docs belong to a marketing/business_guide cluster.
+            # This prevents docs from other topic clusters (e.g. กลยุทธ์ด้านราคา) from
+            # being mixed in when user asks a sub-topic question (e.g. "b2b คือ").
+            # Only applied when there is no entity_type filter (regulatory path skips this).
+            #
+            # Trigger logic (improved): use MAJORITY main_topic from pre-docs (≥50% agree)
+            # rather than requiring 100% agreement. This handles the case where supervisor's
+            # main_topic chapter retrieval loaded ALL 20 docs of a chapter — Academic fresh
+            # retrieval must stay within that chapter, not drift to related clusters.
+            if not metadata_filter:
+                _pre_docs = state.current_docs or []
+                _pre_data_types = {
+                    (d.get("metadata") or {}).get("data_type", "").strip()
+                    for d in _pre_docs
+                    if isinstance(d, dict)
+                }
+                _NON_REG_TYPES = {"marketing", "business_guide"}
+                if _pre_data_types and _pre_data_types.issubset(_NON_REG_TYPES):
+                    _pre_main_topics = [
+                        (d.get("metadata") or {}).get("main_topic", "").strip()
+                        for d in _pre_docs
+                        if isinstance(d, dict) and (d.get("metadata") or {}).get("main_topic", "").strip()
+                    ]
+                    _unique_main_topics = list(dict.fromkeys(_pre_main_topics))
+                    if len(_unique_main_topics) == 1:
+                        # All pre-docs agree on one main_topic — apply filter directly
+                        metadata_filter = {"main_topic": _unique_main_topics[0]}
+                        _LOG.info("[Academic] main_topic filter applied (unanimous): %r", _unique_main_topics[0])
+                    elif len(_unique_main_topics) > 1 and _pre_main_topics:
+                        # Multiple main_topics in pre-docs — use majority (most frequent)
+                        from collections import Counter as _Counter
+                        _mt_counts = _Counter(_pre_main_topics)
+                        _majority_mt, _majority_cnt = _mt_counts.most_common(1)[0]
+                        _majority_ratio = _majority_cnt / len(_pre_main_topics)
+                        if _majority_ratio >= 0.5 and len(_majority_mt) >= 5:
+                            metadata_filter = {"main_topic": _majority_mt}
+                            _LOG.info(
+                                "[Academic] main_topic filter applied (majority %d%%): %r",
+                                int(_majority_ratio * 100), _majority_mt,
+                            )
+
+            # Safety net C: 2-pass topic_group detection.
+            # When entity_type filter is set (regulatory path), the filter is broad —
+            # นิติบุคคล covers 42/142 docs across ALL license types. Adding topic_group
+            # to the filter narrows the scope to only docs of the same topic cluster,
+            # preventing cross-topic contamination before slot questions are built.
+            # Only applied when: entity filter is set AND main_topic filter is NOT set
+            # (to avoid conflicting with the marketing/business_guide path above).
+            if metadata_filter and "$or" in metadata_filter and "main_topic" not in metadata_filter:
+                # Use original (pre-enrichment) query for topic_group detection.
+                # The enriched query includes entity slot values (e.g. "บริษัทจำกัด") which
+                # bias broad retrieval toward entity-specific docs and cause misclassification.
+                # e.g. "การปิดงบการเงิน บริษัทจำกัด" → 67% ทะเบียนธุรกิจ (wrong)
+                #      "การปิดงบการเงิน" alone → สำนักงานบัญชี (correct)
+                _detected_groups = self._detect_topic_group(_q_before_enrichment)
+                if _detected_groups:
+                    # Add topic_group filter alongside entity filter ($and combines both).
+                    # Single group → equality filter; multiple groups → $in so cross-domain
+                    # queries (e.g. "จดทะเบียน + ภาษี") are not truncated to one topic.
+                    _existing_or = metadata_filter["$or"]
+                    _tg_filter = (
+                        {"topic_group": _detected_groups[0]}
+                        if len(_detected_groups) == 1
+                        else {"topic_group": {"$in": _detected_groups}}
+                    )
+                    metadata_filter = {
+                        "$and": [
+                            {"$or": _existing_or},
+                            _tg_filter,
+                        ]
+                    }
+                    _LOG.info(
+                        "[Academic] Safety net C: added topic_group filter %r to entity filter",
+                        _detected_groups,
+                    )
 
             # Multi-topic retrieval: if the question covers multiple distinct topics,
             # retrieve for each sub-topic separately then merge (de-dup by content hash).
@@ -472,6 +882,28 @@ class AcademicPersonaService:
                 _LOG.info("[Academic] Multi-topic interleaved merge → %d total docs", len(merged))
             else:
                 state.current_docs = self._retrieve_docs(q, metadata_filter=metadata_filter)
+                # Safety net C fallback: if topic_group filter was applied but top reranker score
+                # is extremely low (< 0.05), the topic_group was misdetected — retry with entity-only filter.
+                # e.g. "การปิดงบการเงิน" + entity=นิติบุคคล + topic_group=ทะเบียนธุรกิจ (wrong) → score 0.002
+                if (
+                    state.current_docs
+                    and isinstance(metadata_filter, dict)
+                    and "$and" in metadata_filter
+                    and any("topic_group" in (c or {}) for c in (metadata_filter.get("$and") or []))
+                ):
+                    _top_rr = (state.current_docs[0].get("metadata") or {}).get("_rerank_score")
+                    if _top_rr is not None and float(_top_rr) < 0.05:
+                        # Extract entity-only $or filter from the $and compound
+                        _entity_filter = next(
+                            (c for c in (metadata_filter.get("$and") or []) if "$or" in c),
+                            None,
+                        )
+                        _LOG.info(
+                            "[Academic] Safety net C fallback: top_score=%.3f < 0.05 — "
+                            "topic_group filter likely wrong, retrying with entity-only filter",
+                            float(_top_rr),
+                        )
+                        state.current_docs = self._retrieve_docs(q, metadata_filter=_entity_filter)
 
         if hasattr(state, "set_last_retrieval_query"):
             state.set_last_retrieval_query(q, cache_to_context=True)
@@ -608,19 +1040,479 @@ class AcademicPersonaService:
             pass
         return None
 
-    # Stage 2.1: dynamic slots (LLM-generated from question + docs)
-    # Fields to include in slot generation prompt (reduces prompt tokens significantly)
-    _SLOT_PROMPT_META_KEYS = (
-        "topic_name", "short_name", "regulation_name", "target_audience",
-        "conditions_applicability", "entity_type", "location_scope",
-    )
+    # Stage 0: Topic selection — shown when retrieved docs span multiple distinct license_types.
+    # Threshold: show menu only when ≥ this many distinct topics found.
+    _MIN_TOPICS_FOR_MENU = 2
+
+    def _detect_distinct_topics(
+        self, docs: List[Dict], query: str = ""
+    ) -> List[Dict[str, str]]:
+        """
+        Scan docs for distinct topic labels to build a Phase 0 selection menu.
+        Preserves insertion order (first-seen = highest similarity rank).
+
+        Priority for topic label:
+          1. license_type  — regulatory docs (most authoritative)
+          2. sub_topic     — business_guide/marketing docs (e.g. "การจดทะเบียนพาณิชย์")
+        Skips docs where both fields are empty/nan.
+
+        When query is provided, scores each topic by keyword overlap with the user's question
+        and drops topics with zero overlap (unless all topics score zero — then keep all to
+        avoid an empty menu). This prevents unrelated license_types from contaminating the menu
+        when a broad entity-filtered retrieval returns docs from multiple topics.
+
+        Returns list of {"key": topic_key, "label": display_label} dicts.
+        Returns [] when only one distinct topic exists (no menu needed).
+        """
+        # Main-topic pre-filter: if the query explicitly names one main_topic (e.g.
+        # "ขยายความส่วนประสมสินค้า ของกลยุทธ์ด้านผลิตภัณฑ์"), restrict the doc pool to
+        # that cluster before building the topic menu.  When all surviving sub_topics
+        # share that one main_topic the same-main_topic collapse below will skip the menu.
+        if query and docs:
+            _q_lower_mt = query.lower()
+            _candidate_mts: Dict[str, int] = {}
+            for _d_mt in docs:
+                _mt_val = str((_d_mt.get("metadata") or {}).get("main_topic") or "").strip()
+                if _mt_val and _mt_val.lower() not in ("nan", "none", ""):
+                    _candidate_mts[_mt_val] = _candidate_mts.get(_mt_val, 0) + 1
+            _query_matched_mts = [mt for mt in _candidate_mts if mt.lower() in _q_lower_mt]
+            if len(_query_matched_mts) == 1:
+                _target_mt = _query_matched_mts[0]
+                _docs_filtered = [
+                    _d for _d in docs
+                    if str((_d.get("metadata") or {}).get("main_topic") or "").strip() == _target_mt
+                ]
+                if _docs_filtered:
+                    _LOG.info(
+                        "[Academic] Topic menu: query names main_topic=%r — pre-filtered %d→%d docs",
+                        _target_mt, len(docs), len(_docs_filtered),
+                    )
+                    docs = _docs_filtered
+
+        # Map: topic_key → {"label": str, "score": int, "title_score": int, "main_topic": str}
+        seen: Dict[str, Dict] = {}
+        if query:
+            _q_clean = re.sub(r'[^\u0E00-\u0E7Fa-zA-Z0-9]', ' ', query.lower())
+            _q_words = [w for w in _q_clean.split() if len(w) >= 3]
+        else:
+            _q_words = []
+
+        for d in (docs or []):
+            md = d.get("metadata") or {}
+            lt = str(md.get("license_type") or "").strip()
+            topic_key = None
+            if lt and lt.lower() not in ("nan", "none", ""):
+                topic_key = lt
+            else:
+                st = str(md.get("sub_topic") or "").strip()
+                if st and st.lower() not in ("nan", "none", ""):
+                    topic_key = st
+            if not topic_key:
+                continue
+            _mt = str(md.get("main_topic") or "").strip()
+            if topic_key not in seen:
+                seen[topic_key] = {"label": topic_key, "score": 0, "title_score": 0, "main_topic": _mt}
+            # Score = keyword overlap with topic name (title_score) vs content (score)
+            # title_score: query words found in license_type / sub_topic / topic_name only
+            # score: query words found in content[:300] (broader but less precise)
+            if _q_words:
+                _title_text = " ".join([
+                    str(md.get("license_type") or ""),
+                    str(md.get("sub_topic") or ""),
+                    str(md.get("topic_name") or ""),
+                ]).lower()
+                _content_text = " ".join([
+                    str(md.get("operation_topic") or ""),
+                    str(d.get("content") or "")[:300],
+                ]).lower()
+                for _w in _q_words:
+                    if _w in _title_text:
+                        seen[topic_key]["title_score"] += 1
+                    elif _w in _content_text:
+                        seen[topic_key]["score"] += 1
+
+        if not seen:
+            return []
+
+        # If query provided, prefer topics that matched in title fields (sub_topic/license_type).
+        # Only fall back to content-matched topics when NO topic has any title match.
+        # This prevents generic words (e.g. "สินค้า") in doc content from promoting
+        # unrelated topics (e.g. "ทางเลือกของกิจการเมื่อคู่แข่งขันเปลี่ยนแปลงราคา") into the menu.
+        if _q_words:
+            _total_before = len(seen)
+            title_matched = [(k, v) for k, v in seen.items() if v["title_score"] > 0]
+            if title_matched:
+                # At least one topic matched in title — keep only title-matched topics
+                seen = {k: v for k, v in title_matched}
+                _LOG.info(
+                    "[Academic] Topic menu title-filter: kept %d/%d topics (query=%r)",
+                    len(seen), _total_before, query[:60],
+                )
+            else:
+                # No title matches — fall back to content matches (old behavior)
+                content_matched = [(k, v) for k, v in seen.items() if v["score"] > 0]
+                if content_matched:
+                    seen = {k: v for k, v in content_matched}
+                    _LOG.info(
+                        "[Academic] Topic menu content-filter: kept %d/%d topics (query=%r)",
+                        len(seen), _total_before, query[:60],
+                    )
+
+        # If all remaining topics share the same main_topic (i.e. they are sub-sections of
+        # one chapter), skip the menu entirely — Academic will answer all of them together.
+        # Example: "ขยายความส่วนประสมสินค้า" → 3 sub_topics all under "กลยุทธ์ด้านผลิตภัณฑ์"
+        # → no need to ask which one; compile a comprehensive answer covering all sections.
+        # Only applies to non-regulatory docs (regulatory docs use license_type as topic_key,
+        # which never has a meaningful main_topic set).
+        if len(seen) >= self._MIN_TOPICS_FOR_MENU:
+            _main_topics = {v["main_topic"] for v in seen.values() if v["main_topic"]}
+            if len(_main_topics) == 1:
+                _LOG.info(
+                    "[Academic] Topic menu skipped — all %d topics share same main_topic=%r",
+                    len(seen), next(iter(_main_topics)),
+                )
+                return []
+
+        topics = [{"key": k, "label": v["label"]} for k, v in seen.items()]
+
+        # Doc-count dominance: if one topic has ≥3× as many retrieved docs as all other
+        # topics combined (and ≥3 docs total), it overwhelmingly represents the user's query.
+        # E.g. ระบบชำระเงินออนไลน์=9 docs vs POS ID=1 doc → 9:1 ratio → auto-select.
+        # Handles cases where a minor topic appears only because one generic keyword matched.
+        if len(seen) >= 2 and docs:
+            _doc_counts: Dict[str, int] = {}
+            for _d in docs:
+                _md = _d.get("metadata") or {}
+                _lt = str(_md.get("license_type") or "").strip()
+                _st = str(_md.get("sub_topic") or "").strip()
+                _tk = _lt or _st
+                if _tk and _tk in seen:
+                    _doc_counts[_tk] = _doc_counts.get(_tk, 0) + 1
+            if _doc_counts:
+                _dom_key = max(_doc_counts, key=_doc_counts.__getitem__)
+                _dom_count = _doc_counts[_dom_key]
+                _others_count = sum(c for tk, c in _doc_counts.items() if tk != _dom_key)
+                if _dom_count >= 3 and _dom_count >= 3 * max(_others_count, 1):
+                    _LOG.info(
+                        "[Academic] Topic auto-select: doc-count dominance → %r (%d docs vs %d others)",
+                        _dom_key, _dom_count, _others_count,
+                    )
+                    return [{"key": _dom_key, "label": seen[_dom_key]["label"]}]
+
+        # Unique-discriminating keyword check: if any query word appears in docs of exactly
+        # 1 topic (and not in any other topic's docs), that word uniquely identifies the topic.
+        if len(seen) >= 2 and _q_words and docs:
+            _topic_content: Dict[str, str] = {}
+            for _d in docs:
+                _md = _d.get("metadata") or {}
+                _lt = str(_md.get("license_type") or "").strip()
+                _st = str(_md.get("sub_topic") or "").strip()
+                _tk = _lt or _st
+                if _tk and _tk in seen:
+                    _topic_content[_tk] = _topic_content.get(_tk, "") + " " + (str(_d.get("content") or "")).lower()
+            _discriminating: set = set()
+            for _w in _q_words:
+                _matches = [tk for tk, content in _topic_content.items() if _w in content]
+                if len(_matches) == 1:
+                    _discriminating.add(_matches[0])
+            if len(_discriminating) == 1:
+                _unique_key = next(iter(_discriminating))
+                _LOG.info(
+                    "[Academic] Topic auto-select: unique discriminating keyword → topic=%r",
+                    _unique_key,
+                )
+                return [{"key": _unique_key, "label": seen[_unique_key]["label"]}]
+
+        # Always return topics (even single-topic) — caller handles auto-selection.
+        # Previously returned [] for single-topic, causing academic_selected_license_type
+        # to never be set, which prevented Fix3 from scoping diversity_docs correctly.
+        return topics
+
+    def _ask_topic_selection(self, state: ConversationState) -> str:
+        """
+        Phase 0: if retrieved docs contain ≥2 distinct license_types, present a numbered
+        topic menu so the user narrows to one topic before slots are asked.
+        Returns "" when only one topic exists — caller skips directly to slot phase.
+        Sets stage="awaiting_topic" when menu is shown.
+        """
+        # Bug 2 fix: if Practical just answered a multi-topic answer, use those exact
+        # topics as menu options — these are the topics the user already saw and chose
+        # from. Don't build a new list from Chroma docs (which may include unrelated topics).
+        # Guard: only apply when current retrieved docs actually contain at least one of those topics —
+        # prevents stale last_answered_license_types from bleeding into an unrelated new query (Bug 4).
+        _last_lts = (state.context.get("last_answered_license_types") or [])
+        if _last_lts and len(_last_lts) >= 2:
+            # Check overlap against both license_type AND main_topic in current_docs —
+            # broad-question answers include main_topic topics (non-regulatory) alongside
+            # license_type topics, so we must check both to avoid false "no overlap" skips.
+            _current_meta_vals = (
+                {
+                    str((d.get("metadata") or {}).get("license_type") or "").strip()
+                    for d in (state.current_docs or [])
+                } | {
+                    str((d.get("metadata") or {}).get("main_topic") or "").strip()
+                    for d in (state.current_docs or [])
+                }
+            ) - {"", "nan", "None"}
+            _overlap_lts = [lt for lt in _last_lts if lt in _current_meta_vals]
+            if _overlap_lts:
+                topics = [{"key": lt, "label": lt} for lt in _last_lts if lt]
+                _LOG.info(
+                    "[Academic] Bug2-fix: topic menu from last Practical multi-answer: %s",
+                    [t["key"] for t in topics],
+                )
+            else:
+                _current_doc_lts = {
+                    str((d.get("metadata") or {}).get("license_type") or "").strip()
+                    for d in (state.current_docs or [])
+                } - {"", "nan", "None"}
+                _LOG.info(
+                    "[Academic] Bug2-fix SKIPPED: last_lts=%s not in current docs lts=%s — using retrieved docs",
+                    _last_lts, list(_current_doc_lts),
+                )
+                _aq = (state.context.get("academic_question") or "").strip()
+                topics = self._detect_distinct_topics(state.current_docs or [], query=_aq)
+        else:
+            _aq = (state.context.get("academic_question") or "").strip()
+            topics = self._detect_distinct_topics(state.current_docs or [], query=_aq)
+        if not topics:
+            return ""  # No topics found — skip Phase 0
+
+        # Single topic: auto-select it directly without showing a menu.
+        # Previously _detect_distinct_topics returned [] here, causing academic_selected_license_type
+        # to never be set → diversity_docs not scoped → irrelevant slot questions shown.
+        if len(topics) == 1:
+            _auto_key = topics[0]["key"]
+            _LOG.info("[Academic] Topic auto-selected (only 1 topic in docs): %r", _auto_key)
+            state.context["academic_topic_catalog"] = topics
+            state.context["academic_remaining_topics"] = []
+            self._filter_docs_by_selected_topic(state, _auto_key)
+            return ""  # Skip menu — topic already determined
+
+        # Issue 1 fix: if query directly names exactly one topic, auto-select and skip menu.
+        # E.g. "ประโยชน์ของการตลาดออนไลน์ต่อผู้ขายมีทั้งหมดกี่แบบ" → auto-selects
+        # "ประโยชน์ของการตลาดออนไลน์ต่อผู้ขาย" without showing menu.
+        _aq_direct = (state.context.get("academic_question") or "").strip().lower()
+        if _aq_direct:
+            _direct_matches = [
+                t for t in topics
+                if len(t["key"]) >= 6 and t["key"].lower() in _aq_direct
+            ]
+            if len(_direct_matches) == 1:
+                _auto_key = _direct_matches[0]["key"]
+                _LOG.info("[Academic] Topic auto-selected (direct name in query): %r", _auto_key)
+                state.context["academic_topic_catalog"] = topics
+                state.context["academic_remaining_topics"] = [
+                    t["key"] for t in topics if t["key"] != _auto_key
+                ]
+                self._filter_docs_by_selected_topic(state, _auto_key)
+                return ""  # Skip menu — answer directly
+
+        # Store full catalog and initialize remaining list (all topics, none selected yet)
+        state.context["academic_topic_catalog"] = topics
+        state.context["academic_remaining_topics"] = [t["key"] for t in topics]
+
+        lines = ["มีหลายเรื่องที่เกี่ยวข้องกับคำถามของคุณครับ อยากเจาะลึกเรื่องไหนก่อน?"]
+        opts: Dict[int, str] = {}
+        for i, t in enumerate(topics, 1):
+            opts[i] = t["key"]
+            lines.append(f"{i}) {t['label']}")
+
+        msg = "\n".join(lines)
+        state.context["pending_options"] = opts
+        state.context["pending_question"] = msg
+        self._set_flow(state, stage="awaiting_topic")
+        _LOG.info("[Academic] Topic menu: %d topics → %s", len(topics), [t["key"] for t in topics])
+        return msg
+
+    def _filter_docs_by_selected_topic(self, state: ConversationState, selected_key: str) -> None:
+        """
+        Filter state.current_docs to only docs matching the chosen topic key.
+        Topic key is license_type for regulatory docs, sub_topic for non-regulatory docs
+        (matching the logic in _detect_distinct_topics).
+        Updates academic_remaining_topics (removes selected topic from the list).
+        Falls back to keeping all docs when 0 match (defensive).
+        """
+        docs = state.current_docs or []
+
+        def _doc_matches(d: Dict) -> bool:
+            md = d.get("metadata") or {}
+            lt = str(md.get("license_type") or "").strip()
+            if lt and lt.lower() not in ("nan", "none", ""):
+                return lt == selected_key
+            st = str(md.get("sub_topic") or "").strip()
+            return st == selected_key
+
+        filtered = [d for d in docs if _doc_matches(d)]
+        _LOG.info(
+            "[Academic] Topic filter '%s': %d → %d docs",
+            selected_key, len(docs), len(filtered),
+        )
+
+        # ALWAYS do targeted re-retrieval regardless of how many docs matched in the broad set.
+        #
+        # Why: The broad query (e.g. "เปิดร้านอาหาร ต้องทำอะไร") retrieves top-17 docs across
+        # ALL topics. After topic filter, we may get e.g. 5 docs for ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร
+        # — but those 5 happen to cover entity='' and entity='นิติบุคคล' only (บุคคลธรรมดา ranked
+        # below position 17 in the broad query and was never retrieved).
+        # Consequence: _compute_diversity_from_docs sees only 1 distinct entity_type → doesn't
+        # ask entity_type or location → Phase 1 asks only area_size → 3 slot rounds instead of 1.
+        #
+        # Fix: always do a targeted topic-specific query so the full entity/location landscape
+        # is visible before slot questions are generated. This is always called once per topic
+        # selection so the extra Chroma query is acceptable.
+        base_q = (state.context.get("academic_question") or "").strip()
+        target_q = f"{selected_key} {base_q}".strip() if selected_key not in base_q else base_q
+        _LOG.info(
+            "[Academic] Targeted re-retrieval for topic '%s' (%d broad-filtered docs) query=%r",
+            selected_key, len(filtered), target_q[:60],
+        )
+        # Use Chroma license_type filter for targeted re-retrieval — avoids getting 12 mixed docs
+        # back from unfiltered vector search and then falling into the "re-filter gave 1 < 2" path.
+        # For non-regulatory topics (sub_topic key), license_type won't match → falls through to unfiltered.
+        _lt_filter: Optional[Dict[str, Any]] = {"license_type": selected_key}
+        fresh_docs = self._retrieve_docs(target_q, metadata_filter=_lt_filter)
+        if not fresh_docs:
+            # Fallback: try unfiltered (e.g. selected_key is sub_topic, not license_type)
+            _LOG.info("[Academic] Targeted re-retrieval: license_type filter returned 0, retrying unfiltered")
+            fresh_docs = self._retrieve_docs(target_q)
+        if fresh_docs:
+            # After topic-specific retrieval, Chroma may still return docs from other topics
+            # (e.g. querying "ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร" also ranks
+            # การจดทะเบียนพาณิชย์ / ภาษีป้าย / SAN highly). Those foreign-topic docs
+            # contaminate _compute_diversity_from_docs → wrong entity choices like
+            # "สำนักงานเขตที่ตั้งร้านค้า" (which is registration_type from a
+            # การจดทะเบียนพาณิชย์ doc, not an entity type at all).
+            #
+            # Strategy: try to re-filter fresh_docs by _doc_matches (license_type/sub_topic).
+            # If the re-filtered set is large enough (≥ 2), use it — topic-pure set.
+            # Fall back to ALL fresh_docs only when re-filtered < 2. This handles the
+            # VAT case where the menu key is sub_topic="การจดทะเบียนภาษีมูลค่าเพิ่ม"
+            # but regulatory docs carry license_type="ใบภาษีมูลค่าเพิ่ม ภพ.20" → strict
+            # re-filter would drop them, so we use all fresh_docs in that case.
+            _fresh_matched = [d for d in fresh_docs if _doc_matches(d)]
+            if len(_fresh_matched) >= 2:
+                # Good: enough topic-matched docs from fresh retrieval — use only those.
+                # Merge with any broad-filtered docs not already present.
+                _seen_fps = {hash(d.get("content", "")[:80]) for d in _fresh_matched}
+                merged = list(_fresh_matched)
+                for d in filtered:
+                    fp = hash(d.get("content", "")[:80])
+                    if fp not in _seen_fps:
+                        merged.append(d)
+                        _seen_fps.add(fp)
+                filtered = merged
+                _LOG.info(
+                    "[Academic] Targeted re-retrieval: %d topic-matched docs (dropped %d from other topics)",
+                    len(filtered), len(fresh_docs) - len(_fresh_matched),
+                )
+            else:
+                # Re-filter yielded < 2 docs (menu key ≠ license_type, e.g. VAT).
+                # Use ALL fresh_docs — the topic-specific query already biases ranking.
+                _seen_fps = {hash(d.get("content", "")[:80]) for d in fresh_docs}
+                merged = list(fresh_docs)
+                for d in filtered:
+                    fp = hash(d.get("content", "")[:80])
+                    if fp not in _seen_fps:
+                        merged.append(d)
+                        _seen_fps.add(fp)
+                filtered = merged
+                _LOG.info(
+                    "[Academic] Targeted re-retrieval: using all %d fresh docs (re-filter gave %d < 2)",
+                    len(filtered), len(_fresh_matched),
+                )
+            state.current_docs = filtered
+        elif filtered:
+            # Re-retrieval returned nothing — use original broad-filtered docs
+            state.current_docs = filtered
+            _LOG.info(
+                "[Academic] Targeted re-retrieval returned 0 — using %d broad-filtered docs",
+                len(filtered),
+            )
+        else:
+            # Both empty — keep all docs (defensive fallback)
+            state.current_docs = docs
+            _LOG.info("[Academic] Both filtered and targeted retrieval empty — keeping all %d docs", len(docs))
+
+        # Record selected topic and update remaining list for auto-return followup
+        catalog = state.context.get("academic_topic_catalog") or []
+        remaining = [t["key"] for t in catalog if t["key"] != selected_key]
+        state.context["academic_remaining_topics"] = remaining
+        state.context["academic_selected_license_type"] = selected_key
+        # Update academic_question to be topic-specific for downstream retrieval/prompts
+        current_q = (state.context.get("academic_question") or "").strip()
+        if selected_key and selected_key not in current_q:
+            state.context["academic_question"] = f"{current_q} {selected_key}".strip()
+        _LOG.info(
+            "[Academic] After topic select: selected=%r remaining=%s",
+            selected_key, remaining,
+        )
+
+    def _filter_docs_for_multi_topics(self, state: ConversationState, selected_keys: List[str]) -> None:
+        """
+        Issue 2 fix: merge docs for ALL user-selected topics (e.g. "3 4" selects two topics).
+        Retrieves docs for each selected key separately then merges de-duped into state.current_docs.
+        Updates academic_question, academic_selected_license_type, academic_remaining_topics.
+        """
+        base_q = (state.context.get("academic_question") or "").strip()
+        all_docs: List[Dict] = []
+        seen_fps: set = set()
+
+        for key in selected_keys:
+            target_q = f"{key} {base_q}".strip() if key not in base_q else base_q
+            # Try license_type-filtered retrieval first
+            fresh = self._retrieve_docs(target_q, metadata_filter={"license_type": key})
+            if not fresh:
+                fresh = self._retrieve_docs(target_q)
+            for d in (fresh or []):
+                fp = hash((d.get("content") or "")[:80])
+                if fp not in seen_fps:
+                    all_docs.append(d)
+                    seen_fps.add(fp)
+
+        # Include any topic-matching docs already in broad retrieval set
+        for d in (state.current_docs or []):
+            md = d.get("metadata") or {}
+            lt = str(md.get("license_type") or "").strip()
+            st = str(md.get("sub_topic") or "").strip()
+            if lt in selected_keys or st in selected_keys:
+                fp = hash((d.get("content") or "")[:80])
+                if fp not in seen_fps:
+                    all_docs.append(d)
+                    seen_fps.add(fp)
+
+        if all_docs:
+            state.current_docs = all_docs
+
+        # Update context: question covers all selected topics
+        current_q = base_q
+        for key in selected_keys:
+            if key not in current_q:
+                current_q = f"{current_q} {key}".strip()
+        state.context["academic_question"] = current_q
+
+        # Primary topic = first selection; remaining = everything else in catalog
+        state.context["academic_selected_license_type"] = selected_keys[0]
+        catalog = state.context.get("academic_topic_catalog") or []
+        remaining = [t["key"] for t in catalog if t["key"] not in selected_keys]
+        state.context["academic_remaining_topics"] = remaining
+
+        _LOG.info(
+            "[Academic] Multi-topic select: topics=%s → %d merged docs, remaining=%s",
+            selected_keys, len(all_docs), remaining,
+        )
 
     # Chroma metadata fields that (a) vary across docs and (b) can be used as direct Chroma filters.
     # Mapped to: (set of semantically-equivalent known_slot keys that mean "already answered").
     _DIVERSITY_FIELD_EQUIV: Dict[str, frozenset] = {
         "entity_type_normalized": frozenset({
-            "entity_type", "entity_type_normalized", "business_type",
-            "registration_type", "juristic_type",
+            "entity_type", "entity_type_normalized", "business_type", "juristic_type",
+            # registration_type intentionally excluded: knowing registration_type does NOT mean
+            # entity_type is known — a stale or non-entity registration_type value (e.g.
+            # "ระหว่างการใช้งาน QR PAYMENT") would incorrectly suppress the entity question.
+            # When user properly answers entity via registration_type (e.g. "บริษัทจำกัด"),
+            # _save_slot_answers also saves entity_type_normalized separately, so the skip
+            # will still trigger via entity_type_normalized key directly.
         }),
         "location": frozenset({"location", "location_scope", "operation_location"}),
         "area_size": frozenset({"area_size", "shop_area_type"}),
@@ -671,20 +1563,164 @@ class AcademicPersonaService:
         #
         # Fix: replace broad "นิติบุคคล" label with its sub-types in the combined choices.
         # Result: ONE question — ก)บุคคลธรรมดา ข)บริษัทจำกัด ค)ห้างหุ้นส่วนจำกัด ง)ห้างหุ้นส่วนสามัญ
-        if "entity_type_normalized" in result and "registration_type" in result:
-            _entity_vals = set(result["entity_type_normalized"])
-            _reg_vals = set(result["registration_type"])
-            # Drop the broad "นิติบุคคล" label — it's replaced by its specific sub-types.
-            # Keep "บุคคลธรรมดา" since it has no sub-types.
-            _combined = {v for v in _entity_vals if v != "นิติบุคคล"}
-            _combined.update(_reg_vals)
-            if len(_combined) >= 2:
-                result["entity_type_normalized"] = sorted(_combined)
+        _AREA_KEYWORDS_RE = re.compile(
+            r"(ตารางเมตร|ตร\.|พื้นที่|มากกว่า|น้อยกว่า|ตรม\.?|sq\.?m)", re.IGNORECASE
+        )
+        # Operation-type keyword detector: these are VAT/procedure subtypes (ย้าย/แก้ไข/เลิก/ยื่นใหม่)
+        # stored in registration_type for some licenses, NOT entity sub-types.
+        # If majority of registration_type values match these verbs, drop registration_type entirely
+        # so it never leaks into entity_type choices.
+        _OP_TYPE_KEYWORDS_RE = re.compile(
+            r"(ย้าย|แก้ไข|เพิ่มสาขา|ลดสาขา|เลิก|ยกเลิก|จดทะเบียนใหม่|ยื่นใหม่|ต่ออายุ|"
+            r"โอน|ออกนอกราชอาณาจักร|ภายในท้องที่|ยกเว้น|รับโอน|เปลี่ยนชื่อ|เปลี่ยนแปลง|"
+            # Nominal/prefix forms of procedural actions
+            r"การโอน|การแก้ไข|การเลิก|การต่อ|การยกเลิก|การเพิ่ม|การลด|"
+            r"การจดทะเบียน|การจด|การขอ|การยื่น|การต่ออายุ|"
+            # Open/close facility operations (VAT: "เปิดสถานประกอบการ", "ปิดสถานประกอบการ")
+            r"ปิด.*สถาน|เปิด.*สถาน|"
+            # Field/attribute change types stored in registration_type for liquor licenses
+            r"ชื่อและที่อยู่|ชื่อ.*ที่อยู่|ที่อยู่.*ชื่อ|"
+            r"เพิ่ม.*ลด|ลด.*เพิ่ม|ประเภทสินค้า|ประเภทบริการ|นำเข้า|ส่งออก)",
+            re.IGNORECASE,
+        )
+        # Entity-type keywords: registration_type values that ARE entity discriminators.
+        # Values that contain NONE of these keywords are sub-topic descriptors (e.g.
+        # "ประโยชน์ทดแทนที่ได้รับ", "แยกยื่น/ยื่นรวม") and should not be asked as slots.
+        _ENTITY_KW_RE = re.compile(
+            # Legal entity types only — "ร้านค้า" excluded (it's a location/descriptor, not entity type)
+            # "ผู้ประกอบการ"/"ผู้สัมผัสอาหาร" intentionally excluded — those are role labels,
+            # not entity types; they will appear as registration_type options only if this
+            # check is NOT triggered (i.e. _op_count already did not drop them).
+            r"(บุคคลธรรมดา|นิติบุคคล|นิติบุคล|บริษัท|ห้างหุ้นส่วน|หจก\.?|บจก\.?|มหาชน|"
+            r"สหกรณ์|กิจการร่วมค้า|องค์กร|มูลนิธิ|สมาคม|วิสาหกิจชุมชน|กองทุน)",
+            re.IGNORECASE,
+        )
+        if "registration_type" in result:
+            _rt_vals = result["registration_type"]
+            _op_count = sum(1 for v in _rt_vals if _OP_TYPE_KEYWORDS_RE.search(v))
+            if _op_count >= max(1, len(_rt_vals) / 2):
+                # Majority (or any) are operation-type verbs → drop registration_type entirely.
+                # These values are NOT entity discriminators and must never appear as entity choices.
                 del result["registration_type"]
                 _LOG.info(
-                    "[Academic] Merged registration_type choices into entity_type_normalized: %s",
-                    sorted(_combined),
+                    "[Academic] Dropped registration_type — %d/%d values are operation types: %s",
+                    _op_count, len(_rt_vals), _rt_vals,
                 )
+                # Promote to operation_by_department when not already in result and not yet known.
+                # Without this, operation diversity is silently lost → all operation docs sent to LLM.
+                # e.g. การจัดหาพนักงาน: registration_type=['แก้ไข/ยกเลิก ตำแหน่ง', 'แก้ไขข้อมูลนายจ้าง']
+                # but operation_by_department='การจัดหาพนักงาน' for ALL docs (no variation) →
+                # neither field asks the operation question → 3 operation docs mixed in LLM answer.
+                _op_equiv = frozenset({"operation_group", "operation_type", "operation_action", "operation_by_department"})
+                if "operation_by_department" not in result and not (_op_equiv & set(known_slots.keys())):
+                    result["operation_by_department"] = sorted(_rt_vals)
+                    _LOG.info(
+                        "[Academic] Promoted operation-type registration_type values → operation_by_department: %s",
+                        _rt_vals,
+                    )
+            elif not any(_ENTITY_KW_RE.search(v) for v in _rt_vals):
+                # None of the values look like entity types → sub-topic descriptors, not useful to ask.
+                # e.g. "ประโยชน์ทดแทนที่ได้รับ" / "แยกยื่น/ยื่นรวม" for ทะเบียนผู้ประกันตน.
+                del result["registration_type"]
+                _LOG.info(
+                    "[Academic] Dropped registration_type — no entity-type keywords in values: %s",
+                    _rt_vals,
+                )
+
+        if "entity_type_normalized" in result and "registration_type" in result:
+            _entity_vals = set(result["entity_type_normalized"])
+            # Filter out area-size descriptions that leaked into registration_type field.
+            # These look like "ร้านที่มีพื้นที่ > 200 ตารางเมตร" — not entity types at all.
+            _reg_vals = {
+                v for v in result["registration_type"]
+                if not _AREA_KEYWORDS_RE.search(v) and len(v) <= 40
+            }
+            # Only merge when _reg_vals contains actual นิติบุคคล sub-types
+            # (e.g. บริษัทจำกัด, ห้างหุ้นส่วนจำกัด) — NOT บุคคลธรรมดา variants.
+            # If only บุคคลธรรมดา variants remain after filtering, skip the merge and
+            # keep entity_type_normalized as-is (บุคคลธรรมดา vs นิติบุคคล).
+            _juristic_reg_vals = {v for v in _reg_vals if "บุคคลธรรมดา" not in v}
+            if _juristic_reg_vals:
+                # Drop the broad "นิติบุคคล" label — it's replaced by its specific sub-types.
+                # Keep "บุคคลธรรมดา" since it has no sub-types.
+                _combined = {v for v in _entity_vals if v != "นิติบุคคล"}
+                _combined.update(_juristic_reg_vals)
+                if len(_combined) >= 2:
+                    result["entity_type_normalized"] = sorted(_combined)
+                    del result["registration_type"]
+                    _LOG.info(
+                        "[Academic] Merged registration_type choices into entity_type_normalized: %s",
+                        sorted(_combined),
+                    )
+            else:
+                # No useful juristic sub-types → drop registration_type.
+                # Extract clean area_size choices so the user gets a proper area question
+                # in the SAME slot round (not a separate second round).
+                _area_choices: set = set()
+                for v in result["registration_type"]:
+                    if re.search(r"มากกว่า|> ?200|เกิน\s*200", v, re.IGNORECASE):
+                        _area_choices.add("มากกว่า 200 ตารางเมตร")
+                    if re.search(r"น้อยกว่า|< ?200|ไม่เกิน\s*200", v, re.IGNORECASE):
+                        _area_choices.add("น้อยกว่า 200 ตารางเมตร")
+                _area_known = {"area_size", "shop_area_type"} & set(known_slots.keys())
+                if len(_area_choices) >= 2 and not _area_known and "area_size" not in result:
+                    result["area_size"] = sorted(_area_choices)
+                    _LOG.info("[Academic] Extracted area_size from registration_type (Round 1): %s", sorted(_area_choices))
+                del result["registration_type"]
+                _LOG.info("[Academic] Skipped merge — no juristic sub-types in registration_type after filtering")
+
+        # General cleanup: if registration_type still in result at this point (entity already known,
+        # merge block didn't run), clean it up now — extract area_size if applicable, drop garbled values.
+        if "registration_type" in result:
+            _reg_remaining = result["registration_type"]
+            _reg_clean = [v for v in _reg_remaining if not _AREA_KEYWORDS_RE.search(v) and len(v) <= 40]
+            _juristic_remaining = [v for v in _reg_clean if "บุคคลธรรมดา" not in v]
+            if _juristic_remaining:
+                result["registration_type"] = sorted(_juristic_remaining)
+            else:
+                # No juristic sub-types — extract area_size if found
+                _area_choices2: set = set()
+                for v in _reg_remaining:
+                    if re.search(r"มากกว่า|> ?200|เกิน\s*200", v, re.IGNORECASE):
+                        _area_choices2.add("มากกว่า 200 ตารางเมตร")
+                    if re.search(r"น้อยกว่า|< ?200|ไม่เกิน\s*200", v, re.IGNORECASE):
+                        _area_choices2.add("น้อยกว่า 200 ตารางเมตร")
+                _area_known2 = {"area_size", "shop_area_type"} & set(known_slots.keys())
+                if len(_area_choices2) >= 2 and not _area_known2 and "area_size" not in result:
+                    result["area_size"] = sorted(_area_choices2)
+                    _LOG.info("[Academic] Extracted area_size from registration_type (Round 2): %s", sorted(_area_choices2))
+                del result["registration_type"]
+                _LOG.info("[Academic] Dropped garbled registration_type — no valid juristic sub-types")
+
+        # Fix 4: Subsumption dedup — if a shorter label is a proper prefix/substring of a longer one,
+        # remove the shorter one. Prevents duplicates like ["บริษัท", "บริษัทจำกัด"] where "บริษัท"
+        # is strictly subsumed by "บริษัทจำกัด". Applied to all choice lists in result.
+        for _field in list(result.keys()):
+            _vals = result[_field]
+            if len(_vals) < 2:
+                continue
+            _to_remove: set = set()
+            for _a in _vals:
+                for _b in _vals:
+                    if _a != _b and _a in _b and len(_a) < len(_b):
+                        # _a is a substring of longer _b → _a is subsumed
+                        _to_remove.add(_a)
+            if _to_remove:
+                result[_field] = sorted(v for v in _vals if v not in _to_remove)
+                _LOG.info(
+                    "[Academic] Fix4: removed subsumed registration options %s from %s choices",
+                    sorted(_to_remove), _field,
+                )
+
+        # Fix4b: after subsumption dedup, drop any field that has fewer than 2 choices remaining.
+        # A field with only 1 value needs no question — the answer is already determined.
+        _single_choice_fields = [f for f, v in result.items() if len(v) < 2]
+        for _f in _single_choice_fields:
+            _LOG.info(
+                "[Academic] Fix4b: auto-filling single-choice field '%s'='%s' (no question needed)",
+                _f, result[_f][0] if result[_f] else "",
+            )
+            del result[_f]
 
         return result
 
@@ -753,7 +1789,7 @@ class AcademicPersonaService:
 
     def _render_slot_message(self, needed: List[Dict], state: Optional["ConversationState"] = None) -> str:
         """Build the slot question message. Stores per-slot and global choice maps in state."""
-        lines = ["เพื่อตอบได้ตรงกรณีของคุณ รบกวนตอบรวดเดียวครับ (ตอบเท่าที่รู้)"]
+        lines = ["เพื่อตอบได้ตรงกรณีของคุณ ตอบได้เลยครับ"]
         choice_map: Dict[str, str] = {}          # global fallback label → text
         slot_choice_maps: Dict[str, Dict[str, str]] = {}  # slot_key → {label → text}
         for i, slot in enumerate(needed, 1):
@@ -797,15 +1833,225 @@ class AcademicPersonaService:
         user_q = ctx.get("academic_question", "")
         known_slots = state.get_collected_slots() if hasattr(state, "get_collected_slots") else {}
 
+        # Merge academic_slots (C3 pre-fills + earlier slot answers) into known_slots so that
+        # _compute_diversity_from_docs sees pre-filled values (entity_type_normalized etc.)
+        # and skips asking them again.  academic_slots takes priority if same key exists.
+        _ac_slots_pre = ctx.get("academic_slots") or {}
+        if isinstance(_ac_slots_pre, dict) and _ac_slots_pre:
+            known_slots = {**known_slots, **_ac_slots_pre}
+
+        # Stale entity guard: if the ORIGINAL user query explicitly names an entity type
+        # that contradicts the entity_type in known_slots (stale from previous topic),
+        # remove the stale entity so the diversity check asks the correct question.
+        # e.g. known entity='นิติบุคคล' but user asks "ประเภทบุคคลธรรมดา" → remove stale.
+        # Use the PRE-enrichment query (last_user_legal_query) to avoid false positives
+        # from slot-enriched academic_question (which already has the stale entity appended).
+        _original_user_q = (state.context or {}).get("last_user_legal_query") or user_q
+        _NATURAL_STALE_RE = re.compile(r"บุคคลธรรมดา", re.IGNORECASE)
+        _JURISTIC_STALE_RE = re.compile(r"นิติบุคคล|บริษัท|ห้างหุ้นส่วน", re.IGNORECASE)
+        _orig_says_natural = bool(_NATURAL_STALE_RE.search(_original_user_q))
+        _orig_says_juristic = bool(_JURISTIC_STALE_RE.search(_original_user_q))
+        _known_entity = known_slots.get("entity_type", "") or known_slots.get("entity_type_normalized", "")
+        if _known_entity:
+            _ke_is_juristic = bool(_JURISTIC_STALE_RE.search(_known_entity))
+            _ke_is_natural = _known_entity == "บุคคลธรรมดา"
+            if (_ke_is_juristic and _orig_says_natural and not _orig_says_juristic) or \
+               (_ke_is_natural and _orig_says_juristic and not _orig_says_natural):
+                known_slots = {k: v for k, v in known_slots.items()
+                               if k not in ("entity_type", "entity_type_normalized")}
+                _LOG.info(
+                    "[Academic] Stale entity %r cleared from known_slots — query says %s",
+                    _known_entity,
+                    "บุคคลธรรมดา" if _orig_says_natural else "นิติบุคคล",
+                )
+
+        # Pre-infer operation_by_department from user question when intent is unambiguously "new".
+        # "อยากเปิดร้าน / จะเปิดร้าน / ตั้งร้าน / เริ่มกิจการ / จดใหม่" → operation = ยื่นใหม่
+        # Prevents the slot question from showing irrelevant "ต่ออายุ / แก้ไข" options.
+        _NEW_OP_RE = re.compile(
+            r"(เปิดร้าน|จะเปิด|อยากเปิด|ตั้งร้าน|เริ่มกิจการ|จดใหม่|ยื่นใหม่|ขอใหม่|สมัครใหม่|เริ่มต้น)", re.IGNORECASE
+        )
+        if _NEW_OP_RE.search(user_q) and "operation_by_department" not in known_slots:
+            known_slots = {**known_slots, "operation_by_department": "ยื่นใหม่"}
+            _LOG.info("[Academic] Pre-inferred operation_by_department='ยื่นใหม่' from question context")
+            # Persist to academic_slots so _filter_docs_by_inferred_operation can read it later.
+            # Without this, the filter function always sees empty operation_by_department and
+            # skips filtering entirely — causing ต่ออายุ/แก้ไข/ยกเลิก docs to leak into the answer.
+            _ac_slots = ctx.get("academic_slots") or {}
+            if not isinstance(_ac_slots, dict):
+                _ac_slots = {}
+            _ac_slots["operation_by_department"] = "ยื่นใหม่"
+            ctx["academic_slots"] = _ac_slots
+            state.context = ctx
+
+        # Fix 3: If a topic is already selected, use only topic-matched docs for diversity
+        # computation. Without this, contaminated broad docs (e.g. QR Payment, VAT) leak
+        # wrong operation_by_department values into slot options.
+        _selected_lt = (ctx.get("academic_selected_license_type") or "").strip()
+        _diversity_docs = state.current_docs or []
+        if _selected_lt:
+            def _topic_matches_for_diversity(d: Dict) -> bool:
+                _md2 = d.get("metadata") or {}
+                for _fk in ("license_type", "sub_topic", "topic_name", "short_name"):
+                    _fv = (_md2.get(_fk) or "").strip()
+                    if _fv and (_fv == _selected_lt or _selected_lt in _fv or _fv in _selected_lt):
+                        return True
+                return False
+            _topic_docs = [d for d in _diversity_docs if _topic_matches_for_diversity(d)]
+            if len(_topic_docs) >= 2:
+                _diversity_docs = _topic_docs
+                _LOG.info(
+                    "[Academic] Fix3: diversity scoped to %d topic-matched docs (dropped %d off-topic)",
+                    len(_topic_docs), len(state.current_docs or []) - len(_topic_docs),
+                )
+
+        # Stale operation_group guard: collected_slots may carry operation_group from a PREVIOUS
+        # topic (e.g. "ยื่นขอใหม่ / จดทะเบียน" from การจัดหาพนักงาน).  _compute_diversity_from_docs
+        # sees it in known_keys → skips operation_by_department diversity → no operation question
+        # asked → all docs (ขึ้นทะเบียน/ยกเลิก/แก้ไข/ส่งเงินสมทบ) sent to LLM together.
+        # Fix: if the stored operation value doesn't match any operation_by_department in current
+        # docs, remove it from the local known_slots view so the diversity check runs fresh.
+        _OP_EQUIV_KEYS = {"operation_group", "operation_type", "operation_action", "operation_by_department"}
+        _op_stored_val = next(
+            (known_slots[k] for k in _OP_EQUIV_KEYS if k in known_slots), None
+        )
+        if _op_stored_val:
+            _doc_ops = {
+                str((d.get("metadata") or {}).get("operation_by_department") or "").strip()
+                for d in _diversity_docs
+            } - {"", "nan", "None"}
+            _op_val_lower = _op_stored_val.lower()
+            _op_matches_docs = any(
+                _op_val_lower in dop.lower() or dop.lower() in _op_val_lower
+                for dop in _doc_ops
+            )
+            if not _op_matches_docs and len(_doc_ops) >= 2:
+                known_slots = {k: v for k, v in known_slots.items() if k not in _OP_EQUIV_KEYS}
+                _LOG.info(
+                    "[Academic] Stale operation_group=%r cleared from known_slots — "
+                    "does not match any doc operation_by_department: %s",
+                    _op_stored_val, sorted(_doc_ops),
+                )
+
+        # Entity-scoped diversity: when entity_type is already known, filter _diversity_docs
+        # to exclude docs from the OTHER entity type before computing diversity.
+        # Without this, registration_type values from นิติบุคคล docs (e.g. "บริษัทจำกัด",
+        # "ห้างหุ้นส่วน") appear in diversity_data even when entity='บุคคลธรรมดา' is known,
+        # causing LLM to generate a wrong "รูปแบบนิติบุคคล" slot question.
+        _known_entity_for_scope = (
+            known_slots.get("entity_type_normalized")
+            or known_slots.get("entity_type")
+            or ""
+        ).strip()
+        if _known_entity_for_scope:
+            _scoped_docs = [
+                d for d in _diversity_docs
+                if str((d.get("metadata") or {}).get("entity_type_normalized") or "").strip()
+                in (_known_entity_for_scope, "", "nan", "None")
+            ]
+            if len(_scoped_docs) >= 2:
+                _dropped = len(_diversity_docs) - len(_scoped_docs)
+                if _dropped > 0:
+                    _LOG.info(
+                        "[Academic] Entity-scoped diversity: kept %d/%d docs for entity=%r (dropped %d other-entity docs)",
+                        len(_scoped_docs), len(_diversity_docs), _known_entity_for_scope, _dropped,
+                    )
+                    _diversity_docs = _scoped_docs
+
         # Pre-compute which fields actually vary in the docs and are not yet known.
         # Fast path: if nothing varies → no questions to ask, go straight to sections.
-        diversity_data = self._compute_diversity_from_docs(state.current_docs or [], known_slots)
+        diversity_data = self._compute_diversity_from_docs(_diversity_docs, known_slots)
+
+        # Auto-fill any field that has exactly 1 distinct value across docs (not already known).
+        # These were either excluded by _compute_diversity_from_docs (always 1 value) or
+        # reduced to 1 by Fix4 subsumption dedup — no question needed, just fill automatically.
+        _ac_slots_fill = ctx.get("academic_slots") or {}
+        if not isinstance(_ac_slots_fill, dict):
+            _ac_slots_fill = {}
+        _slots_updated = False
+        # entity_type_normalized / entity_type must come from explicit user input or supervisor
+        # query-text inference — never auto-fill from sparse doc metadata.
+        # Root cause: 1 out of 10 docs having entity_type='บุคคลธรรมดา' is NOT a signal that
+        # the user is บุคคลธรรมดา — the 9 docs with empty entity_type are universal (not excluded).
+        _NO_AUTOFILL_ENTITY_FIELDS = frozenset({"entity_type_normalized", "entity_type"})
+        for _field, _equiv_set in self._DIVERSITY_FIELD_EQUIV.items():
+            if _field in _NO_AUTOFILL_ENTITY_FIELDS:
+                continue  # Must come from user input, not inferred from sparse doc metadata
+            if _equiv_set & set(known_slots.keys()):
+                continue  # Already known
+            if _field in (diversity_data or {}):
+                continue  # Still has variation — will be asked
+            _field_vals: set = set()
+            for _dd in _diversity_docs:
+                _v = ((_dd.get("metadata") or {}).get(_field) or "").strip()
+                if _v and _v.lower() not in ("nan", "none"):
+                    _field_vals.add(_v[:80])
+            if len(_field_vals) == 1:
+                _auto_val = next(iter(_field_vals))
+                known_slots = {**known_slots, _field: _auto_val}
+                _ac_slots_fill[_field] = _auto_val
+                _slots_updated = True
+                _LOG.info(
+                    "[Academic] Auto-filled single-value field '%s'='%s' into academic_slots",
+                    _field, _auto_val,
+                )
+        if _slots_updated:
+            ctx["academic_slots"] = _ac_slots_fill
+            state.context = ctx
+
+        # Query-match auto-fill: if user_q contains exactly one option verbatim, skip the question.
+        # e.g. "การขึ้นทะเบียนผู้ประกันตน" in query → auto-fill operation_by_department without asking.
+        # Compare space-stripped versions to handle Thai text with inserted spaces (e.g. "การขึ้น ทะเบียน").
+        _q_lower = user_q.lower()
+        _q_nospace = _q_lower.replace(" ", "")
+        _query_autofilled = False
+        for _field in list(diversity_data.keys()):
+            _equiv_set = self._DIVERSITY_FIELD_EQUIV.get(_field, frozenset({_field}))
+            if _equiv_set & set(known_slots.keys()):
+                continue  # Already known
+            _matched = [
+                v for v in diversity_data[_field]
+                if v and (
+                    v.lower() in _q_lower
+                    or v.lower().replace(" ", "") in _q_nospace
+                    # Prefix match for operation fields: option may have extra qualifier words
+                    # e.g. option="การขออนุมัติใช้เครื่องบันทึก..." but query says "การขออนุมัติเครื่องบันทึก..."
+                    # Use first 8 chars (no spaces) as anchor — long enough to be distinctive.
+                    or (
+                        _field == "operation_by_department"
+                        and len(v.replace(" ", "")) >= 6
+                        and v.lower().replace(" ", "")[:8] in _q_nospace
+                    )
+                )
+            ]
+            if len(_matched) == 1:
+                _match_val = _matched[0]
+                known_slots = {**known_slots, _field: _match_val}
+                if not isinstance(_ac_slots_fill, dict):
+                    _ac_slots_fill = {}
+                _ac_slots_fill[_field] = _match_val
+                ctx["academic_slots"] = _ac_slots_fill
+                state.context = ctx
+                del diversity_data[_field]
+                _query_autofilled = True
+                _LOG.info(
+                    "[Academic] Query-matched auto-fill '%s'='%s' (found in user query)",
+                    _field, _match_val,
+                )
+
+        # Recompute diversity_data with updated known_slots so that _DIVERSITY_FIELD_EQUIV
+        # skip-conditions (e.g. skip registration_type when operation_by_department is known)
+        # take effect. Without this, fields auto-filled above are not visible to _compute_diversity
+        # since it ran before the query-match loop.
+        if _query_autofilled:
+            diversity_data = self._compute_diversity_from_docs(_diversity_docs, known_slots)
+
         if not diversity_data:
             _LOG.info("[Academic] No varying data fields beyond known slots — skipping slot questions")
             return ""
 
         # ── Strategy A: lean prompt constrained to diversity fields ──
-        prompt_a = self._build_slot_generation_prompt(user_q, state.current_docs or [], known_slots, diversity_data)
+        prompt_a = self._build_slot_generation_prompt(user_q, _diversity_docs, known_slots, diversity_data)
         slots_data: List[Dict] = []
         try:
             resp = llm_invoke(self.llm_slots, [HumanMessage(content=prompt_a)], logger=_LOG, label="Academic/slots", state=state)
@@ -844,25 +2090,38 @@ class AcademicPersonaService:
         needed = [s for s in slots_data
                   if isinstance(s, dict) and s.get("key") and s["key"] not in known_slots]
 
-        # Semantic dedup: if known_slots already has registration/entity type info,
-        # drop any LLM-generated slot that is semantically equivalent (LLM may use different key names)
-        _ENTITY_REG_KEYS = {
-            "registration_type", "entity_type", "entity_type_normalized",
+        # Semantic dedup: if known_slots already has entity type info,
+        # drop any LLM-generated slot that is semantically equivalent (LLM may use different key names).
+        # NOTE: registration_type is intentionally excluded — it is a sub-level of entity_type
+        # (e.g. entity_type_normalized='นิติบุคคล' does NOT answer registration_type='บริษัทจำกัด').
+        # registration_type is only skipped when registration_type itself is already in known_slots.
+        _ENTITY_ONLY_KEYS = {
+            "entity_type", "entity_type_normalized",
             "business_type", "juristic_type", "company_type", "org_type", "organization_type",
         }
-        _known_has_reg = bool(known_slots.keys() & _ENTITY_REG_KEYS)
-        if _known_has_reg:
-            needed = [s for s in needed if s.get("key") not in _ENTITY_REG_KEYS]
+        _known_has_entity = bool(known_slots.keys() & _ENTITY_ONLY_KEYS)
+        if _known_has_entity:
+            needed = [s for s in needed if s.get("key") not in _ENTITY_ONLY_KEYS]
+        # Drop registration_type only when it is already explicitly collected
+        if "registration_type" in known_slots:
+            needed = [s for s in needed if s.get("key") != "registration_type"]
 
-        # Semantic dedup: if known_slots already has location/area info,
-        # drop any LLM-generated slot with a different key name for the same concept
+        # Semantic dedup: if known_slots already has geographic location info,
+        # drop any LLM-generated slot with a different key name for the same concept.
+        # NOTE: area_size (shop floor area) is intentionally excluded — it is a shop-size
+        # dimension, not a geographic location, and must be asked independently.
         _LOCATION_KEYS = {
-            "location", "area_size", "location_scope", "shop_area_type",
-            "operation_location", "province", "region",
+            "location", "location_scope", "operation_location", "province", "region",
         }
         _known_has_location = bool(known_slots.keys() & _LOCATION_KEYS)
         if _known_has_location:
             needed = [s for s in needed if s.get("key") not in _LOCATION_KEYS]
+
+        # Semantic dedup: if area_size (shop floor area) is already known, skip it.
+        _AREA_SIZE_KEYS = {"area_size", "shop_area_type"}
+        _known_has_area = bool(known_slots.keys() & _AREA_SIZE_KEYS)
+        if _known_has_area:
+            needed = [s for s in needed if s.get("key") not in _AREA_SIZE_KEYS]
 
         # Semantic dedup: if known_slots already has operation group/type info,
         # drop any LLM-generated slot asking the same GROUP-level question under a different key.
@@ -989,6 +2248,34 @@ class AcademicPersonaService:
                     except Exception as _e:
                         _LOG.warning("[Academic] save_collected_slot failed key=%r val=%r: %s", key, val, _e)
 
+        # Fallback: for slots that were NOT assigned by the label path above (e.g. user typed
+        # free text "นิติบุคคล กรุงเทพ" instead of "ข ก"), try reverse value-text matching.
+        # Tokenise the raw answer and check if each token substring-matches any option VALUE in
+        # each slot's per_map. Only assign when exactly ONE option matches (avoids ambiguity).
+        _assigned_by_label = set(slots.keys()) - {"raw"}
+        if slot_choice_maps:
+            _raw_tokens = re.split(r"[\s,/]+", raw)
+            for _fb_key in slot_keys:
+                if _fb_key in _assigned_by_label:
+                    continue  # already handled by label path
+                _fb_map = slot_choice_maps.get(_fb_key, {})
+                _fb_vals = [v for k, v in _fb_map.items() if len(k) > 1]  # skip single-char labels
+                _matched: list = []
+                for _tok in _raw_tokens:
+                    _tok = _tok.strip()
+                    if not _tok or len(_tok) < 2:
+                        continue
+                    for _v in _fb_vals:
+                        if _tok in _v or _v in _tok:
+                            if _v not in _matched:
+                                _matched.append(_v)
+                if len(_matched) == 1:
+                    slots[_fb_key] = _matched[0]
+                    try:
+                        state.save_collected_slot(_fb_key, _matched[0])
+                    except Exception as _e:
+                        _LOG.warning("[Academic] save_collected_slot(free-text) key=%r val=%r: %s", _fb_key, _matched[0], _e)
+
         # Fallback: resolve single-label/numeric input "ก"/"1" → actual text via global map
         resolved_raw = raw
         _num_to_label_fb = {"1": "ก", "2": "ข", "3": "ค", "4": "ง"}
@@ -1011,19 +2298,36 @@ class AcademicPersonaService:
         its stored values are long descriptions that may not match the LLM-shortened choices.
 
         Falls back to existing docs if filtered retrieval returns 0 results.
+
+        Topic lock: when Phase 0 selected a specific topic (academic_selected_license_type),
+        ALL retrieval here must stay scoped to that topic's docs. The query is enriched with
+        the selected topic key and the filter results are post-filtered to that topic only.
+        This prevents the fallback "use existing docs" path from returning unrelated topics.
         """
         ctx = state.context or {}
         slots = ctx.get("academic_slots") or {}
+        # Phase 0 topic lock: the license_type/sub_topic chosen by user in topic menu.
+        # When set, retrieval must stay within that topic — no widening to all 12 broad docs.
+        _selected_topic = (ctx.get("academic_selected_license_type") or "").strip()
 
-        # Fields that map cleanly to Chroma metadata keys for exact-match filtering
+        # Fields that map cleanly to Chroma metadata keys for exact-match filtering.
+        # NOTE: area_size is intentionally excluded. Its values used in slot questions
+        # are extracted/synthesised from registration_type text (e.g. "ร้านที่มีพื้นที่
+        # ร้านค้า • มากกว่า 200 ตารางเมตร") and do NOT exist as real Chroma metadata
+        # values → filtering by area_size always returns 0 docs → breaks topic lock.
+        # Instead, area_size is treated as query enrichment only (see below).
         _DIRECT_FILTER_FIELDS = frozenset({
-            "entity_type_normalized", "location", "area_size", "registration_type",
+            "entity_type_normalized", "location", "registration_type",
             "operation_topic",
         })
 
         filter_parts: List[Dict] = []
         query_enrichments: List[str] = []
         query = (ctx.get("academic_question") or "").strip()
+
+        # Enrich query with selected topic so retrieval ranks topic-specific docs first
+        if _selected_topic and _selected_topic not in query:
+            query = f"{_selected_topic} {query}".strip()
 
         for key, val in slots.items():
             if key == "raw":
@@ -1040,14 +2344,36 @@ class AcademicPersonaService:
                         {"entity_type_normalized": ""},
                     ]
                 })
+            elif key == "area_size":
+                # area_size is always query enrichment — never a Chroma filter.
+                # Synthetic values extracted from registration_type text don't exist
+                # as real Chroma metadata → filtering by them always returns 0 docs.
+                if sv not in query:
+                    query_enrichments.append(sv)
             elif key in _DIRECT_FILTER_FIELDS:
+                # Skip location filter when the current topic docs have no location metadata.
+                # A stale location value from a previous topic (e.g. "กรุงเทพฯ" from
+                # ใบอนุญาตจัดตั้ง) must not bleed into unrelated topics like การปิดงบการเงิน
+                # where no docs carry a location field → filter would return 0 docs.
+                if key == "location":
+                    _loc_vals_in_docs = set()
+                    for _ld in (state.current_docs or []):
+                        _lv = ((_ld.get("metadata") or {}).get("location") or "").strip()
+                        if _lv and _lv.lower() not in ("nan", "none"):
+                            _loc_vals_in_docs.add(_lv)
+                    if not _loc_vals_in_docs:
+                        _LOG.info(
+                            "[Academic] slot re-retrieve: location=%r SKIPPED — current docs have no location field",
+                            sv,
+                        )
+                        continue
                 filter_parts.append({key: sv})
             elif key == "operation_by_department":
                 # Query enrichment only — stored values may differ from displayed choice text
                 if sv not in query:
                     query_enrichments.append(sv)
 
-        if not filter_parts and not query_enrichments:
+        if not filter_parts and not query_enrichments and not _selected_topic:
             return  # Nothing to filter or enrich
 
         # Enrich query with operation context
@@ -1080,6 +2406,60 @@ class AcademicPersonaService:
         # Build combined Chroma filter
         chroma_filter: Dict = filter_parts[0] if len(filter_parts) == 1 else {"$and": filter_parts}
 
+        # --- TOPIC LOCK: in-memory filtering when Phase 0 selected a specific topic ---
+        # When user chose a specific topic in Phase 0, state.current_docs is already topic-locked.
+        # A fresh Chroma query using only entity/location filters has NO topic constraint →
+        # it returns docs from OTHER license types (e.g. ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร
+        # when filtering by location=กรุงเทพฯ since those docs have entity_type_normalized='').
+        # This causes two downstream bugs:
+        #   (a) Spurious extra slot rounds: foreign-topic docs introduce location/area_size
+        #       variation not present in the selected topic → extra questions asked
+        #   (b) Final answer mixes license types: foreign docs reach the LLM prompt
+        # Solution: when a topic is locked, apply slot filters IN-MEMORY on the topic-locked
+        # docs — no Chroma re-query needed. Only fall through to Chroma if in-memory gives 0.
+        if _selected_topic and state.current_docs:
+            def _eval_cf(md: dict, filt: dict) -> bool:
+                """Evaluate a Chroma-style filter dict against a metadata dict.
+                Empty doc value = universal doc → passes any filter value for that field.
+                (e.g. registration_type='' means the doc applies to ALL registration types.)
+                """
+                if "$or" in filt:
+                    return any(_eval_cf(md, sub) for sub in filt["$or"])
+                if "$and" in filt:
+                    return all(_eval_cf(md, sub) for sub in filt["$and"])
+                k, v = next(iter(filt.items()))
+                doc_val = md.get(k)
+                # Empty/null doc value = universal (applies to all sub-types) → always matches
+                if doc_val is None or (
+                    isinstance(doc_val, str) and doc_val.strip().lower() in ("", "nan", "none")
+                ):
+                    return True
+                return doc_val == v
+
+            in_mem = [d for d in state.current_docs if _eval_cf(d.get("metadata") or {}, chroma_filter)]
+            _LOG.info(
+                "[Academic] Topic-locked in-memory filter: %d → %d docs (filter=%r)",
+                len(state.current_docs), len(in_mem), chroma_filter,
+            )
+            if in_mem:
+                state.current_docs = in_mem
+            else:
+                # In-memory filter returned 0. This happens when:
+                # (a) the field doesn't exist in topic docs (e.g. area_size not in VAT docs), or
+                # (b) the filter value doesn't match any doc exactly.
+                # CRITICAL: do NOT fall through to Chroma — a Chroma query without topic
+                # constraint returns docs from ALL topics (breaking the Phase 0 topic lock).
+                # Keep the current topic-locked docs unchanged. The slot value is still saved
+                # and will be passed to the LLM via SLOTS in the final prompt.
+                _LOG.info(
+                    "[Academic] Topic-locked in-memory 0 → keeping %d topic-locked docs unchanged",
+                    len(state.current_docs),
+                )
+            # Always return when topic is locked — never fall through to Chroma
+            if hasattr(state, "last_retrieval_query"):
+                state.last_retrieval_query = query
+            return
+
         # Re-retrieve using _retrieve_docs (handles fallback + logging)
         new_docs = self._retrieve_docs(query, metadata_filter=chroma_filter)
         if new_docs:
@@ -1092,14 +2472,205 @@ class AcademicPersonaService:
                 len(new_docs), chroma_filter,
             )
         else:
+            # Slot-filtered Chroma retrieval returned 0.
+            # Topic-locked query already has the topic name prepended (see query enrichment above).
+            # Try unfiltered re-retrieval with the topic-enriched query as last resort.
             _LOG.info(
-                "[Academic] Slot re-retrieval returned 0 docs — keeping existing %d docs",
-                len(state.current_docs or []),
+                "[Academic] Slot re-retrieval returned 0 docs (filter=%r) — trying topic-enriched unfiltered fallback",
+                chroma_filter,
             )
+            if _selected_topic:
+                fallback_docs = self._retrieve_docs(query)
+                if fallback_docs:
+                    state.current_docs = fallback_docs
+                    if hasattr(state, "last_retrieval_query"):
+                        state.last_retrieval_query = query
+                    _LOG.info(
+                        "[Academic] Topic-enriched fallback: %d docs for topic '%s'",
+                        len(fallback_docs), _selected_topic,
+                    )
+                else:
+                    _LOG.info(
+                        "[Academic] Topic-enriched fallback also returned 0 — keeping existing %d docs",
+                        len(state.current_docs or []),
+                    )
+            else:
+                _LOG.info(
+                    "[Academic] Slot re-retrieval returned 0 docs — keeping existing %d docs",
+                    len(state.current_docs or []),
+                )
+
+    # Keywords that mark "new registration" operations — docs matching these are kept.
+    # Docs about ต่ออายุ/ยกเลิก/แก้ไข are filtered out when operation='ยื่นใหม่' is pre-inferred.
+    _NEW_OP_KEEP_RE = re.compile(
+        r"(ยื่นใหม่|จัดตั้ง|ขอใหม่|การยื่น|สมัครใหม่|ลงทะเบียนใหม่|ขอจัดตั้ง)", re.IGNORECASE
+    )
+    _NON_NEW_OP_RE = re.compile(
+        r"(ต่ออายุ|ยกเลิก|แก้ไข|เปลี่ยนแปลง|โอนกิจการ)", re.IGNORECASE
+    )
+
+    def _filter_docs_by_known_entity(self, state: ConversationState) -> None:
+        """
+        When entity_type_normalized is already known (e.g. pre-filled from query),
+        drop docs that belong to the OTHER entity type.
+
+        Keeps:
+        - Docs with entity_type_normalized == known entity (exact match)
+        - Docs with empty/universal entity_type_normalized (apply to all types)
+        - Falls back to all docs if filtering would leave < 2 docs
+        """
+        ctx = state.context or {}
+        slots = ctx.get("academic_slots") or {}
+        _cslots = ctx.get("collected_slots") or {}
+        entity_val = (
+            slots.get("entity_type_normalized")
+            or slots.get("entity_type")
+            or _cslots.get("entity_type_normalized")
+            or _cslots.get("entity_type")
+            or ""
+        ).strip()
+
+        if not entity_val:
+            return  # Entity not known — nothing to filter
+
+        docs = state.current_docs or []
+        filtered = []
+        for d in docs:
+            _meta = d.get("metadata") or {}
+            _doc_entity = str(_meta.get("entity_type_normalized") or "").strip()
+            if not _doc_entity or _doc_entity.lower() in ("nan", "none"):
+                filtered.append(d)  # Universal doc — applies to all entity types
+            elif _doc_entity == entity_val:
+                filtered.append(d)  # Matches known entity — keep
+            # else: belongs to a different entity type — drop
+
+        if len(filtered) >= 2:
+            _LOG.info(
+                "[Academic] Entity filter entity='%s': %d → %d docs (dropped %d other-entity)",
+                entity_val, len(docs), len(filtered), len(docs) - len(filtered),
+            )
+            state.current_docs = filtered
+        else:
+            _LOG.info(
+                "[Academic] Entity filter entity='%s' would leave %d docs — keeping all %d",
+                entity_val, len(filtered), len(docs),
+            )
+
+    def _filter_docs_by_known_operation(self, state: ConversationState) -> None:
+        """
+        When operation_by_department is exactly known (e.g. auto-filled from query match like
+        'การจดทะเบียนพาณิชย์'), filter state.current_docs to keep only docs whose
+        operation_by_department is empty (universal) or overlaps with the known value.
+
+        This is distinct from _filter_docs_by_inferred_operation which only handles
+        the 'ยื่นใหม่' pre-inferred case.
+
+        Keeps:
+        - Docs with empty/null operation_by_department (apply to all operations)
+        - Docs whose operation value is contained in or contains the known value
+        - Falls back to all docs if filtering would leave < 1 doc
+        """
+        ctx = state.context or {}
+        slots = ctx.get("academic_slots") or {}
+        op_val = (slots.get("operation_by_department") or "").strip()
+
+        if not op_val:
+            return  # No specific operation known — nothing to filter
+
+        # Only apply when the known operation is a SPECIFIC value (not the generic 'ยื่นใหม่'
+        # which is handled by _filter_docs_by_inferred_operation).
+        _GENERIC_OPS = {"ยื่นใหม่", "ขอใหม่", "สมัครใหม่", "อื่น ๆ"}
+        if op_val in _GENERIC_OPS:
+            return
+
+        docs = state.current_docs or []
+        op_lower = op_val.lower()
+        filtered = []
+        for d in docs:
+            _meta = d.get("metadata") or {}
+            _doc_op = str(_meta.get("operation_by_department") or "").strip()
+            if not _doc_op or _doc_op.lower() in ("nan", "none"):
+                filtered.append(d)  # Universal doc — no operation constraint
+            elif _doc_op.lower() in op_lower or op_lower in _doc_op.lower():
+                filtered.append(d)  # Overlapping/matching operation — keep
+            # else: different operation — drop
+
+        if len(filtered) >= 1:
+            _LOG.info(
+                "[Academic] Op exact-filter operation='%s': %d → %d docs (dropped %d wrong-op)",
+                op_val, len(docs), len(filtered), len(docs) - len(filtered),
+            )
+            # Save pre-filter docs for link collection — links (forms, portals) are the same
+            # across operations for a given license type. Only CONTENT (steps, fees) differs.
+            # Without this, a single-operation doc set may have no form keywords → form
+            # section disappears from menu even though the forms exist in the broader doc set.
+            state.context["_link_source_docs"] = list(docs)
+            state.current_docs = filtered
+        else:
+            _LOG.info(
+                "[Academic] Op exact-filter operation='%s' would leave 0 docs — keeping all %d",
+                op_val, len(docs),
+            )
+
+    def _filter_docs_by_inferred_operation(self, state: ConversationState) -> None:
+        """
+        When operation_by_department was pre-inferred as 'ยื่นใหม่' (new registration),
+        remove docs whose operation_by_department clearly indicates a different operation
+        (ต่ออายุ / ยกเลิก / แก้ไข / เปลี่ยนแปลง).
+
+        Keeps:
+        - Docs with no operation_by_department (universal)
+        - Docs whose operation_by_department matches new-registration keywords
+        - All docs if pre-inferred operation was not 'ยื่นใหม่' (do nothing)
+        - Falls back to all docs if filtering would leave < 1 doc
+        """
+        ctx = state.context or {}
+        slots = ctx.get("academic_slots") or {}
+        inferred_op = (slots.get("operation_by_department") or "").strip()
+
+        if not self._NEW_OP_KEEP_RE.search(inferred_op):
+            return  # Not a 'new' operation pre-infer — don't filter
+
+        docs = state.current_docs or []
+        filtered = []
+        for d in docs:
+            op = ((d.get("metadata") or {}).get("operation_by_department") or "").strip()
+            if not op:
+                filtered.append(d)  # Universal doc — keep
+            elif self._NON_NEW_OP_RE.search(op):
+                continue  # Clearly a different operation type — drop
+            else:
+                filtered.append(d)  # Matches new or has unrelated op label — keep
+
+        if filtered:
+            _LOG.info(
+                "[Academic] Filtered docs by inferred operation='%s': %d → %d docs",
+                inferred_op, len(docs), len(filtered),
+            )
+            state.current_docs = filtered
+        else:
+            _LOG.info("[Academic] Operation filter would leave 0 docs — keeping all %d", len(docs))
 
     # Stage 2.2: dynamic section menu (only what exists)
     def _available_sections_from_docs(self, state: ConversationState) -> List[Dict[str, str]]:
         docs = state.current_docs or []
+
+        # Detect if all docs are non-regulatory (marketing/business_guide).
+        # Legal-specific sections that come ONLY from content fallback (not metadata)
+        # produce false positives for marketing topics — suppress them when no regulatory
+        # docs are present.  Metadata-backed sections are never suppressed.
+        _NON_REG_TYPES = {"marketing", "business_guide"}
+        _LEGAL_ONLY_SECTIONS = {
+            "identification_documents", "fees", "operation_duration",
+            "service_channel", "operation_steps", "research_reference",
+            "terms_and_conditions", "legal_regulatory",
+        }
+        _data_types = {
+            str((d.get("metadata") or {}).get("data_type") or "").strip().lower()
+            for d in docs if isinstance(d, dict)
+        }
+        _data_types.discard("")
+        _is_non_regulatory = bool(_data_types) and _data_types.issubset(_NON_REG_TYPES)
 
         def has_any_metadata(keys: List[str]) -> bool:
             for d in docs:
@@ -1125,6 +2696,33 @@ class AcademicPersonaService:
                         return True
             return False
 
+        # Keywords for metadata (research_reference) check — broader, includes บุคคลธรรมดา form codes
+        _FORM_META_KEYWORDS = [
+            "แบบ บอจ", "แบบ ภพ", "แบบ ก.", "แบบ ว.", "แบบ ทพ", "แบบ หส",
+            "ดาวน์โหลด", "คู่มือ", "แบบฟอร์ม", "download",
+            "แบบคำขอ", "หนังสือมอบอำนาจ", "Website เอกสาร",
+        ]
+        # Keywords for doc content fallback — narrower to avoid false positives in general text
+        _FORM_VALUE_KEYWORDS = ["แบบ บอจ", "แบบ ภพ", "แบบ ก.", "แบบ ว.", "ดาวน์โหลด", "คู่มือ", "แบบฟอร์ม", "download"]
+
+        def has_form_reference() -> bool:
+            """Show แบบฟอร์มและเอกสารที่เกี่ยวข้อง only when research_reference metadata value
+            actually contains form/download keywords — not just any URL or reference link.
+            Also checks _link_source_docs (entity-filtered, pre-op-filter) because links/forms
+            are the same across operations — only content (steps, fees) differs by operation."""
+            # Check both current docs AND the broader link source docs (saved before op filter)
+            _link_src = (state.context or {}).get("_link_source_docs") or []
+            _check_docs = docs if not _link_src else list({id(d): d for d in list(docs) + _link_src}.values())
+            for d in _check_docs:
+                md = d.get("metadata") or {}
+                val = str(md.get("research_reference") or "").strip()
+                if not val or val.lower() in ("nan", "none"):
+                    continue
+                if any(kw in val for kw in _FORM_META_KEYWORDS):
+                    return True
+            # Fallback: check doc content for form-specific keywords (excluding bare http)
+            return has_any_content(_FORM_VALUE_KEYWORDS)
+
         candidates = [
             (
                 ["operation_steps", "operation_step", "steps", "procedure", "ขั้นตอนการดำเนินการ"],
@@ -1140,17 +2738,29 @@ class AcademicPersonaService:
             (["operation_duration", "duration", "ระยะเวลา การดำเนินการ", "ระยะเวลาดำเนินการ"], "ระยะเวลา", ["ระยะเวลา", "วันทำการ", "duration"]),
             (["service_channel", "channel", "ช่องทางการ ให้บริการ", "ช่องทาง", "หน่วยงาน", "department"], "ช่องทาง/สถานที่ยื่น", ["ช่องทาง", "หน่วยงาน", "สำนักงาน", "department"]),
             # ❗ metadata-only: content keywords เป็น false positive สูง — เปิด choice เฉพาะเมื่อมี field ส่งให้ LLM จริงๆ
-            (["terms_and_conditions", "conditions", "เงื่อนไขและหลักเกณฑ์"], "เงื่อนไขและหลักเกณฑ์", None),
-            (["legal_regulatory", "law", "regulation", "ข้อกำหนดทางกฎหมาย และข้อบังคับ", "บทลงโทษ"], "ข้อกฎหมาย/ข้อควรระวัง/บทลงโทษ", None),
-            (["research_reference"], "แบบฟอร์มและเอกสารที่เกี่ยวข้อง", ["แบบ บอจ", "แบบ ภพ", "แบบ ก.", "แบบ ว.", "ดาวน์โหลด", "คู่มือ", "http"]),
+            (["terms_and_conditions", "เงื่อนไขและหลักเกณฑ์"], "เงื่อนไขและหลักเกณฑ์", None),
+            (["legal_regulatory", "ข้อกำหนดทางกฎหมาย และข้อบังคับ", "บทลงโทษ"], "ข้อกฎหมาย/ข้อควรระวัง/บทลงโทษ", None),
+            (["research_reference"], "แบบฟอร์มและเอกสารที่เกี่ยวข้อง", ["แบบ บอจ", "แบบ ภพ", "แบบ ก.", "แบบ ว.", "ดาวน์โหลด", "คู่มือ"]),
         ]
 
         out: List[Dict[str, str]] = []
         for keys, label, kws in candidates:
+            section_key = keys[0]
+            # research_reference requires stricter check: metadata value must contain form keywords.
+            # Generic has_any_metadata would false-positive on any doc with a reference URL.
+            if section_key == "research_reference":
+                if has_form_reference():
+                    out.append({"key": section_key, "label": label})
+                continue
             if has_any_metadata(keys):
-                out.append({"key": keys[0], "label": label})
-            elif kws and has_any_content(kws):  # content fallback only when kws is not None
-                out.append({"key": keys[0], "label": label})
+                out.append({"key": section_key, "label": label})
+            elif kws and has_any_content(kws):
+                # Suppress legal-specific content-fallback sections when docs are all
+                # marketing/business_guide — avoids "เอกสารที่ต้องใช้" appearing for
+                # marketing strategy topics that have no legal document requirements.
+                if _is_non_regulatory and section_key in _LEGAL_ONLY_SECTIONS:
+                    continue
+                out.append({"key": section_key, "label": label})
         return out
 
     def _ask_sections(self, state: ConversationState) -> str:
@@ -1163,6 +2773,30 @@ class AcademicPersonaService:
             state.context["pending_options"] = {}
             state.context["pending_question"] = ""
             self._set_flow(state, stage="no_sections")
+            return ""
+
+        # Option A fix: only 1 real section available → no meaningful choice to make.
+        # The menu would show "1) <section>  2) ทั้งหมด" and the user always needs "ทั้งหมด".
+        # Skip the menu and auto-select all to save one unnecessary round-trip.
+        if len(sections) == 1:
+            state.context["selected_sections"] = {"type": "all", "keys": [s["key"] for s in sections]}
+            state.context["section_catalog"] = sections
+            state.context["pending_options"] = {}
+            state.context["pending_question"] = ""
+            self._set_flow(state, stage="awaiting_sections")
+            _LOG.info("[Academic] Only 1 section — auto-select all, skipping menu")
+            return ""
+
+        # When user said "อย่างละเอียด" / "ทั้งหมด" style → supervisor sets
+        # academic_auto_select_all=True so we skip the menu and go straight to full answer.
+        if state.context.get("academic_auto_select_all"):
+            state.context.pop("academic_auto_select_all", None)
+            state.context["selected_sections"] = {"type": "all", "keys": [s["key"] for s in sections]}
+            state.context["section_catalog"] = sections
+            state.context["pending_options"] = {}
+            state.context["pending_question"] = ""
+            self._set_flow(state, stage="awaiting_sections")
+            _LOG.info("[Academic] auto_select_all: skipping menu, answering all %d sections", len(sections))
             return ""
 
         lines = ["คุณอยากรู้เรื่องไหนครับ"]
@@ -1245,7 +2879,7 @@ class AcademicPersonaService:
             "analysis": "LLM JSON parse failed",
             "action": "answer",
             "execution": {
-                "answer": "ขอโทษครับ ตอนนี้ยังสรุปคำตอบที่ยืนยันได้จากเอกสารไม่ได้",
+                "answer": "ขอโทษครับ ตอนนี้ยังไม่สามารถสรุปคำตอบจากเอกสารได้",
                 "context_update": {"auto_return_to_practical": True},
             },
         }
@@ -1269,22 +2903,22 @@ class AcademicPersonaService:
             # must come from every doc (not deduplicated like operation_steps).
             "identification_documents",
             # Section-backing fields: must be whitelisted so LLM can actually answer these sections
-            "terms_and_conditions", "conditions",
-            "legal_regulatory", "law", "regulation",
-            "service_channel", "service_hours", "service_location",
+            "terms_and_conditions",
+            "legal_regulatory",
+            "service_channel",
             # Marketing / business_guide fields (data_loader_general.py)
             "main_topic", "sub_topic", "answer_guideline",
+            # เอกสาร/ฟอร์ม AI ร้านอาหาร — bypasses content truncation via metadata track
+            "restaurant_ai_document",
         }
         # research_reference is aggregated separately below (deduped) — skip from per-doc metadata
         _ACADEMIC_FIELD_CAPS = {
-            "fees": 150, "operation_duration": 150,
-            # cap the longer legal/condition fields to avoid token explosion
-            "terms_and_conditions": 400, "conditions": 400,
-            "legal_regulatory": 600, "law": 400, "regulation": 400,
-            "service_channel": 300, "service_hours": 150, "service_location": 150,
-            "identification_documents": 1500,  # never truncate doc lists
-            # marketing / business_guide content cap
-            "answer_guideline": 600, "main_topic": 120, "sub_topic": 150,
+            "fees": 2000, "operation_duration": 1000,
+            "terms_and_conditions": 3000,
+            "legal_regulatory": 2000,
+            "service_channel": 1000,
+            "identification_documents": 4000,
+            "answer_guideline": 1500, "main_topic": 500, "sub_topic": 500,
         }
         # Long fields: send once (first doc that has them) to avoid ×N repetition
         # identification_documents is intentionally excluded — it varies by entity_type and must
@@ -1332,10 +2966,33 @@ class AcademicPersonaService:
         _is_multi_topic = len(_lt_counts) >= 2
 
         # Parse research_reference into (desc, url) pairs — deduplicated across docs.
-        # Using shared _parse_link_entries from persona_practical (same format).
+        # Fix 5: When a topic is locked (academic_selected_license_type), only collect links
+        # from topic-matched docs to prevent form links from unrelated licenses leaking in.
+        _ctx_selected_lt = ((state.context or {}).get("academic_selected_license_type") or "").strip()
+        def _link_doc_matches_topic(d: Dict) -> bool:
+            if not _ctx_selected_lt:
+                return True  # No topic lock → include all
+            _md2 = d.get("metadata") or {}
+            for _fk in ("license_type", "sub_topic", "topic_name", "short_name"):
+                _fv = (_md2.get(_fk) or "").strip()
+                if _fv and (_fv == _ctx_selected_lt or _ctx_selected_lt in _fv or _fv in _ctx_selected_lt):
+                    return True
+            return False
+
         _seen_ref_keys: set = set()
         _link_entries: list = []            # (desc, url) pairs, deduplicated
-        for _d in (state.current_docs or [])[:_MAX_DOCS_ACADEMIC]:
+        # Use _link_source_docs (entity-filtered, pre-op-filter) when available — links/forms
+        # are not operation-specific (same แบบ ทพ. form used for new/change/cancel),
+        # so collect from the broader entity-scoped set to avoid missing form links.
+        _link_pool = (state.context or {}).get("_link_source_docs") or (state.current_docs or [])
+        _link_docs = [_d for _d in _link_pool[:_MAX_DOCS_ACADEMIC] if _link_doc_matches_topic(_d)]
+        if not _link_docs and _ctx_selected_lt:
+            # Fallback: topic filter left no docs → include all (don't lose links entirely)
+            _link_docs = _link_pool[:_MAX_DOCS_ACADEMIC]
+            _LOG.info("[Academic] Fix5: link topic filter yielded 0 docs — using all %d docs", len(_link_docs))
+        else:
+            _LOG.info("[Academic] Fix5: collecting links from %d topic-matched docs (topic=%r)", len(_link_docs), _ctx_selected_lt)
+        for _d in _link_docs:
             _md = _d.get("metadata") or {}
             _rr = (_md.get("research_reference") or "").strip()
             for _rd, _ru in _parse_link_entries(_rr):
@@ -1344,25 +3001,27 @@ class AcademicPersonaService:
                     _seen_ref_keys.add(_rkey)
                     _link_entries.append((_rd, _ru))
 
-        # NEW POLICY: Only inject links when user explicitly selected sections (not default/auto)
+        # POLICY: Only inject links when user explicitly selected sections (not default/auto)
         # Links are shown ONLY when:
-        # - User completed section selection (not auto-finalized), AND
-        # - Selected "research_reference" section (แบบฟอร์มและเอกสาร) OR "all"/"picked-all" (ทั้งหมด)
-        # NOTE: type ที่เป็นไปได้: "all", "picked", "specific" — ต้องรวม "picked" ด้วย
+        # - User picked "research_reference" / "แบบฟอร์ม" / "เอกสาร" section explicitly, OR
+        # - User explicitly asked for references/links (ขออ้างอิง, ขอลิงค์, etc.)
+        # NOTE: type="all" from auto_select_all does NOT trigger links — only explicit section picks do.
         _user_selected_sections = selected.get("type") in ("all", "picked", "specific")
         _ref_section_requested = (
             _user_selected_sections
             and (
-                selected.get("type") == "all"
-                or "research_reference" in (selected.get("keys") or [])
+                "research_reference" in (selected.get("keys") or [])
                 # "7) แบบฟอร์มและเอกสาร" maps to section key that may vary — also check label text
                 or any("แบบฟอร์ม" in str(k) or "เอกสาร" in str(k) for k in (selected.get("keys") or []))
             )
         )
 
-        # ตรวจว่า user ถาม "อ้างอิง" โดยตรงหรือเปล่า (เพื่อ unlock reference links)
+        # ตรวจว่า user ถาม "อ้างอิง/ลิงค์" โดยตรงหรือเปล่า (เพื่อ unlock reference/guide links)
         _user_asked_reference = bool(re.search(
-            r"(อ้างอิง|reference|research|เอกสารอ้างอิง|แหล่งอ้างอิง|กฎหมายอ้างอิง)",
+            r"(อ้างอิง|reference|research|เอกสารอ้างอิง|แหล่งอ้างอิง|กฎหมายอ้างอิง"
+            r"|ขอลิงค์|ขอลิงก์|แหล่งที่มา|แหล่งข้อมูล|ขอแหล่ง|URL|ดาวน์โหลด"
+            r"|อ้างอิงได้ที่|ที่มาของข้อมูล|ดูอ้างอิง|อ้างอิงจาก|ข้อมูลจากไหน"
+            r"|แหล่งข้อมูลเพิ่มเติม|ขอแหล่งข้อมูล)",
             user_question, re.IGNORECASE
         ))
 
@@ -1387,6 +3046,22 @@ class AcademicPersonaService:
             else:
                 _ref_entries.append((_rd, _ru))
 
+        # Extract URLs from service_channel metadata — these are always actionable submission portals
+        # (e.g. https://bmaoss.bangkok.go.th/index) but are NOT in research_reference, so they
+        # never reach _link_entries via the normal path. Adding them to _service_entries ensures
+        # the 🌐 section shows the actual portal URL the user needs to access.
+        # Fix 5: also use topic-filtered _link_docs for service_channel to prevent off-topic portals.
+        for _d in _link_docs:
+            _md = _d.get("metadata") or {}
+            _sc = (_md.get("service_channel") or "").strip()
+            if not _sc or "https://" not in _sc:
+                continue
+            for _su in re.findall(r"https?://[^\s\n，。、]+", _sc):
+                _su = _su.rstrip(".,;)")
+                if _su and _su not in _seen_ref_keys:
+                    _seen_ref_keys.add(_su)
+                    _service_entries.append(("ช่องทางยื่นออนไลน์", _su))
+
         if _is_multi_topic:
             _instruction = f" (หลาย topics: {', '.join(_lt_counts.keys())})"
         elif _primary_lt:
@@ -1407,18 +3082,21 @@ class AcademicPersonaService:
                 + "\n".join(_fmt_link(d, u) for d, u in _service_entries) + "\n"
             )
 
-        # FORM + GUIDE + REF → only when user selected research_reference section
+        # FORM → only when user selected research_reference / แบบฟอร์ม / เอกสาร section
         _agg_section = ""
         if _link_entries and _ref_section_requested:
             if _form_entries:
                 _agg_section += f"\n📄 FORM_LINKS{_instruction} — แสดงทั้งหมด:\n" + "\n".join(_fmt_link(d, u) for d, u in _form_entries) + "\n"
+        # GUIDE_LINKS + REF → only when user explicitly asks for sources/references (อ้างอิง)
+        # NOT triggered by แบบฟอร์ม/เอกสาร section selection
+        if _user_asked_reference:
             if _guide_entries:
                 _agg_section += (
-                    f"\n📖 GUIDE_LINKS{_instruction} — เลือกแค่ 1 ลิงก์สำคัญที่สุดเท่านั้น ห้ามเกิน 1 ลิงก์:\n"
+                    f"\n📖 GUIDE_LINKS{_instruction} — เลือกแค่ 1 ลิงก์สำคัญที่สุดเท่านั้น ห้ามเกิน 1 ลิงก์ — output header: '📖 แหล่งข้อมูลอ้างอิง':\n"
                     + "\n".join(_fmt_link(d, u) for d, u in _guide_entries) + "\n"
                 )
-            if _ref_entries and _user_asked_reference:
-                _agg_section += f"\n🔗 REFERENCE_LINKS{_instruction} — แสดงเฉพาะเมื่อ user ถาม:\n" + "\n".join(_fmt_link(d, u) for d, u in _ref_entries) + "\n"
+            if _ref_entries:
+                _agg_section += f"\n📚 REFERENCE_LINKS{_instruction} — user ถามแหล่งอ้างอิง: copy เหล่านี้ under section '📚 แหล่งอ้างอิง':\n" + "\n".join(_fmt_link(d, u) for d, u in _ref_entries) + "\n"
 
         return f"""USER_QUESTION:
 {user_question}
@@ -1503,6 +3181,20 @@ Return JSON:
                            "กฎหมายร้านอาหาร ใบอนุญาต ภาษี VAT จดทะเบียน สุขาภิบาล ประกันสังคม")
 
         prompt = self._build_final_prompt(state, user_question=uq)
+
+        # Fix 6: Collect allowed URLs from the injected link sections so we can strip any
+        # hallucinated URLs the LLM generates that are NOT from the approved source list.
+        _allowed_urls: set = set()
+        _in_link_section = False
+        for _pl in prompt.splitlines():
+            if any(_marker in _pl for _marker in ("SERVICE_LINKS", "FORM_LINKS", "GUIDE_LINKS")):
+                _in_link_section = True
+            elif _pl.strip().startswith("USER_QUESTION:") or (_pl.strip() and not _pl.startswith(" ") and not _pl.startswith("-") and "://" not in _pl and len(_pl) < 20):
+                _in_link_section = False
+            if _in_link_section:
+                for _u in re.findall(r"https?://[^\s\n，。、\"']+", _pl):
+                    _allowed_urls.add(_u.rstrip(".,;)"))
+
         decision = self._call_llm_json(prompt, state=state)
 
         _ex_raw = decision.get("execution") or {}
@@ -1514,8 +3206,22 @@ Return JSON:
         ex = _ex_raw if isinstance(_ex_raw, dict) else {}
         ans = (ex.get("answer") or "").strip()
         if not ans:
-            ans = "ขอโทษครับ ตอนนี้ยังไม่พบข้อมูลที่ยืนยันได้ในเอกสาร"
+            ans = "ขอโทษครับ ตอนนี้ยังไม่พบข้อมูลในเอกสารที่เกี่ยวข้อง"
         ans = self._fix_line_wrapping(ans)
+
+        # Fix 6 (continued): Remove hallucinated URLs from the answer — any URL not in _allowed_urls.
+        if _allowed_urls:
+            def _strip_hallucinated_url(m: re.Match) -> str:
+                u = m.group(0).rstrip(".,;)")
+                return u if u in _allowed_urls else ""
+            ans = re.sub(r"https?://[^\s\n，。、\"']+", _strip_hallucinated_url, ans)
+        else:
+            # No injected links at all — remove ALL URLs to prevent hallucination
+            ans = re.sub(r"https?://[^\s\n，。、\"']+", "", ans)
+
+        # Strip hallucinated empty section headers (no content follows the heading)
+        ans = re.sub(r"\n*📖\s*แหล่งข้อมูลอ้างอิง\s*$", "", ans, flags=re.MULTILINE).rstrip()
+        ans = re.sub(r"\n*🌐\s*ช่องทางยื่นออนไลน์\s*$", "", ans, flags=re.MULTILINE).rstrip()
 
         cu = ex.get("context_update", {})
         if isinstance(cu, dict) and cu:
@@ -1573,17 +3279,120 @@ Return JSON:
                         for k, v in known_slots.items():
                             if k not in existing:
                                 existing[k] = v
+                        # Sync entity_type ↔ entity_type_normalized so _re_retrieve_with_slots
+                        # (which looks for entity_type_normalized) and diversity scoping
+                        # (which reads entity_type) both find the correct value.
+                        if "entity_type" in existing and "entity_type_normalized" not in existing:
+                            existing["entity_type_normalized"] = existing["entity_type"]
+                        elif "entity_type_normalized" in existing and "entity_type" not in existing:
+                            existing["entity_type"] = existing["entity_type_normalized"]
                         ctx["academic_slots"] = existing
                         state.context = ctx
 
+                # C3: Pre-populate entity_type from explicit mention in the user's query.
+                # If user wrote "บุคคลธรรมดา" or "นิติบุคคล" directly in the question,
+                # skip asking for it — we already know the answer.
+                _qt_lower = (state.context.get("academic_question") or user_text or "").lower()
+                _entity_pre: Optional[str] = None
+                if "บุคคลธรรมดา" in _qt_lower:
+                    _entity_pre = "บุคคลธรรมดา"
+                elif any(kw in _qt_lower for kw in ("นิติบุคคล", "บริษัทจำกัด", "ห้างหุ้นส่วน")):
+                    _entity_pre = "นิติบุคคล"
+                if _entity_pre:
+                    _ctx3 = state.context or {}
+                    _slots3 = _ctx3.get("academic_slots") or {}
+                    if not isinstance(_slots3, dict):
+                        _slots3 = {}
+                    if "entity_type_normalized" not in _slots3 and "entity_type" not in _slots3:
+                        _slots3["entity_type_normalized"] = _entity_pre
+                        _ctx3["academic_slots"] = _slots3
+                        state.context = _ctx3
+                        _LOG.info("[Academic] C3: pre-filled entity_type_normalized=%r from query", _entity_pre)
+
+                # Phase 0: if docs span multiple distinct license_types → topic menu first.
+                # This keeps each academic session focused on one license at a time,
+                # preventing mixed answers when a broad question (e.g. "เปิดร้านอาหาร") retrieves
+                # docs for many different permits (ใบอนุญาตจัดตั้ง + จดทะเบียนพาณิชย์ + SAN + ...).
+                #
+                # Bug 1 fix: if supervisor injected academic_selected_license_type (because Practical
+                # just answered that topic), skip Phase 0 entirely and filter docs to that topic now.
+                _pre_selected_lt = (state.context.get("academic_selected_license_type") or "").strip()
+                # Safety check: verify that the pre-selected topic actually exists in retrieved docs.
+                # If 0 docs match (e.g. stale value from previous session for a different topic),
+                # clear it and fall through to normal topic menu — never lock to a wrong topic.
+                if _pre_selected_lt:
+                    _docs_for_lt = [
+                        d for d in (state.current_docs or [])
+                        if str((d.get("metadata") or {}).get("license_type") or "").strip() == _pre_selected_lt
+                    ]
+                    if not _docs_for_lt:
+                        _LOG.info(
+                            "[Academic] Bug1-fix: academic_selected_license_type=%r has 0 matching docs "
+                            "in current query — clearing stale pre-selection, using topic menu",
+                            _pre_selected_lt,
+                        )
+                        state.context.pop("academic_selected_license_type", None)
+                        _pre_selected_lt = ""
+                if _pre_selected_lt:
+                    _LOG.info(
+                        "[Academic] Bug1-fix: academic_selected_license_type=%r pre-injected — skipping topic menu",
+                        _pre_selected_lt,
+                    )
+                    self._filter_docs_by_selected_topic(state, _pre_selected_lt)
+                    self._ensure_flow(state, stage="awaiting_slots")
+                else:
+                    self._ensure_flow(state, stage="awaiting_topic")
+                    q_topic = self._ask_topic_selection(state)
+                    if q_topic:
+                        self._append_assistant(state, q_topic)
+                        state.round = int(getattr(state, "round", 0) or 0) + 1
+                        return state, q_topic
+
+                # License-type filter after main_topic collapse:
+                # When _ask_topic_selection returns "" because all topics share the same
+                # main_topic (not because there's genuinely one topic), docs may still span
+                # multiple license_types (e.g. สุรา + จดทะเบียนพาณิชย์ + ทะเบียนนายจ้าง).
+                # If the query explicitly names one specific license_type, filter to it now
+                # so slot generation doesn't produce irrelevant operation options.
+                if not state.context.get("academic_selected_license_type"):
+                    _lts_in_docs = list({
+                        str((d.get("metadata") or {}).get("license_type") or "").strip()
+                        for d in (state.current_docs or [])
+                    } - {"", "nan", "None"})
+                    if len(_lts_in_docs) > 1:
+                        _aq_q_lc = (state.context.get("academic_question") or "").lower()
+                        # Also strip Thai "ใบ" prefix from license_type before matching, because
+                        # queries often say "การจดทะเบียนพาณิชย์" while license_type is "ใบทะเบียนพาณิชย์".
+                        # "ใบ" = 2 Thai characters; stripping it gives the core word that appears in query.
+                        def _lt_matches_query(lt: str) -> bool:
+                            _ltl = lt.lower()
+                            if _ltl in _aq_q_lc:
+                                return True
+                            if _ltl.startswith("ใบ") and len(_ltl) > 2:
+                                _core = _ltl[2:]  # strip "ใบ" (2 Thai chars)
+                                if len(_core) >= 5 and _core in _aq_q_lc:
+                                    return True
+                            return False
+                        _matched_lts = [lt for lt in _lts_in_docs if len(lt) >= 5 and _lt_matches_query(lt)]
+                        if len(_matched_lts) == 1:
+                            _LOG.info(
+                                "[Academic] Post-collapse lt-filter: query names %r → filtering %d → focused docs",
+                                _matched_lts[0], len(state.current_docs or []),
+                            )
+                            self._filter_docs_by_selected_topic(state, _matched_lts[0])
+
+                # Single topic (or no license_type diversity) — proceed directly to slots.
                 self._ensure_flow(state, stage="awaiting_slots")
                 q = self._ask_required_slots(state)
 
                 if not q:  # All slots already known or question specific — skip to sections
+                    self._filter_docs_by_known_entity(state)
+                    self._filter_docs_by_known_operation(state)
+                    self._filter_docs_by_inferred_operation(state)
                     q2 = self._ask_sections(state)
                     if not q2.strip():  # No sections found — finalize immediately
                         ans = self._finalize_answer(state)
-                        self._append_assistant(state, ans)
+                        self._append_assistant(state, self._summarize_for_history(ans))
                         state.round = 0
                         return state, ans
                     self._append_assistant(state, q2)
@@ -1602,6 +3411,93 @@ Return JSON:
         flow = self._get_flow(state) or {}
         stage = (flow.get("stage") or "").strip()
     
+        # Stage: awaiting_topic → user picks which license/topic to deep-dive into
+        if stage == "awaiting_topic":
+            # Noise/greeting/empty → re-ask topic menu
+            if not user_text or self._looks_like_greeting_or_noise(user_text):
+                msg = (state.context or {}).get("pending_question") or ""
+                if msg:
+                    self._append_assistant(state, msg)
+                    return state, msg
+
+            # Resolve numeric choice ("1", "2", ...) against pending_options.
+            # Issue 2 fix: support multi-select (e.g. "3 4") — collect ALL valid keys.
+            opts = (state.context or {}).get("pending_options") or {}
+            selected_key: Optional[str] = None
+            _all_selected_keys: List[str] = []
+            nums = self._parse_numbers(user_text)
+            if nums:
+                for _n in nums:
+                    _k = opts.get(_n)
+                    if _k:
+                        _all_selected_keys.append(_k)
+                selected_key = _all_selected_keys[0] if _all_selected_keys else None
+
+            # Fallback: text match against catalog labels (user typed the topic name directly)
+            # Uses Thai word-overlap scoring so "ปิดงบการเงิน" matches "จัดการการเงิน"
+            # (shares "การเงิน") even when neither is a full substring of the other.
+            if not selected_key:
+                catalog = (state.context or {}).get("academic_topic_catalog") or []
+                ut_norm = re.sub(r'[^\u0E00-\u0E7Fa-zA-Z0-9]', '', user_text.lower())
+                _best_topic: Optional[str] = None
+                _best_score = 0
+                for t in catalog:
+                    tk_norm = re.sub(r'[^\u0E00-\u0E7Fa-zA-Z0-9]', '', t["key"].lower())
+                    # Exact substring check (original)
+                    if tk_norm in ut_norm or ut_norm in tk_norm:
+                        _best_topic = t["key"]
+                        break
+                    # Sliding 3-char Thai window overlap score
+                    _score = 0
+                    for _i in range(len(tk_norm) - 2):
+                        seg = tk_norm[_i:_i+3]
+                        if seg in ut_norm:
+                            _score += 1
+                    if _score > _best_score:
+                        _best_score = _score
+                        _best_topic = t["key"]
+                # Require at least 2 matching 3-char segments to avoid false matches
+                if _best_topic and _best_score >= 2:
+                    selected_key = _best_topic
+
+            if not selected_key:
+                # Cannot resolve — re-ask menu
+                msg = (state.context or {}).get("pending_question") or ""
+                if msg:
+                    self._append_assistant(state, msg)
+                    return state, msg
+
+            # Filter docs to selected topic(s) then proceed to slot phase.
+            # Issue 2 fix: when multiple topics selected, merge docs from all of them.
+            if len(_all_selected_keys) > 1:
+                self._filter_docs_for_multi_topics(state, _all_selected_keys)
+            else:
+                self._filter_docs_by_selected_topic(state, selected_key)
+
+            # Clear topic-menu options so _bind_choice_if_any (used for section menu later)
+            # doesn't pick up stale topic-menu options
+            state.context["pending_options"] = {}
+            state.context["pending_question"] = ""
+
+            self._ensure_flow(state, stage="awaiting_slots")
+            q = self._ask_required_slots(state)
+            if not q:
+                self._filter_docs_by_known_entity(state)
+                self._filter_docs_by_known_operation(state)
+                self._filter_docs_by_inferred_operation(state)
+                q2 = self._ask_sections(state)
+                if not q2.strip():
+                    ans = self._finalize_answer(state)
+                    self._append_assistant(state, self._summarize_for_history(ans))
+                    state.round = 0
+                    return state, ans
+                self._append_assistant(state, q2)
+                state.round = int(getattr(state, "round", 0) or 0) + 1
+                return state, q2
+            self._append_assistant(state, q)
+            state.round = int(getattr(state, "round", 0) or 0) + 1
+            return state, q
+
         # Stage: awaiting_slots
         if stage == "awaiting_slots":
             # Noise/greeting/empty input while waiting for slots — re-ask (or proceed if all slots known)
@@ -1615,13 +3511,41 @@ Return JSON:
             # Otherwise treat as slot answer — save then re-retrieve with slot filters
             self._save_slots_best_effort(state, user_text)
             self._re_retrieve_with_slots(state)
+            self._filter_docs_by_inferred_operation(state)
 
+            # After re-retrieving with entity filter, check if new docs reveal additional
+            # slot dimensions (e.g. user picked นิติบุคคล → re-retrieved docs may now show
+            # registration_type diversity: บริษัทจำกัด / ห้างหุ้นส่วนจำกัด).
+            # Ask those follow-up slots before going to section menu.
+            # Always call _ask_required_slots regardless of topic lock.
+            # _generate_dynamic_slots already scopes diversity to topic-matched docs when
+            # academic_selected_license_type is set (Fix 3 inside that function), so it
+            # safely asks only entity/registration slots that are still genuinely missing.
+            # Skipping this call when topic is locked caused registration_type to never be
+            # asked for นิติบุคคล — docs from all sub-types (บริษัทจำกัด/ห้างหุ้นส่วน) were
+            # sent to LLM together, producing an unfocused answer.
+            _topic_is_locked = bool((state.context or {}).get("academic_selected_license_type"))
+            q_extra = self._ask_required_slots(state)
+            if q_extra.strip():
+                _LOG.info(
+                    "[Academic] Second slot round%s: asking %r",
+                    " (topic locked)" if _topic_is_locked else "",
+                    q_extra[:60],
+                )
+                self._append_assistant(state, q_extra)
+                state.round = int(getattr(state, "round", 0) or 0) + 1
+                return state, q_extra
+            elif _topic_is_locked:
+                _LOG.info("[Academic] Topic locked — no additional slots needed, proceeding to sections")
+
+            self._filter_docs_by_known_entity(state)
+            self._filter_docs_by_known_operation(state)
             q2 = self._ask_sections(state)
 
             # P0: If no sections -> finalize immediately
             if not q2.strip():
                 ans = self._finalize_answer(state)
-                self._append_assistant(state, ans)
+                self._append_assistant(state, self._summarize_for_history(ans))
                 state.round = 0
                 return state, ans
 
@@ -1631,6 +3555,54 @@ Return JSON:
 
         # Stage: awaiting_sections -> final answer
         if stage == "awaiting_sections":
+            # ── Entity-type change at section menu ───────────────────────────
+            # User says "เปลี่ยนเป็นนิติบุคคล" or "บุคคลธรรมดาค่ะ" while at section menu
+            # → update entity_type and restart intake with the same base query.
+            # Guard: skip when input is a valid section number.
+            _ec_juristic = re.compile(r"นิติบุคคล|บริษัทจำกัด|ห้างหุ้นส่วน", re.IGNORECASE)
+            _ec_natural  = re.compile(r"บุคคลธรรมดา|กิจการเจ้าของคนเดียว|เจ้าของคนเดียว", re.IGNORECASE)
+            _ec_new_entity: Optional[str] = None
+            if _ec_juristic.search(user_text) and not _ec_natural.search(user_text):
+                _ec_new_entity = "นิติบุคคล"
+            elif _ec_natural.search(user_text) and not _ec_juristic.search(user_text):
+                _ec_new_entity = "บุคคลธรรมดา"
+
+            if _ec_new_entity:
+                _ec_ctx    = state.context or {}
+                _ec_slots  = _ec_ctx.get("academic_slots") or {}
+                _ec_cur    = (_ec_slots.get("entity_type_normalized") or _ec_slots.get("entity_type") or "").strip()
+                _ec_nums   = [n for n in self._parse_numbers(user_text) if n in (_ec_ctx.get("pending_options") or {})]
+                if _ec_new_entity != _ec_cur and not _ec_nums:
+                    _ec_base_q = (_ec_ctx.get("academic_question") or "").strip()
+                    _LOG.info(
+                        "[Academic] Entity change at section menu: %r → %r — restarting intake (base_q=%r)",
+                        _ec_cur, _ec_new_entity, _ec_base_q[:60],
+                    )
+                    # Update entity type in academic_slots
+                    _ec_slots["entity_type_normalized"] = _ec_new_entity
+                    _ec_slots["entity_type"] = _ec_new_entity
+                    for _k in ("registration_type", "operation_by_department"):
+                        _ec_slots.pop(_k, None)
+                    _ec_ctx["academic_slots"] = _ec_slots
+                    # Persist to collected_slots
+                    try:
+                        state.save_collected_slot("entity_type_normalized", _ec_new_entity)
+                        state.save_collected_slot("entity_type", _ec_new_entity)
+                    except Exception:
+                        pass
+                    # Reset flow so handle() re-runs full intake on next call
+                    _ec_ctx.pop("academic_flow", None)
+                    _ec_ctx.pop("section_catalog", None)
+                    _ec_ctx.pop("pending_options", None)
+                    _ec_ctx.pop("pending_question", None)
+                    _ec_ctx.pop("resolved_selection", None)
+                    state.current_docs = []
+                    state.last_retrieval_query = ""
+                    state.context = _ec_ctx
+                    # Recurse with same base query — goes through not-stage path (fresh intake)
+                    return self.handle(state, _ec_base_q or user_text, _internal=True)
+            # ── end entity-type change ────────────────────────────────────────
+
             bind = self._bind_choice_if_any(state, user_text)
 
             # If user sends noise here, re-ask section menu (keep stage)
@@ -1643,7 +3615,7 @@ Return JSON:
             self._save_selected_sections(state, user_text, bind)
 
             ans = self._finalize_answer(state)
-            self._append_assistant(state, ans)
+            self._append_assistant(state, self._summarize_for_history(ans))
             state.round = 0
             return state, ans
 

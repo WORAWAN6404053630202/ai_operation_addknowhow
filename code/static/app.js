@@ -1,3 +1,8 @@
+// Fix 2: Configure marked.js for markdown rendering
+if (typeof marked !== "undefined") {
+  marked.use({ breaks: true, gfm: true });
+}
+
 // ─── State ────────────────────────────────────────────────────────────────────
 let sessionId = "";
 let isSending = false;
@@ -16,6 +21,24 @@ const topicCards       = document.getElementById("topicCards");
 const welcomePanel     = document.getElementById("welcomePanel");
 const welcomeTitle     = document.getElementById("welcomeTitle");
 const welcomeSubtitle  = document.getElementById("welcomeSubtitle");
+const sidebar          = document.getElementById("sidebar");
+const sidebarOverlay   = document.getElementById("sidebarOverlay");
+const menuBtn          = document.getElementById("menuBtn");
+
+// ─── Fix 3: Mobile sidebar toggle ─────────────────────────────────────────────
+function openSidebar() {
+  sidebar.classList.add("sidebar--open");
+  sidebarOverlay.classList.add("active");
+}
+function closeSidebar() {
+  sidebar.classList.remove("sidebar--open");
+  sidebarOverlay.classList.remove("active");
+}
+
+menuBtn.addEventListener("click", () => {
+  sidebar.classList.contains("sidebar--open") ? closeSidebar() : openSidebar();
+});
+sidebarOverlay.addEventListener("click", closeSidebar);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function escapeHtml(text) {
@@ -26,13 +49,26 @@ function escapeHtml(text) {
 }
 
 function textToHtml(text) {
-  // Escape HTML first, then convert URLs to clickable links, then newlines to <br>
+  // Used for user messages and streaming chunks (plain text, no markdown)
   const escaped = escapeHtml(text);
   const linked = escaped.replace(
-    /https?:\/\/[^\s&lt;&gt;"]+/g,
-    url => `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`
+    /https?:\/\/[^\s"&]+(?:\n[a-zA-Z0-9][^\s\n"&]*)*/g,
+    match => {
+      const cleanUrl = match.replace(/\n/g, "");
+      return `<a href="${cleanUrl}" target="_blank" rel="noopener noreferrer">${cleanUrl}</a>`;
+    }
   );
   return linked.replace(/\n/g, "<br>");
+}
+
+// Fix 2: Render markdown for finalized assistant messages
+function assistantToHtml(text) {
+  if (typeof marked !== "undefined") {
+    try {
+      return marked.parse(String(text || ""));
+    } catch { /* fall through */ }
+  }
+  return textToHtml(text);
 }
 
 function formatTime(unixSeconds) {
@@ -75,6 +111,34 @@ function scrollToBottom() {
   chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
+// ─── Fix 4: Copy button ────────────────────────────────────────────────────────
+function attachCopyButton(bubbleWrap, getRawText) {
+  const actions = document.createElement("div");
+  actions.className = "message-actions";
+
+  const btn = document.createElement("button");
+  btn.className = "copy-btn";
+  btn.title = "คัดลอก";
+  btn.textContent = "⎘ คัดลอก";
+
+  btn.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(getRawText());
+      btn.textContent = "✓ คัดลอกแล้ว";
+      btn.classList.add("copied");
+      setTimeout(() => {
+        btn.textContent = "⎘ คัดลอก";
+        btn.classList.remove("copied");
+      }, 2000);
+    } catch (e) {
+      console.error("copy failed", e);
+    }
+  });
+
+  actions.appendChild(btn);
+  bubbleWrap.appendChild(actions);
+}
+
 // ─── Welcome panel ────────────────────────────────────────────────────────────
 function showWelcome(title = "สวัสดีครับ 👋", subtitle = "") {
   welcomeTitle.textContent = title;
@@ -111,7 +175,6 @@ function renderTopicCards(topics = []) {
   });
 }
 
-// Renders topic cards as clickable buttons inside the chat messages area
 function renderTopicCardsInChat(topics = []) {
   if (!topics.length) return;
 
@@ -167,28 +230,38 @@ function renderSessionList(sessions = []) {
 }
 
 // ─── Message rendering ────────────────────────────────────────────────────────
-function appendMessage(role, content) {
+// Fix 6: animate=false disables fade-in for history replay
+function appendMessage(role, content, { animate = true } = {}) {
   hideWelcome();
   const isAssistant = role === "assistant";
 
   const row = document.createElement("div");
   row.className = `message-row ${isAssistant ? "assistant" : "user"}`;
+  if (!animate) row.style.animation = "none";
 
   const avatarHtml = isAssistant
     ? `<img class="message-avatar" src="${BOT_AVATAR}" alt="bot" />`
     : `<div class="message-avatar user-avatar">U</div>`;
 
   const roleLabel = isAssistant ? "RESTBIZ" : "You";
+  // Fix 2: use marked.js for assistant, plain for user
+  const bubbleContent = isAssistant ? assistantToHtml(content) : textToHtml(content);
 
   row.innerHTML = `
     <div class="message-card">
       ${avatarHtml}
       <div class="message-bubble-wrap">
         <div class="message-role">${roleLabel}</div>
-        <div class="message-bubble">${textToHtml(content)}</div>
+        <div class="message-bubble">${bubbleContent}</div>
       </div>
     </div>
   `;
+
+  // Fix 4: attach copy button to assistant messages
+  if (isAssistant) {
+    const bubbleWrap = row.querySelector(".message-bubble-wrap");
+    attachCopyButton(bubbleWrap, () => content);
+  }
 
   chatMessages.appendChild(row);
   scrollToBottom();
@@ -200,13 +273,14 @@ function createStreamingBubble() {
   hideWelcome();
   const row = document.createElement("div");
   row.className = "message-row assistant";
+  // Fix 5: animated dots instead of ○
   row.innerHTML = `
     <div class="message-card">
       <img class="message-avatar" src="${BOT_AVATAR}" alt="bot" />
       <div class="message-bubble-wrap">
         <div class="message-role">RESTBIZ</div>
         <div class="message-bubble">
-          <span class="typing-cursor">○</span>
+          <span class="typing-dots"><span></span><span></span><span></span></span>
         </div>
         <span class="wait-timer">0s</span>
       </div>
@@ -217,6 +291,11 @@ function createStreamingBubble() {
 
   const bubble = row.querySelector(".message-bubble");
   const timerEl = row.querySelector(".wait-timer");
+  const bubbleWrap = row.querySelector(".message-bubble-wrap");
+  let rawText = "";
+
+  // Fix 4: copy button on streaming bubble (reads rawText once finalized)
+  attachCopyButton(bubbleWrap, () => rawText);
 
   let seconds = 0;
   const intervalId = setInterval(() => {
@@ -224,7 +303,8 @@ function createStreamingBubble() {
     if (timerEl) timerEl.textContent = `${seconds}s`;
   }, 1000);
 
-  function stopTimer() {
+  function stopTimer(finalText) {
+    rawText = finalText || rawText;
     clearInterval(intervalId);
     if (timerEl) {
       timerEl.textContent = `⏱ ${seconds}s`;
@@ -279,10 +359,8 @@ async function createNewSession() {
     const greeting = data.response || "สวัสดีครับ";
     const topics = data.topics || [];
 
-    // Always show greeting as a chat bubble (same as main.py)
     appendMessage("assistant", greeting);
 
-    // Show topic cards below the greeting if available
     if (topics.length > 0) {
       renderTopicCardsInChat(topics);
     }
@@ -300,14 +378,16 @@ async function loadSession(targetId) {
 
     sessionId = data.session_id || "";
     chatMessages.innerHTML = "";
+    closeSidebar(); // Fix 3: close sidebar on mobile after selecting session
 
     const messages = data.messages || [];
     if (messages.length === 0) {
       showWelcome("ยินดีให้บริการครับ 😊", "พิมพ์คำถามได้เลยครับ");
     } else {
       hideWelcome();
+      // Fix 6: disable animation for history replay
       messages.forEach((msg) => {
-        appendMessage(msg.role, msg.content || "");
+        appendMessage(msg.role, msg.content || "", { animate: false });
       });
     }
 
@@ -342,13 +422,11 @@ async function sendMessage() {
   const text = (messageInput.value || "").trim();
   if (!text || isSending) return;
 
-  // If no session yet, create one first
   if (!sessionId) {
     await createNewSession();
-    if (!sessionId) return; // still failed
+    if (!sessionId) return;
   }
 
-  // Hide welcome, show chat
   hideWelcome();
 
   appendMessage("user", text);
@@ -398,33 +476,36 @@ async function sendMessage() {
 
         if (payload.type === "chunk") {
           fullText += payload.text || "";
+          // Show plain text while streaming; markdown rendered on done
           bubble.innerHTML = textToHtml(fullText) + '<span class="typing-cursor">▋</span>';
           scrollToBottom();
 
         } else if (payload.type === "done") {
-          stopTimer();
-          bubble.innerHTML = textToHtml(fullText);
+          stopTimer(fullText);
+          // Fix 2: render final output as markdown
+          bubble.innerHTML = assistantToHtml(fullText);
           sessionId = payload.session_id || sessionId;
           scrollToBottom();
           await refreshSessions();
 
         } else if (payload.type === "error") {
-          stopTimer();
-          bubble.innerHTML = `<span style="color:#e53e3e">เกิดข้อผิดพลาด: ${escapeHtml(payload.message)}</span>`;
+          stopTimer(fullText);
+          // Fix 9: use CSS class instead of inline style
+          bubble.innerHTML = `<span class="error-text">เกิดข้อผิดพลาด: ${escapeHtml(payload.message)}</span>`;
         }
       }
     }
 
-    // If stream ended without a "done" event, remove cursor
     if (bubble.innerHTML.includes("typing-cursor")) {
-      stopTimer();
-      bubble.innerHTML = textToHtml(fullText);
+      stopTimer(fullText);
+      bubble.innerHTML = assistantToHtml(fullText);
     }
 
   } catch (err) {
-    stopTimer();
+    stopTimer(fullText);
     console.error("sendMessage error:", err);
-    bubble.innerHTML = `<span style="color:#e53e3e">เกิดข้อผิดพลาด: ${escapeHtml(err.message)}</span>`;
+    // Fix 9: use CSS class instead of inline style
+    bubble.innerHTML = `<span class="error-text">เกิดข้อผิดพลาด: ${escapeHtml(err.message)}</span>`;
   } finally {
     setInputLocked(false);
     messageInput.focus();
@@ -455,7 +536,6 @@ messageInput.addEventListener("keydown", (e) => {
 window.addEventListener("DOMContentLoaded", async () => {
   autoResize();
 
-  // Hide chat, show loading welcome
   showWelcome("กรุณารอสักครู่.....", "ระบบกำลังเตรียมพร้อม");
   chatMessages.style.display = "none";
 

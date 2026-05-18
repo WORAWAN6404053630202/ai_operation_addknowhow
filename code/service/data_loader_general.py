@@ -227,16 +227,24 @@ class GeneralDataLoader:
             if not page_content or len(page_content) < 30:
                 continue
 
+            # topic_group for retrieval scoping — maps data_type to broad category
+            _topic_group_map = {
+                "marketing": "การตลาด",
+                "business_guide": "คู่มือเปิดร้าน",
+            }
+
             # Use main_topic as operation_topic analogue so supervisor topic-picker works
             metadata = {
                 "row_id": int(idx),
                 "data_type": self.data_type,
+                "topic_group": _topic_group_map.get(self.data_type, "อื่นๆ"),
                 "source": source,
                 # Topic fields (used by topic-picker and retrieval display)
                 "operation_topic": sub_topic or main_topic,
                 "main_topic": main_topic,
                 "sub_topic": sub_topic,
                 "source_book": source_book,
+                "book_name": source_book,   # explicit alias — used by Chroma filter & boost
                 "content_type": content_type,
                 # Primary answer content
                 "answer_guideline": answer_guideline,

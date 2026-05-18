@@ -191,7 +191,7 @@ async def prometheus_metrics():
             lines.append(f"# HELP memory_usage_percent Memory usage percentage")
             lines.append(f"# TYPE memory_usage_percent gauge")
             lines.append(f"memory_usage_percent {system['memory']['percent']}")
-    except:
+    except Exception:
         pass
     
     return Response(
@@ -225,7 +225,7 @@ async def list_sessions():
                         'last_modified': os.path.getmtime(file),
                         'file_size': os.path.getsize(file)
                     })
-            except:
+            except Exception:
                 pass
         
         return {
