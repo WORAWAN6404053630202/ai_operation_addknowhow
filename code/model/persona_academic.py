@@ -16,8 +16,77 @@ from utils.query_synonyms import SYNONYM_PATTERNS
 
 _LOG = logging.getLogger("restbiz.academic")
 
+# Minimum Jaccard word-overlap for two queries to be considered the same topic.
+# Below this threshold, academic mode treats the new query as a topic change and re-retrieves.
+_QUERY_CHANGE_THRESHOLD = 0.30
+
 # Metadata fields with no semantic value for the LLM — always hidden from docs_json
 _LLM_HIDDEN_METADATA_KEYS = frozenset({"row_id", "source"})
+
+
+def _aggregate_non_reg_docs(
+    docs: List[Dict[str, Any]],
+    chars_per_item: int = 200,
+) -> List[Dict[str, Any]]:
+    """Combine non-regulatory docs that share the same sub_topic into one doc.
+
+    When a sub_topic has N > _MAX_DOCS_ACADEMIC rows (one per content_type),
+    the LLM would only see the first 12.  Aggregating into a single doc whose
+    'content' field is a numbered list of ALL content_types ensures the LLM can
+    correctly answer "มีทั้งหมดกี่แบบ" and enumerate every item.
+
+    Groups by sub_topic (fallback: main_topic).  Sub_topics with only 1 doc are
+    returned as-is.
+    """
+    from collections import OrderedDict as _OD
+    groups: "dict[str, list]" = _OD()
+    for d in docs:
+        md = d.get("metadata") or {}
+        key = str(md.get("sub_topic") or md.get("main_topic") or "").strip()
+        groups.setdefault(key, []).append(d)
+
+    result: List[Dict[str, Any]] = []
+    for st_key, st_docs in groups.items():
+        if len(st_docs) == 1:
+            result.append(st_docs[0])
+            continue
+
+        md0 = st_docs[0].get("metadata") or {}
+        items: list = []
+        refs: list = []
+        for i, sd in enumerate(st_docs, 1):
+            smd = sd.get("metadata") or {}
+            ct = str(smd.get("content_type") or "").strip()
+            ag = str(smd.get("answer_guideline") or "").strip()[:chars_per_item]
+            items.append(f"{i}. {ct}: {ag}" if ct else f"{i}. {ag}")
+            rr = str(smd.get("research_reference") or "").strip()
+            if rr and rr not in refs:
+                refs.append(rr)
+
+        combined_content = (
+            f"หัวข้อย่อย: {st_key}\n"
+            f"จำนวนประเภท: {len(st_docs)} ประเภท\n"
+            + "\n".join(items)
+        )[:3000]
+
+        combined_md = {
+            k: v for k, v in md0.items()
+            if v not in (None, "", "nan", "None") and str(v) not in ("nan", "None", "")
+        }
+        combined_md["answer_guideline"] = (
+            f"มีทั้งหมด {len(st_docs)} ประเภท: "
+            + ", ".join(
+                str((sd.get("metadata") or {}).get("content_type") or "").strip()
+                for sd in st_docs
+                if str((sd.get("metadata") or {}).get("content_type") or "").strip()
+            )
+        )[:1500]
+        if refs:
+            combined_md["research_reference"] = "\n".join(refs[:5])
+
+        result.append({"content": combined_content, "metadata": combined_md})
+
+    return result
 
 
 class AcademicPersonaService:
@@ -72,6 +141,7 @@ class AcademicPersonaService:
     def __init__(self, retriever):
         self.retriever = retriever
         self._cached_main_topics: Optional[List[str]] = None  # populated lazily, same pattern as supervisor
+        self._cached_sub_topics: Optional[List[str]] = None   # populated together with _cached_main_topics
         self._init_llm()
 
     def _init_llm(self):
@@ -316,15 +386,31 @@ class AcademicPersonaService:
                 _vstore_ac = getattr(self.retriever, "vectorstore", None)
                 _coll_ac = getattr(_vstore_ac, "_collection", None) if _vstore_ac else None
                 if _coll_ac is not None:
-                    # Use cached main_topics list — built once, not on every retrieval call
+                    # Use cached topic lists — built once per instance from a single Chroma get().
+                    # Both main_topics and sub_topics are populated together to avoid two full-scan calls.
                     if self._cached_main_topics is None:
                         _all_mt_res = _coll_ac.get(include=["metadatas"])
+                        _all_metas_cache = _all_mt_res.get("metadatas") or []
                         self._cached_main_topics = list({
                             (m.get("main_topic") or "").strip()
-                            for m in (_all_mt_res.get("metadatas") or [])
+                            for m in _all_metas_cache
                             if (m.get("main_topic") or "").strip() and len((m.get("main_topic") or "").strip()) >= 5
                         })
-                        _LOG.info("[Academic] cached %d distinct main_topics from store", len(self._cached_main_topics))
+                        # Only cache sub_topics from non-regulatory (marketing/business_guide) docs.
+                        # Regulatory docs also have sub_topic values (e.g. "บุคคลธรรมดา") but
+                        # those should NOT trigger sub_topic get() — we'd pull docs from ALL
+                        # license_types sharing that sub_topic, causing cross-topic contamination.
+                        self._cached_sub_topics = list({
+                            (m.get("sub_topic") or "").strip()
+                            for m in _all_metas_cache
+                            if (m.get("sub_topic") or "").strip()
+                            and len((m.get("sub_topic") or "").strip()) >= 8
+                            and str(m.get("data_type") or "").strip() in ("marketing", "business_guide")
+                        })
+                        _LOG.info(
+                            "[Academic] cached %d main_topics, %d sub_topics from store",
+                            len(self._cached_main_topics), len(self._cached_sub_topics),
+                        )
                     _q_lower_ac_ch = query.lower()
                     _matched_mts_ac = [mt for mt in self._cached_main_topics if mt.lower() in _q_lower_ac_ch]
                     if _matched_mts_ac:
@@ -346,6 +432,33 @@ class AcademicPersonaService:
                                 {"content": (c or "")[:max_chars], "metadata": m or {}}
                                 for c, m in _ch_docs_raw
                             ]
+                    # Sub_topic targeted retrieval: when the query specifically names a sub_topic
+                    # (e.g. "ประโยชน์ของการตลาดออนไลน์ต่อผู้ขาย"), return ALL docs for that sub_topic
+                    # via Chroma get() instead of semantic top-k.  Semantic search only returns
+                    # top-12 and may miss lower-ranked content_type rows — get() guarantees coverage.
+                    if self._cached_sub_topics:
+                        _matched_sts_ac = [
+                            st for st in self._cached_sub_topics if st.lower() in _q_lower_ac_ch
+                        ]
+                        if _matched_sts_ac:
+                            _target_st_ac = max(_matched_sts_ac, key=len)
+                            _st_ch_res = _coll_ac.get(
+                                where={"sub_topic": _target_st_ac},
+                                include=["documents", "metadatas"],
+                            )
+                            _st_docs_raw = list(zip(
+                                _st_ch_res.get("documents") or [],
+                                _st_ch_res.get("metadatas") or [],
+                            ))
+                            if _st_docs_raw:
+                                _LOG.info(
+                                    "[Academic] sub_topic retrieval: sub_topic=%r → %d docs (bypassing semantic search)",
+                                    _target_st_ac, len(_st_docs_raw),
+                                )
+                                return [
+                                    {"content": (c or "")[:max_chars], "metadata": m or {}}
+                                    for c, m in _st_docs_raw
+                                ]
             except Exception as _ch_ex:
                 _LOG.warning("[Academic] chapter retrieval failed (%s) — falling through to semantic search", _ch_ex)
 
@@ -356,7 +469,7 @@ class AcademicPersonaService:
                 _expansions_ac.append(_exp_ac)
         expanded_query = (query + " " + " ".join(_expansions_ac)).strip() if _expansions_ac else query
         if _expansions_ac:
-            _LOG.info("[Academic] query expanded: %r → %r", query[:50], expanded_query[:80])
+            _LOG.debug("[Academic] query expanded: %r → %r", query[:50], expanded_query[:80])
 
         _hybrid_ac = getattr(conf, "HYBRID_SEARCH_ENABLED", False)
         _rrf_k_ac = int(getattr(conf, "HYBRID_RRF_K", 60))
@@ -429,10 +542,34 @@ class AcademicPersonaService:
         _boosted_ac.sort(key=lambda x: x[1], reverse=True)
         docs = [_d for _d, _ in _boosted_ac]
         if _boosted_ac and any(_b[1] > float((_b[0].metadata or {}).get("_sim") or 0.5) for _b in _boosted_ac[:3]):
-            _LOG.info("[Academic] metadata boost applied — top doc: %r blend=%.3f",
+            _LOG.debug("[Academic] metadata boost applied — top doc: %r blend=%.3f",
                       str((docs[0].metadata if docs else {}).get("operation_topic") or
                           (docs[0].metadata if docs else {}).get("main_topic") or "?")[:60],
                       _boosted_ac[0][1] if _boosted_ac else 0.0)
+
+        # ── Similarity filter ─────────────────────────────────────────────────
+        # Mirror practical's sim_filter: drop docs below RETRIEVAL_MIN_SIMILARITY.
+        # BM25-only docs (_bm25_hit=True) bypass the threshold — same as practical.
+        # Fallback: if filter is too aggressive (< 2 docs pass), use top-N by blend.
+        _min_sim_ac = getattr(conf, "RETRIEVAL_MIN_SIMILARITY", 0.6)
+        _filtered_ac: list = []
+        _low_ac: list = []
+        for _d_f in docs:
+            _md_f_ac = getattr(_d_f, "metadata", {}) or {}
+            if _md_f_ac.get("_bm25_hit"):
+                _filtered_ac.append(_d_f)
+                continue
+            _score_ac = _md_f_ac.get("_sim")
+            if _score_ac is not None and float(_score_ac) >= _min_sim_ac:
+                _filtered_ac.append(_d_f)
+            elif _score_ac is not None:
+                _low_ac.append((_d_f, float(_score_ac)))
+        if len(_filtered_ac) < 2:
+            _filtered_ac = docs[:max_docs]
+            _LOG.warning("[Academic] sim_filter too aggressive — fallback top-%d docs (threshold=%.2f)", len(_filtered_ac), _min_sim_ac)
+        else:
+            _LOG.debug("[Academic] sim_filter: %d → %d docs (removed %d below %.2f)", len(docs), len(_filtered_ac), len(_low_ac), _min_sim_ac)
+        docs = _filtered_ac
 
         results: List[Dict[str, Any]] = []
         for d in (docs or [])[:max_docs]:
@@ -443,15 +580,14 @@ class AcademicPersonaService:
                 }
             )
 
-        # INFO-level doc visibility log (always visible in production)
-        _LOG.info("[Academic] _retrieve_docs query=%r → %d docs returned", query[:60], len(results))
+        _LOG.debug("[Academic] _retrieve_docs query=%r → %d docs returned", query[:60], len(results))
         for i, r in enumerate(results):
             md = r.get("metadata", {}) or {}
             topic = md.get("operation_topic") or md.get("topic") or md.get("filename") or "?"
             etype = md.get("entity_type_normalized") or md.get("entity_type") or ""
             section = md.get("section") or md.get("doc_type") or ""
             snippet = (r.get("content", "") or "")[:80].replace("\n", " ")
-            _LOG.info(
+            _LOG.debug(
                 "  [doc %d/%d] topic=%r entity=%r section=%r | %r",
                 i + 1, len(results), topic, etype, section, snippet,
             )
@@ -481,27 +617,45 @@ class AcademicPersonaService:
         #     state.current_docs, and
         # (b) even when fresh retrieval is forced, the embedding stays on the right topic.
         _META_REQUEST_RE = re.compile(
-            r"ขอแบบละเอียด|แบบละเอียดกว่า|รายละเอียดเพิ่ม|เพิ่มเติม$|^เพิ่ม|^ละเอียด"
+            r"ขอแบบละเอียด|ขอละเอียด|แบบละเอียดกว่า|รายละเอียดเพิ่ม|^เพิ่ม|^ละเอียด|ละเอียดๆ|ละเอียดขึ้น|ละเอียดหน่อย"
             r"|ขอรายละเอียด|ขยายความ|บอกให้ครบ|บอกทุกอย่าง|อยากรู้ครบ|ให้ครบ|ต้องการข้อมูลเพิ่ม"
+            r"|อธิบาย.*มากกว่า|อธิบาย.*เพิ่ม|อธิบายให้|มากกว่านี้|บอกเพิ่ม|มากกว่าเดิม"
+            r"|อยากรู้แบบละเอียด|อยากทราบแบบละเอียด|อยากรู้ให้ละเอียด|อยากทราบให้ละเอียด"
+            r"|(?:ข้อมูล|ขอ|มี|ข้อ)เพิ่มเติม$|^เพิ่มเติม$"
         )
         # Strip meta-words to check if there is a new topic remaining.
         # e.g. "ขยายความ" alone → no topic → substitute base query (old behavior)
         # e.g. "ขยายความส่วนประสมสินค้า ของกลยุทธ์ด้านผลิตภัณฑ์" → has topic → use q as-is
+        # "ขอช่องทางที่ 1 แบบอธิบายมากกว่านี้" → strip "ช่องทางที่ 1" + meta words → no topic → use base query
+        # NOTE: do NOT use อธิบาย.*? here — Thai has no spaces between words so the lazy
+        # quantifier strips everything after "อธิบาย" including real topic content.
+        # Instead, strip only the specific เสริม/ให้/เพิ่ม suffixes that are pure style markers.
         _META_WORD_STRIP_RE = re.compile(
             r'(ขอแบบละเอียด|แบบละเอียดกว่า|รายละเอียดเพิ่ม|ขอรายละเอียด|'
             r'ขยายความ|บอกให้ครบ|บอกทุกอย่าง|อยากรู้ครบ|ให้ครบ|ต้องการข้อมูลเพิ่ม|'
-            r'เพิ่มเติม|^เพิ่ม|^ละเอียด|กว่านี้|กว่าเดิม)',
+            r'เพิ่มเติม|^เพิ่ม|^ละเอียด|กว่านี้|กว่าเดิม|มากกว่านี้|มากกว่าเดิม|'
+            r'แบบอธิบาย|อธิบายให้|อธิบายเพิ่ม|บอกเพิ่ม|'
+            r'ช่องทางที่\s*\d+|วิธีที่\s*\d+|'
+            r'อยากรู้|อยากทราบ|ต้องการรู้|แบบละเอียด|ให้ละเอียด|'
+            r'หน่อยครับ|หน่อยค่ะ|หน่อยนะ|หน่อย|นะครับ|นะคะ|ครับ|ค่ะ)',
             re.IGNORECASE,
         )
         # Do not treat as a meta-request when the user specifies a concrete section —
         # e.g. "ขอรายละเอียดค่าธรรมเนียม" is a specific query, not a vague "tell me more".
+        # NOTE: "ช่องทางที่" (numbered channel reference) is excluded — it's a reference to a
+        # previous answer item, not a request to retrieve the "ช่องทาง" section specifically.
         _SPECIFIC_SECTION_RE = re.compile(
-            r"ค่าธรรมเนียม|เอกสาร|ขั้นตอน|ช่องทาง|ระยะเวลา|เงื่อนไข|กฎหมาย|บทลงโทษ|แบบฟอร์ม"
+            r"ค่าธรรมเนียม|เอกสาร|ขั้นตอน|ช่องทาง(?!ที่)|ระยะเวลา|เงื่อนไข|กฎหมาย|บทลงโทษ|แบบฟอร์ม"
         )
         if _META_REQUEST_RE.search(q) and not _SPECIFIC_SECTION_RE.search(q):
             _q_remaining = _META_WORD_STRIP_RE.sub('', q).strip()
-            # Only substitute base query when there is no meaningful topic left in the input
-            _has_new_topic = len(_q_remaining) >= 5
+            # Remove Thai politeness/filler particles that carry no topic content.
+            # Use \s boundary check since Thai words may not always have spaces around them.
+            _q_remaining = re.sub(r'(?<!\w)(ขอ|แบบ|ค่ะ|ครับ|นะ|หน่อย|นะคะ|นะครับ|ด้วย)(?!\w)', '', _q_remaining).strip()
+            # Has meaningful topic if there are ≥6 consecutive Thai characters — this identifies
+            # a real content word (e.g. "การจดทะเบียน", "ส่วนประสมสินค้า") as opposed to
+            # pure particles like "ขอ แบบ" (each ≤3 chars) which have no consecutive 6-char run.
+            _has_new_topic = bool(re.search(r'[฀-๿]{6,}', _q_remaining))
             if not _has_new_topic:
                 _ctx_lq = (state.context.get("last_user_legal_query") or "").strip()
                 _ctx_rq = (
@@ -514,6 +668,10 @@ class AcademicPersonaService:
                     q = _base
             else:
                 _LOG.info("[Academic] Meta-request %r has new topic %r — using input as-is", q[:40], _q_remaining[:40])
+                # New topic detected → discard preserved broad docs from previous turn.
+                # The fast-path at _broad_retrieval_docs check must not reuse old-topic docs.
+                state.context.pop("_broad_retrieval_docs", None)
+                state.context.pop("_broad_retrieval_query", None)
 
         # Enrich query with entity type if already known (from practical slot memory).
         # Skip enrichment when the query EXPLICITLY names a DIFFERENT entity type —
@@ -524,6 +682,7 @@ class AcademicPersonaService:
         _JURISTIC_ENTITY_RE = re.compile(r"นิติบุคคล|บริษัท|ห้างหุ้นส่วน", re.IGNORECASE)
         _query_says_natural = bool(_NATURAL_ENTITY_RE.search(q))
         _query_says_juristic = bool(_JURISTIC_ENTITY_RE.search(q))
+        _entity_switched_to: Optional[str] = None  # set when entity contradiction detected
         if hasattr(state, "get_collected_slots"):
             slots = state.get_collected_slots() or {}
             for k, v in slots.items():
@@ -537,15 +696,34 @@ class AcademicPersonaService:
                             "[Academic] Skipping entity enrichment %r — query explicitly says บุคคลธรรมดา",
                             sv,
                         )
+                        _entity_switched_to = "บุคคลธรรมดา"
                         break
                     if _slot_is_natural and _query_says_juristic and not _query_says_natural:
                         _LOG.info(
                             "[Academic] Skipping entity enrichment %r — query explicitly says นิติบุคคล",
                             sv,
                         )
+                        _entity_switched_to = "นิติบุคคล"
                         break
                     q = f"{q} {sv}"
                     break
+
+        # Persist entity switch to collected_slots so ALL subsequent turns (practical + academic)
+        # remember the new entity without needing to be told again.
+        if _entity_switched_to and hasattr(state, "save_collected_slot"):
+            try:
+                state.save_collected_slot("entity_type", _entity_switched_to)
+                state.save_collected_slot("entity_type_normalized", _entity_switched_to)
+                if _entity_switched_to == "บุคคลธรรมดา":
+                    # registration_type is a นิติบุคคล-specific sub-type — clear it so future
+                    # turns don't filter with a stale value that has no meaning for บุคคลธรรมดา.
+                    state.save_collected_slot("registration_type", "")
+                _LOG.info(
+                    "[Academic] Entity switch persisted to collected_slots: entity_type=%r",
+                    _entity_switched_to,
+                )
+            except Exception as _esc_e:
+                _LOG.debug("[Academic] Could not persist entity switch: %s", _esc_e)
 
         state.context["academic_question"] = q
 
@@ -608,7 +786,7 @@ class AcademicPersonaService:
             if not old_words:
                 return True
             overlap = len(old_words & new_words) / len(old_words | new_words)
-            changed = overlap < 0.30
+            changed = overlap < _QUERY_CHANGE_THRESHOLD
             if changed:
                 _LOG.info(
                     "[Academic] Query changed (overlap=%.0f%%) — will re-retrieve. old=%r new=%r",
@@ -735,6 +913,16 @@ class AcademicPersonaService:
                             )
                             if not _ENTITY_ENRICH_RE.search(sv):
                                 continue  # Skip non-entity registration_type values
+                            # When user explicitly switches entity to บุคคลธรรมดา, skip any
+                            # juristic registration_type (ห้างหุ้นส่วน/บริษัท) — it's stale.
+                            # บุคคลธรรมดา has no sub-types; enriching biases retrieval toward
+                            # นิติบุคคล docs and contaminates the section-filter step.
+                            if _query_says_natural and not _query_says_juristic:
+                                _LOG.info(
+                                    "[Academic] Skipping registration_type enrichment %r"
+                                    " — entity switch to บุคคลธรรมดา", sv[:30],
+                                )
+                                continue
                         if sv not in q:
                             _q_enrichments.append(sv)
                 # Use $or so shared docs (entity_type_normalized='') are always included
@@ -1341,7 +1529,10 @@ class AcademicPersonaService:
             if lt and lt.lower() not in ("nan", "none", ""):
                 return lt == selected_key
             st = str(md.get("sub_topic") or "").strip()
-            return st == selected_key
+            if st == selected_key:
+                return True
+            mt = str(md.get("main_topic") or "").strip()
+            return mt == selected_key
 
         filtered = [d for d in docs if _doc_matches(d)]
         _LOG.info(
@@ -1369,12 +1560,122 @@ class AcademicPersonaService:
         )
         # Use Chroma license_type filter for targeted re-retrieval — avoids getting 12 mixed docs
         # back from unfiltered vector search and then falling into the "re-filter gave 1 < 2" path.
-        # For non-regulatory topics (sub_topic key), license_type won't match → falls through to unfiltered.
+        # For non-regulatory topics (sub_topic key), license_type won't match → try sub_topic get().
         _lt_filter: Optional[Dict[str, Any]] = {"license_type": selected_key}
         fresh_docs = self._retrieve_docs(target_q, metadata_filter=_lt_filter)
+        if isinstance(state.context, dict):
+            state.context.pop("_academic_supplement_failed", None)
+
+        # Hash function for doc dedup: include registration_type + entity so docs with
+        # identical content but different entity sub-type (e.g. บริษัทจำกัด vs ห้างหุ้นส่วน
+        # sharing first 547 chars) are both preserved for diversity computation.
+        def _meta_hash(d: Dict) -> int:
+            _md = d.get("metadata") or {}
+            return hash(
+                (d.get("content") or "")[:200]
+                + str(_md.get("registration_type", ""))
+                + str(_md.get("entity_type_normalized", ""))
+            )
+
+        # Supplement with Chroma get() to guarantee ALL docs for this license_type are present.
+        # Semantic top-K may miss lower-ranked docs (e.g. the BKK new-application doc for
+        # ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร scores below ยกเลิก/แก้ไข for the broad query).
+        # Without completeness, in-memory location filtering later drops missing operation variants,
+        # causing the stale guard to incorrectly clear pre-inferred "ยื่นใหม่".
+        try:
+            _vstore_lt = getattr(self.retriever, "vectorstore", None)
+            _coll_lt = getattr(_vstore_lt, "_collection", None) if _vstore_lt else None
+            if _coll_lt is not None:
+                _get_lt_res = _coll_lt.get(
+                    where={"license_type": selected_key},
+                    include=["documents", "metadatas"],
+                )
+                _get_lt_raw = list(zip(
+                    _get_lt_res.get("documents") or [],
+                    _get_lt_res.get("metadatas") or [],
+                ))
+                if _get_lt_raw:
+                    _max_chars_lt = int(getattr(conf, "LLM_DOC_CHARS_ACADEMIC", 700) or 700)
+                    _get_lt_docs = [
+                        {"content": (c or "")[:_max_chars_lt], "metadata": m or {}}
+                        for c, m in _get_lt_raw
+                    ]
+                    if fresh_docs is None:
+                        fresh_docs = []
+                    _seen_lt = {_meta_hash(d) for d in fresh_docs}
+                    _added = 0
+                    for _gd in _get_lt_docs:
+                        _fp = _meta_hash(_gd)
+                        if _fp not in _seen_lt:
+                            fresh_docs.append(_gd)
+                            _seen_lt.add(_fp)
+                            _added += 1
+                    if _added:
+                        _LOG.info(
+                            "[Academic] Chroma get() added %d missing docs for license_type=%r (total=%d)",
+                            _added, selected_key, len(fresh_docs),
+                        )
+        except Exception as _e_lt_get:
+            _LOG.warning("[Academic] Chroma get() supplement failed for %r: %s", selected_key, _e_lt_get)
+            if isinstance(state.context, dict):
+                state.context["_academic_supplement_failed"] = True
+
+        # If no doc from fresh_docs actually carries license_type=selected_key, the filter failed
+        # internally (fell back to unfiltered). For non-regulatory chapter topics, the key is
+        # main_topic not license_type — retry with main_topic filter to get topic-pure docs.
+        if fresh_docs and not any(
+            str((d.get("metadata") or {}).get("license_type") or "").strip() == selected_key
+            for d in fresh_docs
+        ):
+            try:
+                _mt_fresh = self._retrieve_docs(target_q, metadata_filter={"main_topic": selected_key})
+                if any(
+                    str((d.get("metadata") or {}).get("main_topic") or "").strip() == selected_key
+                    for d in _mt_fresh
+                ):
+                    fresh_docs = _mt_fresh
+                    _LOG.info(
+                        "[Academic] Targeted re-retrieval: using main_topic=%r filter (%d docs)",
+                        selected_key, len(fresh_docs),
+                    )
+            except Exception as _e_mt:
+                _LOG.warning("[Academic] main_topic filter fallback failed (%s)", _e_mt)
         if not fresh_docs:
-            # Fallback: try unfiltered (e.g. selected_key is sub_topic, not license_type)
-            _LOG.info("[Academic] Targeted re-retrieval: license_type filter returned 0, retrying unfiltered")
+            # Intermediate fallback: try Chroma get() by sub_topic — for marketing/business-guide
+            # docs where the menu key is stored as sub_topic not license_type.
+            # Using get() (not search) ensures ALL docs for this sub_topic are returned,
+            # not just the top-k from semantic ranking (which may miss lower-ranked benefits).
+            try:
+                _vstore_ac_st = getattr(self.retriever, "vectorstore", None)
+                _coll_ac_st = getattr(_vstore_ac_st, "_collection", None) if _vstore_ac_st else None
+                if _coll_ac_st is not None:
+                    _st_res_ac = _coll_ac_st.get(
+                        where={"sub_topic": selected_key},
+                        include=["documents", "metadatas"],
+                    )
+                    _st_docs_ac = list(zip(
+                        _st_res_ac.get("documents") or [],
+                        _st_res_ac.get("metadatas") or [],
+                    ))
+                    if _st_docs_ac:
+                        _doc_chars_ac = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700) or 700)
+                        _st_fresh: List[Dict[str, Any]] = []
+                        for _fc_ac, _fm_ac in _st_docs_ac:
+                            _slim_ac: Dict = {
+                                k: str(v) for k, v in (_fm_ac or {}).items()
+                                if v not in (None, "", "nan", "None") and str(v) not in ("nan", "None", "")
+                            }
+                            _st_fresh.append({"content": (_fc_ac or "")[:_doc_chars_ac], "metadata": _slim_ac})
+                        fresh_docs = _st_fresh
+                        _LOG.info(
+                            "[Academic] Targeted re-retrieval: sub_topic get() returned %d docs for %r",
+                            len(fresh_docs), selected_key,
+                        )
+            except Exception as _e_st_ac:
+                _LOG.warning("[Academic] sub_topic get() fallback failed (%s)", _e_st_ac)
+        if not fresh_docs:
+            # Final fallback: unfiltered semantic search
+            _LOG.info("[Academic] Targeted re-retrieval: both filters returned 0, retrying unfiltered")
             fresh_docs = self._retrieve_docs(target_q)
         if fresh_docs:
             # After topic-specific retrieval, Chroma may still return docs from other topics
@@ -1394,10 +1695,13 @@ class AcademicPersonaService:
             if len(_fresh_matched) >= 2:
                 # Good: enough topic-matched docs from fresh retrieval — use only those.
                 # Merge with any broad-filtered docs not already present.
-                _seen_fps = {hash(d.get("content", "")[:80]) for d in _fresh_matched}
+                # Include registration_type in hash so docs with same content prefix but
+                # different entity sub-type (e.g. บริษัทจำกัด vs ห้างหุ้นส่วน sharing
+                # first 547 chars) are both preserved for diversity computation.
+                _seen_fps = {_meta_hash(d) for d in _fresh_matched}
                 merged = list(_fresh_matched)
                 for d in filtered:
-                    fp = hash(d.get("content", "")[:80])
+                    fp = _meta_hash(d)
                     if fp not in _seen_fps:
                         merged.append(d)
                         _seen_fps.add(fp)
@@ -1407,20 +1711,45 @@ class AcademicPersonaService:
                     len(filtered), len(fresh_docs) - len(_fresh_matched),
                 )
             else:
-                # Re-filter yielded < 2 docs (menu key ≠ license_type, e.g. VAT).
-                # Use ALL fresh_docs — the topic-specific query already biases ranking.
-                _seen_fps = {hash(d.get("content", "")[:80]) for d in fresh_docs}
-                merged = list(fresh_docs)
-                for d in filtered:
-                    fp = hash(d.get("content", "")[:80])
-                    if fp not in _seen_fps:
-                        merged.append(d)
-                        _seen_fps.add(fp)
-                filtered = merged
-                _LOG.info(
-                    "[Academic] Targeted re-retrieval: using all %d fresh docs (re-filter gave %d < 2)",
-                    len(filtered), len(_fresh_matched),
+                # Re-filter yielded < 2 docs from fresh_docs.
+                #
+                # For non-regulatory topics (marketing/business_guide), 'filtered' was built
+                # from a sub_topic chapter get() in _retrieve_docs and is already topic-pure.
+                # fresh_docs arrived via the unfiltered-semantic fallback inside _retrieve_docs
+                # (license_type filter returned 0 → semantic returned 12 mixed docs).
+                # Using fresh_docs would pollute state.current_docs with off-topic content
+                # whose page_content contains research_reference URLs → LLM copies them.
+                # Solution: when filtered is non-regulatory + ≥2 docs, keep it as-is.
+                #
+                # For regulatory topics (e.g. VAT where key is sub_topic ≠ license_type),
+                # filtered is typically small (1-2 docs from broad semantic) and fresh_docs
+                # (biased by topic-specific query) may have more useful docs → keep original
+                # all-fresh-docs fallback.
+                _filtered_is_non_reg = bool(filtered) and all(
+                    not str((d.get("metadata") or {}).get("license_type") or "").strip()
+                    for d in filtered
                 )
+                if _filtered_is_non_reg and len(filtered) >= 2:
+                    _LOG.info(
+                        "[Academic] Targeted re-retrieval: non-reg sub_topic — keeping %d topic-pure filtered docs "
+                        "(fresh_matched=%d < 2, would have mixed off-topic content)",
+                        len(filtered), len(_fresh_matched),
+                    )
+                    # filtered remains unchanged
+                else:
+                    # Original fallback for regulatory topics (VAT, etc.)
+                    _seen_fps = {_meta_hash(d) for d in fresh_docs}
+                    merged = list(fresh_docs)
+                    for d in filtered:
+                        fp = _meta_hash(d)
+                        if fp not in _seen_fps:
+                            merged.append(d)
+                            _seen_fps.add(fp)
+                    filtered = merged
+                    _LOG.info(
+                        "[Academic] Targeted re-retrieval: using all %d fresh docs (re-filter gave %d < 2)",
+                        len(filtered), len(_fresh_matched),
+                    )
             state.current_docs = filtered
         elif filtered:
             # Re-retrieval returned nothing — use original broad-filtered docs
@@ -1433,6 +1762,26 @@ class AcademicPersonaService:
             # Both empty — keep all docs (defensive fallback)
             state.current_docs = docs
             _LOG.info("[Academic] Both filtered and targeted retrieval empty — keeping all %d docs", len(docs))
+
+        # Post-filter: exclude docs for the opposite entity type.
+        # Broad supervisor retrieval is unfiltered → may include both นิติบุคคล and บุคคลธรรมดา docs.
+        # When entity_type is known, keep only entity-matching + entity-neutral docs.
+        _known_entity = (
+            (state.get_collected_slots() if hasattr(state, "get_collected_slots") else {}).get("entity_type")
+            or ""
+        ).strip()
+        if _known_entity and state.current_docs:
+            _opposite_entity = "บุคคลธรรมดา" if _known_entity == "นิติบุคคล" else "นิติบุคคล"
+            _pre_entity_filter = len(state.current_docs)
+            state.current_docs = [
+                d for d in state.current_docs
+                if str((d.get("metadata") or {}).get("entity_type_normalized") or "").strip() != _opposite_entity
+            ]
+            if len(state.current_docs) < _pre_entity_filter:
+                _LOG.info(
+                    "[Academic] Post-entity-filter: removed %d %r docs (keeping %d)",
+                    _pre_entity_filter - len(state.current_docs), _opposite_entity, len(state.current_docs),
+                )
 
         # Record selected topic and update remaining list for auto-return followup
         catalog = state.context.get("academic_topic_catalog") or []
@@ -1465,7 +1814,7 @@ class AcademicPersonaService:
             if not fresh:
                 fresh = self._retrieve_docs(target_q)
             for d in (fresh or []):
-                fp = hash((d.get("content") or "")[:80])
+                fp = hash((d.get("content") or "")[:200])
                 if fp not in seen_fps:
                     all_docs.append(d)
                     seen_fps.add(fp)
@@ -1476,7 +1825,7 @@ class AcademicPersonaService:
             lt = str(md.get("license_type") or "").strip()
             st = str(md.get("sub_topic") or "").strip()
             if lt in selected_keys or st in selected_keys:
-                fp = hash((d.get("content") or "")[:80])
+                fp = hash((d.get("content") or "")[:200])
                 if fp not in seen_fps:
                     all_docs.append(d)
                     seen_fps.add(fp)
@@ -1525,6 +1874,10 @@ class AcademicPersonaService:
         "operation_by_department": frozenset({
             "operation_group", "operation_type", "operation_action", "operation_by_department",
         }),
+        # department = the issuing agency or bank (e.g. ธนาคารไทยพาณิชย์ vs ธนาคารกสิกรไทย).
+        # Only has multiple values for ระบบชำระเงินออนไลน์ (QR PAYMENT) — other license types
+        # have a single department so this produces a single-value field → dropped by Fix4b.
+        "department": frozenset({"department"}),
     }
 
     def _compute_diversity_from_docs(
@@ -1621,6 +1974,23 @@ class AcademicPersonaService:
             elif not any(_ENTITY_KW_RE.search(v) for v in _rt_vals):
                 # None of the values look like entity types → sub-topic descriptors, not useful to ask.
                 # e.g. "ประโยชน์ทดแทนที่ได้รับ" / "แยกยื่น/ยื่นรวม" for ทะเบียนผู้ประกันตน.
+                # But first: check if these values encode area_size options (มากกว่า/น้อยกว่า 200 ตรม).
+                # This happens for ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร whose registration_type contains
+                # "ร้านที่มีพื้นที่ร้านค้า • มากกว่า 200 ตรม • น้อยกว่า 200 ตรม" — no entity keywords
+                # but carries area_size diversity that should be asked, not lost.
+                _area_choices_pre: set = set()
+                for _v_pre in _rt_vals:
+                    if re.search(r"มากกว่า|> ?200|เกิน\s*200", _v_pre, re.IGNORECASE):
+                        _area_choices_pre.add("มากกว่า 200 ตารางเมตร")
+                    if re.search(r"น้อยกว่า|< ?200|ไม่เกิน\s*200", _v_pre, re.IGNORECASE):
+                        _area_choices_pre.add("น้อยกว่า 200 ตารางเมตร")
+                _area_known_pre = {"area_size", "shop_area_type"} & set(known_slots.keys())
+                if len(_area_choices_pre) >= 2 and not _area_known_pre and "area_size" not in result:
+                    result["area_size"] = sorted(_area_choices_pre)
+                    _LOG.info(
+                        "[Academic] Extracted area_size from registration_type (pre-drop): %s",
+                        sorted(_area_choices_pre),
+                    )
                 del result["registration_type"]
                 _LOG.info(
                     "[Academic] Dropped registration_type — no entity-type keywords in values: %s",
@@ -1635,11 +2005,37 @@ class AcademicPersonaService:
                 v for v in result["registration_type"]
                 if not _AREA_KEYWORDS_RE.search(v) and len(v) <= 40
             }
-            # Only merge when _reg_vals contains actual นิติบุคคล sub-types
-            # (e.g. บริษัทจำกัด, ห้างหุ้นส่วนจำกัด) — NOT บุคคลธรรมดา variants.
-            # If only บุคคลธรรมดา variants remain after filtering, skip the merge and
-            # keep entity_type_normalized as-is (บุคคลธรรมดา vs นิติบุคคล).
-            _juristic_reg_vals = {v for v in _reg_vals if "บุคคลธรรมดา" not in v}
+            _COMPOUND_NUM_RE = re.compile(r"^\d+\.")
+            _expanded_reg_vals: set = set()
+            for _rv in _reg_vals:
+                if _COMPOUND_NUM_RE.search(_rv):
+                    _parts = re.split(r"\s*\d+\.", _rv)
+                    _expanded_reg_vals.update(p.strip() for p in _parts if p.strip())
+                else:
+                    _expanded_reg_vals.add(_rv)
+            _juristic_reg_vals = {
+                v for v in _expanded_reg_vals
+                if "บุคคลธรรมดา" not in v
+                and v not in _entity_vals
+                and not ("และ" in v and any(ek in v for ek in ["บริษัท", "ห้างหุ้นส่วน", "นิติบุคคล"]))
+                and _ENTITY_KW_RE.search(v)  # only genuine entity sub-types, not op descriptors
+            }
+            # Promote op descriptors excluded from juristic merge to operation_by_department
+            _op_descriptor_merge = {
+                v for v in _expanded_reg_vals
+                if "บุคคลธรรมดา" not in v
+                and v not in _entity_vals
+                and not ("และ" in v and any(ek in v for ek in ["บริษัท", "ห้างหุ้นส่วน", "นิติบุคคล"]))
+                and not _ENTITY_KW_RE.search(v)
+            }
+            if _op_descriptor_merge:
+                _op_equiv_merge = frozenset({"operation_group", "operation_type", "operation_action", "operation_by_department"})
+                if "operation_by_department" not in result and not (_op_equiv_merge & set(known_slots.keys())):
+                    result["operation_by_department"] = sorted(_op_descriptor_merge)
+                    _LOG.info(
+                        "[Academic] Promoted op descriptors from registration_type (merge block) → operation_by_department: %s",
+                        sorted(_op_descriptor_merge),
+                    )
             if _juristic_reg_vals:
                 # Drop the broad "นิติบุคคล" label — it's replaced by its specific sub-types.
                 # Keep "บุคคลธรรมดา" since it has no sub-types.
@@ -1676,7 +2072,35 @@ class AcademicPersonaService:
             _reg_clean = [v for v in _reg_remaining if not _AREA_KEYWORDS_RE.search(v) and len(v) <= 40]
             _juristic_remaining = [v for v in _reg_clean if "บุคคลธรรมดา" not in v]
             if _juristic_remaining:
-                result["registration_type"] = sorted(_juristic_remaining)
+                # Separate genuine entity sub-types (บริษัทจำกัด, ห้างหุ้นส่วน) from operation-phase
+                # descriptors (ระหว่างการใช้งาน, ระหว่างดำเนินการ) that leaked into registration_type.
+                # Entity is already known here (general cleanup only runs when entity NOT in result).
+                # Operation descriptors should be asked as operation_by_department, not entity sub-type.
+                _genuine_entity_rt = [v for v in _juristic_remaining if _ENTITY_KW_RE.search(v)]
+                _op_descriptor_rt = [v for v in _juristic_remaining if not _ENTITY_KW_RE.search(v)]
+                if _op_descriptor_rt:
+                    # Promote operation descriptors to operation_by_department (if not already known).
+                    _op_equiv_rt = frozenset({"operation_group", "operation_type", "operation_action", "operation_by_department"})
+                    if "operation_by_department" not in result and not (_op_equiv_rt & set(known_slots.keys())):
+                        result["operation_by_department"] = sorted(_op_descriptor_rt)
+                        _LOG.info(
+                            "[Academic] Promoted operation descriptors from registration_type → operation_by_department: %s",
+                            sorted(_op_descriptor_rt),
+                        )
+                    # Keep only genuine entity sub-types in registration_type (drop op descriptors).
+                    # If _genuine_entity_rt has ≥2 values (บริษัทจำกัด/ห้างหุ้นส่วน), they're still asked.
+                    # If only 1 entity label remains (e.g. "นิติบุคคล" which is already known),
+                    # Fix4b will drop the single-value field automatically.
+                    if _genuine_entity_rt:
+                        result["registration_type"] = sorted(_genuine_entity_rt)
+                    else:
+                        del result["registration_type"]
+                    _LOG.info(
+                        "[Academic] registration_type split: entity_rt=%s op_rt=%s",
+                        sorted(_genuine_entity_rt), sorted(_op_descriptor_rt),
+                    )
+                else:
+                    result["registration_type"] = sorted(_juristic_remaining)
             else:
                 # No juristic sub-types — extract area_size if found
                 _area_choices2: set = set()
@@ -1766,6 +2190,12 @@ class AcademicPersonaService:
 6. กฎรวม sub-types: ถ้า entity_type_normalized มีทั้ง "บุคคลธรรมดา" และ registration sub-types
    ให้รวม sub-types ทั้งหมดเป็น choices เดียวโดยตรง ห้ามถามสองชั้น
 7. ถ้าคำถาม user เฉพาะเจาะจงพอแล้ว หรือ fields ทั้งหมดอยู่ใน known_slots แล้ว → return slots: []
+8. operation_by_department — การตรวจจับ intent "ยื่นใหม่":
+   ถ้าคำถาม user มีคำบ่งชี้การ "ขอใหม่/จดใหม่" ชัดเจน ได้แก่:
+   • จด / ขอจด / จดทะเบียน / จดใบ / อยากจด / ต้องการจด / จะจด
+   • สมัครใหม่ / ยื่นขอ / ขอใบ / ขออนุญาต / เปิดร้าน / เริ่มกิจการ
+   และคำถาม user ไม่มีคำว่า แก้ไข / ยกเลิก / เปลี่ยนแปลง / ต่ออายุ / ชำรุด / สูญหาย
+   → ถือว่า operation_by_department ชัดเจนแล้วว่าเป็น "ยื่นใหม่" ห้ามถามซ้ำ ไม่ต้องใส่ใน slots
 
 ตอบ JSON เท่านั้น:
 {{"slots": [{{"key": "entity_type_normalized", "question": "ร้านของคุณเปิดในนามอะไรครับ?", "choices": ["บุคคลธรรมดา", "บริษัทจำกัด", "ห้างหุ้นส่วนจำกัด"]}}]}}"""
@@ -1840,13 +2270,18 @@ class AcademicPersonaService:
         if isinstance(_ac_slots_pre, dict) and _ac_slots_pre:
             known_slots = {**known_slots, **_ac_slots_pre}
 
-        # Stale entity guard: if the ORIGINAL user query explicitly names an entity type
-        # that contradicts the entity_type in known_slots (stale from previous topic),
-        # remove the stale entity so the diversity check asks the correct question.
-        # e.g. known entity='นิติบุคคล' but user asks "ประเภทบุคคลธรรมดา" → remove stale.
-        # Use the PRE-enrichment query (last_user_legal_query) to avoid false positives
-        # from slot-enriched academic_question (which already has the stale entity appended).
-        _original_user_q = (state.context or {}).get("last_user_legal_query") or user_q
+        # Stale entity guard: if the CURRENT user query explicitly names an entity type
+        # that contradicts entity_type in known_slots, remove the stale entity so the
+        # diversity check asks the correct question and the answer covers the right entity.
+        # e.g. prior session had entity='นิติบุคคล'; user now says "ขอแบบบุคคลธรรมดา".
+        #
+        # Use `user_q` (= academic_question, set PRE-enrichment) as primary source.
+        # last_user_legal_query may be from a PRIOR turn (e.g. the original topic question
+        # without the entity clarification) — using it first caused the guard to miss cases
+        # where the entity switch was only stated in the current follow-up message.
+        # academic_question is safe: entity enrichment is already skipped in the contradiction
+        # case, so it never carries the stale entity when the user switches entity.
+        _original_user_q = user_q or (state.context or {}).get("last_user_legal_query") or ""
         _NATURAL_STALE_RE = re.compile(r"บุคคลธรรมดา", re.IGNORECASE)
         _JURISTIC_STALE_RE = re.compile(r"นิติบุคคล|บริษัท|ห้างหุ้นส่วน", re.IGNORECASE)
         _orig_says_natural = bool(_NATURAL_STALE_RE.search(_original_user_q))
@@ -1857,23 +2292,50 @@ class AcademicPersonaService:
             _ke_is_natural = _known_entity == "บุคคลธรรมดา"
             if (_ke_is_juristic and _orig_says_natural and not _orig_says_juristic) or \
                (_ke_is_natural and _orig_says_juristic and not _orig_says_natural):
-                known_slots = {k: v for k, v in known_slots.items()
-                               if k not in ("entity_type", "entity_type_normalized")}
+                _new_entity_label = "บุคคลธรรมดา" if _orig_says_natural else "นิติบุคคล"
+                # Clear entity + registration_type from local known_slots.
+                # registration_type is entity-specific (นิติบุคคล sub-types don't apply to
+                # บุคคลธรรมดา) — keeping it would bias diversity and the answer header.
+                _stale_keys = frozenset({"entity_type", "entity_type_normalized", "registration_type"})
+                known_slots = {k: v for k, v in known_slots.items() if k not in _stale_keys}
+                # Also purge from academic_slots so _build_final_prompt doesn't emit the
+                # wrong "📌 กรณีของคุณ: นิติบุคคล (ห้างหุ้นส่วนจำกัด)" header.
+                _ac_stale = ctx.get("academic_slots") or {}
+                if isinstance(_ac_stale, dict) and any(k in _ac_stale for k in _stale_keys):
+                    ctx["academic_slots"] = {k: v for k, v in _ac_stale.items() if k not in _stale_keys}
+                    state.context = ctx
                 _LOG.info(
-                    "[Academic] Stale entity %r cleared from known_slots — query says %s",
-                    _known_entity,
-                    "บุคคลธรรมดา" if _orig_says_natural else "นิติบุคคล",
+                    "[Academic] Stale entity %r + registration_type cleared from known_slots"
+                    " + academic_slots — query says %s",
+                    _known_entity, _new_entity_label,
                 )
 
         # Pre-infer operation_by_department from user question when intent is unambiguously "new".
-        # "อยากเปิดร้าน / จะเปิดร้าน / ตั้งร้าน / เริ่มกิจการ / จดใหม่" → operation = ยื่นใหม่
-        # Prevents the slot question from showing irrelevant "ต่ออายุ / แก้ไข" options.
+        # Also checks last_user_legal_query for conversation history that implies new registration.
         _NEW_OP_RE = re.compile(
-            r"(เปิดร้าน|จะเปิด|อยากเปิด|ตั้งร้าน|เริ่มกิจการ|จดใหม่|ยื่นใหม่|ขอใหม่|สมัครใหม่|เริ่มต้น)", re.IGNORECASE
+            r"(เปิดร้าน|จะเปิด|อยากเปิด|ตั้งร้าน|เริ่มกิจการ|จดใหม่|ยื่นใหม่|ขอใหม่|สมัครใหม่|เริ่มต้น"
+            r"|ต้องการขอ|อยากขอ|จะขอ|ต้องการสมัคร|อยากสมัคร|จะสมัคร|ต้องการเปิด|อยากได้ใบ"
+            r"|ขอใบอนุญาต|ขอจดทะเบียน|จดใบทะเบียน|ขอใบทะเบียน|ขอทะเบียน|ยื่นขอ|ยื่นคำขอ)",
+            re.IGNORECASE,
         )
-        if _NEW_OP_RE.search(user_q) and "operation_by_department" not in known_slots:
+        _new_op_match_src = ""
+        if _NEW_OP_RE.search(user_q):
+            _new_op_match_src = "academic_question"
+        elif _NEW_OP_RE.search(_original_user_q):
+            _new_op_match_src = "last_user_legal_query"
+        # Also check recent conversation messages for opening-intent context
+        if not _new_op_match_src:
+            _recent_msgs = [
+                m.get("content", "") for m in (getattr(state, "messages", None) or [])[-6:]
+                if isinstance(m, dict) and m.get("role") == "user"
+            ]
+            for _msg_txt in _recent_msgs:
+                if _NEW_OP_RE.search(_msg_txt or ""):
+                    _new_op_match_src = "conversation_history"
+                    break
+        if _new_op_match_src and "operation_by_department" not in known_slots:
             known_slots = {**known_slots, "operation_by_department": "ยื่นใหม่"}
-            _LOG.info("[Academic] Pre-inferred operation_by_department='ยื่นใหม่' from question context")
+            _LOG.info("[Academic] Pre-inferred operation_by_department='ยื่นใหม่' from %s", _new_op_match_src)
             # Persist to academic_slots so _filter_docs_by_inferred_operation can read it later.
             # Without this, the filter function always sees empty operation_by_department and
             # skips filtering entirely — causing ต่ออายุ/แก้ไข/ยกเลิก docs to leak into the answer.
@@ -1912,21 +2374,49 @@ class AcademicPersonaService:
         # Fix: if the stored operation value doesn't match any operation_by_department in current
         # docs, remove it from the local known_slots view so the diversity check runs fresh.
         _OP_EQUIV_KEYS = {"operation_group", "operation_type", "operation_action", "operation_by_department"}
-        _op_stored_val = next(
-            (known_slots[k] for k in _OP_EQUIV_KEYS if k in known_slots), None
+        # Prefer 'operation_by_department' (user's explicit Academic slot answer) over equivalent
+        # keys like 'operation_group' (carried over from practical session).
+        # Without priority: frozenset iteration is non-deterministic — when both keys exist,
+        # next() may pick operation_group (stale practical value), clear ALL _OP_EQUIV_KEYS,
+        # and wipe the freshly-saved operation_by_department → slots LLM re-asks the same question.
+        _OP_PRIORITY = "operation_by_department"
+        _op_stored_key = (
+            _OP_PRIORITY if _OP_PRIORITY in known_slots
+            else next((k for k in _OP_EQUIV_KEYS if k in known_slots), None)
         )
+        _op_stored_val = known_slots.get(_op_stored_key) if _op_stored_key else None
         if _op_stored_val:
             _doc_ops = {
                 str((d.get("metadata") or {}).get("operation_by_department") or "").strip()
                 for d in _diversity_docs
             } - {"", "nan", "None"}
             _op_val_lower = _op_stored_val.lower()
+            # "ยื่นใหม่" is a synthetic sentinel set by the pre-inference logic above to mean
+            # "new application/filing".  Real docs store the full phrase ("การยื่นใบอนุญาต..."),
+            # so an exact/substring match fails.  Match via the root verb "ยื่น" instead so the
+            # stale guard never clears a freshly pre-inferred operation for the current topic.
+            # Each synthetic sentinel maps to a list of root verbs that can appear in
+            # real Chroma operation values.  "ยื่นใหม่" matches not only "ยื่น" (ยื่นใบอนุญาต)
+            # but also "จดทะเบียน" (การจดทะเบียนพาณิชย์) and "ขอ" (ขอใบอนุญาต) which are
+            # all "new application" verbs stored differently per license_type.
+            _SYNTHETIC_OP_ROOTS: Dict[str, List[str]] = {
+                "ยื่นใหม่": ["ยื่น", "จดทะเบียน", "ขอ"],
+                "ขอใหม่": ["ขอ", "จดทะเบียน", "ยื่น"],
+            }
+            _op_roots = _SYNTHETIC_OP_ROOTS.get(_op_stored_val, [])
+            if isinstance(_op_roots, str):
+                _op_roots = [_op_roots]
             _op_matches_docs = any(
-                _op_val_lower in dop.lower() or dop.lower() in _op_val_lower
+                _op_val_lower in dop.lower()
+                or dop.lower() in _op_val_lower
+                or any(r in dop.lower() for r in _op_roots if r)
                 for dop in _doc_ops
             )
             if not _op_matches_docs and len(_doc_ops) >= 2:
-                known_slots = {k: v for k, v in known_slots.items() if k not in _OP_EQUIV_KEYS}
+                # Clear only the specific stale key, not all _OP_EQUIV_KEYS.
+                # Clearing all would also erase operation_by_department when only
+                # operation_group (from prior practical session) is the stale one.
+                known_slots = {k: v for k, v in known_slots.items() if k != _op_stored_key}
                 _LOG.info(
                     "[Academic] Stale operation_group=%r cleared from known_slots — "
                     "does not match any doc operation_by_department: %s",
@@ -2024,6 +2514,21 @@ class AcademicPersonaService:
                     )
                 )
             ]
+            # registration_type disambiguation: query mentions "ห้างหุ้นส่วน" but not "บริษัท"
+            # → exclude compound options like "ห้างหุ้นส่วนและบริษัท" to isolate the real match.
+            if _field == "registration_type" and len(_matched) != 1:
+                _RT_KWS = ["ห้างหุ้นส่วน", "บริษัท", "บุคคลธรรมดา"]
+                _kws_in_q = [kw for kw in _RT_KWS if kw in _q_nospace]
+                if _kws_in_q:
+                    _rt_cands = [
+                        v for v in diversity_data[_field]
+                        if v
+                        and any(kw in v.lower().replace(" ", "") for kw in _kws_in_q)
+                        and not any(kw in v.lower().replace(" ", "") for kw in _RT_KWS if kw not in _kws_in_q)
+                    ]
+                    if len(_rt_cands) == 1:
+                        _matched = _rt_cands
+                        _LOG.debug("[Academic] registration_type kw-disambiguation: %r", _rt_cands[0])
             if len(_matched) == 1:
                 _match_val = _matched[0]
                 known_slots = {**known_slots, _field: _match_val}
@@ -2156,11 +2661,24 @@ class AcademicPersonaService:
                 _LOG.info("[Academic] No slots needed (all known or question is specific)")
             return ""
 
-        # Build message (pass state so choice_map gets stored for label resolution)
-        msg = self._render_slot_message(needed, state=state)
+        # One slot per turn: ask only the first slot, store the rest in a queue.
+        # The awaiting_slots handler pops from this queue after each answer.
+        if len(needed) > 1:
+            ctx["academic_pending_slots"] = needed[1:]
+            _LOG.info(
+                "[Academic] One-at-a-time: queuing %d remaining slots after showing first (%s)",
+                len(needed) - 1,
+                [s.get("key") for s in needed[1:]],
+            )
+        else:
+            ctx["academic_pending_slots"] = []
+        state.context = ctx
 
-        # Store slot keys for later context enrichment
-        state.context["dynamic_slot_keys"] = [s.get("key") for s in needed if s.get("key")]
+        # Build message for only the first slot
+        msg = self._render_slot_message(needed[:1], state=state)
+
+        # Store slot keys for later context enrichment (only the currently-shown slot)
+        state.context["dynamic_slot_keys"] = [s.get("key") for s in needed[:1] if s.get("key")]
         state.context["pending_options"] = {}
         state.context["pending_question"] = ""
         self._set_flow(state, stage="awaiting_slots")
@@ -2210,7 +2728,7 @@ class AcademicPersonaService:
                     break
                 label = labels[i]
                 per_map = slot_choice_maps.get(key, {})
-                val = per_map.get(label) or per_map.get(label.lower()) or choice_map.get(label) or label
+                val = per_map.get(label) or per_map.get(label.lower()) or choice_map.get(label) or None
                 if val:
                     # Special handling for entity_type_normalized when choices were merged with
                     # registration sub-types (from _compute_diversity_from_docs merge logic).
@@ -2259,16 +2777,30 @@ class AcademicPersonaService:
                 if _fb_key in _assigned_by_label:
                     continue  # already handled by label path
                 _fb_map = slot_choice_maps.get(_fb_key, {})
-                _fb_vals = [v for k, v in _fb_map.items() if len(k) > 1]  # skip single-char labels
+                # Include ALL option values regardless of key length.
+                # ก/ข/ค/ง keys have len=1 — the old `len(k) > 1` filter made _fb_vals always empty,
+                # so users typing the full option text (e.g. "ระหว่างการใช้งาน") were never matched.
+                _fb_vals = list({v for k, v in _fb_map.items() if v})
                 _matched: list = []
-                for _tok in _raw_tokens:
-                    _tok = _tok.strip()
-                    if not _tok or len(_tok) < 2:
+                _raw_lower = raw.lower()
+                # Full-value substring match first: handles multi-word Thai phrases like
+                # "ระหว่างการใช้งาน QR PAYMENT" where token splitting loses phrase context.
+                for _v in sorted(_fb_vals, key=len, reverse=True):
+                    if not _v or len(_v) < 3:
                         continue
-                    for _v in _fb_vals:
-                        if _tok in _v or _v in _tok:
-                            if _v not in _matched:
-                                _matched.append(_v)
+                    if _v.lower() in _raw_lower:
+                        if _v not in _matched:
+                            _matched.append(_v)
+                # Token fallback: for short values not caught by substring match
+                if not _matched:
+                    for _tok in _raw_tokens:
+                        _tok = _tok.strip()
+                        if not _tok or len(_tok) < 2:
+                            continue
+                        for _v in _fb_vals:
+                            if _tok in _v or _v in _tok:
+                                if _v not in _matched:
+                                    _matched.append(_v)
                 if len(_matched) == 1:
                     slots[_fb_key] = _matched[0]
                     try:
@@ -2318,7 +2850,7 @@ class AcademicPersonaService:
         # Instead, area_size is treated as query enrichment only (see below).
         _DIRECT_FILTER_FIELDS = frozenset({
             "entity_type_normalized", "location", "registration_type",
-            "operation_topic",
+            "operation_topic", "department",
         })
 
         filter_parts: List[Dict] = []
@@ -2365,6 +2897,20 @@ class AcademicPersonaService:
                         _LOG.info(
                             "[Academic] slot re-retrieve: location=%r SKIPPED — current docs have no location field",
                             sv,
+                        )
+                        continue
+                if key == "department":
+                    _dept_vals_in_docs = set()
+                    for _ld in (state.current_docs or []):
+                        _dv = ((_ld.get("metadata") or {}).get("department") or "").strip()
+                        if _dv and _dv.lower() not in ("nan", "none"):
+                            _dept_vals_in_docs.add(_dv)
+                    if sv not in _dept_vals_in_docs:
+                        # Stale dept value from a prior topic (e.g. "ธนาคารไทยพาณิชย์" from QR PAYMENT
+                        # bleeding into ใบทะเบียนพาณิชย์ with dept="กรมพัฒนาธุรกิจการค้า") → skip.
+                        _LOG.info(
+                            "[Academic] slot re-retrieve: department=%r SKIPPED — not in current docs dept values %s",
+                            sv, sorted(_dept_vals_in_docs),
                         )
                         continue
                 filter_parts.append({key: sv})
@@ -2422,6 +2968,14 @@ class AcademicPersonaService:
                 """Evaluate a Chroma-style filter dict against a metadata dict.
                 Empty doc value = universal doc → passes any filter value for that field.
                 (e.g. registration_type='' means the doc applies to ALL registration types.)
+
+                Special rules for registration_type:
+                  - Use SUBSTRING match (v in doc_val) because docs may store multiple types
+                    in one field (e.g. '1.ห้างหุ้นส่วนจำกัด 2.ห้างหุ้นส่วนสามัญ').
+                  - Empty doc RT is universal ONLY if the doc is also entity-neutral (entity='').
+                    A doc with entity_type_normalized set but empty RT belongs to that entity
+                    class — it may be irrelevant to the user's specific sub-type (e.g. a
+                    บริษัทมหาชนจำกัด procedure doc should not appear for ห้างหุ้นส่วนจำกัด).
                 """
                 if "$or" in filt:
                     return any(_eval_cf(md, sub) for sub in filt["$or"])
@@ -2429,11 +2983,27 @@ class AcademicPersonaService:
                     return all(_eval_cf(md, sub) for sub in filt["$and"])
                 k, v = next(iter(filt.items()))
                 doc_val = md.get(k)
-                # Empty/null doc value = universal (applies to all sub-types) → always matches
+                # Empty/null doc value handling
                 if doc_val is None or (
                     isinstance(doc_val, str) and doc_val.strip().lower() in ("", "nan", "none")
                 ):
+                    # registration_type special case: นิติบุคคล has many sub-types
+                    # (บริษัทจำกัด, บริษัทมหาชนจำกัด, ห้างหุ้นส่วนจำกัด, ห้างหุ้นส่วนสามัญ),
+                    # so a doc with entity='นิติบุคคล' but empty RT is NOT universal —
+                    # it may belong to only one sub-type (e.g. บริษัทมหาชน procedure docs).
+                    # Exclude these when filtering for a specific RT sub-type.
+                    # บุคคลธรรมดา has effectively one sub-type, so its empty-RT docs ARE universal.
+                    if k == "registration_type" and v and str(v).strip():
+                        doc_et = str(md.get("entity_type_normalized") or "").strip().lower()
+                        if doc_et == "นิติบุคคล":
+                            return False
                     return True
+                # registration_type: substring match because one doc may cover multiple types
+                # e.g. '1.ห้างหุ้นส่วนจำกัด 2.ห้างหุ้นส่วนสามัญ' should match 'ห้างหุ้นส่วนจำกัด'
+                if k == "registration_type":
+                    v_str = str(v)
+                    dv_str = str(doc_val)
+                    return v_str in dv_str or dv_str in v_str
                 return doc_val == v
 
             in_mem = [d for d in state.current_docs if _eval_cf(d.get("metadata") or {}, chroma_filter)]
@@ -2604,7 +3174,10 @@ class AcademicPersonaService:
             # across operations for a given license type. Only CONTENT (steps, fees) differs.
             # Without this, a single-operation doc set may have no form keywords → form
             # section disappears from menu even though the forms exist in the broader doc set.
-            state.context["_link_source_docs"] = list(docs)
+            # IMPORTANT: only set if not already populated by supervisor handoff (_presaved_license_docs),
+            # which is a broader set (all docs for this license, before any op/entity filter).
+            if not state.context.get("_link_source_docs"):
+                state.context["_link_source_docs"] = list(docs)
             state.current_docs = filtered
         else:
             _LOG.info(
@@ -2673,6 +3246,7 @@ class AcademicPersonaService:
         _is_non_regulatory = bool(_data_types) and _data_types.issubset(_NON_REG_TYPES)
 
         def has_any_metadata(keys: List[str]) -> bool:
+            _TRIVIAL = frozenset({"nan", "none", "-", "–", "—", "n/a", "ไม่ระบุ", "ไม่มี", "ไม่มีข้อมูล", "ไม่ระบุข้อมูล", "ไม่ได้ระบุ"})
             for d in docs:
                 md = (d.get("metadata") or {})
                 for key in keys:
@@ -2680,7 +3254,7 @@ class AcademicPersonaService:
                     if val is None:
                         continue
                     s = str(val).strip()
-                    if s and s.lower() != "nan":
+                    if s and s.lower() not in _TRIVIAL and len(s) >= 5:
                         return True
             return False
 
@@ -2709,7 +3283,10 @@ class AcademicPersonaService:
             """Show แบบฟอร์มและเอกสารที่เกี่ยวข้อง only when research_reference metadata value
             actually contains form/download keywords — not just any URL or reference link.
             Also checks _link_source_docs (entity-filtered, pre-op-filter) because links/forms
-            are the same across operations — only content (steps, fees) differs by operation."""
+            are the same across operations — only content (steps, fees) differs by operation.
+            Non-regulatory docs (marketing/bakery) have no government forms — always return False."""
+            if _is_non_regulatory:
+                return False
             # Check both current docs AND the broader link source docs (saved before op filter)
             _link_src = (state.context or {}).get("_link_source_docs") or []
             _check_docs = docs if not _link_src else list({id(d): d for d in list(docs) + _link_src}.values())
@@ -2740,7 +3317,7 @@ class AcademicPersonaService:
             # ❗ metadata-only: content keywords เป็น false positive สูง — เปิด choice เฉพาะเมื่อมี field ส่งให้ LLM จริงๆ
             (["terms_and_conditions", "เงื่อนไขและหลักเกณฑ์"], "เงื่อนไขและหลักเกณฑ์", None),
             (["legal_regulatory", "ข้อกำหนดทางกฎหมาย และข้อบังคับ", "บทลงโทษ"], "ข้อกฎหมาย/ข้อควรระวัง/บทลงโทษ", None),
-            (["research_reference"], "แบบฟอร์มและเอกสารที่เกี่ยวข้อง", ["แบบ บอจ", "แบบ ภพ", "แบบ ก.", "แบบ ว.", "ดาวน์โหลด", "คู่มือ"]),
+            (["research_reference"], "แบบฟอร์ม คู่มือ และลิงค์ที่เกี่ยวข้อง", ["แบบ บอจ", "แบบ ภพ", "แบบ ก.", "แบบ ว.", "ดาวน์โหลด", "คู่มือ"]),
         ]
 
         out: List[Dict[str, str]] = []
@@ -2925,8 +3502,33 @@ class AcademicPersonaService:
         # come from every matching doc so the complete list reaches the LLM.
         _ACADEMIC_LONG_FIELDS = {"operation_steps"}
         _academic_long_sent = False
+
+        # Non-regulatory aggregation: if ALL current_docs are marketing/business_guide (no license_type)
+        # group them by sub_topic into combined docs before applying the _MAX_DOCS_ACADEMIC cap.
+        # Without this, a sub_topic with >12 rows is silently truncated and the LLM cannot correctly
+        # enumerate all content_type items or answer "มีทั้งหมดกี่แบบ" accurately.
+        _docs_for_ac_llm = list(state.current_docs or [])
+        _ac_is_non_reg = (
+            bool(_docs_for_ac_llm)
+            and all(
+                not str((d.get("metadata") or {}).get("license_type") or "").strip()
+                for d in _docs_for_ac_llm[:20]
+            )
+            and any(
+                str((d.get("metadata") or {}).get("data_type") or "").strip()
+                in ("marketing", "business_guide")
+                for d in _docs_for_ac_llm[:5]
+            )
+        )
+        if _ac_is_non_reg and len(_docs_for_ac_llm) > _MAX_DOCS_ACADEMIC:
+            _docs_for_ac_llm = _aggregate_non_reg_docs(_docs_for_ac_llm)
+            _LOG.info(
+                "[Academic] Non-reg aggregation: %d docs → %d combined for LLM",
+                len(state.current_docs), len(_docs_for_ac_llm),
+            )
+
         docs_json = []
-        for d in (state.current_docs or [])[:_MAX_DOCS_ACADEMIC]:
+        for d in _docs_for_ac_llm[:_MAX_DOCS_ACADEMIC]:
             md = d.get("metadata", {}) or {}
             filtered_md = {}
             for k, v in md.items():
@@ -2945,11 +3547,16 @@ class AcademicPersonaService:
                 filtered_md[k] = v_str[:cap] if cap and len(v_str) > cap else v_str
             if any(k in filtered_md for k in _ACADEMIC_LONG_FIELDS):
                 _academic_long_sent = True
+            _ac_content = d.get("content", "") or ""
+            if _ac_is_non_reg:
+                # Strip "อ้างอิง: Website...\nhttps://..." appended at ingest time.
+                # Marketing/bakery reference links shown only when user explicitly asks.
+                _ac_content = re.sub(r'\nอ้างอิง:.*', '', _ac_content, flags=re.DOTALL).strip()
             docs_json.append(
                 {
                     "metadata": filtered_md,
                     # content already clipped to LLM_DOC_CHARS_ACADEMIC by _retrieve_docs()
-                    "content": (d.get("content", "") or ""),
+                    "content": _ac_content,
                 }
             )
 
@@ -2984,7 +3591,42 @@ class AcademicPersonaService:
         # Use _link_source_docs (entity-filtered, pre-op-filter) when available — links/forms
         # are not operation-specific (same แบบ ทพ. form used for new/change/cancel),
         # so collect from the broader entity-scoped set to avoid missing form links.
-        _link_pool = (state.context or {}).get("_link_source_docs") or (state.current_docs or [])
+        # Staleness guard: _link_source_docs persists in context across turns.
+        # When current_docs are marketing/business-guide content (no license_type) but
+        # _link_source_docs contain regulatory docs (with license_type from a previous turn),
+        # using _link_source_docs would inject irrelevant registration forms.
+        # Validate: only use _link_source_docs if its license_type set overlaps current_docs.
+        _raw_link_src = (state.context or {}).get("_link_source_docs")
+        if _raw_link_src:
+            _cur_lts_ac = {
+                str((d.get("metadata") or {}).get("license_type") or "").strip()
+                for d in (state.current_docs or []) if isinstance(d, dict)
+            } - {"", "nan", "None"}
+            _src_lts_ac = {
+                str((d.get("metadata") or {}).get("license_type") or "").strip()
+                for d in _raw_link_src if isinstance(d, dict)
+            } - {"", "nan", "None"}
+            # Stale: _link_source_docs has regulatory license but current topic has none (marketing)
+            # OR license types don't overlap at all (different regulatory topic)
+            if (_src_lts_ac and not _cur_lts_ac) or (_src_lts_ac and _cur_lts_ac and not (_src_lts_ac & _cur_lts_ac)):
+                _LOG.info(
+                    "[Academic] _link_source_docs stale (src=%r, cur=%r) — using current_docs for links",
+                    _src_lts_ac, _cur_lts_ac,
+                )
+                _raw_link_src = None
+        # Prefer whichever pool is larger — Academic's own Chroma-expanded set (state.current_docs)
+        # is built AFTER this function is entered and often has many more docs than the
+        # pre-saved _link_source_docs (which may be just 1 doc from a chapter retrieval hit).
+        _cur_docs_ac = state.current_docs or []
+        if _raw_link_src and len(_raw_link_src) >= len(_cur_docs_ac):
+            _link_pool = _raw_link_src
+        else:
+            _link_pool = _cur_docs_ac
+            if _raw_link_src:
+                _LOG.info(
+                    "[Academic] Fix5: using current_docs (%d) over _link_source_docs (%d) — larger set",
+                    len(_cur_docs_ac), len(_raw_link_src),
+                )
         _link_docs = [_d for _d in _link_pool[:_MAX_DOCS_ACADEMIC] if _link_doc_matches_topic(_d)]
         if not _link_docs and _ctx_selected_lt:
             # Fallback: topic filter left no docs → include all (don't lose links entirely)
@@ -2992,6 +3634,35 @@ class AcademicPersonaService:
             _LOG.info("[Academic] Fix5: link topic filter yielded 0 docs — using all %d docs", len(_link_docs))
         else:
             _LOG.info("[Academic] Fix5: collecting links from %d topic-matched docs (topic=%r)", len(_link_docs), _ctx_selected_lt)
+
+        # Filter link_docs by registration_type family when known — prevents form links from
+        # a different registration family (e.g. บริษัทจำกัด forms when user chose ห้างหุ้นส่วน).
+        # Uses family-key matching so ห้างหุ้นส่วนจำกัด and ห้างหุ้นส่วนสามัญนิติบุคคล
+        # are treated as the same family and both included (they share the same forms หส.1/หส.2).
+        _rt_known = (
+            slots.get("registration_type")
+            or (ctx.get("collected_slots") or {}).get("registration_type")
+            or ""
+        ).strip()
+        if _rt_known and _rt_known.lower() not in ("nan", "none"):
+            # Extract the broadest shared family token from user's registration_type.
+            # Order matters: check "บริษัทมหาชน" before "บริษัท" to avoid partial match.
+            _RT_FAMILIES = ("ห้างหุ้นส่วน", "บริษัทมหาชน", "บริษัท", "บุคคลธรรมดา")
+            _rt_family = next((f for f in _RT_FAMILIES if f in _rt_known), None)
+            if _rt_family:
+                def _rt_matches_link_doc(_d2: Dict) -> bool:
+                    _doc_rt = str((_d2.get("metadata") or {}).get("registration_type") or "").strip()
+                    if not _doc_rt or _doc_rt.lower() in ("nan", "none"):
+                        return True  # neutral/empty doc → always include
+                    return _rt_family in _doc_rt  # family match: "ห้างหุ้นส่วน" in "ห้างหุ้นส่วนสามัญนิติบุคคล"
+                _link_docs_rt = [_d2 for _d2 in _link_docs if _rt_matches_link_doc(_d2)]
+                if _link_docs_rt:
+                    _LOG.info(
+                        "[Academic] Link rt-filter: %d → %d docs (family=%r from rt=%r)",
+                        len(_link_docs), len(_link_docs_rt), _rt_family, _rt_known[:40],
+                    )
+                    _link_docs = _link_docs_rt
+
         for _d in _link_docs:
             _md = _d.get("metadata") or {}
             _rr = (_md.get("research_reference") or "").strip()
@@ -3070,33 +3741,39 @@ class AcademicPersonaService:
             _instruction = ""
 
         def _fmt_link(desc: str, url: str) -> str:
-            if desc and url:
-                return f"- {desc}\n  {url}"
-            return f"- {url or desc}"
+            _d = re.sub(r'(?i)^(?:Website|เว็บไซต์)\s*', '', (desc or "").strip()).strip()
+            if _d and url:
+                return f"- {_d}\n  {url}"
+            return f"- {url or _d}"
 
-        # SERVICE_LINKS → always injected, no section condition
+        # SERVICE_LINKS → always injected (same as Practical)
         _service_section = ""
         if _service_entries:
             _service_section = (
-                f"\n🌐 SERVICE_LINKS{_instruction} — copy เหล่านี้ into section '🌐 ช่องทางยื่นออนไลน์' ทุก answer (แสดง URL ตรงๆ ห้าม paraphrase):\n"
+                f"\n🌐 SERVICE_LINKS{_instruction} — copy เหล่านี้ใต้ header 🌐 ที่เหมาะสมกับเนื้อหา (ห้ามใช้ header ตายตัว '🌐 ช่องทางยื่นออนไลน์'):\n"
                 + "\n".join(_fmt_link(d, u) for d, u in _service_entries) + "\n"
             )
 
-        # FORM → only when user selected research_reference / แบบฟอร์ม / เอกสาร section
+        # FORM + GUIDE + REF — same injection conditions as Practical
         _agg_section = ""
         if _link_entries and _ref_section_requested:
             if _form_entries:
-                _agg_section += f"\n📄 FORM_LINKS{_instruction} — แสดงทั้งหมด:\n" + "\n".join(_fmt_link(d, u) for d, u in _form_entries) + "\n"
-        # GUIDE_LINKS + REF → only when user explicitly asks for sources/references (อ้างอิง)
-        # NOT triggered by แบบฟอร์ม/เอกสาร section selection
-        if _user_asked_reference:
+                _agg_section += (
+                    f"\n📄 FORM_LINKS{_instruction} — แสดงแต่ละลิงก์ในรูปแบบ '📄 {{desc}}' (ใช้ desc เป็น header ต่อหนึ่งลิงก์ ห้ามใช้ header กลาง '📄 แบบฟอร์ม'):\n"
+                    + "\n".join(_fmt_link(d, u) for d, u in _form_entries) + "\n"
+                )
+        if _user_asked_reference or _ref_section_requested:
             if _guide_entries:
                 _agg_section += (
-                    f"\n📖 GUIDE_LINKS{_instruction} — เลือกแค่ 1 ลิงก์สำคัญที่สุดเท่านั้น ห้ามเกิน 1 ลิงก์ — output header: '📖 แหล่งข้อมูลอ้างอิง':\n"
+                    f"\n📖 GUIDE_LINKS{_instruction} — แสดงแต่ละลิงก์ในรูปแบบ '📖 {{desc}}' (ใช้ desc เป็น header ต่อหนึ่งลิงก์ ห้ามใช้ header กลาง '📖 คู่มือ'):\n"
                     + "\n".join(_fmt_link(d, u) for d, u in _guide_entries) + "\n"
                 )
+        # REFERENCE_LINKS: only when user explicitly asks for อ้างอิง/แหล่งที่มา.
+        # _ref_section_requested (triggered by selecting แบบฟอร์ม/เอกสาร section) must NOT
+        # inject ref links — those are form/guide section triggers, not reference requests.
+        if _user_asked_reference:
             if _ref_entries:
-                _agg_section += f"\n📚 REFERENCE_LINKS{_instruction} — user ถามแหล่งอ้างอิง: copy เหล่านี้ under section '📚 แหล่งอ้างอิง':\n" + "\n".join(_fmt_link(d, u) for d, u in _ref_entries) + "\n"
+                _agg_section += f"\n📚 REFERENCE_LINKS{_instruction} — copy เหล่านี้ตรงๆ under section '📚 แหล่งอ้างอิง':\n" + "\n".join(_fmt_link(d, u) for d, u in _ref_entries) + "\n"
 
         return f"""USER_QUESTION:
 {user_question}
@@ -3184,18 +3861,19 @@ Return JSON:
 
         # Fix 6: Collect allowed URLs from the injected link sections so we can strip any
         # hallucinated URLs the LLM generates that are NOT from the approved source list.
-        _allowed_urls: set = set()
-        _in_link_section = False
-        for _pl in prompt.splitlines():
-            if any(_marker in _pl for _marker in ("SERVICE_LINKS", "FORM_LINKS", "GUIDE_LINKS")):
-                _in_link_section = True
-            elif _pl.strip().startswith("USER_QUESTION:") or (_pl.strip() and not _pl.startswith(" ") and not _pl.startswith("-") and "://" not in _pl and len(_pl) < 20):
-                _in_link_section = False
-            if _in_link_section:
-                for _u in re.findall(r"https?://[^\s\n，。、\"']+", _pl):
-                    _allowed_urls.add(_u.rstrip(".,;)"))
+        # Collect all URLs present in the prompt — any URL the LLM outputs that wasn't in the
+        # prompt is a hallucination (fabricated). Using the whole prompt avoids the fragile
+        # section-tracking heuristic that could miss URLs when a short line resets the state.
+        _allowed_urls: set = {
+            u.rstrip(".,;)")
+            for u in re.findall(r"https?://[^\s\n，。、\"']+", prompt)
+        }
 
-        decision = self._call_llm_json(prompt, state=state)
+        try:
+            decision = self._call_llm_json(prompt, state=state)
+        except Exception as _fa_err:
+            _LOG.error("[Academic] _finalize_answer: LLM call failed: %s", _fa_err)
+            decision = {}
 
         _ex_raw = decision.get("execution") or {}
         if isinstance(_ex_raw, str):
@@ -3219,9 +3897,45 @@ Return JSON:
             # No injected links at all — remove ALL URLs to prevent hallucination
             ans = re.sub(r"https?://[^\s\n，。、\"']+", "", ans)
 
+        # Post-process: strip "Website"/"เว็บไซต์" prefix from 📄/📖 header lines (same as Practical)
+        if '📄' in ans or '📖' in ans:
+            ans = re.sub(
+                r'(?m)^([ \t]*📄️?[ \t]*)(?:Website|เว็บไซต์)[ \t]+',
+                r'\1', ans, flags=re.IGNORECASE,
+            )
+            ans = re.sub(
+                r'(?m)^([ \t]*📖️?[ \t]*)(?:Website|เว็บไซต์)[ \t]+',
+                r'\1', ans, flags=re.IGNORECASE,
+            )
+
         # Strip hallucinated empty section headers (no content follows the heading)
         ans = re.sub(r"\n*📖\s*แหล่งข้อมูลอ้างอิง\s*$", "", ans, flags=re.MULTILINE).rstrip()
         ans = re.sub(r"\n*🌐\s*ช่องทางยื่นออนไลน์\s*$", "", ans, flags=re.MULTILINE).rstrip()
+        # Strip any 🌐 section header that has no https:// URL within the next 5 lines.
+        # LLM sometimes hallucinates a "🌐 เว็บไซต์ที่เกี่ยวข้อง" header by extracting URLs
+        # from doc content even when SERVICE_LINKS was absent from the prompt.
+        _ac_lines = ans.split('\n')
+        _ac_out: list = []
+        _ac_i = 0
+        while _ac_i < len(_ac_lines):
+            _ac_line = _ac_lines[_ac_i]
+            if _ac_line.strip().startswith('🌐'):
+                _ac_url_found = any(
+                    'https://' in _ac_lines[_ac_j]
+                    for _ac_j in range(_ac_i + 1, min(_ac_i + 6, len(_ac_lines)))
+                )
+                if _ac_url_found:
+                    _ac_out.append(_ac_line)
+                else:
+                    # Consume following blank lines too
+                    _ac_i += 1
+                    while _ac_i < len(_ac_lines) and not _ac_lines[_ac_i].strip():
+                        _ac_i += 1
+                    continue
+            else:
+                _ac_out.append(_ac_line)
+            _ac_i += 1
+        ans = '\n'.join(_ac_out)
 
         cu = ex.get("context_update", {})
         if isinstance(cu, dict) and cu:
@@ -3508,8 +4222,26 @@ Return JSON:
                     return state, q
                 # All slots already known — fall through to sections below
 
-            # Otherwise treat as slot answer — save then re-retrieve with slot filters
+            # Otherwise treat as slot answer — save then check pending queue before re-retrieve
             self._save_slots_best_effort(state, user_text)
+
+            # One-at-a-time queue: if there are pre-computed slots still to ask, show the next
+            # one now without re-retrieving (saves LLM call + retrieval latency).
+            _pending_slots_q = (state.context or {}).get("academic_pending_slots") or []
+            if _pending_slots_q and isinstance(_pending_slots_q, list):
+                _next_slot = _pending_slots_q[0]
+                _remaining_q = _pending_slots_q[1:]
+                state.context["academic_pending_slots"] = _remaining_q
+                _q_next = self._render_slot_message([_next_slot], state=state)
+                state.context["dynamic_slot_keys"] = [_next_slot.get("key")] if _next_slot.get("key") else []
+                self._append_assistant(state, _q_next)
+                state.round = int(getattr(state, "round", 0) or 0) + 1
+                _LOG.info(
+                    "[Academic] One-at-a-time: showed next queued slot '%s' (%d remaining)",
+                    _next_slot.get("key"), len(_remaining_q),
+                )
+                return state, _q_next
+
             self._re_retrieve_with_slots(state)
             self._filter_docs_by_inferred_operation(state)
 
@@ -3596,6 +4328,7 @@ Return JSON:
                     _ec_ctx.pop("pending_options", None)
                     _ec_ctx.pop("pending_question", None)
                     _ec_ctx.pop("resolved_selection", None)
+                    _ec_ctx.pop("academic_pending_slots", None)
                     state.current_docs = []
                     state.last_retrieval_query = ""
                     state.context = _ec_ctx
@@ -3607,13 +4340,23 @@ Return JSON:
 
             # If user sends noise here, re-ask section menu (keep stage)
             if not user_text or (not bind.get("bound") and self._looks_like_greeting_or_noise(user_text)):
-                msg = (state.context or {}).get("pending_question") or self._ask_sections(state)
+                msg = (state.context or {}).get("pending_question") or "พิมพ์เลขข้อที่ต้องการ (เช่น 1, 2) หรือพิมพ์เลขข้อสุดท้ายเพื่อดูทั้งหมดครับ"
                 msg = msg.strip() or "พิมพ์เลขข้อที่ต้องการ (เช่น 1, 2) หรือพิมพ์เลขข้อสุดท้ายเพื่อดูทั้งหมดครับ"
                 self._append_assistant(state, msg)
                 return state, msg
 
             self._save_selected_sections(state, user_text, bind)
 
+            ans = self._finalize_answer(state)
+            self._append_assistant(state, self._summarize_for_history(ans))
+            state.round = 0
+            return state, ans
+
+        # Stage no_sections: _ask_sections() found no displayable sections — finalize immediately.
+        # This stage can persist when the awaiting_sections noise path calls _ask_sections() and
+        # docs have no sections (e.g. after entity change). Without this handler every subsequent
+        # message returns the generic fallback forever.
+        if stage == "no_sections":
             ans = self._finalize_answer(state)
             self._append_assistant(state, self._summarize_for_history(ans))
             state.round = 0

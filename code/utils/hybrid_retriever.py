@@ -30,7 +30,8 @@ def _tokenize(text: str) -> List[str]:
         from pythainlp.tokenize import word_tokenize
         tokens = word_tokenize(str(text or ""), engine="newmm", keep_whitespace=False)
         return [t for t in tokens if t and t.strip()]
-    except Exception:
+    except Exception as _e:
+        _LOG.debug("[BM25/tokenize] PyThaiNLP unavailable (%s) — using whitespace split", type(_e).__name__)
         return str(text or "").split()
 
 
@@ -100,12 +101,28 @@ def invalidate_bm25_cache(collection_name: Optional[str] = None) -> None:
 
 def _matches_metadata_filter(doc_metadata: dict, flt: dict) -> bool:
     """Evaluate a Chroma-style metadata filter against doc metadata.
-    Supports $or, $and, and simple key=value pairs."""
+    Supports $or, $and, $in, $eq, and simple key=value pairs."""
     if "$or" in flt:
         return any(_matches_metadata_filter(doc_metadata, sub) for sub in flt["$or"])
     if "$and" in flt:
         return all(_matches_metadata_filter(doc_metadata, sub) for sub in flt["$and"])
-    return all((doc_metadata or {}).get(fk) == fv for fk, fv in flt.items())
+    md = doc_metadata or {}
+    for fk, fv in flt.items():
+        actual = md.get(fk)
+        if isinstance(fv, dict):
+            if "$in" in fv:
+                if actual not in fv["$in"]:
+                    return False
+            elif "$eq" in fv:
+                if actual != fv["$eq"]:
+                    return False
+            elif "$ne" in fv:
+                if actual == fv["$ne"]:
+                    return False
+        else:
+            if actual != fv:
+                return False
+    return True
 
 
 # ── RRF fusion ────────────────────────────────────────────────────────────────
@@ -144,8 +161,9 @@ def _rrf_fuse(
             doc_map[did] = doc
 
     merged = sorted(rrf_scores.items(), key=lambda x: -x[1])
-    # Dense score is None for BM25-only docs — callers must not treat None as low quality
-    return [(doc_map[did], dense_scores.get(did)) for did, _ in merged]
+    # BM25-only docs get 0.0 dense score (not None) — callers do arithmetic/comparison on score
+    # and a None value raises TypeError when used with comparison operators like ">".
+    return [(doc_map[did], dense_scores.get(did, 0.0)) for did, _ in merged]
 
 
 # ── Public API ────────────────────────────────────────────────────────────────

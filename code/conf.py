@@ -123,15 +123,15 @@ LOCAL_VECTOR_DIR = os.getenv(
 # Google Sheets source URLs — override in env.properties when sheets move or change tabs
 SHEET_URL_REGULATORY = os.getenv(
     "SHEET_URL_REGULATORY",
-    "https://docs.google.com/spreadsheets/d/1YnLKV7gJXCu7jvcH1sUL9crMlBCJKOpQfp2wtulMszE/edit?gid=657201027#gid=657201027",
+    "https://docs.google.com/spreadsheets/d/1Yh73jnA2vVRHAtGYfkRNPoZhv5w8umxkpretU_9hT6E/edit?gid=657201027#gid=657201027",
 )
 SHEET_URL_MARKETING = os.getenv(
     "SHEET_URL_MARKETING",
-    "https://docs.google.com/spreadsheets/d/1YnLKV7gJXCu7jvcH1sUL9crMlBCJKOpQfp2wtulMszE/edit?gid=809205387#gid=809205387",
+    "https://docs.google.com/spreadsheets/d/1Yh73jnA2vVRHAtGYfkRNPoZhv5w8umxkpretU_9hT6E/edit?gid=809205387#gid=809205387",
 )
 SHEET_URL_BAKERY = os.getenv(
     "SHEET_URL_BAKERY",
-    "https://docs.google.com/spreadsheets/d/1YnLKV7gJXCu7jvcH1sUL9crMlBCJKOpQfp2wtulMszE/edit?gid=610069215#gid=610069215",
+    "https://docs.google.com/spreadsheets/d/1Yh73jnA2vVRHAtGYfkRNPoZhv5w8umxkpretU_9hT6E/edit?gid=610069215#gid=610069215",
 )
 
 # State manager configuration

@@ -21,6 +21,11 @@ from __future__ import annotations
 from typing import List
 
 
+def _safe_embed(text: str) -> str:
+    """Sanitize user-supplied text before embedding in LLM prompts."""
+    return str(text or "").replace('"', "'").replace("\n", " ").strip()
+
+
 # 1. TOPIC PICKER
 
 def build_topic_picker_prompt(
@@ -62,7 +67,7 @@ def build_confirm_prompt(user_text: str) -> str:
         "ถ้ากำกวมจริงๆ ให้ confidence ต่ำ\n"
         "ตอบเป็น JSON เท่านั้น:\n"
         '{ "yes": true/false, "no": true/false, "confidence": 0.0 }\n'
-        f"ข้อความผู้ใช้: {user_text}"
+        f"ข้อความผู้ใช้: {_safe_embed(user_text)}"
     )
 
 
@@ -84,14 +89,16 @@ def build_style_detect_prompt(user_text: str, last_query: str = "") -> str:
         "  - 'ขอแบบเต็ม', 'แบบให้ครบ', 'ลงรายละเอียด', 'ให้ครอบคลุม'\n\n"
         "ไม่ใช่ wants_long (คำถามธรรมดา ไม่ได้ระบุ style):\n"
         "  - 'อยากรู้', 'ต้องการทราบ', 'ถามว่า', 'คืออะไร', 'มีอะไรบ้าง'\n"
-        "  - 'ค่าธรรมเนียมเท่าไหร่', 'ต้องใช้เอกสารอะไร' (แค่ถามข้อมูล ไม่ได้บอก style)\n\n"
+        "  - 'ค่าธรรมเนียมเท่าไหร่', 'ต้องใช้เอกสารอะไร' (แค่ถามข้อมูล ไม่ได้บอก style)\n"
+        "  - 'แล้วถ้าเป็น SAN PLUS', 'แล้วถ้าเป็นใบอนุญาตจัดตั้ง' (ถามหัวข้อใหม่ ไม่ใช่ขอรายละเอียดเพิ่ม)\n"
+        "  - 'แล้วถ้าต้องการ X', 'แล้วถ้าจะขอ X' (follow-up คำถามใหม่ ไม่มีคำบอก style)\n\n"
         "wants_short=true เมื่อผู้ใช้ต้องการคำตอบสั้น กระชับ\n"
         "ตัวอย่าง wants_short=true:\n"
         "  - 'แบบสั้น', 'กระชับ', 'สรุปแค่', 'พอสังเขป', 'แบบย่อๆ'\n\n"
         "ถ้าไม่ชัดหรือเป็นแค่การถามเรื่องทั่วไป → confidence ต่ำ (<0.5) และ wants_long=false\n\n"
         "ตอบเป็น JSON เท่านั้น:\n"
         '{ "wants_long": true/false, "wants_short": true/false, "confidence": 0.0 }\n\n'
-        f"ข้อความผู้ใช้: {user_text}"
+        f"ข้อความผู้ใช้: {_safe_embed(user_text)}"
     )
 
 
@@ -154,26 +161,49 @@ def build_op_group_classifier_prompt(license_type: str, raw_ops: List[str]) -> s
     ops_str = "\n".join(f"- {o}" for o in raw_ops)
     return (
         "คุณเป็น AI ที่ช่วยจัดกลุ่มประเภทการดำเนินการสำหรับใบอนุญาตธุรกิจ\n"
-        "หน้าที่: จัดกลุ่ม raw operation values ด้านล่างให้เป็นหมวดหมู่ที่ user เข้าใจง่าย\n"
-        "กฎ:\n"
+        "หน้าที่: จัดกลุ่ม raw operation values ด้านล่างให้เป็นหมวดหมู่ตาม prefix ของแต่ละค่า\n"
+        "กฎสำคัญ — จัดกลุ่มตาม prefix ตัวอักษรแรกของ raw value เท่านั้น ห้ามตีความความหมาย:\n"
         "1. แต่ละกลุ่มต้องมี label ภาษาไทยที่กระชับ ชัดเจน (ไม่เกิน 30 ตัวอักษร)\n"
-        "2. ค่าที่หมายถึงการยื่น/จด/ขอใหม่ → label เช่น 'ยื่นขอใหม่ / จดทะเบียน'\n"
-        "3. ค่าที่หมายถึงต่ออายุ → label 'ต่ออายุ'\n"
-        "4. ค่าที่หมายถึงแก้ไข/เปลี่ยนแปลง → label 'แก้ไข / เปลี่ยนแปลงรายการ'\n"
-        "5. ค่าที่หมายถึงยกเลิก/เลิก → label 'ยกเลิก'\n"
-        "6. ค่าที่หมายถึงย้าย → label 'ย้ายสถานประกอบการ'\n"
-        "7. ค่าที่หมายถึงเพิ่มสาขา → label 'เพิ่มสถานประกอบการ'\n"
-        "8. ค่าที่หมายถึงปิดสาขา → label 'ปิดสถานประกอบการ'\n"
-        "9. ค่าที่หมายถึงขอใบแทน/กรณีสูญหาย → label 'ขอใบแทน / กรณีสูญหาย'\n"
-        "10. ค่าที่ไม่เข้าข้อใดข้างต้น → label 'อื่น ๆ'\n"
-        "11. ถ้าหลาย raw values มีความหมายเดียวกัน ให้รวมไว้ใน group เดียวกัน\n"
-        "12. ห้ามสร้าง label ที่ไม่มีใน raw list\n"
+        "2. raw op ที่ขึ้นต้นด้วย 'การจดทะเบียน', 'การจด', 'การขอ', 'การยื่น', 'ยื่นใหม่' → label 'ยื่นขอใหม่ / จดทะเบียน'\n"
+        "3. raw op ที่ขึ้นต้นด้วย 'ต่ออายุ' → label 'ต่ออายุ'\n"
+        "4. raw op ที่ขึ้นต้นด้วย 'แก้ไข' หรือ 'เปลี่ยนแปลง' → label 'แก้ไข / เปลี่ยนแปลงรายการ'\n"
+        "5. raw op ที่ขึ้นต้นด้วย 'ยกเลิก' หรือ 'เลิก' → label 'ยกเลิก'\n"
+        "6. raw op ที่ขึ้นต้นด้วย 'ย้าย' เท่านั้น → label 'ย้ายสถานประกอบการ'\n"
+        "7. raw op ที่ขึ้นต้นด้วย 'เพิ่ม' เท่านั้น → label 'เพิ่มสถานประกอบการ'\n"
+        "8. raw op ที่ขึ้นต้นด้วย 'ปิด' (ไม่ใช่ 'ปิดงบ') → label 'ปิดสถานประกอบการ'\n"
+        "9. raw op ที่ขึ้นต้นด้วย 'ขอใบแทน', 'ทะเบียนพาณิชย์ชำรุด', 'ทะเบียนสูญหาย' → label 'ขอใบแทน / กรณีสูญหาย'\n"
+        "10. raw op ที่ไม่ขึ้นต้นด้วยคำใดข้างต้น → label 'อื่น ๆ'\n"
+        "11. ทุก raw value ต้องอยู่ใน group ใด group หนึ่งเสมอ — ห้ามทิ้ง raw value ไว้นอก groups\n"
+        "12. ห้ามสร้าง group ที่ไม่มี raw value ใดอยู่เลย\n"
         f"license_type: {license_type}\n"
         f"raw operations:\n{ops_str}\n"
         "Return JSON only:\n"
         '{"groups": [{"label": "...", "raw": ["..."]}, ...]}'
     )
 
+
+
+def build_sub_op_group_classifier_prompt(license_type: str, sub_ops: List[str]) -> str:
+    """
+    Group a long list of raw sub-operation strings (แก้ไขชื่อ/แก้ไขกรรมการ/...) into
+    ≤5 user-friendly category labels. Used when operation_sub_type would have >5 options.
+    """
+    ops_str = "\n".join(f"- {o}" for o in sub_ops)
+    return (
+        "คุณเป็น AI ที่ช่วยจัดกลุ่มรายการดำเนินการย่อยสำหรับใบอนุญาตธุรกิจ\n"
+        "หน้าที่: จัดกลุ่ม raw sub-operation values ด้านล่างให้เป็นหมวดหมู่ที่ user เข้าใจง่าย\n"
+        "กฎ:\n"
+        "1. สร้างได้ไม่เกิน 5 กลุ่ม\n"
+        "2. label ต้องภาษาไทย กระชับ เข้าใจง่าย เช่น 'ชื่อ', 'กรรมการ', 'ที่ตั้งสำนักงาน', 'ทุน/หุ้น'\n"
+        "3. ถ้าหลาย raw values เกี่ยวกับสิ่งเดียวกัน (เช่น แก้ไขชื่อ กรณีต่างๆ) ให้รวมเป็นกลุ่มเดียว\n"
+        "4. ถ้ามีกลุ่มย่อยเกิน 5 กลุ่ม ให้รวมกลุ่มเล็กที่เหลือเป็น 'อื่นๆ'\n"
+        "5. ทุก raw value ต้องอยู่ใน group ใด group หนึ่งเสมอ\n"
+        "6. label ไม่เกิน 20 ตัวอักษร\n"
+        f"license_type: {license_type}\n"
+        f"raw sub-operations:\n{ops_str}\n"
+        "Return JSON only:\n"
+        '{"groups": [{"label": "...", "raw": ["..."]}, ...]}'
+    )
 
 
 # 6. DEDUPLICATE OPTIONS
@@ -225,7 +255,7 @@ def build_slot_mapper_prompt(slot_key: str, user_text: str, options: List[str]) 
         + "ตอบเป็น JSON เท่านั้น:\n"
         '{"choice_index": 0, "choice_text": "", "confidence": 0.0}\n'
         f"slot_key: {slot_key}\n"
-        f"user_text: {user_text}\n"
+        f"user_text: {_safe_embed(user_text)}\n"
         f"options: {opts}\n"
     )
 
@@ -238,8 +268,8 @@ def build_fallback_intent_prompt(user_text: str, last_query: str, persona: str) 
         "คุณคือ routing classifier สำหรับ AI ที่ปรึกษาธุรกิจร้านอาหารครบวงจร\n"
         "บอทช่วยได้ทั้ง: กฎหมาย/ใบอนุญาต/ภาษี, การตลาด/กลยุทธ์, การเปิดร้าน/บริหารร้าน (เบเกอรี่, คาเฟ่, ร้านอาหาร)\n"
         "จงจำแนก intent จากข้อความผู้ใช้ด้านล่าง\n\n"
-        f"user_text: {user_text}\n"
-        f"last_query: {last_query or '(none)'}\n"
+        f"user_text: {_safe_embed(user_text)}\n"
+        f"last_query: {_safe_embed(last_query) or '(none)'}\n"
         f"current_persona: {persona}\n\n"
         "Intent categories:\n"
         "- new_topic: อยากดูหัวข้ออื่นหรือขอเมนูหัวข้อ (เช่น 'ขอเรื่องอื่น', 'มีหัวข้ออะไรอีก')\n"
@@ -275,6 +305,11 @@ def build_entity_type_detect_prompt(user_text: str, last_query: str) -> str:
         f"last_query: {last_query or '(none)'}\n\n"
         "นิติบุคคล = บริษัทจำกัด, บริษัทมหาชน, ห้างหุ้นส่วน, นิติบุคคล, นิติ, บจก, หจก\n"
         "บุคคลธรรมดา = เจ้าของคนเดียว, บุคคลธรรมดา, กิจการส่วนตัว, ร้านส่วนตัว, ทำคนเดียว\n\n"
+        "กฎสำคัญ: ระบุ entity_type จาก user_text เท่านั้น\n"
+        "last_query ใช้เฉพาะเมื่อ user_text มีคำย่อ/คำพูดที่ต้องการ context (เช่น 'แบบนิติ', 'บจก')\n"
+        "ถ้า user_text ไม่มี entity signal → return null เสมอ ไม่ว่า last_query จะมีคำอะไร\n"
+        "คำสรรพนาม (ฉัน/ผม/หนู/เรา/คุณ) ไม่ใช่ entity signal — ห้ามระบุ entity_type จากสรรพนาม\n"
+        "entity signal ต้องเป็นคำที่ระบุโครงสร้างธุรกิจ เช่น บจก, หจก, นิติบุคคล, บริษัท, เจ้าของคนเดียว, บุคคลธรรมดา\n\n"
         'ตอบ JSON เท่านั้น: {"entity_type": "นิติบุคคล"|"บุคคลธรรมดา"|null, "confidence": 0.0}\n'
         "null = user ไม่ได้ระบุประเภทหรือไม่แน่ใจเลย (confidence < 0.70)"
     )

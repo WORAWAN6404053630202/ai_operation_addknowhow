@@ -36,6 +36,35 @@ if TYPE_CHECKING:
 _ROOT_LOG = logging.getLogger("restbiz.llm")
 
 
+def _is_length_error(exc: Exception) -> bool:
+    """Return True when exc is a LengthFinishReasonError (token limit hit).
+    Retrying with identical input always reproduces the same error, so callers
+    should skip all retry attempts and re-raise immediately."""
+    n = type(exc).__name__
+    return "LengthFinishReasonError" in n or "LengthFinishReason" in str(exc)[:80]
+
+
+def _extract_token_counts(response: Any, log: logging.Logger, label: str) -> tuple[int, int]:
+    """Extract (prompt_tokens, completion_tokens) from a LangChain response object.
+    Returns (0, 0) on any failure and emits a debug log so the gap is visible."""
+    try:
+        um = getattr(response, "usage_metadata", None) or {}
+        if um:
+            return (
+                int(um.get("input_tokens") or um.get("prompt_tokens") or 0),
+                int(um.get("output_tokens") or um.get("completion_tokens") or 0),
+            )
+        rm = getattr(response, "response_metadata", None) or {}
+        tu = rm.get("token_usage") or rm.get("usage") or {}
+        return (
+            int(tu.get("prompt_tokens") or tu.get("input_tokens") or 0),
+            int(tu.get("completion_tokens") or tu.get("output_tokens") or 0),
+        )
+    except Exception as _e_tok:
+        log.debug("[%s] Token extraction failed (continuing with 0 tokens): %s", label, _e_tok)
+        return 0, 0
+
+
 def _safe_log_with_data(log_obj: logging.Logger, level: str, message: str, payload: dict) -> None:
     """Structured-log when available, otherwise fallback to plain logging."""
     method = getattr(log_obj, "log_with_data", None)
@@ -63,9 +92,10 @@ except ImportError:
 
 # Token Management: session-level cumulative token threshold.
 # When session_total exceeds this value after an LLM call, auto-summarize or trim is triggered.
-# Set to 20,000 so that long slot-filling sequences (3-4 Q&A turns + prior topic history)
-# trigger early summarization before the final answer call accumulates a 20K+ token prompt.
-_TOKEN_WARN_THRESHOLD = 20_000  # trigger summarize/trim when session total exceeds this
+# The practical system prompt alone is ~15K tokens per call. A threshold of 20K fires on the
+# first LLM call in a fresh session — useless and adds latency. Raised to 80K so that
+# summarize/trim only kicks in after ~4-5 full Q&A rounds of real message accumulation.
+_TOKEN_WARN_THRESHOLD = 80_000  # trigger summarize/trim when session total exceeds this
 
 
 def _handle_post_call_token_budget(
@@ -115,11 +145,11 @@ def _handle_post_call_token_budget(
             else:
                 log.info("[%s] Summarization not needed, using trim instead", label)
                 if hasattr(state, "trim_messages"):
-                    state.trim_messages(keep_last=6)
+                    state.trim_messages(keep_last=4)
         except Exception as e:
             log.warning("[%s] Summarization failed: %s, falling back to trim", label, e)
             if hasattr(state, "trim_messages"):
-                state.trim_messages(keep_last=6)
+                state.trim_messages(keep_last=4)
     except Exception:
         pass
 
@@ -293,7 +323,7 @@ def llm_invoke(
 
             # BUG-G fix: LengthFinishReasonError means the model hit the token limit.
             # Retrying with identical input always produces the same error — skip all retries.
-            if "LengthFinishReasonError" in type(exc).__name__ or "LengthFinishReason" in str(exc)[:80]:
+            if _is_length_error(exc):
                 log.warning(
                     "[%s] LengthFinishReasonError — skip retries (token limit, same input = same result)",
                     label,
@@ -329,24 +359,11 @@ def llm_invoke(
 
     elapsed = time.perf_counter() - t0
 
-    # Extract token counts — LangChain may expose them in different places
-    prompt_tokens = 0
-    completion_tokens = 0
-    try:
-        um = getattr(response, "usage_metadata", None) or {}
-        if um:
-            prompt_tokens = int(um.get("input_tokens") or um.get("prompt_tokens") or 0)
-            completion_tokens = int(um.get("output_tokens") or um.get("completion_tokens") or 0)
-        else:
-            rm = getattr(response, "response_metadata", None) or {}
-            tu = rm.get("token_usage") or rm.get("usage") or {}
-            prompt_tokens = int(tu.get("prompt_tokens") or tu.get("input_tokens") or 0)
-            completion_tokens = int(tu.get("completion_tokens") or tu.get("output_tokens") or 0)
-    except Exception:
-        pass
+    # Extract token counts via shared helper (logs debug on failure)
+    prompt_tokens, completion_tokens = _extract_token_counts(response, log, label)
 
     total_call = prompt_tokens + completion_tokens
-    
+
     # Calculate cost
     cost_usd = estimate_cost(model_name, prompt_tokens, completion_tokens)
     
@@ -445,7 +462,7 @@ async def llm_invoke_async(
             log.warning("[%s] exception: %s — %s", label, type(exc).__name__, str(exc)[:300])
 
             # BUG-G fix: same as llm_invoke — skip retries for LengthFinishReasonError
-            if "LengthFinishReasonError" in type(exc).__name__ or "LengthFinishReason" in str(exc)[:80]:
+            if _is_length_error(exc):
                 log.warning(
                     "[%s] LengthFinishReasonError — skip retries (token limit, same input = same result)",
                     label,
@@ -480,21 +497,8 @@ async def llm_invoke_async(
 
     elapsed = time.perf_counter() - t0
 
-    # Extract token counts
-    prompt_tokens = 0
-    completion_tokens = 0
-    try:
-        um = getattr(response, "usage_metadata", None) or {}
-        if um:
-            prompt_tokens = int(um.get("input_tokens") or um.get("prompt_tokens") or 0)
-            completion_tokens = int(um.get("output_tokens") or um.get("completion_tokens") or 0)
-        else:
-            rm = getattr(response, "response_metadata", None) or {}
-            tu = rm.get("token_usage") or rm.get("usage") or {}
-            prompt_tokens = int(tu.get("prompt_tokens") or tu.get("input_tokens") or 0)
-            completion_tokens = int(tu.get("completion_tokens") or tu.get("output_tokens") or 0)
-    except Exception:
-        pass
+    # Extract token counts via shared helper (logs debug on failure)
+    prompt_tokens, completion_tokens = _extract_token_counts(response, log, label)
 
     total_call = prompt_tokens + completion_tokens
     cost_usd = estimate_cost(model_name, prompt_tokens, completion_tokens)

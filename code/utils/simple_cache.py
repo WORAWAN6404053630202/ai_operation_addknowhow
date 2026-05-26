@@ -43,11 +43,12 @@ class SimpleCache:
         self.ttl_seconds = ttl_seconds
         self._cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
         self._lock = threading.RLock()
-        
+
         # Metrics
         self.hits = 0
         self.misses = 0
         self.evictions = 0
+        self._sets_since_cleanup = 0
     
     def _generate_key(self, session_id: str, question: str, persona: str = "practical") -> str:
         """
@@ -107,7 +108,7 @@ class SimpleCache:
             if len(self._cache) >= self.max_size and key not in self._cache:
                 self._cache.popitem(last=False)  # Remove oldest (FIFO)
                 self.evictions += 1
-            
+
             # Store with timestamp
             self._cache[key] = {
                 "value": value,
@@ -118,7 +119,16 @@ class SimpleCache:
             
             # Move to end (most recent)
             self._cache.move_to_end(key)
-    
+
+            # Opportunistic expired-entry cleanup every 50 set calls to prevent
+            # the cache from filling with TTL-expired entries when traffic is steady.
+            self._sets_since_cleanup += 1
+            if self._sets_since_cleanup >= 50:
+                self._sets_since_cleanup = 0
+                expired_keys = [k for k, v in self._cache.items() if self._is_expired(v)]
+                for k in expired_keys:
+                    del self._cache[k]
+
     def clear(self) -> None:
         """Clear all cache entries."""
         with self._lock:
