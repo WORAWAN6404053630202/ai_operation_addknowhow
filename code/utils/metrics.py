@@ -7,7 +7,7 @@ import time
 from typing import Dict, Optional, List
 from dataclasses import dataclass, field
 from datetime import datetime
-from collections import defaultdict
+from collections import defaultdict, deque
 import threading
 
 
@@ -48,21 +48,21 @@ class MetricsCollector:
     """
     
     _instance = None
-    _lock = threading.Lock()
-    
+    _singleton_lock = threading.Lock()
+
     def __new__(cls):
         if cls._instance is None:
-            with cls._lock:
+            with cls._singleton_lock:
                 if cls._instance is None:
                     cls._instance = super().__new__(cls)
                     cls._instance._initialize()
         return cls._instance
     
     def _initialize(self):
-        self.llm_calls: List[LLMCallMetrics] = []
-        self.requests: List[RequestMetrics] = []
+        self.llm_calls: deque = deque(maxlen=10000)
+        self.requests: deque = deque(maxlen=5000)
         self.counters: Dict[str, int] = defaultdict(int)
-        self.timers: Dict[str, List[float]] = defaultdict(list)
+        self.timers: Dict[str, deque] = defaultdict(lambda: deque(maxlen=5000))
         self._lock = threading.Lock()
     
     # === LLM Metrics ===
@@ -111,7 +111,7 @@ class MetricsCollector:
     def get_llm_stats(self, last_n: Optional[int] = None) -> Dict:
         """Get LLM usage statistics"""
         with self._lock:
-            calls = self.llm_calls[-last_n:] if last_n else self.llm_calls
+            calls = list(self.llm_calls)[-last_n:] if last_n else list(self.llm_calls)
             
             if not calls:
                 return {
@@ -195,7 +195,7 @@ class MetricsCollector:
     def get_request_stats(self, last_n: Optional[int] = None) -> Dict:
         """Get request statistics"""
         with self._lock:
-            requests = self.requests[-last_n:] if last_n else self.requests
+            requests = list(self.requests)[-last_n:] if last_n else list(self.requests)
             
             if not requests:
                 return {

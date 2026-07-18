@@ -50,28 +50,32 @@ class SimpleCache:
         self.evictions = 0
         self._sets_since_cleanup = 0
     
-    def _generate_key(self, session_id: str, question: str, persona: str = "practical") -> str:
+    def _generate_key(self, session_id: str, question: str, persona: str = "practical", collected_slots: dict = None) -> str:
         """
-        Generate cache key from session + question + persona.
-        
-        Uses hash to keep keys short.
+        Generate cache key from session + question + persona + collected_slots.
+
+        collected_slots is included so the same question asked before vs. after
+        slot-fill (e.g. entity_type=นิติบุคคล) gets a different cache entry.
         """
-        content = f"{session_id}:{question}:{persona}"
+        slots_str = ""
+        if collected_slots:
+            slots_str = json.dumps(dict(sorted(collected_slots.items())), ensure_ascii=False)
+        content = f"{session_id}:{question}:{persona}:{slots_str}"
         return hashlib.sha256(content.encode()).hexdigest()[:16]
     
     def _is_expired(self, entry: Dict[str, Any]) -> bool:
         """Check if cache entry is expired."""
         return time.time() - entry["timestamp"] > self.ttl_seconds
     
-    def get(self, session_id: str, question: str, persona: str = "practical") -> Optional[Any]:
+    def get(self, session_id: str, question: str, persona: str = "practical", collected_slots: dict = None) -> Optional[Any]:
         """
         Get cached result.
         
         Returns:
             Cached value or None if not found/expired
         """
-        key = self._generate_key(session_id, question, persona)
-        
+        key = self._generate_key(session_id, question, persona, collected_slots)
+
         with self._lock:
             if key not in self._cache:
                 self.misses += 1
@@ -91,17 +95,19 @@ class SimpleCache:
             
             return entry["value"]
     
-    def set(self, session_id: str, question: str, value: Any, persona: str = "practical") -> None:
+    def set(self, session_id: str, question: str, value: Any, persona: str = "practical", collected_slots: dict = None) -> None:
         """
         Store value in cache.
-        
+
         Args:
             session_id: Session identifier
             question: User question
             value: Response to cache (can be dict, str, etc.)
             persona: Persona used (practical/academic)
+            collected_slots: Current slot context — included in key so same question
+                with different slots (e.g. entity_type) gets a separate entry.
         """
-        key = self._generate_key(session_id, question, persona)
+        key = self._generate_key(session_id, question, persona, collected_slots)
         
         with self._lock:
             # Evict oldest if at capacity
@@ -191,5 +197,11 @@ def get_cache() -> SimpleCache:
     """Get global cache instance (singleton)."""
     global _global_cache
     if _global_cache is None:
-        _global_cache = SimpleCache(max_size=1000, ttl_seconds=3600)
+        try:
+            import conf as _conf
+            _ttl = getattr(_conf, "CACHE_TTL_SECONDS", 86400)
+            _size = getattr(_conf, "CACHE_MAX_SIZE", 1000)
+        except Exception:
+            _ttl, _size = 86400, 1000
+        _global_cache = SimpleCache(max_size=_size, ttl_seconds=_ttl)
     return _global_cache

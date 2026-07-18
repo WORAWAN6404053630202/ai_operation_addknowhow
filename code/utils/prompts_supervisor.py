@@ -260,6 +260,24 @@ def build_slot_mapper_prompt(slot_key: str, user_text: str, options: List[str]) 
     )
 
 
+# 7b. SELECT-ALL INTENT (multi-select slots only)
+
+def build_select_all_intent_prompt(slot_key: str, user_text: str, options: List[str]) -> str:
+    """Detect if user wants to select ALL available options rather than just one."""
+    opts = [str(x).strip() for x in options if str(x).strip()][:10]
+    return (
+        "คุณเป็น classifier: user ต้องการเลือก 'ตัวเลือกทั้งหมด' หรือไม่?\n"
+        "กติกา:\n"
+        "- ตอบ select_all=true: ถ้า user สื่อว่าต้องการข้อมูลหรือเลือก 'ทุกตัวเลือก' / 'ทั้งหมด' / 'ทั้งคู่' / 'ทั้งนั้น' / 'หมดเลย' ฯลฯ\n"
+        "- ตอบ select_all=false: ถ้า user เลือกเพียงบางตัวเลือก หรือพิมพ์ตัวเลขระบุตัวเลือกเดียว\n"
+        "ตอบ JSON เท่านั้น:\n"
+        '{"select_all": false, "confidence": 0.0}\n'
+        f"slot_key: {slot_key}\n"
+        f"user_text: {_safe_embed(user_text)}\n"
+        f"options: {opts}\n"
+    )
+
+
 # 8. FALLBACK INTENT
 
 def build_fallback_intent_prompt(user_text: str, last_query: str, persona: str) -> str:
@@ -361,7 +379,30 @@ def build_area_size_detect_prompt(user_text: str) -> str:
     )
 
 
-# 13. LICENSE TYPE DETECT
+# 13. REGISTRATION TYPE DETECT
+
+def build_registration_type_detect_prompt(user_text: str, options: List[str]) -> str:
+    """
+    LLM fallback for registration_type inference — called when user implies a sub-type
+    but doesn't use the exact option label (e.g. typo, partial name, or synonym).
+    Returns the matched option string (may be a partial like "ห้างหุ้นส่วน"), or null.
+    """
+    opts_block = "\n".join(f"- {o}" for o in (options or []))
+    return (
+        "ระบุรูปแบบการจดทะเบียนที่ user กล่าวถึงจากตัวเลือกที่ให้\n"
+        f"user_text: {user_text}\n\n"
+        f"ตัวเลือกที่มีในระบบ:\n{opts_block}\n\n"
+        "กติกา:\n"
+        "- ถ้า user ระบุชัดเจนว่าเป็นประเภทใดในรายการ → ตอบตัวเลือกนั้นทั้งข้อความ\n"
+        "- ถ้า user บอกแค่กลุ่มกว้างๆ เช่น 'ห้างหุ้นส่วน' (ไม่ระบุจำกัด/สามัญ) → ตอบ 'ห้างหุ้นส่วน'\n"
+        "- ถ้า user บอกแค่ 'บริษัท' (ไม่ระบุรายละเอียด) → ตอบ 'บริษัทจำกัด'\n"
+        "- ถ้า user ไม่ได้กล่าวถึงรูปแบบเลย หรือไม่ชัดเจน → ตอบ null\n"
+        "- confidence < 0.70 → ตอบ null\n\n"
+        'ตอบ JSON เท่านั้น: {"registration_type": "..."|null, "confidence": 0.0}'
+    )
+
+
+# 14. LICENSE TYPE DETECT
 
 def build_license_type_detect_prompt(user_text: str, candidates: List[str]) -> str:
     """
@@ -456,10 +497,37 @@ def build_elaborate_detect_prompt(user_text: str, last_topic: str) -> str:
         "- ยกตัวอย่างเพิ่มเกี่ยวกับเรื่องเดิม\n\n"
         "is_elaborate=false เมื่อ user:\n"
         "- ถามเรื่องใหม่หรือ topic อื่น\n"
+        "- topic เปลี่ยนด้าน เช่น last_topic='กฎหมาย/ใบอนุญาต/เปิดร้าน' แต่ user_text='ทำให้ดัง/มีกระแส/การตลาด' → false เสมอ\n"
         "- ทักทาย / ขอบคุณ / ขอเมนูหัวข้อ\n"
         "- คำถามที่ไม่เกี่ยวกับ last_topic\n\n"
         'ตอบ JSON เท่านั้น: {"is_elaborate": true/false, "confidence": 0.0}\n'
         "confidence < 0.75 → is_elaborate=false"
+    )
+
+
+def build_meta_request_detect_prompt(user_text: str, last_topic: str) -> str:
+    """
+    Classify user input as meta-request and detect whether a new topic is embedded.
+    Returns 3 fields in one call to avoid the need for a separate word-strip heuristic.
+    Confidence threshold: 0.75.
+    """
+    _u = _safe_embed(user_text)
+    _t = _safe_embed(last_topic)
+    return (
+        "คุณคือ classifier ตรวจ 3 อย่างพร้อมกัน:\n"
+        f"user_text: {_u}\n"
+        f"หัวข้อที่กำลังคุยอยู่: {_t or '(ยังไม่มี)'}\n\n"
+        "1) is_meta_request — user ขอรายละเอียดเพิ่มของหัวข้อเดิมหรือไม่\n"
+        "   TRUE: 'อธิบายละเอียดกว่านี้', 'ขอแบบครบกว่านี้', 'ขยายความ', 'เพิ่มเติมหน่อย'\n"
+        "   FALSE: ถามเรื่องใหม่ที่ไม่เกี่ยวกับหัวข้อเดิม หรือทักทาย/ขอบคุณ\n\n"
+        "2) has_embedded_topic — ถ้า is_meta_request=true มีหัวข้อใหม่ฝังอยู่ใน user_text ด้วยหรือไม่\n"
+        "   TRUE: 'ขอรายละเอียดเพิ่มเรื่องใบอนุญาตจำหน่ายสุรา' → มีหัวข้อ 'ใบอนุญาตจำหน่ายสุรา' ฝังอยู่\n"
+        "   FALSE: 'อธิบายละเอียดกว่านี้หน่อยคะ' → ไม่มีหัวข้อ — ขอรายละเอียดเรื่องเดิม\n\n"
+        "3) extracted_topic — ถ้า has_embedded_topic=true ระบุหัวข้อที่แท้จริงจาก user_text (null ถ้าไม่มี)\n"
+        "   เช่น 'ขอรายละเอียดค่าธรรมเนียมการจดทะเบียน' → 'ค่าธรรมเนียมการจดทะเบียน'\n\n"
+        'ตอบ JSON เท่านั้น: {"is_meta_request": true/false, "confidence": 0.0, '
+        '"has_embedded_topic": false, "extracted_topic": null}\n'
+        "ถ้า confidence < 0.75 → is_meta_request=false, has_embedded_topic=false"
     )
 
 
@@ -485,6 +553,30 @@ def build_broad_question_detect_prompt(user_text: str) -> str:
         "- 'ขั้นตอนจดทะเบียนพาณิชย์' → เรื่องเดียว\n\n"
         'ตอบ JSON เท่านั้น: {"is_broad": true/false, "confidence": 0.0}\n'
         "confidence < 0.75 → is_broad=false"
+    )
+
+
+def build_new_topic_detect_prompt(user_text: str, last_topic: str) -> str:
+    """
+    Detect whether user wants to switch to a DIFFERENT topic / see a new topic menu,
+    as opposed to asking a follow-up on the current topic.
+    Called when _NEW_TOPIC_RE regex misses. Confidence threshold: 0.75.
+    """
+    return (
+        "คุณคือ classifier ตรวจว่า user ต้องการ 'เปลี่ยนหัวข้อ / ดูรายการหัวข้อใหม่' หรือไม่\n"
+        f"user_text: {user_text}\n"
+        f"หัวข้อที่คุยอยู่ตอนนี้: {last_topic or '(ยังไม่มี)'}\n\n"
+        "is_new_topic=TRUE — user ขอดูรายการหัวข้อหรือเปลี่ยนเรื่องอย่างชัดเจน:\n"
+        "- 'มีเรื่องอื่นให้แนะนำมั้ย', 'อยากรู้เรื่องอื่นด้วย', 'มีอะไรอีกไหม'\n"
+        "- 'ขอดูหัวข้ออื่น', 'ขอเปลี่ยนเรื่องได้มั้ย', 'สนใจเรื่องอื่นด้วย'\n\n"
+        "is_new_topic=FALSE — user ถามต่อหรือถามคำถามกฎหมายโดยตรง:\n"
+        "- 'แล้วถ้าเป็นบุคคลธรรมดาต้องทำไร' → FALSE (follow-up มุมอื่นของหัวข้อเดิม)\n"
+        "- 'ถ้าจะขอใบอนุญาตต้องทำยังไง' → FALSE (คำถามกฎหมายโดยตรง ไม่ใช่ขอเมนู)\n"
+        "- 'มีข้อมูลเพิ่มเติมมั้ย', 'บอกอีกหน่อย' → FALSE (ขอข้อมูลเพิ่มหัวข้อเดิม)\n"
+        "- ทักทาย / ขอบคุณ → FALSE\n\n"
+        "กฎสำคัญ: ถ้า user_text มีคำถามกฎหมายชัดเจน (ใบอนุญาต/จดทะเบียน/ภาษี/ขั้นตอน) → FALSE เสมอ\n\n"
+        'ตอบ JSON เท่านั้น: {"is_new_topic": true/false, "confidence": 0.0}\n'
+        "confidence < 0.75 → is_new_topic=false"
     )
 
 
@@ -522,12 +614,33 @@ def build_greeting_detect_prompt(user_text: str) -> str:
         "is_greeting=true เมื่อ user:\n"
         "- ทักทายหรือแนะนำตัว (เช่น 'ยินดีที่ได้รู้จัก', 'มาใหม่นะครับ', 'เพิ่งเริ่มใช้')\n"
         "- ขอโทษหรือขอรบกวน (เช่น 'ขอโทษที่รบกวน', 'ขอรบกวนหน่อยนะ')\n"
-        "- บอกว่าพร้อมจะเริ่ม (เช่น 'มาเริ่มต้นกันเลย', 'เริ่มกันได้เลยนะ')\n\n"
+        "- บอกว่าพร้อมจะเริ่ม (เช่น 'มาเริ่มต้นกันเลย', 'เริ่มกันได้เลยนะ')\n"
+        "- ทักทายภาษาอังกฤษ รวมถึงที่พิมพ์ยาวหรือซ้ำตัวอักษร (เช่น 'heyyyy', 'hiiii', 'heyyyyyyyd', 'yooooo', 'hiii')\n\n"
         "is_greeting=false เมื่อ user:\n"
         "- ถามคำถามที่มีเนื้อหาจริงๆ (แม้ขึ้นต้นด้วยคำสุภาพ)\n"
         "- ต้องการข้อมูลหรือขั้นตอน\n\n"
         'ตอบ JSON เท่านั้น: {"is_greeting": true/false, "confidence": 0.0}\n'
         "confidence < 0.80 → is_greeting=false"
+    )
+
+
+def build_topic_group_detect_prompt(user_text: str, known_groups: List[str]) -> str:
+    """
+    When retrieval-based topic_group scoring is inconclusive (< 30%), ask LLM to pick the
+    best matching topic group from the known list.
+    Returns: {"topic_group": str | null, "confidence": 0.0-1.0}
+    Threshold: 0.60 (borderline case — some signal from regex already; LLM adds directional confidence)
+    """
+    opts = "\n".join(f"- {g}" for g in known_groups if g and g != "อื่นๆ")
+    return (
+        "คุณคือ classifier หมวดหมู่หัวข้อสำหรับบอทกฎหมายร้านอาหารไทย\n"
+        "งาน: จัดคำถามนี้เข้าหมวดที่ตรงที่สุดจากรายการด้านล่าง\n\n"
+        f"คำถาม: {user_text}\n\n"
+        "หมวดที่มี:\n"
+        f"{opts}\n\n"
+        "ตอบ JSON เท่านั้น:\n"
+        '{"topic_group": "<ชื่อหมวด หรือ null ถ้าไม่ตรงเลย>", "confidence": 0.0}\n'
+        "confidence < 0.60 → topic_group=null"
     )
 
 
@@ -568,8 +681,13 @@ def build_info_action_q_detect_prompt(user_text: str) -> str:
     return (
         "คุณคือระบบจำแนกความตั้งใจของผู้ใช้บอทกฎหมายร้านอาหารไทย\n"
         "งาน: จำแนกว่าข้อความนี้เป็นคำถามเชิงข้อมูล (is_info) หรือต้องการดำเนินการ (is_action)\n\n"
-        "is_info=true: ผู้ใช้ถามเพื่อรับทราบข้อมูล — ค่าธรรมเนียม ระยะเวลา เงื่อนไข บทลงโทษ เอกสารที่ต้องใช้\n"
+        "is_info=true: ผู้ใช้ต้องการรับทราบข้อมูล — รวมถึงกรณีที่พิมพ์แค่ชื่อหัวข้อ/คำนามโดดๆ\n"
+        "กฎสำคัญ: ถ้าข้อความเป็นแค่ชื่อหัวข้อหรือคำนามเดี่ยวๆ (ไม่มีกริยาหรือคำถาม) → is_info=true เสมอ\n"
+        "ผู้ใช้กำลังบอกหัวข้อที่สนใจ ต้องการทราบข้อมูลทั่วไปเกี่ยวกับหัวข้อนั้น\n"
         "ตัวอย่าง is_info=true:\n"
+        '- "ภาษีป้าย" (ชื่อหัวข้อเดี่ยว — ต้องการทราบข้อมูลทั่วไป)\n'
+        '- "ทะเบียนพาณิชย์" (ชื่อหัวข้อเดี่ยว)\n'
+        '- "ใบอนุญาตสุรา" (ชื่อหัวข้อเดี่ยว)\n'
         '- "ค่าธรรมเนียมเท่าไหร่ครับ"\n'
         '- "ใช้เวลากี่วันครับ"\n'
         '- "ต้องใช้เอกสารอะไรบ้าง"\n'
@@ -582,7 +700,6 @@ def build_info_action_q_detect_prompt(user_text: str) -> str:
         '- "ต้องการไปยื่นเอกสารที่ไหน"\n'
         '- "จะขอใบอนุญาตต้องเริ่มต้นยังไง"\n'
         '- "อยากแก้ไขชื่อในทะเบียน"\n\n'
-        "ทั้ง is_info และ is_action เป็น false ได้ ถ้าข้อความกำกวมหรือไม่ชัดเจน\n\n"
         f'ข้อความผู้ใช้: "{user_text}"\n\n'
         'ตอบเป็น JSON เท่านั้น: {"is_info": true, "is_action": false, "confidence": 0.0}'
     )
@@ -746,18 +863,4 @@ def build_academic_stop_detect_prompt(user_text: str) -> str:
         "- ตอบคำถาม slot\n\n"
         'ตอบ JSON เท่านั้น: {"is_stop": true/false, "confidence": 0.0}\n'
         "confidence < 0.80 → is_stop=false"
-    )
-
-
-def build_topic_desc_prompt(topics: List[str], context_block: str) -> str:
-    """Generate one-sentence descriptions for topic menu items."""
-    topic_list = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(topics))
-    return (
-        "คุณคือ AI ที่ปรึกษาร้านอาหาร สร้างคำอธิบายสั้น 1 ประโยค (ไม่เกิน 20 คำ) สำหรับแต่ละหัวข้อ\n"
-        "โทน: บอกจากมุมบอทว่า ผมจะแนะนำ/สอน/บอกอะไรคุณได้บ้างในหัวข้อนี้\n"
-        "สำคัญ: ใช้เฉพาะข้อมูลที่มีอยู่ในเอกสารด้านล่าง ห้ามสร้างข้อมูลที่ไม่มี\n"
-        "ห้ามขึ้นต้นด้วย 'ถ้าเลือกหัวข้อนี้' หรือ 'ผมจด' หรือ 'ผมทำ'\n\n"
-        f"หัวข้อ:\n{topic_list}\n\n"
-        f"เอกสารอ้างอิง:\n{context_block}"
-        'ตอบ JSON เท่านั้น รูปแบบ: {"descriptions": ["คำอธิบาย1", "คำอธิบาย2"]}'
     )

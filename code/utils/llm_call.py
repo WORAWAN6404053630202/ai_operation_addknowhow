@@ -28,7 +28,7 @@ import time
 from typing import TYPE_CHECKING, Any, List, Optional
 
 _MAX_RETRIES = 2
-_RETRY_DELAYS = (1.0, 2.0)  # exponential backoff in seconds
+_RETRY_DELAYS = (0.3, 1.0)  # exponential backoff in seconds
 
 if TYPE_CHECKING:
     from code.model.conversation_state import ConversationState
@@ -196,17 +196,6 @@ def _check_token_budget(total: int, model: str) -> None:
                 "model": model,
                 "severity": "warning",
                 "detail": f"Token usage {total:,} exceeds WARNING threshold. Target: {conf.TOKEN_BUDGET_PER_CALL:,}"
-            }
-        )
-    elif total >= _TOKEN_WARN_THRESHOLD:
-        logger.info(
-            "INFO: Token usage within acceptable range",
-            extra={
-                "tokens": total,
-                "target": conf.TOKEN_BUDGET_PER_CALL,
-                "warning_threshold": conf.TOKEN_BUDGET_WARNING,
-                "model": model,
-                "severity": "info"
             }
         )
 
@@ -388,11 +377,11 @@ def llm_invoke(
         })
         
         # Performance warning
-        if elapsed > 2.0:
+        if elapsed > 10.0:
             _safe_log_with_data(log, "warning", "LLM ช้าเกินไป", {
                 "label": label,
                 "duration_ms": round(elapsed * 1000, 2),
-                "threshold_ms": 2000,
+                "threshold_ms": 10000,
                 "model": model_name
             })
     else:
@@ -522,11 +511,11 @@ async def llm_invoke_async(
             "temperature": getattr(llm, "temperature", None),
         })
         
-        if elapsed > 2.0:
+        if elapsed > 10.0:
             _safe_log_with_data(log, "warning", "LLM ช้าเกินไป (async)", {
                 "label": label,
                 "duration_ms": round(elapsed * 1000, 2),
-                "threshold_ms": 2000,
+                "threshold_ms": 10000,
                 "model": model_name
             })
     else:

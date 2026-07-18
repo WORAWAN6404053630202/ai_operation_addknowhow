@@ -71,6 +71,74 @@ try:
 
     logger.info("Services initialized successfully")
 
+    # Pre-warm cross-encoder reranker in background so first request doesn't pay
+    # the 1-2s model-load cost. Daemon thread — does not block server startup.
+    if getattr(conf, "RERANKER_ENABLED", False):
+        import threading
+        def _prewarm_reranker():
+            try:
+                from utils.reranker import _get_reranker
+                _rr_model = getattr(conf, "RERANKER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
+                _get_reranker(_rr_model)
+                logger.info("Reranker pre-warmed: %s", _rr_model)
+            except Exception as _rr_e:
+                logger.warning("Reranker pre-warm failed (non-blocking): %s", _rr_e)
+        threading.Thread(target=_prewarm_reranker, daemon=True, name="reranker_prewarm").start()
+
+    # Pre-warm topic pool in background — populates global cross-session cache so the
+    # first user greeting doesn't pay the 5-retrieval build cost (~1-2s).
+    import threading as _th
+    def _prewarm_topic_pool():
+        try:
+            _dummy = ConversationState(session_id="__prewarm__", persona_id="practical", context={})
+            supervisor._build_topic_pool_from_corpus(_dummy)
+            logger.info("Topic pool pre-warmed: %d items", len(_dummy.context.get("topic_pool") or []))
+        except Exception as _tp_e:
+            logger.warning("Topic pool pre-warm failed (non-blocking): %s", _tp_e)
+    _th.Thread(target=_prewarm_topic_pool, daemon=True, name="topic_pool_prewarm").start()
+
+    # Pre-warm BM25 index — builds tokenized corpus index so the first
+    # hybrid_scored_search() call doesn't pay the PyThaiNLP tokenization cost (~0.3-0.5s).
+    # topic_pool_prewarm uses retriever.invoke() (pure vector) and does NOT trigger this.
+    def _prewarm_bm25():
+        try:
+            from utils.hybrid_retriever import _get_bm25_index
+            from service.local_vector_store import get_vs_manager
+            _vs = get_vs_manager().vectorstore
+            if _vs:
+                _idx = _get_bm25_index(_vs)
+                logger.info("BM25 index pre-warmed: %d docs", _idx.doc_count if _idx else 0)
+            else:
+                logger.warning("BM25 pre-warm skipped — vectorstore not ready")
+        except Exception as _bm_e:
+            logger.warning("BM25 pre-warm failed (non-blocking): %s", _bm_e)
+    _th.Thread(target=_prewarm_bm25, daemon=True, name="bm25_prewarm").start()
+
+    # Pre-warm op-group classifier cache — so the first user who asks about
+    # แก้ไข/ต่ออายุ/ยกเลิก doesn't pay the Haiku LLM call cost (~3-5s).
+    # Iterates every license_type found in Chroma × 3 entity variants.
+    def _prewarm_op_groups():
+        try:
+            _vs = getattr(getattr(supervisor, "_practical", None), "retriever", None)
+            _vs = getattr(_vs, "vectorstore", None)
+            _coll = getattr(_vs, "_collection", None)
+            if _coll is None:
+                logger.warning("Op-group pre-warm skipped — vectorstore not ready")
+                return
+            _result = _coll.get(include=["metadatas"])
+            _license_types = {
+                (md.get("license_type") or "").strip()
+                for md in (_result.get("metadatas") or [])
+                if (md.get("license_type") or "").strip()
+            }
+            for _lt in sorted(_license_types):
+                for _entity in ("นิติบุคคล", "บุคคลธรรมดา", ""):
+                    supervisor._get_operation_groups_for_entity(_lt, _entity)
+            logger.info("Op-group cache pre-warmed: %d license types", len(_license_types))
+        except Exception as _og_e:
+            logger.warning("Op-group pre-warm failed (non-blocking): %s", _og_e)
+    _th.Thread(target=_prewarm_op_groups, daemon=True, name="op_group_prewarm").start()
+
 except Exception:
     logger.error("Failed to initialize services", exc_info=True)
     supervisor = None
@@ -146,7 +214,8 @@ async def start_session(payload: Optional[NewSessionRequest] = None):
     state = ConversationState(session_id=session_id, persona_id=persona_id, context={})
 
     try:
-        state, greeting_text = supervisor.handle(state, "")
+        loop = asyncio.get_running_loop()
+        state, greeting_text = await loop.run_in_executor(None, supervisor.handle, state, "")
         state_manager.save(session_id, state)
     except Exception:
         logger.error(f"[{session_id}] Greeting failed", exc_info=True)
@@ -178,7 +247,8 @@ async def reset_session(request: SessionRequest):
     state = ConversationState(session_id=session_id, persona_id="practical", context={})
 
     try:
-        state, greeting_text = supervisor.handle(state, "")
+        loop = asyncio.get_running_loop()
+        state, greeting_text = await loop.run_in_executor(None, supervisor.handle, state, "")
         state_manager.save(session_id, state)
     except Exception:
         logger.error(f"[{session_id}] Reset failed", exc_info=True)
@@ -344,13 +414,21 @@ async def chat(request: ChatRequest):
 
             cache = get_cache()
             has_pending_slot = bool((state.context or {}).get("pending_slot"))
-            _CACHE_SKIP_SLOTS = {"entity_type", "registration_type", "location", "area_size"}
             _collected_slots = (state.context or {}).get("collected_slots") or {}
-            has_slot_context = bool(_CACHE_SKIP_SLOTS & set(_collected_slots.keys()))
+            # First-turn queries with no prior user messages and no collected slots
+            # produce identical LLM context across sessions (same system prompt +
+            # same greeting + same retrieved docs). Use a shared cache key so
+            # different users asking the same first question share one cache entry.
+            _prior_user_msgs = [
+                m for m in (state.messages or [])
+                if (m.get("role") if isinstance(m, dict) else getattr(m, "role", "")) == "user"
+            ]
+            _is_context_free = not _collected_slots and not _prior_user_msgs and not has_pending_slot
+            _cache_session_id = "__shared__" if _is_context_free else session_id
             cached_result = (
                 None
-                if (has_pending_slot or has_slot_context)
-                else cache.get(session_id, request.message, state.persona_id)
+                if has_pending_slot
+                else cache.get(_cache_session_id, request.message, state.persona_id, _collected_slots)
             )
 
             if cached_result is not None:
@@ -368,39 +446,39 @@ async def chat(request: ChatRequest):
                 )
 
             logger.info(f"[{session_id}] Cache MISS - Calling LLM")
-            state, bot_reply = supervisor.handle(state, request.message)
+            loop = asyncio.get_running_loop()
+            state, bot_reply = await loop.run_in_executor(None, supervisor.handle, state, request.message)
             state_manager.save(session_id, state)
 
-        # Record token delta for window-level rate tracking.
-        _post_tokens = (getattr(state, "total_prompt_tokens", 0) or 0) + (getattr(state, "total_completion_tokens", 0) or 0)
-        _delta_tokens = max(0, _post_tokens - _pre_tokens)
-        if _delta_tokens > 0:
-            rate_limiter.record_token_usage(session_id, _delta_tokens)
+            # Record token delta and cache inside the lock — prevents stale reads
+            # when two requests for the same session overlap.
+            _post_tokens = (getattr(state, "total_prompt_tokens", 0) or 0) + (getattr(state, "total_completion_tokens", 0) or 0)
+            _delta_tokens = max(0, _post_tokens - _pre_tokens)
+            if _delta_tokens > 0:
+                rate_limiter.record_token_usage(session_id, _delta_tokens)
 
-        # Compute actual cost from token delta and persona-appropriate model
-        _post_prompt = getattr(state, "total_prompt_tokens", 0) or 0
-        _post_completion = getattr(state, "total_completion_tokens", 0) or 0
-        _model_for_cost = {
-            "academic": conf.OPENROUTER_MODEL_ACADEMIC,
-            "practical": conf.OPENROUTER_MODEL_PRACTICAL,
-        }.get(state.persona_id, conf.OPENROUTER_MODEL)
-        _actual_cost = estimate_cost(
-            _model_for_cost,
-            max(0, _post_prompt - _pre_prompt),
-            max(0, _post_completion - _pre_completion),
-        )
-
-        # Store in cache for future use
-        cache.set(
-            session_id=session_id,
-            question=request.message,
-            value={
-                "response": bot_reply,
-                "cost": _actual_cost,
-                "persona": state.persona_id
-            },
-            persona=state.persona_id
-        )
+            _post_prompt = getattr(state, "total_prompt_tokens", 0) or 0
+            _post_completion = getattr(state, "total_completion_tokens", 0) or 0
+            _model_for_cost = {
+                "academic": conf.OPENROUTER_MODEL_ACADEMIC,
+                "practical": conf.OPENROUTER_MODEL_PRACTICAL,
+            }.get(state.persona_id, conf.OPENROUTER_MODEL)
+            _actual_cost = estimate_cost(
+                _model_for_cost,
+                max(0, _post_prompt - _pre_prompt),
+                max(0, _post_completion - _pre_completion),
+            )
+            cache.set(
+                session_id=_cache_session_id,
+                question=request.message,
+                value={
+                    "response": bot_reply,
+                    "cost": _actual_cost,
+                    "persona": state.persona_id
+                },
+                persona=state.persona_id,
+                collected_slots=_collected_slots,
+            )
 
         return HandleSuccess(
             message="Chat completed",
@@ -411,6 +489,8 @@ async def chat(request: ChatRequest):
             cache_stats=cache.get_stats()
         )
 
+    except HTTPException:
+        raise
     except Exception:
         logger.error(f"[{session_id}] Chat failed", exc_info=True)
         raise HTTPException(
@@ -472,16 +552,24 @@ async def _stream_reply(session_id: str, message: str) -> AsyncGenerator[str, No
                     # lock released at end of with block
 
             if not _stream_error:
-                # Skip cache if pending_slot or slot-sensitive values collected.
+                # Skip cache only when a slot question is pending (mid-collection).
+                # collected_slots is included in the cache key so different slot combos
+                # never share a cache entry — no need to skip cache when slots are present.
+                # First-turn + no-slot queries use a shared key so different users
+                # asking the same question share one cache entry (see /chat endpoint).
                 cache = get_cache()
                 has_pending_slot = bool((state.context or {}).get("pending_slot"))
-                _CACHE_SKIP_SLOTS = {"entity_type", "registration_type", "location", "area_size"}
                 _collected_slots = (state.context or {}).get("collected_slots") or {}
-                has_slot_context = bool(_CACHE_SKIP_SLOTS & set(_collected_slots.keys()))
+                _prior_user_msgs_st = [
+                    m for m in (state.messages or [])
+                    if (m.get("role") if isinstance(m, dict) else getattr(m, "role", "")) == "user"
+                ]
+                _is_context_free_st = not _collected_slots and not _prior_user_msgs_st and not has_pending_slot
+                _cache_session_id_st = "__shared__" if _is_context_free_st else session_id
                 cached_result = (
                     None
-                    if (has_pending_slot or has_slot_context)
-                    else cache.get(session_id, message, state.persona_id)
+                    if has_pending_slot
+                    else cache.get(_cache_session_id_st, message, state.persona_id, _collected_slots)
                 )
 
                 if cached_result is not None:
@@ -519,10 +607,11 @@ async def _stream_reply(session_id: str, message: str) -> AsyncGenerator[str, No
                     )
 
                     cache.set(
-                        session_id=session_id,
+                        session_id=_cache_session_id_st,
                         question=message,
                         value={"response": bot_reply, "cost": _stream_cost, "persona": state.persona_id},
                         persona=state.persona_id,
+                        collected_slots=_collected_slots,
                     )
 
                     _full_text = bot_reply
@@ -539,13 +628,13 @@ async def _stream_reply(session_id: str, message: str) -> AsyncGenerator[str, No
         yield f"data: {json.dumps({'type': 'error', 'message': _stream_error})}\n\n"
         return
 
-    chunk_size = 5
+    chunk_size = 20
     for i in range(0, len(_full_text), chunk_size):
         chunk = _full_text[i:i + chunk_size]
-        yield f"data: {json.dumps({'type': 'chunk', 'text': chunk})}\n\n"
-        await asyncio.sleep(0.008 if not _stream_cached else 0.01)
+        yield f"data: {json.dumps({'type': 'chunk', 'text': chunk}, separators=(',', ':'))}\n\n"
+        await asyncio.sleep(0.008 if not _stream_cached else 0.003)
 
-    yield f"data: {json.dumps({'type': 'done', 'session_id': session_id, 'persona_id': _stream_persona_id, 'cached': _stream_cached})}\n\n"
+    yield f"data: {json.dumps({'type': 'done', 'session_id': session_id, 'persona_id': _stream_persona_id, 'cached': _stream_cached}, separators=(',', ':'))}\n\n"
 
 
 @api_v1.post("/chat/stream")

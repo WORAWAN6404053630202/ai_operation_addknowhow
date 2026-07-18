@@ -55,3 +55,7 @@ coverage.xml
 *.swo
 
 
+code_friday_backup/
+.claude/
+code_friday_backup/
+.claude/

@@ -129,7 +129,7 @@ class ConversationState(BaseModel):
         Call this after loading old state that doesn't have display_messages.
         """
         if not self.display_messages and self.messages:
-            self.display_messages = self.messages.copy()
+            self.display_messages = [dict(m) for m in self.messages]
 
     # Locks (explicit supervisor contract)
     def set_persona_lock(self, persona_id: Optional[str]) -> None:
@@ -223,6 +223,9 @@ class ConversationState(BaseModel):
             return
         trimmed = non_system[-keep_last:]
         self.messages = system_msgs + trimmed
+        # Cap display_messages (UI history) — never grows without bound
+        if len(self.display_messages) > 200:
+            self.display_messages = self.display_messages[-200:]
     
     def summarize_old_messages(self, summary: str, keep_last: int = 5) -> None:
         """

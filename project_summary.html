@@ -1,0 +1,894 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Restbiz Project Summary</title>
+<link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Sarabun', 'Thonburi', 'TH Sarabun New', Arial, sans-serif;
+    background: #f0f2f5;
+    color: #1a1a2e;
+    font-size: 14px;
+    line-height: 1.7;
+  }
+
+  .page {
+    width: 1200px;
+    margin: 0 auto;
+    padding: 40px 20px;
+  }
+
+  /* ── COVER ── */
+  .cover {
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+    border-radius: 20px;
+    padding: 60px 80px;
+    color: white;
+    margin-bottom: 32px;
+    position: relative;
+    overflow: hidden;
+  }
+  .cover::before {
+    content: '';
+    position: absolute;
+    top: -60px; right: -60px;
+    width: 300px; height: 300px;
+    background: rgba(255,255,255,0.05);
+    border-radius: 50%;
+  }
+  .cover::after {
+    content: '';
+    position: absolute;
+    bottom: -80px; left: -40px;
+    width: 250px; height: 250px;
+    background: rgba(255,255,255,0.03);
+    border-radius: 50%;
+  }
+  .cover-badge {
+    display: inline-block;
+    background: rgba(99,179,237,0.2);
+    border: 1px solid rgba(99,179,237,0.4);
+    color: #63b3ed;
+    padding: 6px 16px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    margin-bottom: 24px;
+  }
+  .cover h1 {
+    font-size: 48px;
+    font-weight: 700;
+    line-height: 1.2;
+    margin-bottom: 12px;
+    color: #fff;
+  }
+  .cover h1 span { color: #63b3ed; }
+  .cover-subtitle {
+    font-size: 18px;
+    color: rgba(255,255,255,0.7);
+    margin-bottom: 40px;
+    font-weight: 300;
+  }
+  .cover-meta {
+    display: flex;
+    gap: 40px;
+  }
+  .cover-meta-item { text-align: center; }
+  .cover-meta-num {
+    font-size: 32px;
+    font-weight: 700;
+    color: #63b3ed;
+  }
+  .cover-meta-label {
+    font-size: 12px;
+    color: rgba(255,255,255,0.5);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  /* ── SECTIONS ── */
+  .section {
+    background: white;
+    border-radius: 16px;
+    padding: 40px;
+    margin-bottom: 24px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+    border-left: 5px solid #4f46e5;
+  }
+  .section.green  { border-left-color: #10b981; }
+  .section.blue   { border-left-color: #3b82f6; }
+  .section.purple { border-left-color: #8b5cf6; }
+  .section.orange { border-left-color: #f59e0b; }
+  .section.red    { border-left-color: #ef4444; }
+  .section.teal   { border-left-color: #14b8a6; }
+  .section.pink   { border-left-color: #ec4899; }
+  .section.gray   { border-left-color: #6b7280; }
+
+  .section-header {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 28px;
+  }
+  .section-icon {
+    width: 48px; height: 48px;
+    border-radius: 12px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 22px;
+    flex-shrink: 0;
+  }
+  .section-icon.indigo { background: #eef2ff; }
+  .section-icon.green  { background: #ecfdf5; }
+  .section-icon.blue   { background: #eff6ff; }
+  .section-icon.purple { background: #f5f3ff; }
+  .section-icon.orange { background: #fffbeb; }
+  .section-icon.red    { background: #fef2f2; }
+  .section-icon.teal   { background: #f0fdfa; }
+  .section-icon.pink   { background: #fdf2f8; }
+  .section-icon.gray   { background: #f9fafb; }
+
+  .section-title {
+    font-size: 22px;
+    font-weight: 700;
+    color: #1a1a2e;
+  }
+  .section-subtitle {
+    font-size: 13px;
+    color: #6b7280;
+    margin-top: 2px;
+  }
+
+  /* ── TABLES ── */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0;
+    font-size: 13px;
+  }
+  th {
+    background: #f8fafc;
+    padding: 12px 16px;
+    text-align: left;
+    font-weight: 600;
+    color: #374151;
+    border-bottom: 2px solid #e5e7eb;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  td {
+    padding: 11px 16px;
+    border-bottom: 1px solid #f0f0f0;
+    color: #374151;
+    vertical-align: top;
+  }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #fafafa; }
+
+  /* ── HIGHLIGHTS ── */
+  .highlight-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+    margin: 16px 0;
+  }
+  .highlight-card {
+    background: linear-gradient(135deg, #f8fafc, #f1f5f9);
+    border-radius: 12px;
+    padding: 20px;
+    border: 1px solid #e2e8f0;
+  }
+  .highlight-card h4 {
+    font-size: 13px;
+    color: #6b7280;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 6px;
+  }
+  .highlight-card .value {
+    font-size: 18px;
+    font-weight: 700;
+    color: #1a1a2e;
+  }
+  .highlight-card .desc {
+    font-size: 12px;
+    color: #9ca3af;
+    margin-top: 4px;
+  }
+
+  /* ── CODE ── */
+  .code-block {
+    background: #1e293b;
+    color: #e2e8f0;
+    border-radius: 10px;
+    padding: 20px 24px;
+    font-family: 'Menlo', 'Monaco', monospace;
+    font-size: 12px;
+    line-height: 1.8;
+    margin: 16px 0;
+    overflow-x: auto;
+    white-space: pre;
+  }
+  .code-block .comment { color: #64748b; }
+  .code-block .keyword { color: #7dd3fc; }
+  .code-block .string  { color: #86efac; }
+  .code-block .number  { color: #fbbf24; }
+
+  /* ── TAGS ── */
+  .tag {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+    margin: 2px;
+  }
+  .tag-blue   { background: #dbeafe; color: #1d4ed8; }
+  .tag-green  { background: #d1fae5; color: #065f46; }
+  .tag-purple { background: #ede9fe; color: #5b21b6; }
+  .tag-orange { background: #fed7aa; color: #c2410c; }
+  .tag-red    { background: #fee2e2; color: #991b1b; }
+  .tag-gray   { background: #f3f4f6; color: #374151; }
+
+  /* ── FLOW ── */
+  .flow-box {
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    padding: 16px 20px;
+    margin: 8px 0;
+  }
+  .flow-arrow {
+    text-align: center;
+    color: #9ca3af;
+    font-size: 18px;
+    margin: 4px 0;
+  }
+
+  /* ── RULE LIST ── */
+  .rule-list { list-style: none; margin: 16px 0; }
+  .rule-list li {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 10px 0;
+    border-bottom: 1px solid #f0f0f0;
+    font-size: 13px;
+  }
+  .rule-list li:last-child { border-bottom: none; }
+  .rule-num {
+    min-width: 28px; height: 28px;
+    background: #4f46e5;
+    color: white;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px;
+    font-weight: 700;
+    flex-shrink: 0;
+  }
+  .rule-num.green  { background: #10b981; }
+  .rule-num.blue   { background: #3b82f6; }
+  .rule-num.orange { background: #f59e0b; }
+  .rule-num.red    { background: #ef4444; }
+
+  /* ── ALERT BOXES ── */
+  .alert {
+    border-radius: 10px;
+    padding: 16px 20px;
+    margin: 16px 0;
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    font-size: 13px;
+  }
+  .alert-icon { font-size: 18px; flex-shrink: 0; }
+  .alert-red    { background: #fef2f2; border-left: 4px solid #ef4444; }
+  .alert-yellow { background: #fffbeb; border-left: 4px solid #f59e0b; }
+  .alert-green  { background: #ecfdf5; border-left: 4px solid #10b981; }
+  .alert-blue   { background: #eff6ff; border-left: 4px solid #3b82f6; }
+
+  h3 { font-size: 16px; font-weight: 700; color: #374151; margin: 20px 0 10px; }
+  h4 { font-size: 14px; font-weight: 600; color: #4b5563; margin: 14px 0 8px; }
+  p  { margin: 8px 0; color: #4b5563; font-size: 13px; }
+
+  .two-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    margin: 16px 0;
+  }
+  .sub-card {
+    background: #f8fafc;
+    border-radius: 10px;
+    padding: 16px;
+    border: 1px solid #e2e8f0;
+    font-size: 13px;
+  }
+  .sub-card h4 { margin-top: 0; }
+
+  .pill-row {
+    display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0;
+  }
+  .pill {
+    background: #f1f5f9;
+    border: 1px solid #e2e8f0;
+    border-radius: 20px;
+    padding: 4px 14px;
+    font-size: 12px;
+    color: #374151;
+  }
+  .pill.active {
+    background: #4f46e5;
+    border-color: #4f46e5;
+    color: white;
+  }
+
+  /* page-break hint for print */
+  .page-break { page-break-before: always; }
+
+  .model-row {
+    display: flex; gap: 16px; margin: 16px 0;
+  }
+  .model-card {
+    flex: 1;
+    border-radius: 12px;
+    padding: 18px;
+    border: 1px solid #e2e8f0;
+    text-align: center;
+  }
+  .model-card .model-emoji { font-size: 28px; margin-bottom: 8px; }
+  .model-card .model-name  { font-size: 11px; font-weight: 700; color: #4f46e5; margin-bottom: 4px; }
+  .model-card .model-use   { font-size: 13px; font-weight: 600; color: #1a1a2e; margin-bottom: 4px; }
+  .model-card .model-desc  { font-size: 11px; color: #9ca3af; }
+  .model-card.a { background: #f5f3ff; border-color: #c4b5fd; }
+  .model-card.b { background: #eff6ff; border-color: #bfdbfe; }
+  .model-card.c { background: #ecfdf5; border-color: #a7f3d0; }
+</style>
+</head>
+<body>
+<div class="page">
+
+<!-- ══════════════════════════════════════════════
+     COVER
+══════════════════════════════════════════════ -->
+<div class="cover">
+  <div class="cover-badge">🤖 AI Engineering Documentation</div>
+  <h1>Restbiz<br><span>AI Regulatory Assistant</span></h1>
+  <p class="cover-subtitle">ระบบ AI ช่วยเจ้าของธุรกิจร้านอาหารไทยด้านกฎหมาย ใบอนุญาต และขั้นตอนราชการ<br>Hybrid RAG + Deterministic FSM + Persona-based Conversational UX</p>
+  <div class="cover-meta">
+    <div class="cover-meta-item">
+      <div class="cover-meta-num">23K+</div>
+      <div class="cover-meta-label">Lines of Code</div>
+    </div>
+    <div class="cover-meta-item">
+      <div class="cover-meta-num">142</div>
+      <div class="cover-meta-label">Chroma Docs</div>
+    </div>
+    <div class="cover-meta-item">
+      <div class="cover-meta-num">3</div>
+      <div class="cover-meta-label">LLM Models</div>
+    </div>
+    <div class="cover-meta-item">
+      <div class="cover-meta-num">25+</div>
+      <div class="cover-meta-label">Intent Classifiers</div>
+    </div>
+    <div class="cover-meta-item">
+      <div class="cover-meta-num">3-Layer</div>
+      <div class="cover-meta-label">RAG Retrieval</div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     1. WHAT IS IT?
+══════════════════════════════════════════════ -->
+<div class="section green">
+  <div class="section-header">
+    <div class="section-icon green">🏪</div>
+    <div>
+      <div class="section-title">โปรเจคนี้คืออะไร?</div>
+      <div class="section-subtitle">Product Overview — สำหรับทุกทีม</div>
+    </div>
+  </div>
+
+  <p><strong>Restbiz</strong> คือ AI Assistant เฉพาะทางที่ช่วยเจ้าของธุรกิจร้านอาหารและอาหารไทย ตอบคำถามด้าน <strong>กฎหมาย ใบอนุญาต ภาษี ทะเบียน และขั้นตอนราชการ</strong> ทุกคำตอบมาจากเอกสารจริงที่ ingest เข้าระบบ — ไม่ตอบจากความรู้ทั่วไป</p>
+
+  <div class="highlight-grid" style="margin-top: 20px;">
+    <div class="highlight-card">
+      <h4>✅ ทำได้</h4>
+      <div class="value" style="font-size:13px; line-height:1.8;">ตอบว่าต้องทำใบอนุญาตอะไร<br>เอกสารต้องใช้อะไร<br>ค่าธรรมเนียมเท่าไหร่<br>ไปยื่นที่ไหน</div>
+    </div>
+    <div class="highlight-card">
+      <h4>🎯 จุดเด่น</h4>
+      <div class="value" style="font-size:13px; line-height:1.8;">ถามข้อมูลก่อนตอบ<br>ปรับสไตล์ได้ 2 แบบ<br>ระบบ slot memory<br>ไม่ hallucinate</div>
+    </div>
+    <div class="highlight-card">
+      <h4>⛔ ทำไม่ได้</h4>
+      <div class="value" style="font-size:13px; line-height:1.8;">ตอบจาก general knowledge<br>ข้อมูลนอกขอบเขตร้านอาหาร<br>แก้ไข/ลบประวัติสนทนา</div>
+    </div>
+  </div>
+
+  <h3>ขอบเขตหัวข้อที่ครอบคลุม</h3>
+  <div class="pill-row">
+    <span class="pill active">ใบอนุญาตร้านอาหาร (BMA/อปท.)</span>
+    <span class="pill active">VAT / ภพ.20</span>
+    <span class="pill active">จดทะเบียนพาณิชย์ (DBD)</span>
+    <span class="pill active">นิติบุคคล / บุคคลธรรมดา</span>
+    <span class="pill active">ประกันสังคม</span>
+    <span class="pill active">กองทุนเงินทดแทน</span>
+    <span class="pill active">ใบอนุญาตจำหน่ายสุรา</span>
+    <span class="pill active">ภาษีป้าย</span>
+    <span class="pill active">จัดการการเงินธุรกิจ</span>
+    <span class="pill active">คู่มือเปิดร้านเบเกอรี่/คาเฟ่</span>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     2. TECH STACK
+══════════════════════════════════════════════ -->
+<div class="section blue">
+  <div class="section-header">
+    <div class="section-icon blue">⚙️</div>
+    <div>
+      <div class="section-title">Tech Stack</div>
+      <div class="section-subtitle">เทคโนโลยีที่ใช้ทั้งหมด</div>
+    </div>
+  </div>
+
+  <table>
+    <tr><th>Layer</th><th>Technology</th><th>Purpose</th></tr>
+    <tr><td>API Framework</td><td><span class="tag tag-green">FastAPI</span> Python</td><td>REST API + Streaming SSE</td></tr>
+    <tr><td>Vector DB</td><td><span class="tag tag-blue">Chroma</span> (local) / <span class="tag tag-blue">Milvus Zilliz</span> (cloud)</td><td>Document embedding storage</td></tr>
+    <tr><td>Embedding Model</td><td><code>intfloat/multilingual-e5-large</code></td><td>Thai-capable dense embedding (prefix: query:/passage:)</td></tr>
+    <tr><td>LLM Gateway</td><td><span class="tag tag-orange">OpenRouter API</span></td><td>Unified LLM access (Claude, GPT)</td></tr>
+    <tr><td>LLM Framework</td><td>LangChain + LangChain OpenAI</td><td>LLM orchestration</td></tr>
+    <tr><td>Data Source</td><td>Google Sheets (3 tabs, CSV export)</td><td>Knowledge base management</td></tr>
+    <tr><td>Thai NLP</td><td>PyThaiNLP (newmm tokenizer)</td><td>BM25 Thai tokenization</td></tr>
+    <tr><td>Reranker</td><td><code>BAAI/bge-reranker-v2-m3</code></td><td>Cross-encoder multilingual reranking</td></tr>
+    <tr><td>Session Storage</td><td>JSON files (file-locked, atomic write)</td><td>Conversation state persistence</td></tr>
+    <tr><td>Cache</td><td>In-memory TTL+LRU (SHA256 key)</td><td>Reduce duplicate LLM calls 30-40%</td></tr>
+    <tr><td>Deployment</td><td>Docker + EC2 / docker-compose</td><td>Multi-env (dev/staging/prod)</td></tr>
+  </table>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     3. MODEL ALLOCATION
+══════════════════════════════════════════════ -->
+<div class="section purple">
+  <div class="section-header">
+    <div class="section-icon purple">🧠</div>
+    <div>
+      <div class="section-title">Model Allocation Strategy</div>
+      <div class="section-subtitle">ใช้ LLM 3 ตัว ตาม criticality และ cost</div>
+    </div>
+  </div>
+
+  <div class="model-row">
+    <div class="model-card a">
+      <div class="model-emoji">📚</div>
+      <div class="model-name">openai/gpt-5.1</div>
+      <div class="model-use">Academic Answer</div>
+      <div class="model-desc">ตอบแบบละเอียด<br>ต้องการความครบถ้วนสูงสุด<br>Temp: 0.3 | Max: 8,000 tokens</div>
+    </div>
+    <div class="model-card b">
+      <div class="model-emoji">⚡</div>
+      <div class="model-name">anthropic/claude-sonnet-4-5</div>
+      <div class="model-use">Practical Answer + Supervisor</div>
+      <div class="model-desc">สมดุลคุณภาพ/ความเร็ว<br>Routing + practical answers<br>Temp: 0.2 | Max: 6,000 tokens</div>
+    </div>
+    <div class="model-card c">
+      <div class="model-emoji">🎯</div>
+      <div class="model-name">anthropic/claude-haiku-4-5</div>
+      <div class="model-use">Slot / Topic Picker / Summarizer</div>
+      <div class="model-desc">งาน classification เล็ก<br>ต้องเร็วและถูก<br>Timeout: 8s (fail-fast)</div>
+    </div>
+  </div>
+
+  <div class="alert alert-blue">
+    <span class="alert-icon">💡</span>
+    <div><strong>Cost Estimation:</strong> Claude Sonnet $3.00/$15.00 per M tokens | Claude Haiku $0.80/$4.00 per M tokens | Daily Budget: $50 USD | Token Warning: 20K/call, Critical: 25K/call</div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     4. SUPERVISOR
+══════════════════════════════════════════════ -->
+<div class="section" style="border-left-color: #4f46e5;">
+  <div class="section-header">
+    <div class="section-icon indigo">🎛️</div>
+    <div>
+      <div class="section-title">Persona Supervisor — Control Tower</div>
+      <div class="section-subtitle">persona_supervisor.py (11,595 บรรทัด) — หัวใจของระบบ</div>
+    </div>
+  </div>
+
+  <p>Supervisor เป็น <strong>Hybrid Brain</strong> ที่ผสม deterministic rules + LLM โดย LLM ใช้เฉพาะสำหรับ classify intent — state transitions ทั้งหมดทำด้วย code ไม่ใช่ LLM</p>
+
+  <h3>_handle_inner() — Routing Priority (9 ด่าน)</h3>
+  <ul class="rule-list">
+    <li><div class="rule-num">1</div><div><strong>Academic Intake Lock active</strong> → ส่งให้ Academic persona handle ทั้งหมด</div></li>
+    <li><div class="rule-num green">2</div><div><strong>Academic Resume</strong> → resume silently | Guard: ถ้าถามเรื่องใหม่ → clear flag</div></li>
+    <li><div class="rule-num red">3</div><div><strong>Off-Topic Guard</strong> → Chroma similarity &lt; 0.72 + ไม่มี legal signal → deflect (ไม่ตอบ)</div></li>
+    <li><div class="rule-num blue">4</div><div><strong>Style Request</strong> → "ละเอียด/เชิงลึก" → silent switch Academic (confidence ≥0.65)</div></li>
+    <li><div class="rule-num orange">5</div><div><strong>Number input + no pending_slot</strong> → recover last_topic_menu</div></li>
+    <li><div class="rule-num">6</div><div><strong>Dynamic clarification pending</strong> → _resolve_dynamic_clarification()</div></li>
+    <li><div class="rule-num green">7</div><div><strong>Slot correction</strong> → "ขอแก้ไข/ตอบผิด" → pop last collected slot</div></li>
+    <li><div class="rule-num blue">8</div><div><strong>Pending slot รออยู่</strong> → _route_pending_slot_to_persona() (ผ่าน 9 guards ก่อน)</div></li>
+    <li><div class="rule-num orange">9</div><div><strong>Legal question</strong> → Practical routing | <strong>LLM fallback</strong> → new_topic/elaborate/greeting/unknown</div></li>
+  </ul>
+
+  <h3>Slot Detection Rules (_discover_slots_for_license)</h3>
+  <table>
+    <tr><th>Rule</th><th>เงื่อนไขใน Chroma</th><th>ถามว่าอะไร</th></tr>
+    <tr><td>-1 Department</td><td>≥2 หน่วยงาน × ≥2 docs แต่ละอัน (ไม่ใช่ bank gov)</td><td>ต้องการยื่นกับหน่วยงานใด?</td></tr>
+    <tr><td>0 Location</td><td>≥2 location ใน metadata หรือ content scan เจอ BKK/Province diff</td><td>ร้านของคุณอยู่ที่ใด?</td></tr>
+    <tr><td>0.5 operation_topic</td><td>2–5 distinct topics (ไม่มี entity split)</td><td>ต้องการดำเนินการเรื่องใด?</td></tr>
+    <tr><td>0.6 operation_group</td><td>&gt;5 operation_topic → LLM จัดกลุ่ม ≤5</td><td>ต้องการทำแบบใด?</td></tr>
+    <tr><td>1 entity_type</td><td>≥2 entity ที่ content ต่างกัน</td><td>ธุรกิจเป็นรูปแบบใด?</td></tr>
+    <tr><td>2 shop_area</td><td>area keyword ใน registration_type</td><td>ขนาดพื้นที่ร้านเท่าไหร่?</td></tr>
+    <tr><td>3 registration_type</td><td>short clean labels ≥2 ค่า</td><td>รูปแบบการจดทะเบียนแบบใด?</td></tr>
+  </table>
+
+  <h3>Slot Mapping — 9-Step Matching (regex → LLM)</h3>
+  <div class="code-block"><span class="comment">/* _map_pending_slot_reply() — hierarchy of matching strategies */</span>
+<span class="number">1.</span> Parse index number  (เลขตัวเลือก)
+<span class="number">2.</span> Area measurement   ("7.8 ตรม" → deterministic math, ไม่ให้ LLM เดา)
+<span class="number">3.</span> Exact / contains match
+<span class="number">4.</span> Stripped match      (ตัด ครับ/ค่ะ + prefix "ต้องการ/สมัคร")
+<span class="number">5.</span> Numeric area compare ("8.9 ตรม" vs "น้อยกว่า 200 ตร.ม.")
+<span class="number">6.</span> Free-text for topic  (topic key → accept any text)
+<span class="number">7.</span> Multi-select check   (LLM: does user want ALL options?)
+<span class="number">8.</span> LLM slot mapper      (confidence ≥ 0.60)
+<span class="number">9.</span> Fuzzy bigram match   (threshold 0.50)
+   → Error: "กรุณาตอบเป็นตัวเลขตามตัวเลือกครับ"</div>
+
+  <div class="alert alert-yellow">
+    <span class="alert-icon">⚠️</span>
+    <div><strong>Cross-topic Slot Memory:</strong> entity_type ที่ถามในหัวข้อ A จะถูกจำและ skip ในหัวข้อ B โดยอัตโนมัติ | Slot queue capped ที่ 2 items เพื่อป้องกัน question loop</div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     5. RAG PIPELINE
+══════════════════════════════════════════════ -->
+<div class="section teal">
+  <div class="section-header">
+    <div class="section-icon teal">🔍</div>
+    <div>
+      <div class="section-title">RAG Pipeline — 3-Level Retrieval</div>
+      <div class="section-subtitle">Hybrid Search + Iterative Gap-Fill + Cross-Encoder Reranking</div>
+    </div>
+  </div>
+
+  <div class="code-block"><span class="keyword">Round 1:</span> Base + Hybrid
+  ├─ Query expansion: SYNONYM_PATTERNS (Thai↔English bridging)
+  ├─ Append slot context (entity_type, registration_type ใน query string)
+  ├─ BM25 (PyThaiNLP newmm) + Dense (e5-large) → <span class="string">RRF fusion (k=60)</span>
+  └─ Apply metadata_filter (Chroma where clause) + similarity ≥ 0.6
+
+<span class="keyword">Round 2:</span> Anchor Enrichment
+  ├─ ดึง anchor: license_type / operation_topic / main_topic จาก top doc
+  ├─ Re-query: original + anchor
+  └─ Dedup by page_content hash
+
+<span class="keyword">Round 3:</span> Gap-Fill (Iterative)
+  ├─ _check_field_coverage(): operation_steps, fees, identification_documents, duration
+  ├─ ขาด ≥ 2 fields → re-query: original + missing_terms
+  └─ Dedup อีกรอบ
+
+<span class="keyword">Post-Processing:</span>
+  ├─ Metadata Boost: +0.25 ถ้า operation_topic/sub_topic/license_type match query
+  ├─ Sibling completion: fetch ALL docs ใน (license_type, operation_by_department)
+  ├─ Cross-encoder Reranker: BAAI/bge-reranker-v2-m3
+  ├─ Operation intent filter: exclude แก้ไข/ยกเลิก docs เมื่อ query = new-reg
+  └─ Cap: <span class="string">Practical max 6 docs × 1,000 chars | Academic max 12 docs × 700 chars</span></div>
+
+  <h3>Metadata Filter Fallback Chain</h3>
+  <div class="code-block">Combined: <span class="string">{"$and": [{"entity_type_normalized": "นิติบุคคล"}, {"location": "กรุงเทพฯ"}]}</span>
+  → fallback: <span class="string">{"entity_type_normalized": "นิติบุคคล"}</span>
+  → fallback: <span class="string">{"location": "กรุงเทพฯ"}</span>
+  → fallback: unfiltered (0 docs = never say "ไม่พบข้อมูล" at menu stage)</div>
+
+  <div class="two-col">
+    <div class="sub-card">
+      <h4>🔎 Hybrid Search Details</h4>
+      <p><strong>BM25:</strong> PyThaiNLP newmm tokenizer, Okapi BM25, thread-safe singleton index</p>
+      <p><strong>Dense:</strong> multilingual-e5-large embeddings</p>
+      <p><strong>RRF:</strong> score(d) = Σ 1/(k+rank_i), k=60</p>
+      <p><strong>BM25-only hits:</strong> marked _bm25_hit=True, not dropped for low dense score</p>
+    </div>
+    <div class="sub-card">
+      <h4>🎯 Reranker Details</h4>
+      <p><strong>Model:</strong> BAAI/bge-reranker-v2-m3 (multilingual)</p>
+      <p><strong>Type:</strong> Cross-encoder (pairwise query-doc scoring)</p>
+      <p><strong>Config:</strong> RERANKER_ENABLED=true, TOP_K=10</p>
+      <p><strong>Fallback:</strong> ถ้า error → return original docs unchanged</p>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     6. PRACTICAL PERSONA
+══════════════════════════════════════════════ -->
+<div class="section orange">
+  <div class="section-header">
+    <div class="section-icon orange">⚡</div>
+    <div>
+      <div class="section-title">Practical Persona — Default Mode</div>
+      <div class="section-subtitle">persona_practical.py (5,777 บรรทัด) — ตอบสั้น กระชับ actionable</div>
+    </div>
+  </div>
+
+  <div class="code-block"><span class="keyword">handle() Decision Flow:</span>
+  ├─ Slot recovery จาก last bot message
+  ├─ _consume_pending_slot_from_user() → FILLED / INVALID / BYPASS
+  ├─ Satisfaction detection (_THANKS_RE + LLM) → greeting menu
+  ├─ Greeting detection → topic menu
+  ├─ 3-Round retrieval (with slot context enrichment)
+  ├─ Doc sorting: richest first (has ops+idd+sc+od)
+  ├─ Link classification: SERVICE / FORM / GUIDE / REF
+  ├─ Context building (slim_context, per-field caps)
+  ├─ <span class="string">Short-circuit:</span> topic_slot_queue has askable slot + docs → action="ask" (ข้าม LLM!)
+  └─ LLM call → JSON {action, question/answer, context_update}
+      action="ask"     → pop slot queue → set pending_slot → numbered menu
+      action="retrieve" → block if docs exist; force answer after 2 blocks
+      action="answer"  → URL restore → hallucination strip → lint → return</div>
+
+  <h3>Link Safety Nets (4 Tiers)</h3>
+  <table>
+    <tr><th>Tier</th><th>เมื่อไหร่</th><th>ทำอะไร</th></tr>
+    <tr><td>Tier 1</td><td>เสมอ (Service URLs)</td><td>inject ลง 🏪 / 🌐 block</td></tr>
+    <tr><td>Tier 2</td><td>Form links missing</td><td>Chroma fallback (license_type filter)</td></tr>
+    <tr><td>Tier 3</td><td>LLM skip guide แต่ answer มี steps</td><td>append guide links</td></tr>
+    <tr><td>Tier 4</td><td>User ถามอ้างอิง</td><td>append reference links</td></tr>
+  </table>
+
+  <h3>Hallucination Defenses</h3>
+  <div class="pill-row">
+    <span class="pill">URL Pool Validation</span>
+    <span class="pill">Phone Number Whitelist</span>
+    <span class="pill">Form URL Verification (Tier 2)</span>
+    <span class="pill">practical_lint (40+ forbidden phrases)</span>
+    <span class="pill">Evidence-only System Prompt</span>
+  </div>
+
+  <h3>Practical Lint Policy</h3>
+  <div class="two-col">
+    <div class="sub-card">
+      <h4>⛔ Forbidden Phrases (~40+)</h4>
+      <p>Meta-talk: "จากเอกสาร", "ฉันจะ", "รบกวน", "ขออนุญาต"</p>
+      <p>System leakage: "LLM", "chroma", "embedding", "โมเดล"</p>
+      <p>Hedging: "เท่าที่รู้", "น่าจะ", "ตามข้อมูลที่มี"</p>
+    </div>
+    <div class="sub-card">
+      <h4>📏 Structural Limits</h4>
+      <p>max_lines: 6 บรรทัด</p>
+      <p>max_bullets: 5 ข้อ</p>
+      <p>max_chars: 650 ตัวอักษร</p>
+      <p>question_max: 160 ตัวอักษร</p>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     7. ACADEMIC PERSONA
+══════════════════════════════════════════════ -->
+<div class="section red">
+  <div class="section-header">
+    <div class="section-icon red">📚</div>
+    <div>
+      <div class="section-title">Academic Persona — Deep Mode FSM</div>
+      <div class="section-subtitle">persona_academic.py (4,625 บรรทัด) — ตอบละเอียด วิชาการ เป็น 5 phases</div>
+    </div>
+  </div>
+
+  <div class="code-block"><span class="keyword">FSM Stages:</span>
+
+idle
+  ↓ (user: "ละเอียด/เชิงลึก" → silent switch)
+<span class="string">Phase 0: awaiting_topic</span>
+  _detect_distinct_topics(): สแกน docs หา distinct license_type/sub_topic
+  Auto-select: 1 topic | doc dominance (≥3×) | same main_topic
+  User picks → _filter_docs_by_selected_topic() (re-retrieve + Chroma supplement)
+  ↓
+<span class="string">Phase 1: awaiting_slots (Dynamic Generation)</span>
+  _compute_diversity_from_docs(): scan metadata variation
+    Complex entity: merge registration_type → entity_type_normalized (1 question!)
+  _generate_dynamic_slots():
+    Stale guard → Pre-fill from query keywords → One-at-a-time queue
+  _re_retrieve_with_slots():
+    Topic-lock: apply filter IN-MEMORY (ไม่ไป Chroma → ป้องกัน Phase 0 lock break)
+  ↓
+<span class="string">Phase 2: awaiting_sections</span>
+  _available_sections_from_docs(): check metadata → content keywords
+  Candidates: operation_steps, identification_documents, fees, duration,
+              service_channel, terms_and_conditions, legal_regulatory, research_reference
+  Auto-select: 1 section → skip menu
+  ↓
+<span class="string">Phase 3: finalize</span>
+  _build_final_prompt(): doc prep + link aggregation (4 categories) + hallucination fix
+  LLM (GPT-5.1) → _finalize_answer() → strip hallucinated URLs → fix line wrapping
+  ↓
+done → auto_return_to_practical=True</div>
+
+  <h3>Academic Answer Format Rules</h3>
+  <table>
+    <tr><th>สถานการณ์</th><th>Format ที่ต้องทำ</th></tr>
+    <tr><td>มี collected_slots</td><td>เริ่มด้วย 📌 กรณีของคุณ: นิติบุคคล ในกรุงเทพฯ</td></tr>
+    <tr><td>data_type = "regulatory"</td><td>Section header → ข้อมูลทันที (ห้าม intro paragraph)</td></tr>
+    <tr><td>data_type = "marketing"</td><td>Prose 2-3 ประโยค WHY ก่อน แล้วค่อย bullets</td></tr>
+    <tr><td>FORM_LINKS</td><td>📄 {desc} + URL indented (แยกแต่ละฟอร์ม)</td></tr>
+    <tr><td>SERVICE_LINKS</td><td>ภายใต้ 🌐 header (always shown)</td></tr>
+  </table>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     8. DATA PIPELINE
+══════════════════════════════════════════════ -->
+<div class="section pink">
+  <div class="section-header">
+    <div class="section-icon pink">📊</div>
+    <div>
+      <div class="section-title">Data Pipeline — Google Sheets → Chroma</div>
+      <div class="section-subtitle">ingest_local.py + data_loader.py — 142 flat docs (1 doc/row)</div>
+    </div>
+  </div>
+
+  <div class="code-block"><span class="keyword">3 Sources:</span>
+  Sheet A (Regulatory) → DataLoader         data_type="regulatory"   กฎหมาย ใบอนุญาต
+  Sheet B (Marketing)  → GeneralDataLoader  data_type="marketing"    การตลาด กลยุทธ์
+  Sheet C (Bakery)     → GeneralDataLoader  data_type="business_guide" คู่มือเปิดร้าน
+
+<span class="keyword">_normalize_text():</span>
+  ├─ Remove zero-width spaces (​)
+  ├─ Collapse whitespace
+  ├─ Dedup tokens: Thai <span class="number">≥6 chars</span>, Latin <span class="number">≥3 chars</span> (จัดการการเงิน → ไม่ตัด "การ")
+  ├─ Skip normalization ถ้า URL/email ใน text (preserve domain integrity)
+  └─ Loop จน stable หรือ cap 4 passes
+
+<span class="keyword">Metadata Derived Fields:</span>
+  entity_type_normalized → "นิติบุคคล" | "บุคคลธรรมดา" | "" (fuzzy match)
+  location               → "กรุงเทพฯ" | "ต่างจังหวัด"
+  area_size              → "มากกว่า 200 ตารางเมตร" | "ไม่เกิน 200 ตารางเมตร"
+  topic_group            → taxonomy mapping ของ license_type
+
+<span class="keyword">Atomic Ingest:</span>
+  write → {persist_dir}_new → atomic swap → live | old → delete
+  Invalidate BM25 cache → rebuild on next query</div>
+
+  <div class="alert alert-green">
+    <span class="alert-icon">✅</span>
+    <div><strong>ทำไมถึงใช้ Flat (ไม่ Chunk):</strong> เคยลอง semantic chunking (5 chunks/doc) แต่ metadata ทุก field copy ไปทุก chunk อยู่แล้ว → Chroma มี 710 docs โดยไม่ได้ประโยชน์เพิ่ม → เปลี่ยนกลับเป็น flat → เร็วขึ้น 50%, tokens ลด 30-40%</div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     9. INFRASTRUCTURE
+══════════════════════════════════════════════ -->
+<div class="section gray">
+  <div class="section-header">
+    <div class="section-icon gray">🏗️</div>
+    <div>
+      <div class="section-title">Infrastructure & API Layer</div>
+      <div class="section-subtitle">StateManager + route_v1 + rate_limiter + cache</div>
+    </div>
+  </div>
+
+  <div class="two-col">
+    <div class="sub-card">
+      <h4>💾 StateManager (File Locking)</h4>
+      <p><strong>Atomic save:</strong> write .{pid}.tmp → rename → ensures no corruption</p>
+      <p><strong>Message trim:</strong> เก็บ 18 ล่าสุด | internal_messages: 40</p>
+      <p><strong>File lock:</strong> os.O_CREAT | os.O_EXCL (atomic) | timeout: 2s | stale: 15s</p>
+      <p><strong>Startup:</strong> cleanup_orphan_locks() ก่อนรับ requests</p>
+    </div>
+    <div class="sub-card">
+      <h4>⚡ Rate Limiter + Cache</h4>
+      <p><strong>Rate limit:</strong> Sliding window 10 req/60s per session</p>
+      <p><strong>Token window:</strong> configurable (default off)</p>
+      <p><strong>Cache:</strong> TTL+LRU | 1,000 slots | 1 hour | SHA256 key</p>
+      <p><strong>Hit rate:</strong> ลด duplicate LLM calls 30-40%</p>
+    </div>
+  </div>
+
+  <h3>API Endpoints</h3>
+  <table>
+    <tr><th>Method</th><th>Path</th><th>ทำอะไร</th></tr>
+    <tr><td><span class="tag tag-green">POST</span></td><td>/greeting</td><td>สร้าง session + ส่งคำทักทาย + topic menu</td></tr>
+    <tr><td><span class="tag tag-green">POST</span></td><td>/chat</td><td>Main chat (non-streaming) — rate limit → cache check → supervisor → cost estimate</td></tr>
+    <tr><td><span class="tag tag-green">POST</span></td><td>/chat/stream</td><td>Streaming SSE (chunk=5 chars) — asyncio lock per session</td></tr>
+    <tr><td><span class="tag tag-green">POST</span></td><td>/reset</td><td>Reset session</td></tr>
+    <tr><td><span class="tag tag-blue">GET</span></td><td>/sessions</td><td>List sessions (limit 20)</td></tr>
+    <tr><td><span class="tag tag-blue">GET</span></td><td>/healthcheck</td><td>Status + cache stats + rate limit stats</td></tr>
+  </table>
+
+  <h3>Token Budget Management</h3>
+  <table>
+    <tr><th>Config</th><th>ค่าปัจจุบัน</th><th>ทำอะไร</th></tr>
+    <tr><td>TOKEN_BUDGET_WARNING</td><td>20,000 tokens</td><td>log warning ต่อ call</td></tr>
+    <tr><td>TOKEN_BUDGET_CRITICAL</td><td>25,000 tokens</td><td>log critical</td></tr>
+    <tr><td>_TOKEN_WARN_THRESHOLD</td><td>80,000 tokens</td><td>trigger conversation summarizer (Haiku)</td></tr>
+    <tr><td>DAILY_BUDGET_USD</td><td>$50</td><td>daily spending limit (warning only)</td></tr>
+  </table>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     10. PRODUCTION GUARDRAILS
+══════════════════════════════════════════════ -->
+<div class="section" style="border-left-color: #dc2626;">
+  <div class="section-header">
+    <div class="section-icon red">🛡️</div>
+    <div>
+      <div class="section-title">Production Guardrails</div>
+      <div class="section-subtitle">กฎที่ห้ามละเมิด — locked deterministic safety nets</div>
+    </div>
+  </div>
+
+  <div class="highlight-grid">
+    <div class="highlight-card">
+      <h4>🚫 No Greeting Retrieval</h4>
+      <div style="font-size:12px; color:#4b5563; margin-top:6px;">Greeting/thanks/smalltalk ไม่เคย trigger RAG — bypass ตรงไปหา greeting menu</div>
+    </div>
+    <div class="highlight-card">
+      <h4>🚫 No Slot Re-ask</h4>
+      <div style="font-size:12px; color:#4b5563; margin-top:6px;">collected_slots ตรวจทุก turn — ถ้าเคยถามแล้วจะ skip โดยอัตโนมัติ ข้าม persona</div>
+    </div>
+    <div class="highlight-card">
+      <h4>🚫 No Persona Drift</h4>
+      <div style="font-size:12px; color:#4b5563; margin-top:6px;">Supervisor owns ALL transitions — LLM ไม่ตัดสินใจสลับ persona เอง</div>
+    </div>
+    <div class="highlight-card">
+      <h4>🚫 No Hallucination</h4>
+      <div style="font-size:12px; color:#4b5563; margin-top:6px;">Evidence-only prompt + URL/phone whitelist validation + "ไม่พบข้อมูล" fallback</div>
+    </div>
+    <div class="highlight-card">
+      <h4>🚫 No Prompt Explosion</h4>
+      <div style="font-size:12px; color:#4b5563; margin-top:6px;">trim_messages(keep_last=4) เมื่อ >20K tokens | Summarizer เมื่อ >80K tokens</div>
+    </div>
+    <div class="highlight-card">
+      <h4>🚫 No Mutation</h4>
+      <div style="font-size:12px; color:#4b5563; margin-top:6px;">state.messages.append() ONLY — ห้าม edit/rewrite ประวัติ append-only เสมอ</div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     11. REMAINING WORK
+══════════════════════════════════════════════ -->
+<div class="section" style="border-left-color: #6b7280; background: #fafafa;">
+  <div class="section-header">
+    <div class="section-icon gray">🗺️</div>
+    <div>
+      <div class="section-title">Remaining Work & Current Status</div>
+      <div class="section-subtitle">สิ่งที่ยังต้องทำ</div>
+    </div>
+  </div>
+
+  <table>
+    <tr><th>หัวข้อ</th><th>สถานะ</th><th>Priority</th></tr>
+    <tr><td>Integration playback tests (20-40 turns drift)</td><td><span class="tag tag-red">ยังไม่มี</span></td><td>High</td></tr>
+    <tr><td>Budget guard hard enforcement (block, ไม่ใช่แค่ warn)</td><td><span class="tag tag-orange">warning only</span></td><td>Medium</td></tr>
+    <tr><td>Grafana observability dashboard</td><td><span class="tag tag-red">ยังไม่มี</span></td><td>Medium</td></tr>
+    <tr><td>LangSmith tracing</td><td><span class="tag tag-orange">มี config, ปิดอยู่</span></td><td>Low</td></tr>
+    <tr><td>PyThaiNLP fallback (ถ้าไม่ install)</td><td><span class="tag tag-orange">whitespace split</span></td><td>Low</td></tr>
+  </table>
+
+  <div class="alert alert-blue" style="margin-top: 20px;">
+    <span class="alert-icon">📋</span>
+    <div><strong>Architecture Maturity:</strong> Production-ready | Guardrails: Senior-level | FSM: Clean | Determinism: High | Testing: Unit tests complete, E2E integration tests needed</div>
+  </div>
+</div>
+
+<!-- footer -->
+<div style="text-align:center; padding: 30px; color: #9ca3af; font-size: 12px;">
+  Restbiz AI Regulatory Assistant — Project Documentation | Generated 2026-05-28
+</div>
+
+</div>
+</body>
+</html>

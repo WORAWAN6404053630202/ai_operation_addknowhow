@@ -32,7 +32,7 @@ def _safe_rmtree(path: Path) -> None:
     Raises RuntimeError if path is outside safe dirs instead of silently deleting.
     """
     resolved = str(path.resolve())
-    if not any(resolved.startswith(safe) for safe in _SAFE_RMTREE_PARENTS):
+    if not any(resolved == safe or resolved.startswith(safe.rstrip("/") + "/") for safe in _SAFE_RMTREE_PARENTS):
         raise RuntimeError(
             f"[VectorStore] Refusing to delete '{resolved}' — path is outside safe directories. "
             f"Check LOCAL_VECTOR_DIR in env.properties."
@@ -121,6 +121,7 @@ class LocalVectorStoreManager:
     def _build_retriever(self, k: Optional[int] = None):
         kk = int(k or getattr(conf, "RETRIEVAL_TOP_K", 20))
         self.retriever = self.vectorstore.as_retriever(search_kwargs={"k": kk})
+        self._retriever_k = kk
         print(f"[Retriever] Ready (k={kk})")
         return self.retriever
 
@@ -211,6 +212,13 @@ class LocalVectorStoreManager:
             if p.exists():
                 p.rename(p_old)
             p_new.rename(p)
+            # Reconnect to the renamed live directory — self.vectorstore still
+            # points to the now-gone _new path after the rename
+            self.vectorstore = Chroma(
+                collection_name=collection_name,
+                embedding_function=self.embedding_model,
+                persist_directory=str(p),
+            )
             print(f"[VectorStore] Atomic swap complete — new corpus is live")
             try:
                 if p_old.exists():
@@ -279,8 +287,9 @@ def get_vs_manager() -> LocalVectorStoreManager:
 
 def get_retriever(k: int = 0, fail_if_empty: bool = True):
     if _MANAGER.retriever is not None:
-        if k and int(k) > 0 and _MANAGER.vectorstore is not None:
-            _MANAGER._build_retriever(k=int(k))
+        _want_k = int(k) if (k and int(k) > 0) else int(getattr(conf, "RETRIEVAL_TOP_K", 20))
+        if getattr(_MANAGER, "_retriever_k", None) != _want_k and _MANAGER.vectorstore is not None:
+            _MANAGER._build_retriever(k=_want_k)
         return _MANAGER.retriever
 
     _MANAGER.connect_to_existing(fail_if_empty=fail_if_empty)

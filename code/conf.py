@@ -100,6 +100,11 @@ RETRIEVAL_QUERY_MAX_CHARS = _safe_int("RETRIEVAL_QUERY_MAX_CHARS", 200)
 
 # Timeouts (seconds) for LLM and external requests
 LLM_REQUEST_TIMEOUT = _safe_int("LLM_REQUEST_TIMEOUT", 60)
+# Practical-specific timeout (claude-sonnet-4-5, max 3000 tokens, ~15-25s typical).
+# Falls back to LLM_REQUEST_TIMEOUT if not set. Academic uses LLM_REQUEST_TIMEOUT
+# directly since GPT-5.1 (thinking model) may need 60-120s for 8000-token answers.
+LLM_REQUEST_TIMEOUT_PRACTICAL = _safe_int("LLM_REQUEST_TIMEOUT_PRACTICAL",
+                                           _safe_int("LLM_REQUEST_TIMEOUT", 60))
 # Shorter timeout for topic_picker (non-critical, fast-fail to fallback)
 LLM_TOPIC_PICKER_TIMEOUT = _safe_int("LLM_TOPIC_PICKER_TIMEOUT", 8)
 SHEETS_REQUEST_TIMEOUT = _safe_int("SHEETS_REQUEST_TIMEOUT", 20)
@@ -123,24 +128,27 @@ LOCAL_VECTOR_DIR = os.getenv(
 # Google Sheets source URLs — override in env.properties when sheets move or change tabs
 SHEET_URL_REGULATORY = os.getenv(
     "SHEET_URL_REGULATORY",
-    "https://docs.google.com/spreadsheets/d/1Yh73jnA2vVRHAtGYfkRNPoZhv5w8umxkpretU_9hT6E/edit?gid=657201027#gid=657201027",
+    "https://docs.google.com/spreadsheets/d/1YnLKV7gJXCu7jvcH1sUL9crMlBCJKOpQfp2wtulMszE/edit?pli=1&gid=657201027#gid=657201027",
 )
 SHEET_URL_MARKETING = os.getenv(
     "SHEET_URL_MARKETING",
-    "https://docs.google.com/spreadsheets/d/1Yh73jnA2vVRHAtGYfkRNPoZhv5w8umxkpretU_9hT6E/edit?gid=809205387#gid=809205387",
+    "https://docs.google.com/spreadsheets/d/1YnLKV7gJXCu7jvcH1sUL9crMlBCJKOpQfp2wtulMszE/edit?pli=1&gid=809205387#gid=809205387",
 )
 SHEET_URL_BAKERY = os.getenv(
     "SHEET_URL_BAKERY",
-    "https://docs.google.com/spreadsheets/d/1Yh73jnA2vVRHAtGYfkRNPoZhv5w8umxkpretU_9hT6E/edit?gid=610069215#gid=610069215",
+    "https://docs.google.com/spreadsheets/d/1YnLKV7gJXCu7jvcH1sUL9crMlBCJKOpQfp2wtulMszE/edit?pli=1&gid=610069215#gid=610069215",
 )
 
 # State manager configuration
 STATE_DIR = os.getenv("STATE_DIR") or None
-STATE_LOCK_TIMEOUT_S = _safe_float("STATE_LOCK_TIMEOUT_S", 2.0)
-STATE_LOCK_POLL_S = _safe_float("STATE_LOCK_POLL_S", 0.05)
-STATE_LOCK_STALE_S = _safe_float("STATE_LOCK_STALE_S", 15.0)
+STATE_LOCK_TIMEOUT_S = _safe_float("STATE_LOCK_TIMEOUT_S", 0.5)
+STATE_LOCK_POLL_S = _safe_float("STATE_LOCK_POLL_S", 0.02)
+STATE_LOCK_STALE_S = _safe_float("STATE_LOCK_STALE_S", 90.0)
 MAX_RECENT_MESSAGES_SAVE = _safe_int("MAX_RECENT_MESSAGES_SAVE", 18)
 MAX_INTERNAL_MESSAGES_SAVE = _safe_int("MAX_INTERNAL_MESSAGES_SAVE", 40)
+
+CACHE_TTL_SECONDS = _safe_int("CACHE_TTL_SECONDS", 86400)
+CACHE_MAX_SIZE = _safe_int("CACHE_MAX_SIZE", 1000)
 
 # NEW: centralized default retrieval fallback query — single source of truth
 # All code should import this instead of hardcoding the Thai string

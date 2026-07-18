@@ -17,6 +17,7 @@ Toggle via env: RERANKER_ENABLED=true / RERANKER_MODEL=... / RERANKER_TOP_K=10
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Any, List, Optional
 
@@ -24,23 +25,31 @@ _LOG = logging.getLogger(__name__)
 
 # Singleton: loaded once on first call, reused across all requests.
 _reranker_cache: dict = {}  # model_name → CrossEncoder instance
+_reranker_lock = threading.Lock()
 
 
 def _get_reranker(model_name: str) -> Any:
-    """Lazy-load CrossEncoder singleton. Thread-safe for typical server use (GIL)."""
-    if model_name not in _reranker_cache:
-        _LOG.info("[Reranker] Loading cross-encoder model: %s", model_name)
-        t0 = time.time()
-        try:
-            from sentence_transformers import CrossEncoder  # type: ignore
-        except ImportError as e:
-            raise ImportError(
-                "sentence-transformers is required for reranker. "
-                "Install with: pip install sentence-transformers"
-            ) from e
+    """Lazy-load CrossEncoder singleton. Thread-safe via double-checked locking.
 
-        _reranker_cache[model_name] = CrossEncoder(model_name, max_length=512)
-        _LOG.info("[Reranker] Model loaded in %.1fs", time.time() - t0)
+    Fast path (model already loaded): no lock acquired — dict lookup only.
+    Slow path (first load): lock prevents concurrent threads from loading the
+    same model twice, which would waste ~280MB RAM and ~2s at startup.
+    """
+    if model_name not in _reranker_cache:
+        with _reranker_lock:
+            if model_name not in _reranker_cache:
+                _LOG.info("[Reranker] Loading cross-encoder model: %s", model_name)
+                t0 = time.time()
+                try:
+                    from sentence_transformers import CrossEncoder  # type: ignore
+                except ImportError as e:
+                    raise ImportError(
+                        "sentence-transformers is required for reranker. "
+                        "Install with: pip install sentence-transformers"
+                    ) from e
+
+                _reranker_cache[model_name] = CrossEncoder(model_name, max_length=512)
+                _LOG.info("[Reranker] Model loaded in %.1fs", time.time() - t0)
     return _reranker_cache[model_name]
 
 
@@ -71,21 +80,21 @@ def rerank(
         reranker = _get_reranker(model_name)
 
         pairs = [
-            (query, (getattr(d, "page_content", "") or "")[:512])
+            (query, (getattr(d, "page_content", "") or "")[:1500])
             for d in docs
         ]
         scores: List[float] = reranker.predict(pairs).tolist()
 
         ranked = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
 
-        # Store rerank score in metadata for downstream logging / fallback
+        if top_k is not None:
+            ranked = ranked[:top_k]
+
+        # Store rerank score only on docs that are actually returned
         for doc, score in ranked:
             md = getattr(doc, "metadata", None)
             if isinstance(md, dict):
                 md["_rerank_score"] = round(float(score), 4)
-
-        if top_k is not None:
-            ranked = ranked[:top_k]
 
         elapsed_ms = (time.time() - t0) * 1000
         _LOG.info(

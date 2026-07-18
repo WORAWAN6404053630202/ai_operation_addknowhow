@@ -45,7 +45,7 @@ class MonitoringMiddleware(BaseHTTPMiddleware):
                 import json
                 data = json.loads(body) if body else {}
                 session_id = data.get("session_id")
-            except:
+            except Exception:
                 pass
         
         # Set logging context

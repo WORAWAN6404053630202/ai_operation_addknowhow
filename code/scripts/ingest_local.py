@@ -73,13 +73,14 @@ def _normalize_text(s: str) -> str:
         return ""
     t = str(s)
 
-    # Do not normalize URLs/emails aggressively (avoid breaking them)
-    if _URLISH_RE.search(t) or _EMAILISH_RE.search(t):
-        return t.strip()
-
-    # Remove zero-width spaces and normalize whitespace
+    # Remove zero-width spaces and normalize whitespace (safe for URLs too)
     t = t.replace("\u200b", "")
     t = _WS_RE.sub(" ", t).strip()
+
+    # Skip aggressive dedup transforms when string contains a URL/email \u2014
+    # duplicate-token regex can corrupt compound words adjacent to URLs
+    if _URLISH_RE.search(t) or _EMAILISH_RE.search(t):
+        return t
     if not t:
         return t
 
@@ -160,6 +161,14 @@ def _validate_documents(docs: List[Document]) -> int:
             issues.append(
                 f"page_content too short ({len(content)} chars) — embedding quality will be poor"
             )
+
+        # Non-regulatory docs must have operation_topic for supervisor topic routing.
+        if dt in ("marketing", "business_guide"):
+            op_topic = str(md.get("operation_topic") or "").strip()
+            if not op_topic:
+                issues.append(
+                    "operation_topic is empty on a non-regulatory doc — supervisor topic routing will not surface this topic"
+                )
 
         # Regulatory docs must have a license_type to enable slot-queue discovery.
         if dt == "regulatory":

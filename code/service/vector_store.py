@@ -14,7 +14,7 @@ from langchain_community.vectorstores import Milvus
 import conf
 
 
-# ---- Embeddings import (forward-compatible) ----
+# Embeddings import (forward-compatible)
 try:
     from langchain_huggingface import HuggingFaceEmbeddings  # type: ignore
 except Exception:
@@ -35,6 +35,8 @@ class VectorStoreManager:
         self.retriever = None
 
     def initialize_embeddings(self) -> None:
+        if self.embedding_model is not None:
+            return
         print(f"[Embedding] Loading: {conf.EMBEDDING_MODEL}")
         _model = conf.EMBEDDING_MODEL
         _is_e5 = "e5" in _model.lower()
@@ -148,12 +150,12 @@ _MANAGER = VectorStoreManager()
 
 
 def get_retriever(k: int = 15):
-    if _MANAGER.retriever is not None:
+    if _MANAGER.retriever is not None and getattr(_MANAGER, "_retriever_k", None) == k:
         return _MANAGER.retriever
 
-    _MANAGER.connect_to_existing()
+    if _MANAGER.vectorstore is None:
+        _MANAGER.connect_to_existing()
 
-    if k != 15:
-        _MANAGER.retriever = _MANAGER.vectorstore.as_retriever(search_kwargs={"k": k})
-
+    _MANAGER.retriever = _MANAGER.vectorstore.as_retriever(search_kwargs={"k": k})
+    _MANAGER._retriever_k = k
     return _MANAGER.retriever

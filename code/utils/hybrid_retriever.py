@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.documents import Document
@@ -21,6 +22,8 @@ _LOG = logging.getLogger(__name__)
 
 _INDEX_LOCK = threading.Lock()
 _INDEX_CACHE: Dict[str, "_BM25Index"] = {}  # collection_name → BM25Index
+_COUNT_CACHE: Dict[str, tuple] = {}  # collection_name → (count, monotonic_timestamp)
+_COUNT_TTL_S = 30.0  # refresh coll.count() at most every 30s
 
 
 # ── Thai tokenizer ────────────────────────────────────────────────────────────
@@ -41,6 +44,7 @@ class _BM25Index:
     def __init__(self, docs: List[Document]):
         from rank_bm25 import BM25Okapi
         self._docs = docs
+        self.doc_count = len(docs)
         tokenized = [_tokenize(d.page_content) for d in docs]
         self._bm25 = BM25Okapi(tokenized)
         _LOG.info("[BM25] Index built: %d docs", len(docs))
@@ -53,7 +57,11 @@ class _BM25Index:
 
 
 def _get_bm25_index(vectorstore: Any) -> Optional[_BM25Index]:
-    """Lazy-load BM25 index from Chroma collection. Thread-safe singleton."""
+    """Lazy-load BM25 index from Chroma collection. Thread-safe singleton.
+
+    Compares Chroma doc count on every call to detect re-ingest from another
+    process — if count changed, the cached index is invalidated and rebuilt.
+    """
     try:
         coll = vectorstore._collection
         coll_name: str = coll.name
@@ -61,12 +69,32 @@ def _get_bm25_index(vectorstore: Any) -> Optional[_BM25Index]:
         _LOG.warning("[BM25] Cannot access collection: %s", e)
         return None
 
-    if coll_name in _INDEX_CACHE:
-        return _INDEX_CACHE[coll_name]
+    # Cache coll.count() to avoid a SQLite query on every retrieval call.
+    # invalidate_bm25_cache() clears both _INDEX_CACHE and _COUNT_CACHE,
+    # so re-ingest still triggers an immediate rebuild on the next call.
+    _now = time.monotonic()
+    _cached_count = _COUNT_CACHE.get(coll_name)
+    if _cached_count and (_now - _cached_count[1]) < _COUNT_TTL_S:
+        current_count = _cached_count[0]
+    else:
+        try:
+            current_count = coll.count()
+            _COUNT_CACHE[coll_name] = (current_count, _now)
+        except Exception as e:
+            _LOG.warning("[BM25] Cannot access collection: %s", e)
+            return None
+
+    cached = _INDEX_CACHE.get(coll_name)
+    if cached is not None:
+        if cached.doc_count == current_count:
+            return cached
+        _LOG.info("[BM25] Doc count changed (%d→%d) — rebuilding index for %r",
+                  cached.doc_count, current_count, coll_name)
 
     with _INDEX_LOCK:
-        if coll_name in _INDEX_CACHE:
-            return _INDEX_CACHE[coll_name]
+        cached = _INDEX_CACHE.get(coll_name)
+        if cached is not None and cached.doc_count == current_count:
+            return cached
         try:
             result = coll.get(include=["documents", "metadatas"])
             raw_docs = result.get("documents") or []
@@ -92,8 +120,10 @@ def invalidate_bm25_cache(collection_name: Optional[str] = None) -> None:
     with _INDEX_LOCK:
         if collection_name:
             _INDEX_CACHE.pop(collection_name, None)
+            _COUNT_CACHE.pop(collection_name, None)
         else:
             _INDEX_CACHE.clear()
+            _COUNT_CACHE.clear()
     _LOG.info("[BM25] Cache invalidated (collection=%r)", collection_name or "all")
 
 
@@ -119,6 +149,8 @@ def _matches_metadata_filter(doc_metadata: dict, flt: dict) -> bool:
             elif "$ne" in fv:
                 if actual == fv["$ne"]:
                     return False
+            else:
+                return False  # unknown operator — safe default: no match
         else:
             if actual != fv:
                 return False
@@ -156,14 +188,40 @@ def _rrf_fuse(
         did = _doc_id(doc)
         rrf_scores[did] = rrf_scores.get(did, 0.0) + 1.0 / (rrf_k + rank + 1)
         if did not in doc_map:
-            # BM25-only doc — flag it so downstream filters don't drop it for low Dense score
-            doc.metadata["_bm25_hit"] = True
-            doc_map[did] = doc
+            # BM25-only doc — flag it so downstream filters don't drop it for low Dense score.
+            # Copy to avoid mutating the shared doc object cached in _BM25Index._docs.
+            doc_map[did] = Document(page_content=doc.page_content, metadata={**doc.metadata, "_bm25_hit": True})
 
     merged = sorted(rrf_scores.items(), key=lambda x: -x[1])
     # BM25-only docs get 0.0 dense score (not None) — callers do arithmetic/comparison on score
     # and a None value raises TypeError when used with comparison operators like ">".
     return [(doc_map[did], dense_scores.get(did, 0.0)) for did, _ in merged]
+
+
+# ── Filter normalization ──────────────────────────────────────────────────────
+
+def _normalize_chroma_filter(flt: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Normalize a metadata filter dict for Chroma's Dense search.
+
+    Chroma's similarity_search requires exactly one top-level operator when
+    multiple conditions exist. A flat dict with multiple fields raises:
+      "Expected where to have exactly one operator, got {field1: v1, field2: v2}"
+
+    Rules applied:
+    - Drop fields with None values (Chroma rejects them).
+    - Single-field dicts and dicts already using $and/$or are passed through.
+    - Flat multi-field dicts are wrapped in {'$and': [{k: v}, ...]}.
+    """
+    if not flt:
+        return flt
+    cleaned = {k: v for k, v in flt.items() if v is not None}
+    if not cleaned:
+        return None
+    if len(cleaned) == 1:
+        return cleaned
+    # Multiple fields — Chroma Dense requires explicit $and
+    return {"$and": [{k: v} for k, v in cleaned.items()]}
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -184,12 +242,15 @@ def hybrid_scored_search(
     BM25 searches full corpus then post-filters to keep metadata semantics correct.
     Falls back to Dense-only if BM25 index is unavailable.
     """
+    # Normalize filter once: Chroma Dense rejects flat multi-field dicts and None values
+    _eff_filter = _normalize_chroma_filter(metadata_filter)
+
     # Dense search
     dense_pairs: List[Tuple[Document, float]] = []
     try:
         kwargs: Dict[str, Any] = {"k": k}
-        if metadata_filter:
-            kwargs["filter"] = metadata_filter
+        if _eff_filter:
+            kwargs["filter"] = _eff_filter
         dense_pairs = vectorstore.similarity_search_with_relevance_scores(query, **kwargs)
     except Exception as e:
         _LOG.warning("[Hybrid] Dense search failed: %s", e)
@@ -202,12 +263,14 @@ def hybrid_scored_search(
 
     bm25_pairs: List[Tuple[Document, float]] = []
     try:
-        # Oversample BM25 before post-filter so we don't under-retrieve
-        raw_bm25 = bm25_index.search(query, k=k * 2)
-        if metadata_filter:
+        # Oversample BM25 before post-filter — use k*5 when a metadata filter is
+        # present (filter may be very selective, e.g. entity_type=นิติบุคคล)
+        _bm25_oversample = k * 5 if _eff_filter else k * 2
+        raw_bm25 = bm25_index.search(query, k=_bm25_oversample)
+        if _eff_filter:
             raw_bm25 = [
                 (doc, s) for doc, s in raw_bm25
-                if _matches_metadata_filter(doc.metadata or {}, metadata_filter)
+                if _matches_metadata_filter(doc.metadata or {}, _eff_filter)
             ]
         bm25_pairs = raw_bm25[:k]
     except Exception as e:

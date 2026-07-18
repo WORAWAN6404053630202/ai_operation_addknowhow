@@ -255,6 +255,12 @@ class DataLoader:
                 aliases=["แนวทางคำตอบ", "แนวตอบ"],
                 contains_any=["แนวคำตอบ", "แนวตอบ"],
             ),
+            "combined_links": self._resolve_col(
+                df,
+                primary="รวมลิงค์",
+                aliases=["รวมลิ้งค์", "รวมลิงก์", "ลิงค์รวม", "รวม Link"],
+                contains_any=["รวมลิงค์", "รวมลิ้งค์", "รวมลิงก์"],
+            ),
         }
 
     def _validate_sheet_schema(self, df: pd.DataFrame, sheet_url: str) -> None:
@@ -430,10 +436,12 @@ class DataLoader:
         Returns 'มากกว่า 200 ตารางเมตร' | 'ไม่เกิน 200 ตารางเมตร' | None.
         """
         combined = " ".join(filter(None, [registration_type or "", operation_topic or ""]))
-        if "มากกว่า 200" in combined or "เกิน 200" in combined:
-            return "มากกว่า 200 ตารางเมตร"
+        # Check more-specific "ไม่เกิน" FIRST — "เกิน 200" is a substring of "ไม่เกิน 200"
+        # so checking less-specific first would wrongly classify "ไม่เกิน 200" as "มากกว่า 200"
         if "น้อยกว่า 200" in combined or "ไม่เกิน 200" in combined or "ต่ำกว่า 200" in combined:
             return "ไม่เกิน 200 ตารางเมตร"
+        if "มากกว่า 200" in combined or "เกิน 200" in combined:
+            return "มากกว่า 200 ตารางเมตร"
         return None
 
     @staticmethod
@@ -592,20 +600,23 @@ class DataLoader:
                     "source": source,
                 }
 
+                # Merge "รวมลิงค์" column into research_reference so _parse_link_entries
+                # processes and classifies those links (registration portals, guides, etc.).
+                _combined_links_val = self._get_row_value(row, colmap.get("combined_links"))
+                if _combined_links_val and str(_combined_links_val).strip() not in ("", "nan", "None"):
+                    _existing_ref = (metadata.get("research_reference") or "").strip()
+                    _cl_stripped = _combined_links_val.strip()
+                    if _existing_ref:
+                        if _cl_stripped not in _existing_ref:
+                            metadata["research_reference"] = f"{_existing_ref}\n{_cl_stripped}"
+                    else:
+                        metadata["research_reference"] = _cl_stripped
+
                 # For Q&A rows: infer structured field from operation_topic + answer_guideline
                 # so the LLM reads the correct metadata field instead of falling back to
                 # unrelated docs that happen to have that field populated.
                 self._infer_structured_fields_from_guideline(metadata)
 
-                # Normalize flow-internal URLs in service_channel: pages like /termsconditions
-                # are mid-flow T&C screens — they only work inside an active session and cannot
-                # be navigated to directly. Replace them with the portal root so users get a
-                # working entry URL. e.g. https://edbr.dbd.go.th/termsconditions → https://edbr.dbd.go.th/
-                sc = (metadata.get("service_channel") or "").strip()
-                if sc and sc not in ("nan", "None"):
-                    sc_fixed = re.sub(r"(https?://[^/\s]+)/termsconditions\b", r"\1/", sc)
-                    if sc_fixed != sc:
-                        metadata["service_channel"] = sc_fixed
 
                 # Build page_content (high-signal embedding text)
                 page_content = self._build_page_content(metadata)

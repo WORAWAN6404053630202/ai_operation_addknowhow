@@ -29,7 +29,7 @@ PERSONA_PROFILES: Dict[str, Dict[str, Any]] = {
         "allow_assumptions": False,
         "focus": "legal_accuracy",
         "strict_mode": True,
-        "require_switch_confirmation": True,
+        "require_switch_confirmation": False,
     },
     PRACTICAL: {
         "max_recent_messages": 10,
@@ -39,14 +39,11 @@ PERSONA_PROFILES: Dict[str, Dict[str, Any]] = {
         "allow_assumptions": True,
         "focus": "actionable_guidance",
         "strict_mode": False,
-        "require_switch_confirmation": True,
+        "require_switch_confirmation": False,
     },
 }
 
-PERSONA_SWITCH_CONFIRMATION_PROMPTS: Dict[str, str] = {
-    ACADEMIC: "ต้องการเปลี่ยนเป็นโหมด Academic จริง ๆ ใช่ไหม?",
-    PRACTICAL: "ต้องการเปลี่ยนเป็นโหมด Practical จริง ๆ ใช่ไหม?",
-}
+PERSONA_SWITCH_CONFIRMATION_PROMPTS: Dict[str, str] = {}  # silent switch — no confirmation dialog
 
 PERSONA_SWITCH_SUCCESS_MESSAGES: Dict[str, str] = {
     ACADEMIC: "เปลี่ยนเป็นโหมด Academic แล้ว",

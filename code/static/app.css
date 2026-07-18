@@ -397,12 +397,16 @@ button, select, textarea {
 }
 
 /* Fix 2: Markdown styles inside assistant bubbles */
-.message-row.assistant .message-bubble p { margin: 0 0 0.6em; }
+.message-row.assistant .message-bubble p { margin: 0 0 0.85em; }
 .message-row.assistant .message-bubble p:last-child { margin-bottom: 0; }
 .message-row.assistant .message-bubble ul,
-.message-row.assistant .message-bubble ol { padding-left: 1.5em; margin: 0.4em 0; }
-.message-row.assistant .message-bubble li { margin-bottom: 0.25em; }
-.message-row.assistant .message-bubble strong { font-weight: 700; }
+.message-row.assistant .message-bubble ol { padding-left: 1.6em; margin: 0.5em 0 0.75em; }
+.message-row.assistant .message-bubble li { margin-bottom: 0.4em; line-height: 1.7; }
+.message-row.assistant .message-bubble strong {
+  font-weight: 700;
+  color: #0a0f1e;
+  letter-spacing: 0.01em;
+}
 .message-row.assistant .message-bubble em { font-style: italic; }
 .message-row.assistant .message-bubble h1,
 .message-row.assistant .message-bubble h2,
@@ -662,6 +666,10 @@ button, select, textarea {
 
   .message-row.assistant .message-bubble {
     background: linear-gradient(180deg, #1c1e26 0%, #181a22 100%);
+  }
+
+  .message-row.assistant .message-bubble strong {
+    color: #f0f6fc;
   }
 
   .message-row.user .message-bubble {

@@ -71,7 +71,10 @@ RUN useradd -m -u 1000 appuser
 
 WORKDIR /app
 
-# Copy and install requirements
+# Install CPU-only PyTorch first to avoid pulling in the GPU build (~2.5 GB → ~500 MB)
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+# Copy and install requirements (torch already installed above, so sentence-transformers skips it)
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 

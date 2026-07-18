@@ -9,6 +9,11 @@ import time
 from pathlib import Path
 from typing import Optional
 
+try:
+    import conf as _conf
+except Exception:
+    _conf = None
+
 from fastapi import APIRouter, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
@@ -22,14 +27,15 @@ _state_manager = StateManager()
 # Path to uvicorn log file (adjust if needed via env)
 _LOG_FILE = Path(os.getenv("LOG_FILE", str(Path(__file__).resolve().parent.parent.parent / "uvicorn.log")))
 
-# Pricing per million tokens (USD) — same as llm_call.py
+# Pricing per million tokens (USD) — keep in sync with llm_call.py PRICING_USD_PER_MILLION_TOKENS
 _PRICING = {
     "anthropic/claude-sonnet-4-5":             {"input": 3.00,  "output": 15.00},
     "anthropic/claude-sonnet-4":               {"input": 3.00,  "output": 15.00},
+    "anthropic/claude-haiku-4-5":              {"input": 0.80,  "output": 4.00},
     "anthropic/claude-haiku-4":                {"input": 0.25,  "output": 1.25},
     "anthropic/claude-3.5-haiku-20241022":     {"input": 0.25,  "output": 1.25},
+    "openai/gpt-5.1":                          {"input": 2.00,  "output": 8.00},
     "openai/gpt-4o":                           {"input": 5.00,  "output": 15.00},
-    "qwen/qwen-2.5-72b-instruct":              {"input": 0.35,  "output": 0.40},
 }
 
 def _estimate_cost(prompt_tokens: int, completion_tokens: int, model: str = "") -> float:
@@ -62,7 +68,12 @@ async def admin_sessions(limit: int = Query(default=50, le=200)):
         prompt_tokens     = getattr(state, "total_prompt_tokens", 0) or 0
         completion_tokens = getattr(state, "total_completion_tokens", 0) or 0
         total_tokens      = prompt_tokens + completion_tokens
-        cost_usd          = _estimate_cost(prompt_tokens, completion_tokens)
+        _persona          = s.get("persona_id", "practical")
+        _model_for_cost   = {
+            "academic":  getattr(_conf, "OPENROUTER_MODEL_ACADEMIC",  "") if _conf else "",
+            "practical": getattr(_conf, "OPENROUTER_MODEL_PRACTICAL", "") if _conf else "",
+        }.get(_persona, "")
+        cost_usd          = _estimate_cost(prompt_tokens, completion_tokens, model=_model_for_cost)
 
         result.append({
             "session_id": sid,
@@ -93,6 +104,11 @@ async def admin_session_detail(session_id: str):
 
     prompt_tokens     = getattr(state, "total_prompt_tokens", 0) or 0
     completion_tokens = getattr(state, "total_completion_tokens", 0) or 0
+    _persona          = state.persona_id or "practical"
+    _model_for_cost   = {
+        "academic":  getattr(_conf, "OPENROUTER_MODEL_ACADEMIC",  "") if _conf else "",
+        "practical": getattr(_conf, "OPENROUTER_MODEL_PRACTICAL", "") if _conf else "",
+    }.get(_persona, "")
 
     return JSONResponse({
         "session_id": session_id,
@@ -105,7 +121,7 @@ async def admin_session_detail(session_id: str):
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
-        "cost_usd": round(_estimate_cost(prompt_tokens, completion_tokens), 6),
+        "cost_usd": round(_estimate_cost(prompt_tokens, completion_tokens, model=_model_for_cost), 6),
     })
 
 

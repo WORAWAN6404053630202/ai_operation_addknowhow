@@ -10,10 +10,18 @@ Enterprise CLI baseline:
 
 import logging
 import re
+import threading
 import uuid
 from rich.console import Console
 
 logging.basicConfig(level=logging.INFO, format="%(name)s | %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+# Suppress verbose background-thread logs (reranker/embedding model loading)
+# that would appear mid-prompt and corrupt the Rich terminal display.
+logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+logging.getLogger("sentence_transformers.SentenceTransformer").setLevel(logging.WARNING)
+logging.getLogger("utils.reranker").setLevel(logging.WARNING)
 from rich.markup import escape as rich_escape
 from rich.prompt import Prompt
 
@@ -83,6 +91,17 @@ def main():
 
     retriever = get_retriever(fail_if_empty=True)
     supervisor = PersonaSupervisor(retriever=retriever)
+
+    import conf as _conf
+    if getattr(_conf, "RERANKER_ENABLED", False):
+        _rr_model = getattr(_conf, "RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+        def _preload_reranker() -> None:
+            try:
+                from utils.reranker import _get_reranker
+                _get_reranker(_rr_model)
+            except Exception as _e:
+                logging.getLogger(__name__).warning("[Startup] Reranker preload failed: %s", _e)
+        threading.Thread(target=_preload_reranker, daemon=True, name="reranker-preload").start()
 
     state = state_manager.load(session_id)
     if state is None:

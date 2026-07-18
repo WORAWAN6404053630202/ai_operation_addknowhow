@@ -14,10 +14,14 @@ PRODUCTION FIXES:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+
+_LOG = logging.getLogger("restbiz.state_manager")
 
 from model.conversation_state import ConversationState
 
@@ -117,9 +121,23 @@ class StateManager:
     # Context keys that should never be persisted to disk — they are only valid within
     # the single request that set them and become stale immediately after.
     _EPHEMERAL_CTX_KEYS = frozenset({
-        "_broad_retrieval_docs",    # large doc list; set for Academic handoff, stale afterwards
-        "_broad_retrieval_query",   # companion query; same lifecycle as _broad_retrieval_docs
-        "_multi_topic_retrieval",   # flag for multi-topic DC suppression; per-turn only
+        "_broad_retrieval_docs",     # large doc list; set for Academic handoff, stale afterwards
+        "_broad_retrieval_query",    # companion query; same lifecycle as _broad_retrieval_docs
+        "_multi_topic_retrieval",    # flag for multi-topic DC suppression; per-turn only
+        "_style_pw_cache",           # style pre-warm result; keyed by (raw_stripped, last_q), per-turn only
+        # Retrieve-loop guards (practical.py) — per-turn counters; stale values across turns
+        # cause premature hard-abort ("ขอโทษครับ ไม่พบข้อมูล") on the next legitimate question.
+        "_retrieve_blocked_count",   # counts consecutive retrieve-blocked events within one turn
+        "_force_answer_count",       # counts force-answer attempts within one turn (BUG-2 fix)
+        # Auto-fill guard (practical.py) — set before recursive handle(), popped after.
+        # If an exception escapes the recursive call the pop never runs; without ephemeral
+        # treatment the guard sticks to disk and blocks auto-fill permanently. (BUG-3 fix)
+        "_autofill_guard",
+        # Supervisor-set retrieval-done flag (supervisor.py → read in practical.py).
+        # Cleared at start of _ensure_practical_retrieval_for_legal() on legal-question turns,
+        # but greeting/thanks turns leave it True. Adding here prevents stale True leaking
+        # into next turn (confirmed in 6 persisted state files in /data/states/).
+        "_supervisor_retrieval_done",
     })
 
     def _trim_state_for_save(self, state: ConversationState) -> None:
@@ -157,7 +175,7 @@ class StateManager:
         self._trim_state_for_save(state)
 
         path = self._state_path(session_id)
-        tmp_path = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp_path = path.with_suffix(f".{os.getpid()}.{uuid.uuid4().hex[:6]}.tmp")
 
         self._acquire_lock(session_id)
         try:
@@ -167,7 +185,7 @@ class StateManager:
             payload["_meta"]["saved_at"] = time.time()
 
             with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
+                json.dump(payload, f, ensure_ascii=False, separators=(',', ':'))
 
             tmp_path.replace(path)
         finally:
@@ -187,7 +205,14 @@ class StateManager:
             return None
 
         with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            try:
+                data = json.load(f)
+            except (json.JSONDecodeError, ValueError) as _je:
+                _LOG.warning(
+                    "[StateManager] Corrupt state file for session %s — starting fresh (%s)",
+                    session_id, _je,
+                )
+                return None
 
         data.pop("_meta", None)
 
@@ -210,10 +235,11 @@ class StateManager:
             return
 
         path = self._state_path(session_id)
-        lock_path = self._lock_path(session_id)
 
+        _lock_acquired = False
         try:
             self._acquire_lock(session_id)
+            _lock_acquired = True
         except Exception:
             pass
 
@@ -221,13 +247,14 @@ class StateManager:
             if path.exists():
                 path.unlink()
         finally:
-            try:
-                lock_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            self._release_lock(session_id)
+            if _lock_acquired:
+                self._release_lock(session_id)
 
     # session listing
+    def list_session_ids(self) -> List[str]:
+        """Return all active session IDs without loading full state (used for lock cleanup)."""
+        return [p.stem for p in self.dir.glob("*.json")]
+
     def list_sessions(self, limit: int = 20, client_key: Optional[str] = None) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         client_key = (client_key or "").strip()

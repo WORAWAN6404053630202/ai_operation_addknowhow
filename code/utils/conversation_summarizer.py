@@ -145,7 +145,7 @@ class ConversationSummarizer:
 
 สรุป (2-3 ประโยค):"""
 
-        _max_attempts = 3  # 1 ครั้งแรก + retry อีก 2 ครั้ง
+        _max_attempts = 1  # ไม่ retry — fail แล้ว fallback trim ทันที ประหยัด sleep 3s
         _retry_delay = 1.5  # วินาที
 
         for _attempt in range(1, _max_attempts + 1):
@@ -191,7 +191,7 @@ class ConversationSummarizer:
                             "[Summarizer] Retryable error (attempt %d/%d): %s — retrying in %.1fs",
                             _attempt, _max_attempts, e, _retry_delay,
                         )
-                    time.sleep(_retry_delay)
+                    time.sleep(_retry_delay)  # safe: always called from run_in_executor thread, not event loop
                 else:
                     if _HAS_LOGGER:
                         logger.log_with_data("error", "สรุปการสนทนาล้มเหลวหลัง retry", {
@@ -215,7 +215,7 @@ class ConversationSummarizer:
                             "[Summarizer] Unknown error (attempt %d/%d): %s — retrying",
                             _attempt, _max_attempts, e,
                         )
-                    time.sleep(_retry_delay)
+                    time.sleep(_retry_delay)  # safe: always called from run_in_executor thread, not event loop
                 else:
                     if _HAS_LOGGER:
                         logger.log_with_data("error", "สรุปการสนทนาล้มเหลว", {
@@ -253,6 +253,17 @@ class ConversationSummarizer:
 
 # Helper function สำหรับใช้ใน llm_call.py
 
+_summarizer_singleton: Optional[ConversationSummarizer] = None
+
+
+def _get_summarizer() -> ConversationSummarizer:
+    """Lazy-init singleton: reuses one ChatOpenAI instance across all summarization calls."""
+    global _summarizer_singleton
+    if _summarizer_singleton is None:
+        _summarizer_singleton = ConversationSummarizer()
+    return _summarizer_singleton
+
+
 def auto_summarize_if_needed(
     state,
     threshold: int = 10,
@@ -260,16 +271,16 @@ def auto_summarize_if_needed(
 ) -> bool:
     """
     ตรวจสอบและ summarize อัตโนมัติถ้าจำเป็น
-    
+
     Args:
         state: ConversationState object
         threshold: จำนวน messages ที่จะเริ่ม summarize
         keep_recent: เก็บ messages ล่าสุดกี่ข้อความ
-    
+
     Returns:
         True ถ้า summarize แล้ว, False ถ้าไม่ได้ summarize
     """
-    summarizer = ConversationSummarizer()
+    summarizer = _get_summarizer()
     
     if not summarizer.should_summarize(state.messages, threshold):
         return False

@@ -94,7 +94,8 @@ async def root_health():
         from service.local_vector_store import get_vs_manager
         mgr = get_vs_manager()
         ready = mgr.vectorstore is not None and (mgr._collection_count() or 0) > 0
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[health] vectorstore check failed: {e}")
         ready = False
     return {
         "status": "ok" if ready else "starting",

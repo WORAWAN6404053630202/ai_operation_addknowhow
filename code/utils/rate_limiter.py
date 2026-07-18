@@ -17,6 +17,8 @@ from collections import defaultdict, deque
 from typing import Dict, Tuple
 import threading
 
+_GLOBAL_LIMITER_LOCK = threading.Lock()
+
 
 class RateLimiter:
     """
@@ -207,6 +209,7 @@ def get_rate_limiter() -> RateLimiter:
     """Get global rate limiter instance (singleton)."""
     global _global_limiter
     if _global_limiter is None:
-        # Default: 10 requests per minute per session
-        _global_limiter = RateLimiter(max_requests=10, window_seconds=60)
+        with _GLOBAL_LIMITER_LOCK:
+            if _global_limiter is None:
+                _global_limiter = RateLimiter(max_requests=10, window_seconds=60)
     return _global_limiter

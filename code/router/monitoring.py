@@ -16,6 +16,8 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/monitoring", tags=["monitoring"])
 
+_cached_state_manager = None
+
 
 # Startup time
 _start_time = time.time()
@@ -73,8 +75,10 @@ def _check_services() -> Dict[str, bool]:
 
     # Check session storage
     try:
-        from model.state_manager import StateManager
-        sm = StateManager()
+        global _cached_state_manager
+        if _cached_state_manager is None:
+            from model.state_manager import StateManager
+            _cached_state_manager = StateManager()
         checks['session_storage'] = True
     except Exception as e:
         logger.warning(f"Session storage check failed: {e}")

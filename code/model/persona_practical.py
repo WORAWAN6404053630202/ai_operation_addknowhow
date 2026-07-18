@@ -12,8 +12,9 @@ import conf
 from model.conversation_state import ConversationState
 from utils.llm_call import llm_invoke, extract_llm_text
 from utils.prompts_practical import SYSTEM_PROMPT as SYSTEM_PROMPT_PRACTICAL, build_lqs_license_detect_prompt, build_satisfaction_detect_prompt, build_dont_know_detect_prompt, build_short_followup_detect_prompt
-from utils.prompts_supervisor import build_legal_q_detect_prompt
+from utils.prompts_supervisor import build_legal_q_detect_prompt, build_greeting_detect_prompt
 from utils.query_synonyms import SYNONYM_PATTERNS
+from utils.query_rewriter import enrich_query_for_retrieval, _needs_rewrite as _qr_needs_rewrite
 
 # Import professional logging
 from utils.logger import get_logger, log_function_call, TimingContext
@@ -73,7 +74,8 @@ _MULTI_TOPIC_MENU_THRESHOLD: int = 3
 _TOPIC_DESC_MAP: dict = {
     "ใบทะเบียนพาณิชย์": "ขึ้นทะเบียนธุรกิจกับกรมพัฒนาธุรกิจการค้า (DBD)",
     "ใบภาษีมูลค่าเพิ่ม ภพ.20": "จด VAT กับกรมสรรพากร เมื่อยอดขายถึงเกณฑ์",
-    "การขึ้นทะเบียนกองทุนประกันสังคม": "ขึ้นทะเบียนนายจ้าง-ลูกจ้างกับสำนักงานประกันสังคม",
+    "ทะเบียนนายจ้าง": "ขึ้นทะเบียนนายจ้างกับสำนักงานประกันสังคม",
+    "ทะเบียนผู้ประกันตน": "แจ้งขึ้นทะเบียนผู้ประกันตน/ลูกจ้างกับสำนักงานประกันสังคม",
     "ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร": "ใบอนุญาตเปิดร้านอาหารจาก BMA/อปท.",
     "ใบอนุญาตจำหน่ายสุรา": "ใบอนุญาตขายสุราจากกรมสรรพสามิต",
     "แบบแสดงรายการภาษีป้ายร้านอาหาร": "ภาษีป้ายร้านอาหาร ยื่นกับเทศบาล/กทม.",
@@ -89,7 +91,7 @@ _TOPIC_DESC_MAP: dict = {
 # Groups of related topics with a shared context note (used in 4+ topic summary header)
 _RELATED_TOPIC_GROUPS: list = [
     (
-        frozenset({"ใบทะเบียนพาณิชย์", "การขึ้นทะเบียนกองทุนประกันสังคม", "ใบภาษีมูลค่าเพิ่ม ภพ.20"}),
+        frozenset({"ใบทะเบียนพาณิชย์", "ทะเบียนนายจ้าง", "ใบภาษีมูลค่าเพิ่ม ภพ.20"}),
         "ซึ่งเป็นเรื่องพื้นฐานที่ธุรกิจใหม่ต้องดำเนินการ",
     ),
     (
@@ -142,6 +144,13 @@ def _classify_link(desc: str, url: str) -> str:
             _url_pre,
         ):
             return "registration"
+        # Priority 0b: Guide-type URL paths — indicate manual/procedure reference pages.
+        # These override desc checks (e.g. desc "...ตามพระราชบัญญัติ..." would misfire as 'ref').
+        # /manual/ = government service manuals (e.g. dbd.go.th/manual/1061)
+        # /procedure/ = Thai government procedure pages (e.g. info.go.th/procedure/...)
+        # /handbook/ = downloadable handbooks
+        if not _is_social and re.search(r"/(manual|procedure|handbook)/", _url_pre):
+            return "guide"
 
     desc_l = desc.lower().strip()
 
@@ -237,12 +246,25 @@ def _parse_link_entries(text: str) -> list:
             i += 1
             continue
         if stripped.startswith("http"):
+            # Single-line format: a URL line may contain the next entry's description as
+            # trailing text after the URL (e.g. "https://url • Description of next entry").
+            # Extract just the URL; treat trailing text as the next entry's pending desc.
+            _um1 = re.match(r'(https?://\S+)', stripped)
+            if _um1:
+                _just_url = _um1.group(1).rstrip('.,;)')
+                _trailing = stripped[_um1.end():].strip()
+            else:
+                _just_url = stripped.rstrip('.,;)')
+                _trailing = ""
             if entries:
-                entries[-1] = (entries[-1][0], stripped)
+                entries[-1] = (entries[-1][0], _just_url)
+            if _trailing:
+                entries.append((_trailing, ""))
             i += 1
             continue
         desc = stripped
         url = ""
+        _pending_next = ""
         # Detect URL embedded in description line (e.g., "desc text  https://url")
         _emb = re.search(r'\s+(https?://\S+)$', desc)
         if _emb:
@@ -250,11 +272,20 @@ def _parse_link_entries(text: str) -> list:
             desc = desc[:_emb.start()].strip()
             i += 1
         elif i + 1 < len(merged) and merged[i + 1].startswith("http"):
-            url = merged[i + 1]
+            # Next-line URL may also carry trailing text in single-line format
+            _url_line = merged[i + 1]
+            _um2 = re.match(r'(https?://\S+)', _url_line)
+            if _um2:
+                url = _um2.group(1).rstrip('.,;)')
+                _pending_next = _url_line[_um2.end():].strip()
+            else:
+                url = _url_line
             i += 2
         else:
             i += 1
         entries.append((desc, url))
+        if _pending_next:
+            entries.append((_pending_next, ""))
 
     # Step 2: filter entries with clearly truncated/incomplete URLs
     # A valid URL must end with a path character (not % or partial percent-encoding)
@@ -465,7 +496,7 @@ class PracticalPersonaService:
         Returns JSON: { "prefix": "..." }
         """
         switch_model = getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL)
-        timeout = int(getattr(conf, "LLM_REQUEST_TIMEOUT", 30))
+        timeout = int(getattr(conf, "LLM_TOPIC_PICKER_TIMEOUT", 8))
         llm = ChatOpenAI(
             model=switch_model,
             openai_api_key=conf.OPENROUTER_API_KEY,
@@ -530,7 +561,7 @@ class PracticalPersonaService:
     def _default_lqs_license_llm_call(self) -> Callable[[str, List[str]], dict]:
         """Lightweight LLM (switch model) to identify license type from user query when LQS score=0."""
         switch_model = getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL)
-        timeout = int(getattr(conf, "LLM_REQUEST_TIMEOUT", 30))
+        timeout = int(getattr(conf, "LLM_TOPIC_PICKER_TIMEOUT", 8))
         llm = ChatOpenAI(
             model=switch_model,
             openai_api_key=conf.OPENROUTER_API_KEY,
@@ -541,8 +572,8 @@ class PracticalPersonaService:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, candidates: List[str]) -> dict:
-            prompt = build_lqs_license_detect_prompt(user_text, candidates)
+        def _call(user_text: str, candidates: List[str], last_topic: str = "") -> dict:
+            prompt = build_lqs_license_detect_prompt(user_text, candidates, last_topic=last_topic)
             try:
                 text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/lqs_lt")).strip()
                 if "```json" in text:
@@ -696,6 +727,42 @@ class PracticalPersonaService:
                 return obj if isinstance(obj, dict) else {}
             except Exception as _je:
                 _LOG.debug("[Practical/legal_q] JSON parse failed: %s", _je)
+                return {}
+
+        return _call
+
+    def _default_greeting_llm_call(self) -> Callable[[str], dict]:
+        """Lightweight classifier: is this a greeting/smalltalk with no legal intent?"""
+        model = getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL)
+        timeout = int(getattr(conf, "LLM_TOPIC_PICKER_TIMEOUT", 8))
+        llm = ChatOpenAI(
+            model=model,
+            openai_api_key=conf.OPENROUTER_API_KEY,
+            openai_api_base=conf.OPENROUTER_BASE_URL,
+            temperature=0.0,
+            max_tokens=150,
+            request_timeout=timeout,
+            model_kwargs={"response_format": {"type": "json_object"}},
+        )
+
+        def _call(user_text: str) -> dict:
+            prompt = build_greeting_detect_prompt(user_text)
+            try:
+                text = extract_llm_text(
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/greeting")
+                ).strip()
+            except Exception as _e:
+                _LOG.warning("[Practical/greeting] LLM call failed: %s", _e)
+                return {}
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0].strip()
+            elif "```" in text:
+                text = text.split("```")[1].split("```")[0].strip()
+            try:
+                obj = json.loads(text)
+                return obj if isinstance(obj, dict) else {}
+            except Exception as _je:
+                _LOG.debug("[Practical/greeting] JSON parse failed: %s", _je)
                 return {}
 
         return _call
@@ -872,6 +939,16 @@ class PracticalPersonaService:
                 _ot_counts[_ot] = _ot_counts.get(_ot, 0) + 1
 
             if len(vals) >= 2:
+                # Guard for registration_type: only trigger DC when values are actual
+                # entity sub-types containing BIZTYPE keywords (บริษัท / ห้างหุ้นส่วน).
+                # Values like สำนักงานเขตที่ตั้งร้านค้า / ออนไลน์ are submission channels
+                # stored in the same metadata field by data ingest — asking
+                # "รูปแบบการจดทะเบียน?" for them is semantically wrong.
+                if key == "registration_type":
+                    _BIZTYPE_KW_DC = ("บริษัท", "ห้างหุ้นส่วน")
+                    if not any(any(kw in v for kw in _BIZTYPE_KW_DC) for v in vals):
+                        continue  # non-BIZTYPE values (channels/locations) → skip DC
+
                 # Use the #1 doc's operation_topic as the primary (most relevant to query).
                 # Top-1 reliably captures the exact operation the user asked about
                 # (e.g. "ชำรุด/สูญหาย" ranks #1 by BM25 for those exact keywords)
@@ -968,10 +1045,11 @@ class PracticalPersonaService:
         if tmpl and "{}" in tmpl and len(values) == 2:
             q = tmpl.format(*values)
         else:
-            opts = "\n".join(f"{i + 1}) {v}" for i, v in enumerate(values))
+            opts = "\n".join(f"{i + 1}) **{v}**" for i, v in enumerate(values))
             header = prefix or "ช่วยบอกข้อมูลเพิ่มเติมครับ"
-            q = f"{header}\n{opts}"
-        return q if q.endswith("ครับ") else q.rstrip(" .") + "ครับ"
+            q = f"**{header}**\n{opts}"
+        first_line = q.split("\n")[0]
+        return q if re.search(r"(ครับ|ค่ะ|คะ)\s*\??\s*\*{0,2}\s*$", first_line) else q.rstrip(" .") + "ครับ"
 
     def _match_clarification_answer(
         self,
@@ -1055,7 +1133,14 @@ class PracticalPersonaService:
         # Move closing sentence to after all link sections if it sits before them.
         # Happens when LLM outputs: ...content... closing-sentence\n\n📄 links
         # Desired: ...content...\n\n📄 links\n\nclosing-sentence
-        _lf_hdr = re.search(r'(?m)^(?:🌐|📄|📖|📚)[^\n]*$', t)
+        # Must find the FIRST link-section header that is actually followed by a URL
+        # (not content headers like "📄 เอกสารที่ต้องใช้" which also use 📄 emoji).
+        _lf_hdr = None
+        for _m in re.finditer(r'(?m)^(?:🌐|📄|📖|📚)[^\n]*$', t):
+            _after = t[_m.end():]
+            if re.search(r'https?://', _after[:400]):
+                _lf_hdr = _m
+                break
         if _lf_hdr:
             _lf_pre = t[:_lf_hdr.start()].rstrip('\n')
             _lf_links = t[_lf_hdr.start():]
@@ -1188,7 +1273,7 @@ class PracticalPersonaService:
             "collected_key": "entity_type",
             "filter_mode":   "chroma",
             "question_prefix": "ธุรกิจของคุณเป็นรูปแบบใดครับ?",
-            "question_tmpl": "ธุรกิจของคุณเป็น{} หรือ {} ครับ?",
+            "question_tmpl": "",
         },
         {
             "metadata_key":  "operation_by_department",
@@ -1306,7 +1391,7 @@ class PracticalPersonaService:
         re.IGNORECASE,
     )
     _LQS_QR_KEYWORDS_RE = re.compile(
-        r"\bQR\b|QR\s*Payment|QR\s*Code|คิวอาร์|ชำระ.*ออนไลน์|สมัคร.*QR|QR.*สมัคร",
+        r"\bQR\b|QR\s*Payment|QR\s*Code|คิวอาร์|คิวอาเพ|คิวอาพาย|ชำระ.*ออนไลน์|สมัคร.*QR|QR.*สมัคร",
         re.IGNORECASE,
     )
     _LQS_VAT_RE = re.compile(
@@ -1344,17 +1429,20 @@ class PracticalPersonaService:
     def __init__(self, retriever):
         self.retriever = retriever
         self._topic_menu_cache: Optional[List[str]] = None
+
         self.llm_greet_call = self._default_greet_llm_call()
         self._lqs_license_llm_call = self._default_lqs_license_llm_call()
         self._satisfaction_llm_call = self._default_satisfaction_llm_call()
         self._dont_know_llm_call = self._default_dont_know_llm_call()
         self._short_followup_llm_call = self._default_short_followup_llm_call()
         self._practical_legal_q_llm_call = self._default_practical_legal_q_llm_call()
+        self._greeting_llm_call = self._default_greeting_llm_call()
         self._init_llm()
 
     def _init_llm(self):
         model_name = getattr(conf, "OPENROUTER_MODEL_PRACTICAL", conf.OPENROUTER_MODEL)
-        timeout = int(getattr(conf, "LLM_REQUEST_TIMEOUT", 30))
+        timeout = int(getattr(conf, "LLM_REQUEST_TIMEOUT_PRACTICAL",
+                              getattr(conf, "LLM_REQUEST_TIMEOUT", 60)))
         self.llm = ChatOpenAI(
             model=model_name,
             openai_api_key=conf.OPENROUTER_API_KEY,
@@ -1386,7 +1474,11 @@ class PracticalPersonaService:
             return True
         if self._TH_DEE_RE.match(t) and ("ไหม" not in t and "?" not in t):
             return True
-        return False
+        # Short-circuit: legal signal = not a greeting (matches pattern in _satisfaction_llm_check)
+        if self._LEGAL_SIGNAL_RE.search(t):
+            return False
+        # LLM fallback: catches casual greetings regex misses (e.g. "หวัดดีจ้า", "ดีๆ ค่ะ")
+        return self._greeting_llm_check(raw)
 
     def _looks_like_legal_question(self, s: str, state=None) -> bool:
         t = self._normalize_for_intent(s)
@@ -1410,7 +1502,7 @@ class PracticalPersonaService:
             return False
         if self._LEGAL_SIGNAL_RE.search(q):
             return False
-        cache = (state.context or {}).setdefault("_satisfaction_llm_cache", {}) if state is not None else {}
+        cache = (state.context or {}).setdefault("_satisfaction_llm_cache", {}) if state is not None else self.__dict__.setdefault("_satisfaction_static_cache", {})
         cache_key = q[:60]
         if cache_key in cache:
             return cache[cache_key]
@@ -1435,6 +1527,9 @@ class PracticalPersonaService:
         """
         q = (user_text or "").strip()
         if not q or len(q) < 2 or len(q) > 80:
+            return False
+        # Legal-signal inputs are substantive questions, never a "dont_know" or "ask_types" response.
+        if self._LEGAL_SIGNAL_RE.search(q):
             return False
         cache = (state.context or {}).setdefault("_dont_know_llm_cache", {}) if state is not None else {}
         cache_key = q[:60]
@@ -1464,7 +1559,11 @@ class PracticalPersonaService:
         q = (user_text or "").strip()
         if not q or len(q) > 80:
             return False
-        cache = (state.context or {}).setdefault("_short_followup_llm_cache", {}) if state is not None else {}
+        # Legal-signal inputs ≥10 chars are new questions, not short follow-ups of the prior topic.
+        # False negative here (returning False) is safe — triggers fresh retrieval rather than stale docs.
+        if self._LEGAL_SIGNAL_RE.search(q) and len(q) >= 10:
+            return False
+        cache = (state.context or {}).setdefault("_short_followup_llm_cache", {}) if state is not None else self.__dict__.setdefault("_short_followup_static_cache", {})
         cache_key = q[:60]
         if cache_key in cache:
             return cache[cache_key]
@@ -1494,6 +1593,14 @@ class PracticalPersonaService:
         cache_key = q[:80]
         if cache_key in cache:
             return cache[cache_key]
+        # Share supervisor pre-warm False result: supervisor threshold=0.60, practical=0.75.
+        # If supervisor said False (confidence < 0.60), practical (threshold 0.75) is also False.
+        # Never share True: supervisor's lower threshold may accept queries practical would reject.
+        if state is not None:
+            _sup_cache = (state.context or {}).get("_legal_q_llm_cache", {})
+            if cache_key in _sup_cache and not _sup_cache[cache_key]:
+                cache[cache_key] = False
+                return False
         conf_val = 0.0
         try:
             res = self._practical_legal_q_llm_call(q) or {}
@@ -1504,6 +1611,33 @@ class PracticalPersonaService:
             result = False
         if result:
             _LOG.info("[Practical/legal_q] LLM detected legal question: %r (conf=%.2f)", q[:50], conf_val)
+        cache[cache_key] = result
+        return result
+
+    def _greeting_llm_check(self, user_text: str) -> bool:
+        """
+        LLM fallback: is this a greeting/smalltalk with no legal intent?
+        Called when _EN_GREET_RE / _TH_WATDEE_RE / _TH_SAWASDEE_RE / _TH_DEE_RE all miss.
+        Low threshold (0.70) — false positive = skip retrieval for a real question.
+        Uses instance-level cache (no state needed — greeting classification is stateless).
+        """
+        q = (user_text or "").strip()
+        if not q or len(q) > 80:
+            return False
+        cache = self.__dict__.setdefault("_greeting_static_cache", {})
+        cache_key = q[:60]
+        if cache_key in cache:
+            return cache[cache_key]
+        conf_val = 0.0
+        try:
+            res = self._greeting_llm_call(q) or {}
+            conf_val = float(res.get("confidence") or 0.0)
+            result = bool(res.get("is_greeting")) and conf_val >= 0.70
+        except Exception as _e:
+            _LOG.warning("[Practical/greeting] LLM check failed: %s", _e)
+            result = False
+        if result:
+            _LOG.info("[Practical/greeting] LLM detected greeting: %r (conf=%.2f)", q[:50], conf_val)
         cache[cache_key] = result
         return result
 
@@ -1547,7 +1681,7 @@ class PracticalPersonaService:
             return True
         n = self._normalize_for_intent(t)
         toks = self._tokenize_loose(n)
-        if len(toks) <= 3 and len(n) <= 18:
+        if len(toks) <= 1 and len(n) <= 6:
             return True
         if self._FOLLOWUP_SHORT_RE.match(n):
             return True
@@ -1641,7 +1775,7 @@ class PracticalPersonaService:
             if not m:
                 continue
             idx = int(m.group(1))
-            label = (m.group(2) or "").strip()
+            label = (m.group(2) or "").strip().replace("**", "")
             if idx <= 0 or not label:
                 continue
             pairs.append((idx, label))
@@ -1762,7 +1896,7 @@ class PracticalPersonaService:
                 return "FILLED"
 
             if key == "topic" and user_text.strip() and not self._LIKELY_SELECTION_RE.match(user_text.strip()):
-                if self._looks_like_legal_question(user_text):
+                if self._looks_like_legal_question(user_text, state):
                     ctx.pop("pending_slot", None)
                     state.context = ctx
                     return "BYPASS"
@@ -1872,7 +2006,7 @@ class PracticalPersonaService:
 
         menu_str = self._format_numbered_options(topics)
         summary = "\n".join(summary_lines)
-        return f"{header}\n\n{summary}\n\nต้องการรายละเอียดเรื่องไหนก่อนคะ?\n{menu_str}"
+        return f"{header}\n\n{summary}\n\nต้องการรายละเอียดเรื่องไหนก่อนครับ?\n{menu_str}"
 
     def _reply_greeting_with_choices(self, state: ConversationState, kind: str = "greet") -> str:
         """
@@ -2023,15 +2157,19 @@ class PracticalPersonaService:
         min_confidence: 0.70 when regex score=0 (no signal), 0.80 when score 1-4 (weak signal)."""
         if not query or not lt_candidates:
             return None
+        # Read last_topic as context anchor so follow-up queries like "วิธีจดของร้านที่นครศรีฯ"
+        # stay anchored to the active topic instead of drifting to a keyword match (e.g. "จด"→จดทะเบียนพาณิชย์)
+        _last_topic = ((state.context or {}).get("last_topic") or "").strip()
+        # Cache key includes last_topic so the same raw query with different topic context gets separate entries
         cache = (state.context or {}).get("_lqs_lt_llm_cache") or {}
-        cache_key = query.strip()[:80]
+        cache_key = f"{query.strip()[:60]}|{_last_topic[:40]}"
         if cache_key in cache:
             cached = cache[cache_key]
             return cached if cached in lt_candidates else None
         valid_lt_set = set(lt_candidates)
         conf_val = 0.0
         try:
-            result = self._lqs_license_llm_call(query, lt_candidates)
+            result = self._lqs_license_llm_call(query, lt_candidates, last_topic=_last_topic)
             lt_name = (result.get("license_type") or "").strip()
             conf_val = float(result.get("confidence") or 0)
             matched = lt_name if (lt_name and lt_name in valid_lt_set and conf_val >= min_confidence) else None
@@ -2052,6 +2190,12 @@ class PracticalPersonaService:
 
         max_docs = max_docs if max_docs is not None else int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 8))
         max_chars = getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700)
+
+        # LLM query rewriting: convert informal Thai queries to formal regulatory terminology
+        # before synonym expansion. Appends formal terms without replacing original keywords,
+        # so BM25 and synonym patterns still fire on the original text.
+        if _qr_needs_rewrite(query):
+            query = enrich_query_for_retrieval(query)
 
         # Query expansion: Thai/English synonym bridging — patterns defined in utils/query_synonyms.py
         _expansions: list = []
@@ -2133,12 +2277,7 @@ class PracticalPersonaService:
                         "docs_found": len(docs),
                         "persona": "practical"
                     })
-                    if not docs:
-                        # Try same filter with larger k before going unfiltered.
-                        # This preserves entity/license filter intent — avoids mixing
-                        # irrelevant entity types into the result.
-                        docs = _scored_search(query, top_k, metadata_filter)
-                    elif len(docs) < max(2, max_docs // 2):
+                    if 0 < len(docs) < max(2, max_docs // 2):
                         # Got some but fewer than half requested — retry with 2× k to improve coverage
                         _extra = _scored_search(query, top_k * 2, metadata_filter)
                         _seen_h = {hash((getattr(d, "page_content", "") or "")[:80]) for d in docs}
@@ -2190,17 +2329,31 @@ class PracticalPersonaService:
         # Round 2 re-queries with that anchor term appended, catching docs that
         # cover the same topic but use different phrasing from the user's query.
         # Skipped when metadata_filter is active — filtered queries are already targeted.
+        #
+        # Anchor selection: majority vote over top-5 Round-1 docs instead of top-1
+        # alone. Requires ≥2 docs to agree before using a value as anchor, so a single
+        # mis-ranked top-1 doc cannot pull Round 2 off-topic.
+        # Fallback: if no clear majority exists, Round 2 is skipped (safe degradation).
         if docs and not metadata_filter:
-            _top_md = getattr(docs[0], "metadata", {}) or {}
             _r2_anchor: str = ""
+            _top_n_r2 = min(5, len(docs))
             for _r2_field in ("license_type", "operation_topic", "main_topic"):
-                _r2_val = str(_top_md.get(_r2_field) or "").strip()
-                if _r2_val and _r2_val not in expanded_query:
-                    _r2_anchor = _r2_val
+                _r2_freq: Dict[str, int] = {}
+                for _d_r2 in docs[:_top_n_r2]:
+                    _v_r2 = str((getattr(_d_r2, "metadata", {}) or {}).get(_r2_field) or "").strip()
+                    if _v_r2:
+                        _r2_freq[_v_r2] = _r2_freq.get(_v_r2, 0) + 1
+                if not _r2_freq:
+                    continue
+                _r2_winner = max(_r2_freq, key=lambda x: _r2_freq[x])
+                _r2_count = _r2_freq[_r2_winner]
+                # ≥2 votes required (or only 1 doc available) to avoid anchoring on noise
+                if (_r2_count >= 2 or _top_n_r2 == 1) and _r2_winner not in expanded_query:
+                    _r2_anchor = _r2_winner
                     break
             if _r2_anchor:
                 _round2_q = expanded_query + " " + _r2_anchor
-                _round2_docs = _scored_search(_round2_q, top_k)
+                _round2_docs = _scored_search(_round2_q, min(top_k, 8))
                 _seen_r1 = {hash((getattr(d, "page_content", "") or "")[:120]) for d in docs}
                 _r2_added = 0
                 for _d2 in _round2_docs:
@@ -2225,7 +2378,7 @@ class PracticalPersonaService:
             _missing_terms = self._check_field_coverage(docs)
             if len(_missing_terms) >= _iter_min:
                 _round3_q = expanded_query + " " + " ".join(_missing_terms)
-                _round3_docs = _scored_search(_round3_q, top_k)
+                _round3_docs = _scored_search(_round3_q, min(top_k, 8))
                 _seen_r3 = {hash((getattr(d, "page_content", "") or "")[:120]) for d in docs}
                 _r3_added = 0
                 for _d3 in _round3_docs:
@@ -2291,7 +2444,7 @@ class PracticalPersonaService:
         # Rerank raw retrieval results BEFORE metadata boost so the learned model
         # has the final say on relevance ordering. Metadata boost then acts only as
         # a tiebreaker on near-equal scores rather than overriding the reranker.
-        if getattr(conf, "RERANKER_ENABLED", False) and docs:
+        if getattr(conf, "RERANKER_ENABLED", False) and len(docs) >= 3:
             try:
                 from utils.reranker import rerank as _do_rerank
                 _rr_model = getattr(conf, "RERANKER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
@@ -2377,9 +2530,9 @@ class PracticalPersonaService:
         _STORE_FIELD_CAPS = {
             # Must be >= the per-field caps used in the handle() prompt loop below,
             # otherwise the storage cut dominates and the prompt cap has no effect.
-            "operation_steps": 1000, "identification_documents": 4000,
-            "research_reference": 3100, "fees": 500, "service_channel": 500,
-            "legal_regulatory": 2000, "terms_and_conditions": 800,
+            "operation_steps": 2000, "identification_documents": 4000,
+            "research_reference": 3100, "fees": 900, "service_channel": 500,
+            "legal_regulatory": 2000, "terms_and_conditions": 1800,
             "restaurant_ai_document": 800,
             # marketing / business_guide content fields
             "answer_guideline": 1500, "main_topic": 120, "sub_topic": 150,
@@ -2532,10 +2685,12 @@ class PracticalPersonaService:
                     elif isinstance(sel, list) and sel:
                         state.context[self._PHASE3_SLOT_KEY] = [str(x).strip() for x in sel if str(x).strip()]
 
-                    self._append_user_once(state, user_input)
-
-                    forced = f"ขอข้อมูลเฉพาะหัวข้อ: {', '.join(state.context.get(self._PHASE3_SLOT_KEY, []))}"
-                    return self.handle(state, forced, _internal=True)
+                    _phase3_secs = state.context.get(self._PHASE3_SLOT_KEY) or []
+                    if _phase3_secs:
+                        self._append_user_once(state, user_input)
+                        forced = f"ขอข้อมูลเฉพาะหัวข้อ: {', '.join(_phase3_secs)}"
+                        return self.handle(state, forced, _internal=True)
+                    # sel was empty/invalid — fall through to normal handling
 
             if pending_status == "INVALID":
                 _ps_inv = state.context.get("pending_slot")
@@ -2614,7 +2769,9 @@ class PracticalPersonaService:
         # Also skip if supervisor already did multi-topic merge — overwriting loses the merged docs.
         _has_slot_queue = bool((state.context or {}).get("topic_slot_queue"))
         _is_multi_topic_merged = bool((state.context or {}).get("_multi_topic_retrieval"))
-        if (not _internal) and (not _has_slot_queue) and (not _is_multi_topic_merged) and self._looks_like_legal_question(user_text):
+        _slot_change_retrieval_done = bool((state.context or {}).get("_slot_change_retrieval_done"))
+        _supervisor_retrieval_done = bool((state.context or {}).get("_supervisor_retrieval_done"))
+        if (not _internal) and (not _has_slot_queue) and (not _is_multi_topic_merged) and (not _slot_change_retrieval_done) and (not _supervisor_retrieval_done) and self._looks_like_legal_question(user_text, state):
             if self._should_retrieve_new_topic(state, user_text):
                 _mt_slot_ctx = None
                 try:
@@ -2656,16 +2813,16 @@ class PracticalPersonaService:
             else int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 3))
         )
         _FIELD_CAPS = {
-            "operation_steps": 900,
+            "operation_steps": 2000,  # raised 900→2000: multi-phase online channels (e.g. 3-phase ภาษีป้าย) need ~1500 chars
             "identification_documents": 4000,  # must never truncate — missing items = legal error; current max in data is 3156 chars
-            "fees": 400,
+            "fees": 900,
             "operation_duration": 200,
             "service_channel": 400,
             "legal_regulatory": 1250,
-            "terms_and_conditions": 1500,
+            "terms_and_conditions": 1800,
             "restaurant_ai_document": 650,
         }
-        _LONG_FIELDS_DEDUP = {"operation_steps", "legal_regulatory", "identification_documents"}  # deduped per (license_type, entity_type_normalized); terms_and_conditions excluded (cut-off time rows differ per doc)
+        _LONG_FIELDS_DEDUP = {"operation_steps", "legal_regulatory", "identification_documents"}  # deduped per (license_type, entity_type_normalized, service_channel); terms_and_conditions excluded (cut-off time rows differ per doc)
 
         # Cap docs sent to LLM: _prompt_max_docs per license_type to control token usage.
         # For multi-license, each license still gets its own metadata via dedup logic below.
@@ -2691,7 +2848,7 @@ class PracticalPersonaService:
         # Only when user is NOT mentioning entity in this turn (that case is handled by switch block).
         _cs_pre = (state.get_collected_slots() if hasattr(state, "get_collected_slots") else {})
         _cs_entity_pre = (_cs_pre.get("entity_type") or _cs_pre.get("entity_type_normalized") or "").strip()
-        if _cs_entity_pre and _all_docs and not (state.context or {}).get("_entity_switch_done"):
+        if _cs_entity_pre and _all_docs and not (state.context or {}).get("_entity_switch_done") and not _is_broad_q:
             _wrong_entity_docs_pre = [
                 d for d in _all_docs
                 if str((d.get("metadata") or {}).get("entity_type_normalized") or "").strip()
@@ -2802,6 +2959,43 @@ class PracticalPersonaService:
                             if _lt0 and _lt0.lower() not in ("nan", "none"):
                                 _lt_doc_count[_lt0] = _lt_doc_count.get(_lt0, 0) + 1
                         _is_multi_license_docs = len(_lt_order) > 1
+
+                        # Gap #1: After entity-switch retrieval succeeds, check if
+                        # registration_type still needs to be asked.
+                        # Fires only when supervisor's _apply_slot_change_if_detected missed it
+                        # (e.g. last_topic was stale due to FOCUS FILTER not updating it).
+                        _rt_already_sw = str(
+                            state.get_collected_slot("registration_type")
+                            if hasattr(state, "get_collected_slot") else ""
+                        ).strip()
+                        _rt_in_queue_sw = any(
+                            (s.get("key") if isinstance(s, dict) else s) == "registration_type"
+                            for s in (state.context or {}).get("topic_slot_queue", [])
+                        )
+                        _rt_in_pending_sw = (
+                            isinstance((state.context or {}).get("pending_slot"), dict)
+                            and (state.context or {}).get("pending_slot", {}).get("key") == "registration_type"
+                        )
+                        if not _rt_already_sw and not _rt_in_queue_sw and not _rt_in_pending_sw:
+                            _BIZTYPE_KW_SW = ("บริษัท", "ห้างหุ้นส่วน")
+                            _rt_seen_sw: dict = {}
+                            for _d_sw in _all_docs:
+                                _rt_v_sw = str((_d_sw.get("metadata") or {}).get("registration_type") or "").strip()
+                                if _rt_v_sw and any(kw in _rt_v_sw for kw in _BIZTYPE_KW_SW):
+                                    _rt_seen_sw[_rt_v_sw] = _rt_seen_sw.get(_rt_v_sw, 0) + 1
+                            _rt_sw_opts = list(_rt_seen_sw.keys())
+                            if len(_rt_sw_opts) >= 2:
+                                state.context["pending_slot"] = {
+                                    "key": "registration_type",
+                                    "options": _rt_sw_opts,
+                                    "allow_multi": False,
+                                }
+                                _LOG.info(
+                                    "[Practical] entity-switch: queued registration_type | entity=%r opts=%s",
+                                    _query_et_override, _rt_sw_opts,
+                                )
+                                _rt_sw_q = "รูปแบบการจดทะเบียนเป็นแบบใดครับ?"
+                                return state, _rt_sw_q + "\n" + self._format_numbered_options(_rt_sw_opts)
                     else:
                         # This topic is entity-neutral (no separate docs per entity_type).
                         # Clear the override so the LLM prompt stays neutral instead of
@@ -2915,6 +3109,11 @@ class PracticalPersonaService:
         )
         _is_multi_topic_flag = bool((state.context or {}).get("_multi_topic_retrieval"))
         _is_broad_q_flag = bool((state.context or {}).get("_broad_question"))
+        # Tracks whether FOCUS FILTER's multi-requested path kept ≥2 license types.
+        # Set to True inside the multi-requested block; used to skip sibling-completion
+        # (sibling-completion adds 4+ docs for each surviving license → prompt explosion
+        # when 3 license types are all kept by multi-requested).
+        _multi_requested_kept = False
         if _is_multi_license_docs and not _is_broad_query and not _is_multi_topic_flag and not _is_broad_q_flag and _lt_order:
             # Pick dominant license_type by relevance to the CURRENT user query (not doc count alone).
             # Algorithm:
@@ -2987,11 +3186,18 @@ class PracticalPersonaService:
                 # VAT / ภพ.20 / ภาษีมูลค่าเพิ่ม → "ใบภาษีมูลค่าเพิ่ม ภพ.20"
                 if self._LQS_VAT_RE.search(q) and re.search(r"ภาษีมูลค่าเพิ่ม|ภพ", lt, re.IGNORECASE):
                     s += 8.0
-                # ประกันสังคม (without employer context) → ทะเบียนผู้ประกันตน only.
+                # ประกันสังคม (general) → ทะเบียนนายจ้าง: employer registration is always
+                # required for ประกันสังคม, even when user doesn't say "นายจ้าง" explicitly.
+                # Score 8 so it exceeds the multi-requested threshold (>4) alongside VAT.
+                if self._LQS_SOCIAL_RE.search(q) and re.search(r"นายจ้าง", lt, re.IGNORECASE):
+                    s += 8.0
+                # ประกันสังคม (without explicit employer context) → ทะเบียนผู้ประกันตน.
+                # Score 8 (was 4) so it also exceeds the multi-requested threshold when
+                # query mentions both VAT and ประกันสังคม — ensures both are kept together.
                 if (self._LQS_SOCIAL_RE.search(q)
                         and not self._LQS_EMPLOYER_RE.search(q)
                         and re.search(r"ผู้ประกันตน", lt, re.IGNORECASE)):
-                    s += 4.0
+                    s += 8.0
                 # ผู้ประกันตน / ลูกจ้าง / เงินสมทบ → "ทะเบียนผู้ประกันตน"
                 if self._LQS_INSURED_RE.search(q) and re.search(r"ผู้ประกันตน", lt, re.IGNORECASE):
                     s += 8.0
@@ -3077,6 +3283,11 @@ class PracticalPersonaService:
                     {lt: round(_lt_scores.get(lt, 0), 1) for lt in _explicitly_requested},
                     _noise_count,
                 )
+                # Signal sibling-completion to skip: docs already cover all explicitly-requested
+                # license types. Adding siblings for each license would flood the prompt
+                # (e.g. 3 license types × 2 sibling docs = 6 extra docs → 25K+ prompt tokens →
+                # LengthFinishReasonError). The multi-topic coverage here is intentional and complete.
+                _multi_requested_kept = True
                 # _is_multi_license_docs stays True — LLM sees docs for both licenses and will
                 # cover both in its answer. We intentionally do NOT set multi_license_topics here
                 # because that forces action='answer', which would prevent slot questions from
@@ -3095,6 +3306,10 @@ class PracticalPersonaService:
                     _all_docs = _focused_docs
                     _lt_order = [_dominant_lt]
                     _is_multi_license_docs = False
+                    # Restore full doc cap: multi-topic cap was applied before FOCUS FILTER ran.
+                    # Now that we're down to a single license type, reset to the original limit
+                    # so we don't unnecessarily cut docs (e.g. keeping only 3 of 6 สุรา docs).
+                    _prompt_max_docs = int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 6))
                     # Update state.current_docs immediately so supervisor/_route_pending_slot_to_persona
                     # sees the focused set when reading _area_license_lock — critical for topics without
                     # op-intent filter (e.g. Refund, WeChat Pay) where state.current_docs is not
@@ -3325,7 +3540,13 @@ class PracticalPersonaService:
                 ((_d.get("metadata") or {}).get("data_type") or "").strip().lower()
                 for _d in _all_docs
             }
-            if len(_co_mts) == 1 and next(iter(_co_mts)) and _co_dts <= {"marketing", "business_guide", ""}:
+            _subtopic_chapter_used = bool((state.context or {}).get("_subtopic_chapter_used"))
+            if (
+                len(_co_mts) == 1
+                and next(iter(_co_mts))
+                and _co_dts <= {"marketing", "business_guide", ""}
+                and not _subtopic_chapter_used
+            ):
                 _is_chapter_overview = True
                 _LOG.info("[Practical] Chapter overview detected — bypassing doc cap (main_topic=%r, %d docs)", next(iter(_co_mts)), len(_all_docs))
 
@@ -3388,8 +3609,17 @@ class PracticalPersonaService:
             # Exact OBD/operation_topic chapter match — supervisor already fetched ALL sub-case
             # docs for this operation. Never cap: each doc is a distinct sub-case and dropping any
             # would produce an incomplete answer (e.g. 4 of 5 authority-restriction scenarios).
-            _docs_to_process = _all_docs
-            _LOG.info("[Practical] Direct topic match — sending all %d docs (no cap)", len(_all_docs))
+            # Exception: informational (bare topic) queries only need a brief overview — cap to
+            # _prompt_max_docs so LLM produces a concise answer rather than a full guide.
+            if bool((state.context or {}).get("_informational_query")):
+                _docs_to_process = _all_docs[:_prompt_max_docs]
+                _LOG.info(
+                    "[Practical] Direct topic match (informational overview) — capped %d/%d docs",
+                    len(_docs_to_process), len(_all_docs),
+                )
+            else:
+                _docs_to_process = _all_docs
+                _LOG.info("[Practical] Direct topic match — sending all %d docs (no cap)", len(_all_docs))
         elif _is_chapter_overview:
             # Supplement: the reranker cap inside _retrieve_docs may have silently dropped
             # sub_topic docs that ranked lower than LLM_DOCS_MAX_PRACTICAL.
@@ -3578,6 +3808,15 @@ class PracticalPersonaService:
                 # Without this, Academic Phase 3 menu reads unfiltered state.current_docs
                 # and shows ต่ออายุ/แก้ไข sections even when user asked about สมัครใหม่.
                 state.current_docs = _op_pass_docs
+                # Save unique operation_by_department so Academic can translate
+                # Practical's operation_group (LLM-computed, not in Chroma) → Academic's
+                # operation_by_department without re-asking the operation question.
+                _obd_vals_op = {
+                    str((_d.get("metadata") or {}).get("operation_by_department") or "").strip()
+                    for _d in _op_pass_docs
+                } - {"", "nan", "None"}
+                if len(_obd_vals_op) == 1 and state.context is not None:
+                    state.context["last_practical_obd"] = next(iter(_obd_vals_op))
 
                 # Level 1.2: Positive filter — when _op_include_re is set, keep only docs whose
                 # operation_by_department matches the target operation. This prevents "incidental"
@@ -3615,7 +3854,13 @@ class PracticalPersonaService:
                 # Skip sibling-completion when the primary doc was found via exact operation_topic match
                 # (_direct_topic_match): those docs are entity-neutral (no entity/reg_type variants) so
                 # sibling-completion only pollutes them with unrelated registration forms and links.
-                _skip_sib = bool((state.context or {}).get("_direct_topic_match"))
+                # Broad questions already have comprehensive coverage from two-pass retrieval.
+                # Sibling-completion on top causes token explosion (23 docs → 35+ docs, 60k+ tokens).
+                _skip_sib = (
+                    bool((state.context or {}).get("_direct_topic_match"))
+                    or bool((state.context or {}).get("_broad_question"))
+                    or _multi_requested_kept  # skip when FOCUS FILTER already kept all license types
+                )
                 _vs_for_sib = getattr(self.retriever, "vectorstore", None)
                 if _vs_for_sib is not None and not _skip_sib:
                     # Docs from _retrieve_docs use key="content" (clipped).
@@ -4160,15 +4405,46 @@ class PracticalPersonaService:
                 _isf_val = str((_di.get("metadata") or {}).get(_isf) or "").strip()
                 if not _isf_val or _isf_val in ("nan", "None"):
                     continue
-                for _m in _INLINE_URL_RE.finditer(_isf_val):
-                    _raw_url = _m.group(1).rstrip(".,;)")
-                    if _raw_url.lower().startswith("www."):
-                        _raw_url = "https://" + _raw_url
-                    if _raw_url in _link_seen:
+                # Line-based extraction: carry the last pure-description line as a fallback
+                # label for bare URL lines that have no preceding text on the same line.
+                _prev_desc_isf = ""
+                for _isf_line in _isf_val.split('\n'):
+                    _isf_line_s = _isf_line.strip()
+                    if not _isf_line_s:
                         continue
-                    _link_seen.add(_raw_url)
-                    _link_service.append(("", _raw_url))
-                    _LOG.debug("[Practical] inline URL extracted from %r field: %r", _isf, _raw_url[:80])
+                    _line_url_ms = list(_INLINE_URL_RE.finditer(_isf_line_s))
+                    if not _line_url_ms:
+                        _clean_desc = re.sub(r'^[\d\.\-\*•]+\.?\s*', '', _isf_line_s).rstrip(':：').strip()
+                        if _clean_desc:
+                            _prev_desc_isf = _clean_desc
+                        continue
+                    for _m in _line_url_ms:
+                        _raw_url = _m.group(1).rstrip(".,;)")
+                        if _raw_url.lower().startswith("www."):
+                            _raw_url = "https://" + _raw_url
+                        if _raw_url in _link_seen:
+                            continue
+                        if _raw_url.lower().endswith(".pdf"):
+                            continue
+                        _link_seen.add(_raw_url)
+                        _before_url = _isf_line_s[:_m.start()].strip().rstrip(':：-').strip()
+                        _before_url = re.sub(r'^[\d\.\-\*•]+\.?\s*', '', _before_url).strip()
+                        # service_channel is often one long line: all text before the URL is
+                        # a huge preamble. Extract only the last numbered-item label so the
+                        # desc stays short (e.g. "เว็บไซต์" instead of the full channel text).
+                        if len(_before_url) > 50:
+                            _isf_segs = re.split(r'\d+[.)]\s*', _before_url)
+                            if len(_isf_segs) > 1:
+                                _before_url = re.sub(r'^[\d\.\-\*•]+\.?\s*', '', _isf_segs[-1]).strip()
+                            else:
+                                _before_url = _before_url[-50:].lstrip(' .,').strip()
+                        _desc_isf = _before_url if _before_url else _prev_desc_isf
+                        _link_service.append((_desc_isf, _raw_url))
+                        # Sentinel -2: inline service_channel URL — always keep through narrow_answer filter.
+                        # service_channel represents "where to submit" for the license type, not a
+                        # topic-specific link, so it's relevant regardless of which doc the LLM cited.
+                        _url_to_doc_idx.setdefault(_raw_url, -2)
+                        _LOG.debug("[Practical] inline URL from %r: desc=%r url=%r", _isf, (_desc_isf or "")[:60], _raw_url[:80])
 
         # Determine the doc pool for flag computation.
         # Problem: retrieval can return a mix of docs from different topics (e.g., a contact-info doc
@@ -4214,18 +4490,21 @@ class PracticalPersonaService:
             for d in _flag_docs
         )
 
-        # Pass 2: build docs_json with per-(license_type, entity_type, operation_by_department) dedup for long fields.
+        # Pass 2: build docs_json with per-(license_type, entity_type, operation_by_department, service_channel) dedup for long fields.
         # Including operation_by_department ensures different operations (แก้ไขรายการ / ยกเลิก / ต่ออายุ)
         # each send their own identification_documents even when they share the same entity_type_normalized.
+        # Including service_channel ensures different channels (ติดต่อด้วยตนเอง / ออนไลน์) each send
+        # their own operation_steps — without this, the online channel's multi-phase steps are deduped away.
         # research_reference is now injected as labeled sections outside docs_json
-        _long_fields_sent_by_lt: dict = {}  # (lt, entity_type, op_by_dept) → bool
+        _long_fields_sent_by_lt: dict = {}  # (lt, entity_type, op_by_dept, service_channel) → bool
         docs_json = []
         for d in _docs_to_process:
             md = d.get("metadata", {}) or {}
             _lt2 = (md.get("license_type") or "").strip()
             _et2 = (md.get("entity_type_normalized") or "").strip()
             _op_by_dept2 = (md.get("operation_by_department") or "").strip()
-            _lt_et_key = (_lt2, _et2, _op_by_dept2)
+            _sv_channel2 = (md.get("service_channel") or "").strip()[:60]
+            _lt_et_key = (_lt2, _et2, _op_by_dept2, _sv_channel2)
             filtered_md = {}
             for k, v in md.items():
                 if k not in _LLM_METADATA_WHITELIST:
@@ -4246,6 +4525,11 @@ class PracticalPersonaService:
                 v_str = re.sub(r"[\r\n]+", " ", v_str)
                 v_str = re.sub(r"[ \t]+", " ", v_str).strip()
                 cap = _FIELD_CAPS.get(k)
+                # Chapter overview: clip answer_guideline to 300 chars (same as content trim
+                # at line ~4519). answer_guideline is the sole content for business_guide docs —
+                # without this cap, 37 docs × 3500 chars = 43K+ prompt tokens → LengthFinishReasonError.
+                if k == "answer_guideline" and _is_chapter_overview and len(_docs_to_process) > 1:
+                    cap = min(cap, 300) if cap else 300
                 if cap and len(v_str) > cap:
                     v_str = v_str[:cap]
                 filtered_md[k] = v_str
@@ -4327,7 +4611,40 @@ class PracticalPersonaService:
 
         # Link injection flags — used by safety nets post-LLM to decide which link types to append.
         _is_info_q_ctx = bool((state.context or {}).get("_informational_query"))
-        _suppress_links_broad = (_is_broad_q or _is_info_q_ctx) and not _user_wants_links
+        # Bare topic query: supervisor flagged informational but user typed only a noun (no keyword).
+        # e.g. "ภาษีป้าย" — wants a brief overview, NOT links or full procedures.
+        _is_bare_topic_info = (
+            _is_info_q_ctx
+            and not bool(re.search(
+                r"คืออะไร|หมายถึงอะไร|ประเภทใด|ประเภทไหน|อะไรบ้าง|"
+                r"ใครบ้าง|เงื่อนไข|ข้อยกเว้น|ยกเว้น|ไม่ต้อง|"
+                r"แตกต่าง|เปรียบเทียบ|อธิบาย|กรณีใด|เมื่อไหร่|เมื่อไร|"
+                r"จะเกิดอะไร|เกิดอะไร|จะเป็นอะไร|ผลกระทบ|บทลงโทษ|โทษคือ|ค่าปรับ|"
+                r"ต้องโดน|จะถูก|ชำรุด|สูญหาย|ทำหาย|ทำหล่น|เสียหาย",
+                _intent_text, re.IGNORECASE,
+            ))
+            and not bool(re.search(
+                r"อยากจด|ต้องการจด|จะจด|จะสมัคร|อยากสมัคร|ต้องการสมัคร|"
+                r"วิธีจด|ขั้นตอนการจด|วิธีขอ|ขั้นตอนการขอ|วิธีสมัคร|ขั้นตอนการสมัคร",
+                _intent_text, re.IGNORECASE,
+            ))
+            and not bool(re.search(
+                r"ต้องใช้|ต้องเตรียม|เอกสาร(ที่ต้อง|ประกอบ)",
+                _intent_text, re.IGNORECASE,
+            ))
+        )
+        # When retrieved docs have operation_steps, the answer will include actionable steps →
+        # user needs service/guide links even if the query phrasing sounds informational
+        # (e.g. "อยากทราบเรื่อง X" still expects "how to register for X" with links).
+        # Broad questions: always suppress links unless user explicitly asked for them.
+        # _answer_will_have_steps must NOT override this — broad multi-doc answers almost always
+        # have operation_steps, so the old combined condition never suppressed links for broad Qs.
+        # Bare topic queries: always suppress links — user wants a brief overview only.
+        _suppress_links_broad = (
+            (_is_broad_q and not _user_wants_links)
+            or (_is_info_q_ctx and not _is_broad_q and not _user_wants_links and not _answer_will_have_steps)
+            or (_is_bare_topic_info and not _user_wants_links)
+        )
         _is_link_req_ctx = bool((state.context or {}).get("_link_request_query"))
         _wants_guides_specifically = bool(re.search(
             r"ขอคู่มือ|ขอดูคู่มือ|ส่งคู่มือ|คู่มือ(การ|สำหรับ|ของ|ไหน)"
@@ -4507,29 +4824,49 @@ Rules:
         # Forces action="answer" without asking entity_type/registration_type/operation_group,
         # because the answer doesn't change based on entity type for definitional questions.
         # Does NOT apply when: fee/duration already handled, or user has explicit action intent.
+        _no_action_intent = not bool(re.search(
+            r"อยากจด|ต้องการจด|จะจด|จะสมัคร|อยากสมัคร|ต้องการสมัคร|"
+            r"วิธีจด|ขั้นตอนการจด|วิธีขอ|ขั้นตอนการขอ|วิธีสมัคร|ขั้นตอนการสมัคร",
+            _intent_text, re.IGNORECASE,
+        ))
+        _no_doc_request = not bool(re.search(
+            r"ต้องใช้|ต้องเตรียม|เอกสาร(ที่ต้อง|ประกอบ)",
+            _intent_text, re.IGNORECASE,
+        ))
         _is_general_info_q = (
             not _is_fee_info_q
-            and bool(re.search(
-                r"คืออะไร|หมายถึงอะไร|ประเภทใด|ประเภทไหน|อะไรบ้าง|"
-                r"ใครบ้าง|เงื่อนไข|ข้อยกเว้น|ยกเว้น|ไม่ต้อง|"
-                r"แตกต่าง|เปรียบเทียบ|อธิบาย|กรณีใด|เมื่อไหร่|เมื่อไร|"
-                r"จะเกิดอะไร|เกิดอะไร|จะเป็นอะไร|ผลกระทบ|บทลงโทษ|โทษคือ|ค่าปรับ|"
-                r"ต้องโดน|จะถูก|ชำรุด|สูญหาย|ทำหาย|ทำหล่น|เสียหาย",
-                _intent_text, re.IGNORECASE,
-            ))
-            and not bool(re.search(
-                r"อยากจด|ต้องการจด|จะจด|จะสมัคร|อยากสมัคร|ต้องการสมัคร|"
-                r"วิธีจด|ขั้นตอนการจด|วิธีขอ|ขั้นตอนการขอ|วิธีสมัคร|ขั้นตอนการสมัคร",
-                _intent_text, re.IGNORECASE,
-            ))
-            and not bool(re.search(
-                r"ต้องใช้|ต้องเตรียม|เอกสาร(ที่ต้อง|ประกอบ)",
-                _intent_text, re.IGNORECASE,
-            ))
+            and _no_action_intent
+            and _no_doc_request
+            and (
+                bool(re.search(
+                    r"คืออะไร|หมายถึงอะไร|ประเภทใด|ประเภทไหน|อะไรบ้าง|"
+                    r"ใครบ้าง|เงื่อนไข|ข้อยกเว้น|ยกเว้น|ไม่ต้อง|"
+                    r"แตกต่าง|เปรียบเทียบ|อธิบาย|กรณีใด|เมื่อไหร่|เมื่อไร|"
+                    r"จะเกิดอะไร|เกิดอะไร|จะเป็นอะไร|ผลกระทบ|บทลงโทษ|โทษคือ|ค่าปรับ|"
+                    r"ต้องโดน|จะถูก|ชำรุด|สูญหาย|ทำหาย|ทำหล่น|เสียหาย",
+                    _intent_text, re.IGNORECASE,
+                ))
+                # Supervisor classified as informational (e.g. bare topic noun phrase like "ภาษีป้าย")
+                or _is_info_q_ctx
+            )
         )
         _info_q_instruction = ""
         if _is_general_info_q:
-            _info_q_instruction = """
+            if _is_bare_topic_info:
+                _info_q_instruction = """
+
+⚠️ BARE TOPIC OVERVIEW — MANDATORY RULES:
+- action MUST be "answer". DO NOT set action="ask".
+- User typed only a topic name (no specific question). Give a BRIEF OVERVIEW ONLY.
+- Structure: (1) 1-2 sentence definition of what this topic is, (2) 2-4 key highlights (bullets), (3) 1-sentence invite for follow-up.
+- DO NOT include step-by-step filing/registration procedures.
+- DO NOT include complete penalty tables or fine amounts.
+- DO NOT list all required documents.
+- DO NOT output more than 15 lines total.
+- Keep the answer to the most essential facts a business owner needs to know at a glance.
+"""
+            else:
+                _info_q_instruction = """
 
 ⚠️ INFORMATIONAL / DEFINITIONAL QUERY — MANDATORY RULES:
 - action MUST be "answer". DO NOT set action="ask".
@@ -4562,6 +4899,11 @@ Rules:
   Each item: license name + one line explaining what it is and when it is required.
 - The following license types appear in DOCUMENTS — do NOT skip any:
 {_license_list_str}
+- Include ALL of the above, even those with threshold conditions. State the condition briefly within that item's description.
+- IMPORTANT: also read the fees, terms_and_conditions, and legal_regulatory fields of each document.
+  If any field references another type of registration or legal status (e.g. a fee structure that
+  distinguishes between registered and non-registered operators), recognize this as a relevant
+  requirement and include it as a numbered item with a brief explanation of why it matters.
 - Do NOT merge multiple licenses into one bullet. Do NOT use "เช่น..." to abbreviate.
 - Do NOT move legal content to the last line of the response as a footnote.
 - Tone: write naturally, like a knowledgeable friend explaining what the person MUST do legally.
@@ -4619,13 +4961,27 @@ Rules:
                     f"- Show fee/requirement for {_area_hint} ONLY. Do NOT list other area tiers.\n"
                     f"- NEVER reclassify area values mentioned in earlier conversation turns — each turn's area is independent."
                 )
-        elif _area_hint:
-            _entity_filter_hint = (
+        else:
+            _has_entity_docs = any(
+                (d.get("metadata") or {}).get("entity_type_normalized", "") in ("บุคคลธรรมดา", "นิติบุคคล")
+                for d in _docs_to_process
+            )
+            if _has_entity_docs:
+                _entity_filter_hint = (
+                    "\n\n⚠️ ENTITY TYPE UNKNOWN — MANDATORY RULE:\n"
+                    "- The user has NOT specified บุคคลธรรมดา or นิติบุคคล yet.\n"
+                    "- Do NOT assume or default to either type. Do NOT show registration steps/documents for a specific entity type.\n"
+                    "- If procedures differ by business type, note briefly: 'ขั้นตอนและเอกสารจะแตกต่างกันขึ้นอยู่กับรูปแบบธุรกิจ (บุคคลธรรมดา/นิติบุคคล)'\n"
+                    "- Focus only on information that applies to ALL business types."
+                )
+        if _area_hint and not (_et_hint or _rt_hint):
+            _area_only_hint = (
                 f"\n\n⚠️ SHOP AREA SIZE IS KNOWN — MANDATORY RULE:\n"
                 f"- The user's CURRENT area is: {_area_hint}\n"
                 f"- Show fee/requirement for {_area_hint} ONLY. Do NOT list other area tiers.\n"
                 f"- NEVER reclassify area values mentioned in earlier conversation turns — each turn's area is independent."
             )
+            _entity_filter_hint = _entity_filter_hint + _area_only_hint if _entity_filter_hint else _area_only_hint
 
         # Cut-off time query instruction: force LLM to read terms_and_conditions metadata directly.
         # Needed when user asks about ตัดรอบ / cut-off time — the data lives in terms_and_conditions
@@ -4849,7 +5205,7 @@ Your JSON response:
                         _safe_query[:60],
                     )
                     state.context["_retrieve_blocked_count"] = 0
-                    return self.handle(state, _safe_query, _internal=False)
+                    return self.handle(state, _safe_query, _internal=True)
                 return self.handle(state, "__auto_post_retrieve__", _internal=True)
 
             if action == "retrieve":
@@ -4958,6 +5314,12 @@ Your JSON response:
                     }
                     if next_slot.get("context_only"):
                         _pslot_entry["context_only"] = True
+                    # Preserve display_options so the numbered menu shows human-readable
+                    # labels (e.g. "กรุงเทพฯ และปริมณฑล") while raw options keep the
+                    # Chroma filter value (e.g. "กรุงเทพฯ") for retrieval correctness.
+                    _disp_opts_ns = next_slot.get("display_options")
+                    if isinstance(_disp_opts_ns, list) and len(_disp_opts_ns) == len(slot_opts):
+                        _pslot_entry["display_options"] = _disp_opts_ns
                     state.context["pending_slot"] = _pslot_entry
                     if remaining_queue:
                         state.context["topic_slot_queue"] = remaining_queue
@@ -5113,10 +5475,26 @@ Your JSON response:
                     _link_ref = [(d, u) for d, u in _link_ref if _url_to_doc_idx.get(u, -1) in _used_set]
                     _narrow_answer = _n_link_src >= 3 and len(_used_set) < _n_link_src / 2
                     if _narrow_answer:
+                        # In narrow mode, decide whether to keep sentinel -2 service_channel links.
+                        # Rule queries (time/day restrictions): cited doc has no operation_topic
+                        #   → sentinel -2 would inject permit service_channel links = irrelevant.
+                        # Permit/process queries: cited doc has an operation_topic ("ยื่นใบอนุญาต" etc.)
+                        #   → sentinel -2 = "where to submit" = genuinely useful, keep it.
+                        _cited_has_op_topic = any(
+                            bool(((_link_src_docs[_ci].get("metadata") or {}).get("operation_topic") or "").strip())
+                            for _ci in _used_set
+                            if 0 <= _ci < len(_link_src_docs)
+                        )
+                        if _cited_has_op_topic:
+                            # Process query: keep service links from cited docs OR service_channel sentinels
+                            _link_service = [(d, u) for d, u in _link_service if _url_to_doc_idx.get(u, -1) in _used_set or _url_to_doc_idx.get(u) == -2]
+                        else:
+                            # Rule query: exclude sentinel -2 entirely (no permit service channels)
+                            _link_service = [(d, u) for d, u in _link_service if _url_to_doc_idx.get(u, -1) in _used_set]
                         _link_form = [(d, u) for d, u in _link_form if _url_to_doc_idx.get(u, -1) in _used_set]
                         _link_guide = [(d, u) for d, u in _link_guide if _url_to_doc_idx.get(u, -1) in _used_set]
                         _LOG.info(
-                            "[Practical] narrow answer (used=%d/%d) — filtered form/guide links to cited docs only",
+                            "[Practical] narrow answer (used=%d/%d) — filtered service/form/guide links to cited docs only",
                             len(_used_set), _n_link_src,
                         )
                     _LOG.info(
@@ -5303,6 +5681,14 @@ Your JSON response:
 
             ans = self._apply_practical_lint(ans, kind="answer")
 
+            # Strip LLM-generated 📄/📖/📚 link blocks for broad questions.
+            # LLM sometimes writes these despite the ABSOLUTE PROHIBITION (Rule 2 doc-question pattern
+            # overrides it). The injection safety net (_suppress_links_broad=True) already skips
+            # re-injecting them, but we must also remove what the LLM wrote itself.
+            if _is_broad_q and not _user_wants_links and not _user_wants_forms:
+                ans = re.sub(r'\n(?:📄|📖|📚)[^\n]+(?:\n[ \t]+https?://[^\n]*)*', '', ans)
+                ans = ans.rstrip()
+
             # Guard: skip ALL link safety nets when LLM returned the error fallback.
             # Error answers have no content — appending links creates a confusing output.
             _ans_is_error_fallback = "ขออภัยครับ ระบบประมวลผลคำถามไม่สำเร็จ" in ans
@@ -5314,7 +5700,7 @@ Your JSON response:
             # Broader than a section-header check — also catches inline form references like "ภพ.01" or "แบบคำขอ".
             _answer_has_doc_list = bool(re.search(
                 r'(?:^|\n)\s*(?:[📋📄]\s*)?(?:เอกสารที่ต้องใช้|รายการเอกสาร|ต้องใช้เอกสาร|เอกสารประกอบ|หลักฐานที่ต้องใช้|เอกสารที่ต้องเตรียม)'
-                r'|ภพ\.\s*\d+|แบบ\s*ภ[./]\s*\d+|แบบคำขอ|แบบฟอร์ม|ต้องยื่น.{0,20}แบบ'
+                r'|ภพ\.\s*\d+|ภ\.ป\.\s*\d+|แบบ\s*ภ[./]\s*\d+|แบบคำขอ|แบบฟอร์ม|ต้องยื่น.{0,20}แบบ'
                 r'|สำเนา(?:บัตร|ทะเบียน|หนังสือ)|หนังสือ(?:รับรอง|มอบอำนาจ)',
                 ans, re.MULTILINE
             ))
@@ -5334,7 +5720,7 @@ Your JSON response:
             # NOT on _docs_have_id_docs alone (that's a doc property, not question intent).
             # e.g. "ต้องการลิ้งค์" → answer is just a URL, _answer_has_doc_list=False → skip Tier4.
             # Guard: skip for penalty/definition questions (_needs_forms=False).
-            if not _link_form and _needs_forms and (_user_wants_forms or _answer_has_doc_list) and "📄" not in ans and not _ans_is_error_fallback:
+            if not _link_form and _needs_forms and not _suppress_links_broad and (_user_wants_forms or _answer_has_doc_list) and "📄" not in ans and not _ans_is_error_fallback:
                 try:
                     _vs4 = getattr(self.retriever, "vectorstore", None)
                     _col4 = getattr(_vs4, "_collection", None) if _vs4 else None
@@ -5475,16 +5861,61 @@ Your JSON response:
                 except Exception as _e4:
                     _LOG.debug("[Practical] Tier4 form-link lookup failed: %s", _e4)
 
-            # Safety net: inject 🌐 service links if LLM did not include them.
+            # Safety net: inject service URLs into the existing 🏪 block (deterministic, from
+            # service_channel row data). Fallback to 🌐 section if no 🏪 block found in answer.
             _service_urls_in_ans = any(u and u in ans for _, u in _link_service)
-            if _link_service and not _suppress_links_broad and not _is_contact_q and not _service_urls_in_ans and not _ans_is_error_fallback and not _suppress_non_form_links and (_user_wants_registration or _user_wants_links or _docs_have_id_docs or _ans_has_steps):
-                _service_url_lines = [f"  {_sv_url}" for _, _sv_url in _link_service if _sv_url]
-                if _service_url_lines:
-                    ans = ans.rstrip() + "\n\n🌐 ลิงก์สมัครบริการ\n" + "\n".join(_service_url_lines)
-                    _LOG.debug("[Practical] Safety net: appended %d service link(s)", len(_service_url_lines))
+            if _link_service and not _suppress_links_broad and not _is_contact_q and not _service_urls_in_ans and not _ans_is_error_fallback and not _suppress_non_form_links and (_user_wants_registration or _user_wants_links or (_docs_have_id_docs and not (_is_info_q_ctx and not _ans_has_steps)) or _ans_has_steps):
+                # Merge each (desc, url) into the 🏪 block by matching the desc line the LLM
+                # already wrote, then indenting the URL right beneath it.
+                _hk_block_re = re.compile(
+                    r'(?m)🏪[^\n]*(?:\n\n?(?![🏪📋💡📌🌐📄📖📚✅\n])[^\n]+)*'
+                )
+                _hk_last = None
+                for _hk_last in _hk_block_re.finditer(ans):
+                    pass
+                if _hk_last:
+                    _block_lines = _hk_last.group(0).split('\n')
+                    _urls_placed: set = set()
+                    for _sd, _su in _link_service:
+                        if not _su:
+                            continue
+                        _placed = False
+                        _sd_norm = re.sub(r'^[-•*\s]+', '', _sd or "").strip()
+                        if _sd_norm:
+                            for _bi in range(len(_block_lines)):
+                                _bl_norm = re.sub(r'^[-•*\s]+', '', _block_lines[_bi]).strip()
+                                if _bl_norm and _sd_norm[:12] in _bl_norm:
+                                    _ins = _bi + 1
+                                    while _ins < len(_block_lines) and _block_lines[_ins].startswith("  http"):
+                                        _ins += 1
+                                    _block_lines.insert(_ins, f"  {_su}")
+                                    _urls_placed.add(_su)
+                                    _placed = True
+                                    break
+                        if not _placed:
+                            if _sd_norm:
+                                _block_lines.append(f"- {_sd_norm}")
+                            _block_lines.append(f"  {_su}")
+                            _urls_placed.add(_su)
+                    _new_block = '\n'.join(_block_lines)
+                    ans = ans[:_hk_last.start()] + _new_block + ans[_hk_last.end():]
+                    _LOG.debug("[Practical] Safety net: merged %d service URL(s) into 🏪 block", len(_urls_placed))
+                else:
+                    _svc_fallback = []
+                    for _sd, _su in _link_service:
+                        if not _su:
+                            continue
+                        _sd_clean = re.sub(r'^[-•*\s]+', '', _sd or "").strip()
+                        if _sd_clean:
+                            _svc_fallback.append(f"- {_sd_clean}\n  {_su}")
+                        else:
+                            _svc_fallback.append(f"  {_su}")
+                    if _svc_fallback:
+                        ans = ans.rstrip() + "\n\n🌐 ลิงก์สมัครบริการ\n" + "\n".join(_svc_fallback)
+                        _LOG.debug("[Practical] Safety net: no 🏪 block, appended %d service link(s) as 🌐", len(_svc_fallback))
 
             _form_urls_in_ans = any(u and u in ans for _, u in _link_form)
-            if _link_form and _needs_forms and (_user_wants_forms or _answer_has_doc_list) and not _form_urls_in_ans and not _ans_is_error_fallback:
+            if _link_form and _needs_forms and not _suppress_links_broad and (_user_wants_forms or _answer_has_doc_list or _user_wants_registration) and not _form_urls_in_ans and not _ans_is_error_fallback:
                 _form_lines = []
                 for _f_desc, _f_url in _link_form:
                     _f_desc_clean = re.sub(r'^[•\-\*]\s*', '', _f_desc).strip() if _f_desc else ""
@@ -5525,10 +5956,11 @@ Your JSON response:
             # Guards must mirror the main injection block (line ~3807):
             # - _guide_auto_ok: False when _is_link_req_ctx (user only wants the registration link)
             # - _is_contact_q: True when query is a contact/address query — guides are irrelevant
-            #   even if retrieved docs (e.g. registration docs for the same department) have
-            #   operation_steps that set _answer_will_have_steps=True.
+            # - _is_broad_q: True for open-ended overview questions — only service portals are shown,
+            #   guide links are suppressed to avoid flooding with PDFs from multiple topics.
+            #   Exception: user explicitly asked for links (_user_wants_links).
             _guide_urls_in_ans = any(u and u in ans for _, u in _link_guide)
-            if _link_guide and not _suppress_links_broad and _guide_auto_ok and not _is_contact_q and not _suppress_non_form_links and (_user_wants_links or _ans_has_steps) and not _guide_urls_in_ans and not _ans_is_error_fallback:
+            if _link_guide and not _suppress_links_broad and _guide_auto_ok and not _is_contact_q and not _suppress_non_form_links and (_user_wants_links or (not _is_broad_q and _ans_has_steps)) and not _guide_urls_in_ans and not _ans_is_error_fallback:
                 _guide_lines = []
                 for _g_desc, _g_url in _link_guide:
                     _g_desc_clean = re.sub(r'^[•\-\*]\s*', '', _g_desc).strip() if _g_desc else ""
@@ -5540,7 +5972,25 @@ Your JSON response:
                         _guide_lines.append(f"📖 {_g_desc_clean}")
                 if _guide_lines:
                     _guide_block = "\n\n" + "\n".join(_guide_lines)
-                    ans = ans.rstrip() + _guide_block
+                    _gc_closing: list = []
+                    _gc_lines = ans.splitlines()
+                    while _gc_lines:
+                        _gc_tail = _gc_lines[-1].strip()
+                        if (
+                            len(_gc_tail) < 150
+                            and "ครับ" in _gc_tail
+                            and not re.search(r"^\d+[.)]\s", _gc_tail)
+                            and not _gc_tail.startswith("•")
+                            and not _gc_tail.startswith("-")
+                            and not _gc_tail.startswith("⚠")
+                        ):
+                            _gc_closing.insert(0, _gc_lines.pop())
+                        else:
+                            break
+                    if _gc_closing:
+                        ans = "\n".join(_gc_lines).rstrip() + _guide_block + "\n\n" + "\n".join(_gc_closing).strip()
+                    else:
+                        ans = ans.rstrip() + _guide_block
                     _LOG.debug("[Practical] Safety net: appended %d guide link(s) omitted by LLM", len(_guide_lines))
 
             # Safety net: inject 📚 reference links if LLM did not include them.
@@ -5556,7 +6006,26 @@ Your JSON response:
                     elif _r_desc_clean:
                         _ref_lines.append(f"📚 {_r_desc_clean}")
                 if _ref_lines:
-                    ans = ans.rstrip() + "\n\n" + "\n".join(_ref_lines)
+                    _ref_block = "\n\n" + "\n".join(_ref_lines)
+                    _rc_closing: list = []
+                    _rc_lines = ans.splitlines()
+                    while _rc_lines:
+                        _rc_tail = _rc_lines[-1].strip()
+                        if (
+                            len(_rc_tail) < 150
+                            and "ครับ" in _rc_tail
+                            and not re.search(r"^\d+[.)]\s", _rc_tail)
+                            and not _rc_tail.startswith("•")
+                            and not _rc_tail.startswith("-")
+                            and not _rc_tail.startswith("⚠")
+                        ):
+                            _rc_closing.insert(0, _rc_lines.pop())
+                        else:
+                            break
+                    if _rc_closing:
+                        ans = "\n".join(_rc_lines).rstrip() + _ref_block + "\n\n" + "\n".join(_rc_closing).strip()
+                    else:
+                        ans = ans.rstrip() + _ref_block
                     _LOG.debug("[Practical] Safety net: appended %d ref link(s) omitted by LLM", len(_ref_lines))
 
             # Strip 📄/📖 lines the LLM independently generated from doc content
@@ -5579,10 +6048,11 @@ Your JSON response:
                 ans = re.sub(r'\n{3,}', '\n\n', ans).strip()
 
             if _suppress_links_broad and not _ans_is_error_fallback:
-                # broad/informational query — LLM may generate 🌐/📖 from doc JSON even though
-                # safety nets are suppressed; strip them so "คืออะไร" answers have no portal links.
+                # broad/informational query — strip ALL link types (🌐/📖/📄) that the LLM
+                # may have generated from doc JSON; user did not ask for links.
                 ans = re.sub(r'(?m)^🌐[^\n]*(?:\n[ \t]+[^\n]*)*', '', ans)
                 ans = re.sub(r'(?m)^📖[^\n]*(?:\n[ \t]+https?://[^\n]*)?', '', ans)
+                ans = re.sub(r'(?m)^📄[^\n]*(?:\n[ \t]+https?://[^\n]*)?', '', ans)
                 ans = re.sub(r'\n{3,}', '\n\n', ans).strip()
 
             self._append_assistant(state, ans)
