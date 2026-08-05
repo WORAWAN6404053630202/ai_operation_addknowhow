@@ -2,7 +2,7 @@
 import json
 import logging
 import re
-from typing import Tuple, Dict, Any, List, Optional
+from typing import Tuple, Dict, Any, List, Optional, Set
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -10,11 +10,24 @@ from langchain_core.messages import HumanMessage, SystemMessage
 import conf
 from model.conversation_state import ConversationState
 from model.persona_practical import _classify_link, _parse_link_entries
-from utils.llm_call import llm_invoke, extract_llm_text
+from utils.llm_call import llm_invoke, extract_llm_text, build_speed_extra_body, get_shared_http_client
 from utils.prompts_academic import SYSTEM_PROMPT as SYSTEM_PROMPT_ACADEMIC
 from utils.prompts_supervisor import build_greeting_detect_prompt, build_topic_group_detect_prompt, build_meta_request_detect_prompt
 from utils.query_synonyms import SYNONYM_PATTERNS
 from utils.query_rewriter import enrich_query_for_retrieval, _needs_rewrite as _qr_needs_rewrite
+from utils.progress import emit_progress
+from utils.text_patterns import (
+    EN_GREETING_RE as _SHARED_EN_GREETING_RE,
+    EN_GOOD_TIME_RE as _SHARED_EN_GOOD_TIME_RE,
+    TH_SAWASDEE_FUZZY_RE as _SHARED_TH_SAWASDEE_FUZZY_RE,
+    TH_WATDEE_RE as _SHARED_TH_WATDEE_RE,
+    LEGAL_SIGNAL_RE as _SHARED_LEGAL_SIGNAL_RE,
+    ENTITY_NITI_RE as _SHARED_ENTITY_NITI_RE,
+    ENTITY_NATURAL_RE as _SHARED_ENTITY_NATURAL_RE,
+    detect_entity_type_with_negation as _detect_entity_type_with_negation,
+    is_bare_generic_followup as _shared_is_bare_generic_followup,
+    extract_info_gap_tag as _shared_extract_info_gap_tag,
+)
 
 _LOG = logging.getLogger("restbiz.academic")
 
@@ -122,12 +135,36 @@ class AcademicPersonaService:
     # Detect "ทั้งหมด"
     _SELECT_ALL_RE = re.compile(r"(ทั้งหมด|ทุกข้อ|ทุกหัวข้อ|เอาทั้งหมด|all|everything)", re.IGNORECASE)
 
+    # Used by _is_simple_selection_reply() to gate _parse_numbers()-based menu binding.
+    # Strips digits, selection punctuation/connector words, and politeness particles
+    # (same particle list as _FILLER_ONLY_RE below); whatever's left decides whether the
+    # reply is a bare menu choice ("2", "ข้อ 2 ค่ะ") vs. free text that merely contains a
+    # number ("ร้านอยู่ซอย 2 หลังโรงเรียน").
+    _SIMPLE_SELECTION_FILLER_RE = re.compile(
+        r"\d+|[,，、\.\)\:\s]+|ข้อ|เลือก|กับ|และ|ครับ|คับ|ค่ะ|คะ|จ้า|จ้ะ|ค่า|งับ",
+        re.IGNORECASE,
+    )
+
+    # Allowlist for the LLM-answer "context_update" merge in _finalize_answer(). Unlike
+    # persona_practical.py — where context_update IS a documented LLM-facing output field,
+    # guarded with a small denylist of 2 known-dangerous keys — Academic's own prompt schema
+    # (utils/prompts_academic.py) never asks the LLM for context_update at all. The only place
+    # that legitimately populates it today is this file's own JSON-parse-failure fallback
+    # (auto_return_to_practical). Since nothing should ever set it from the LLM side, default-
+    # deny everything except that one verified key rather than enumerating (and having to keep
+    # in sync) Academic's ~25 internal FSM/control keys — academic_flow, academic_slots,
+    # pending_options, dynamic_slot_choice_maps, etc. — the way a denylist would require.
+    _CONTEXT_UPDATE_ALLOWLIST = frozenset({"auto_return_to_practical"})
+
     # Backup greeting/noise detection (supervisor should already do, but keep safe)
     _TH_LAUGH_RE = re.compile(r"^\s*5{3,}\s*$")
-    _EN_GREETING_RE = re.compile(r"^\s*(hi+|hello+|hey+|yo+)\b", re.IGNORECASE)
-    _EN_GOOD_TIME_RE = re.compile(r"^\s*good\s+(morning|afternoon|evening|night)\b", re.IGNORECASE)
-    _TH_SAWASDEE_FUZZY_RE = re.compile(r"^\s*สว[^\s]{0,6}ดี", re.IGNORECASE)
-    _TH_WATDEE_RE = re.compile(r"^\s*หวัดดี", re.IGNORECASE)
+    # Shared with persona_supervisor.py — see utils/text_patterns.py.
+    # _TH_WATDEE_RE reconciled to persona_practical.py's typo-tolerant version (was
+    # exact-match-only here).
+    _EN_GREETING_RE = _SHARED_EN_GREETING_RE
+    _EN_GOOD_TIME_RE = _SHARED_EN_GOOD_TIME_RE
+    _TH_SAWASDEE_FUZZY_RE = _SHARED_TH_SAWASDEE_FUZZY_RE
+    _TH_WATDEE_RE = _SHARED_TH_WATDEE_RE
     _FILLER_ONLY_RE = re.compile(r"^\s*(ครับ|คับ|ค่ะ|คะ|จ้า|จ้ะ|ค่า|งับ)\s*$", re.IGNORECASE)
 
     # IMPORTANT P0:
@@ -140,6 +177,22 @@ class AcademicPersonaService:
     _REPEATED_CHAR_RE = re.compile(r"^\s*(.)\1{6,}\s*$")  # e.g., "aaaaaaa", "!!!!!!", "รรรรรรร"
     _LATIN_GIBBERISH_RE = re.compile(r"^\s*[a-z]{1,8}\s*$", re.IGNORECASE)  # tiny latin-only token
 
+    # Legal-domain vocabulary. Shared with persona_supervisor.py/persona_practical.py —
+    # see utils/text_patterns.py. (This was supervisor's own version, adopted as
+    # canonical — it was already a strict superset of this file's terms.)
+    # Used to short-circuit the greeting/noise LLM check: text containing any of these
+    # is clearly not a greeting.
+    _LEGAL_SIGNAL_RE = _SHARED_LEGAL_SIGNAL_RE
+
+    # Entity-type (นิติบุคคล/บุคคลธรรมดา) detection. Shared with persona_supervisor.py/
+    # persona_practical.py — see utils/text_patterns.py. Reconciled to supervisor's richer
+    # colloquial coverage (ทำคนเดียว/เปิดเอง/ร้านส่วนตัว/...); this file's previous
+    # method-local `_NATURAL_ENTITY_RE`/`_JURISTIC_ENTITY_RE` only matched the literal
+    # formal terms, so a user correcting their entity type via a colloquial phrasing
+    # would silently not be heard by this file's contradiction guard.
+    _ENTITY_NITI_RE = _SHARED_ENTITY_NITI_RE
+    _ENTITY_NATURAL_RE = _SHARED_ENTITY_NATURAL_RE
+
     def __init__(self, retriever):
         self.retriever = retriever
         self._cached_main_topics: Optional[List[str]] = None  # populated lazily, same pattern as supervisor
@@ -149,14 +202,23 @@ class AcademicPersonaService:
     def _init_llm(self):
         model_name = getattr(conf, "OPENROUTER_MODEL_ACADEMIC", conf.OPENROUTER_MODEL)
         timeout = int(getattr(conf, "LLM_REQUEST_TIMEOUT", 30))
+        # Reasoning effort override for GPT-5.1 (thinking model) — empty/unset by default,
+        # meaning model default behavior is unchanged until explicitly tested and enabled
+        # via OPENROUTER_ACADEMIC_REASONING_EFFORT (see conf.py for why this isn't on by
+        # default: latency win is large but not yet validated against real answer quality).
+        _reasoning_effort = getattr(conf, "OPENROUTER_ACADEMIC_REASONING_EFFORT", "")
+        _reasoning_kwargs = {"reasoning_effort": _reasoning_effort} if _reasoning_effort in ("none", "low", "medium", "high") else {}
         self.llm = ChatOpenAI(
             model=model_name,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=getattr(conf, "TEMPERATURE_ACADEMIC", 0.3),
             max_tokens=getattr(conf, "MAX_TOKENS_ACADEMIC", 10000),
             request_timeout=timeout,
             model_kwargs={"response_format": {"type": "json_object"}},
+            extra_body=build_speed_extra_body(model_name),
+            **_reasoning_kwargs,
         )
         # Separate LLM for slot generation.
         # GPT-5.1 is a thinking model — reasoning tokens eat into the budget first.
@@ -166,10 +228,13 @@ class AcademicPersonaService:
             model=model_name,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=slots_max_tokens,
             request_timeout=timeout,
             model_kwargs={"response_format": {"type": "json_object"}},
+            extra_body=build_speed_extra_body(model_name),
+            **_reasoning_kwargs,
         )
         # Fast classifier LLM (Haiku) — used only for lightweight intent detection
         # like meta-request fallback when regex is insufficient.
@@ -179,10 +244,12 @@ class AcademicPersonaService:
             model=switch_model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=300,
             request_timeout=classifier_timeout,
             model_kwargs={"response_format": {"type": "json_object"}},
+            extra_body=build_speed_extra_body(switch_model),
         )
 
     def _meta_request_llm_classify(
@@ -252,8 +319,16 @@ class AcademicPersonaService:
         state.messages.append({"role": "user", "content": c})
 
     def _append_assistant(self, state: ConversationState, content: str) -> None:
+        # One-shot implicit-confirmation flag (see entity_type_source in
+        # persona_supervisor.py) is consumed by _build_final_prompt's prompt
+        # injection — cleared here, at the point a reply is actually committed,
+        # rather than at prompt-build time, since this can be reached more than
+        # once within the same turn and only the reply actually shown to the
+        # user should consume it.
         if hasattr(state, "add_assistant_message_once"):
             state.add_assistant_message_once(content)
+            if isinstance(state.context, dict):
+                state.context.pop("_entity_type_just_inferred", None)
             return
         if content is None:
             return
@@ -266,6 +341,8 @@ class AcademicPersonaService:
             if last.get("role") == "assistant" and (last.get("content") or "").strip() == c:
                 return
         state.messages.append({"role": "assistant", "content": c})
+        if isinstance(state.context, dict):
+            state.context.pop("_entity_type_just_inferred", None)
 
     # Store a compressed version of long Academic final answers in messages history.
     # The full answer is returned to the caller (and user) unchanged — only history is compressed.
@@ -395,6 +472,22 @@ class AcademicPersonaService:
                 return True
             if self._LATIN_GIBBERISH_RE.match(raw):
                 return True
+
+        # Short-circuit: numeric-led short replies (option picks like "1", or raw
+        # measurements like "150"/"9.2 ตรม") are virtually never greetings. This only
+        # decides whether to call the LLM here — it does NOT interpret the value itself;
+        # _save_slots_best_effort already disambiguates option-index vs raw-measurement
+        # numbers on its own (label map + area_size numeric-threshold fallback), so this
+        # short-circuit can't interfere with that. The length cap keeps this scoped to
+        # short slot-answer-style replies, not longer sentences that happen to start
+        # with a digit.
+        if re.match(r"^\d", raw) and len(raw) <= 20:
+            return False
+
+        # Short-circuit: legal-domain vocabulary = not a greeting (mirrors the same
+        # guard already used in persona_practical.py's _looks_like_greeting).
+        if self._LEGAL_SIGNAL_RE.search(raw):
+            return False
 
         # LLM fallback: catches casual greetings regex misses (e.g. "หวัดดีจ้า", "ดีๆ ค่ะ")
         return self._greeting_llm_check(raw)
@@ -658,6 +751,18 @@ class AcademicPersonaService:
         else:
             docs = _ac_search(expanded_query, max_docs)
 
+        # ── Retrieval-stage category filter ───────────────────────────────────
+        # Same logic as Practical — see utils.reranker.filter_by_category_concentration
+        # and conf.RETRIEVAL_CATEGORY_FILTER_ENABLED.
+        if getattr(conf, "RETRIEVAL_CATEGORY_FILTER_ENABLED", False):
+            from utils.reranker import filter_by_category_concentration
+            docs = filter_by_category_concentration(
+                docs,
+                concentration_threshold=getattr(conf, "RETRIEVAL_CATEGORY_CONCENTRATION_THRESHOLD", 0.75),
+                min_pool_size=getattr(conf, "RETRIEVAL_CATEGORY_MIN_POOL_SIZE", 5),
+                min_keep=getattr(conf, "RETRIEVAL_CATEGORY_MIN_KEEP", 3),
+            )
+
         # ── Cross-encoder reranker (Level 3) ─────────────────────────────────
         # Same as Practical — rerank raw retrieval results before metadata boost.
         if getattr(conf, "RERANKER_ENABLED", False) and docs:
@@ -665,7 +770,10 @@ class AcademicPersonaService:
                 from utils.reranker import rerank as _do_rerank
                 _rr_model_ac = getattr(conf, "RERANKER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
                 _rr_top_k_ac = int(getattr(conf, "RERANKER_TOP_K", len(docs)))
-                docs = _do_rerank(expanded_query, docs, model_name=_rr_model_ac, top_k=_rr_top_k_ac)
+                _rr_backend_ac = getattr(conf, "RERANKER_BACKEND", "pytorch")
+                _rr_onnx_file_ac = getattr(conf, "RERANKER_ONNX_FILE", "model_quint8_avx2.onnx")
+                _rr_min_score_ac = getattr(conf, "RERANKER_MIN_SCORE", None)
+                docs = _do_rerank(expanded_query, docs, model_name=_rr_model_ac, top_k=_rr_top_k_ac, backend=_rr_backend_ac, onnx_file=_rr_onnx_file_ac, min_score=_rr_min_score_ac)
             except Exception as _rr_exc_ac:
                 _LOG.warning("[Academic] reranker failed (%s) — continuing without rerank", _rr_exc_ac)
 
@@ -821,17 +929,15 @@ class AcademicPersonaService:
         # e.g. collected entity='นิติบุคคล' but user asks "ประเภทบุคคลธรรมดา".
         # Appending the wrong entity contaminates academic_question → metadata_filter →
         # retrieval → auto-fill → answer covers the wrong entity.
-        _NATURAL_ENTITY_RE = re.compile(r"บุคคลธรรมดา", re.IGNORECASE)
-        _JURISTIC_ENTITY_RE = re.compile(r"นิติบุคคล|บริษัท|ห้างหุ้นส่วน", re.IGNORECASE)
-        _query_says_natural = bool(_NATURAL_ENTITY_RE.search(_orig_user_q))
-        _query_says_juristic = bool(_JURISTIC_ENTITY_RE.search(_orig_user_q))
+        _query_says_natural = bool(self._ENTITY_NATURAL_RE.search(_orig_user_q))
+        _query_says_juristic = bool(self._ENTITY_NITI_RE.search(_orig_user_q))
         _entity_switched_to: Optional[str] = None  # set when entity contradiction detected
         if hasattr(state, "get_collected_slots"):
             slots = state.get_collected_slots() or {}
             for k, v in slots.items():
                 sv = str(v).strip()
                 if k == "entity_type" and sv and sv not in q:
-                    _slot_is_juristic = bool(_JURISTIC_ENTITY_RE.search(sv))
+                    _slot_is_juristic = bool(self._ENTITY_NITI_RE.search(sv))
                     _slot_is_natural = sv == "บุคคลธรรมดา"
                     # Skip if query explicitly contradicts the slot
                     if _slot_is_juristic and _query_says_natural and not _query_says_juristic:
@@ -923,6 +1029,16 @@ class AcademicPersonaService:
             nq = new_q.strip().lower()
             if not old_q:
                 return True  # nothing stored → must retrieve
+            # Bare generic-dimension follow-up (e.g. "ต้องใช้เอกสารอะไรบ้าง") shares almost
+            # no vocabulary with whatever specific topic preceded it, so the word-overlap
+            # check below would misclassify it as a topic change. Shared with
+            # persona_practical.py's `_is_short_followup` — see utils/text_patterns.py
+            # (is_bare_generic_followup). This is the fix for the structural gap found in
+            # the 2026-07-31 classifier-duplication audit: Academic mode previously had no
+            # keyword short-circuit at all here, only this overlap-ratio check, so it was
+            # vulnerable to the same topic-drift bug already fixed in Practical mode.
+            if _shared_is_bare_generic_followup(new_q):
+                return False
             # Use simple keyword-overlap: if < 30 % of significant words overlap → different topic
             old_words = set(w for w in old_q.split() if len(w) > 2)
             new_words = set(w for w in nq.split() if len(w) > 2)
@@ -1031,7 +1147,7 @@ class AcademicPersonaService:
                     if k == "entity_type":
                         # Skip stale entity when query explicitly contradicts it.
                         # Same guard as the query-enrichment block at _start_intake top.
-                        _slot_j = bool(_JURISTIC_ENTITY_RE.search(sv))
+                        _slot_j = bool(self._ENTITY_NITI_RE.search(sv))
                         _slot_n = sv == "บุคคลธรรมดา"
                         if _slot_j and _query_says_natural and not _query_says_juristic:
                             _LOG.info(
@@ -1268,6 +1384,31 @@ class AcademicPersonaService:
                 out.append(n)
         return out
 
+    def _is_simple_selection_reply(self, user_text: str) -> bool:
+        """True when `user_text` looks like a bare menu-choice reply (numbers plus
+        light selection/politeness words only) rather than free text that merely
+        contains a number, e.g. "ร้านอยู่ซอย 2 หลังโรงเรียน" or "ใช้พื้นที่ 30 ตรม".
+        Gates _parse_numbers() so an incidental number embedded in a real sentence
+        is never mistaken for a menu selection."""
+        remaining = self._SIMPLE_SELECTION_FILLER_RE.sub("", user_text or "")
+        return remaining.strip() == ""
+
+    def _is_simple_slot_label_reply(self, user_text: str) -> bool:
+        """True when `user_text` is composed ENTIRELY of slot-answer label tokens (ก/ข/ค/ง
+        or 1-4, one per slot for multi-answer replies like "ก ค ก" / "1 3 2") — nothing else.
+        Unlike _is_simple_selection_reply (used for section/topic NUMBER menus), slot answers
+        are also legitimately answered with a bare Thai letter ("ก"), so that filter's digit-
+        only design doesn't fit here. Checking exact token membership (not substring stripping)
+        avoids the trap of stripping ก/ข/ค/ง as loose characters — those letters appear inside
+        countless ordinary Thai words, so removing them character-wise would misclassify real
+        sentences (e.g. "อยากแก้ไขตราประทับ กรณีที่มีตรามากกว่า 1 ดวง") as bare selections."""
+        raw = (user_text or "").strip()
+        if not raw:
+            return False
+        tokens = re.split(r"[\s,/]+", raw)
+        valid = set(self._CHOICE_LABELS) | {l.lower() for l in self._CHOICE_LABELS} | {"1", "2", "3", "4"}
+        return all(t.strip() in valid for t in tokens if t.strip())
+
     def _is_select_all(self, user_text: str) -> bool:
         return bool(self._SELECT_ALL_RE.search(user_text or ""))
 
@@ -1291,7 +1432,7 @@ class AcademicPersonaService:
             state.context = ctx
             return {"bound": True, "mode": "all", "selected": keys}
 
-        nums = self._parse_numbers(user_text)
+        nums = self._parse_numbers(user_text) if self._is_simple_selection_reply(user_text) else []
         if nums:
             valid = [n for n in nums if n in pending]
             if not valid:
@@ -1371,10 +1512,86 @@ class AcademicPersonaService:
             pass
         return None
 
+    def _match_slot_choice_by_text_llm(self, user_text: str, choices: List[str]) -> Optional[str]:
+        """
+        Last-resort matcher for slot answers when a field has more real choices than the 4
+        shown on screen (issue #4) and deterministic substring/token matching in
+        _save_slots_best_effort found either zero or more-than-one candidate. Modeled on
+        _match_section_by_text_llm, but many overflow fields (e.g. operation_by_department)
+        contain near-duplicate values ("แก้ไข ตราประทับ 1 ดวง" vs "...มากกว่า 1 ดวง"), so the
+        prompt explicitly forbids guessing between close-but-different options.
+        Returns the matched choice VALUE (not an index) or None when unresolved.
+        """
+        opts_str = "\n".join([f"{i}) {v}" for i, v in enumerate(choices, 1)])
+        prompt = (
+            "หน้าที่: จับคู่ข้อความอิสระของผู้ใช้กับตัวเลือกที่ตรงที่สุด\n"
+            f"ข้อความผู้ใช้: {user_text}\n"
+            f"ตัวเลือก:\n{opts_str}\n"
+            "กติกาเคร่งครัด:\n"
+            "- จับคู่ได้เฉพาะเมื่อข้อความผู้ใช้มีรายละเอียดที่ระบุตัวเลือกนั้นได้อย่างเจาะจงจริงๆ เท่านั้น\n"
+            "- ห้ามเลือกตัวเลือกเพราะ 'ดูน่าจะใช่' หรือ 'เป็นกรณีที่พบบ่อยที่สุด' — ต้องมีรายละเอียดในข้อความผู้ใช้ชี้ตรงไปที่ตัวเลือกนั้นเท่านั้น\n"
+            "- ถ้ามีตัวเลือกใกล้เคียงกันหลายข้อ (ต่างกันแค่รายละเอียดย่อย เช่น จำนวน/เงื่อนไข) และข้อความผู้ใช้ไม่ได้ระบุรายละเอียดที่แยกความต่างนั้น ให้คืน null — ห้ามเดา แม้จะดูเหมือนมีตัวเลือกหนึ่งที่ 'เป็นไปได้มากกว่า'\n"
+            "  ตัวอย่าง: ตัวเลือกมี 'แก้ไข ตราประทับ 1 ดวง' และ 'แก้ไข ตราประทับ กรณีมีตราประทับมากกว่า 1 ดวง' "
+            "ถ้าผู้ใช้พิมพ์แค่ 'อยากแก้ไขตราประทับ' (ไม่ได้บอกจำนวนดวง) → ต้องคืน null เพราะแยกไม่ออกจริงๆ\n"
+            "- ถ้าไม่ตรงกับข้อไหนเลย ให้คืน null\n"
+            'ตอบ JSON เท่านั้น: {"choice": 1} หรือ {"choice": null}'
+        )
+        try:
+            resp = llm_invoke(self.llm_classifier, [HumanMessage(content=prompt)], logger=_LOG, label="Academic/slot_overflow_bind")
+            text = extract_llm_text(resp).strip()
+            # Despite response_format=json_object, the model sometimes still wraps the JSON in
+            # a ```json ... ``` fence (occasionally with trailing reasoning text after it, e.g.
+            # for this many-option prompt). Splitting on "```" alone leaves a stray "json" tag
+            # in front of the object, which json.loads() rejects silently — same fix already
+            # proven in license_coverage_check.py's _generate_aliases().
+            if text.startswith("```"):
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+                text = text.strip()
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                idx = obj.get("choice")
+                if isinstance(idx, int) and 1 <= idx <= len(choices):
+                    return choices[idx - 1]
+        except Exception:
+            pass
+        return None
+
     # Stage 0: Topic selection — shown when retrieved docs span multiple distinct license_types.
     # Threshold: show menu only when ≥ this many distinct topics found.
     _MIN_TOPICS_FOR_MENU = 2
 
+    # ── Topic-menu auto-select: 8 independent heuristics (audit note, 2026-08-05) ──────────
+    # Whether a user ever SEES the topic menu below, or gets auto-routed to one topic without
+    # being asked, is decided by 8 separate short-circuit checks spread across this function
+    # and _ask_topic_selection() — each added independently to fix one specific observed bug
+    # (see each one's own comment for that history). None of them share a scoring function or
+    # priority table; whichever fires first wins. Listed here, in the order a real request
+    # actually hits them, purely so a future reader can see the whole cascade in one place
+    # without hunting file-wide — deliberately NOT unified into one function, since each was
+    # validated against a real prior bug and merging them risks silently reintroducing one.
+    # See project memory / today's audit for why: unifying needs a full regression pass across
+    # every scenario each heuristic was built for, which is real work, not a quick refactor.
+    #   1. _ask_topic_selection "Bug2-fix": reuse last_answered_license_types from a prior
+    #      Practical-mode multi-topic answer, if the current docs still overlap with it.
+    #   2. _detect_distinct_topics main-topic pre-filter: query names one main_topic → restrict
+    #      the doc pool to that cluster before building the menu at all.
+    #   3. _detect_distinct_topics title-vs-content filter: prefer topics matched in
+    #      license_type/sub_topic/topic_name over ones only matched in doc content.
+    #   4. _detect_distinct_topics same-main_topic collapse: all remaining topics share one
+    #      main_topic (sub-sections of one chapter) → skip the menu, answer all together.
+    #   5. _detect_distinct_topics doc-count dominance: one topic has ≥3x the retrieved docs
+    #      of all others combined → auto-select it.
+    #   6. _detect_distinct_topics unique discriminating keyword: exactly one query word maps
+    #      to exactly one topic's docs → auto-select that topic.
+    #   7. _ask_topic_selection single-topic-in-docs: only one topic survived the above →
+    #      auto-select without a menu (topics=[] would otherwise lose academic_selected_
+    #      license_type entirely, per that block's own comment).
+    #   8. _ask_topic_selection direct-name-match: the query text directly names exactly one
+    #      of the surviving topics → auto-select and skip the menu.
+    # If a topic-selection bug ever looks like "the menu didn't show / showed the wrong topic
+    # for no obvious reason," check these 8 in this order — one of them is almost certainly why.
     def _detect_distinct_topics(
         self, docs: List[Dict], query: str = ""
     ) -> List[Dict[str, str]]:
@@ -2144,6 +2361,23 @@ class AcademicPersonaService:
                 continue  # Already answered under some key
             result[field] = sorted(vals)
 
+        # registration_type/entity taxonomy — 3 independent sites (audit note, 2026-08-05):
+        # this function classifies whether a raw registration_type value IS an entity sub-type,
+        # an operation-phase descriptor, or an area-size descriptor (below). Two OTHER places
+        # separately re-implement overlapping-but-not-identical Thai entity/registration-type
+        # knowledge for their own different purposes:
+        #   - _generate_dynamic_slots' _norm_rt()/_RT_CANONICAL_MAP/_ENTITY_ONLY_RT_VALUES —
+        #     canonicalizes values for display as answer choices (e.g. "บริษัทจำกัด"→"บริษัท").
+        #   - _build_final_prompt's _RT_FAMILIES — family-matches an ALREADY-KNOWN
+        #     registration_type against doc metadata to decide which form/link docs to attach.
+        # Checked against the real corpus (2026-08-05): the one gap found (bare "นิติบุคคล"
+        # matches here but not _RT_FAMILIES) degrades safely (no family filter applied, all
+        # links kept) rather than picking a wrong family — not an active bug today. Left as 3
+        # separate sites deliberately rather than force-unified, since each serves a genuinely
+        # different downstream need; a real merge would need a shared canonical taxonomy module
+        # (like utils/text_patterns.py did for the simpler niti/natural check) plus regression
+        # testing across all 3 use cases — scoped as future work, not a quick fix.
+        #
         # Merge registration_type choices into entity_type_normalized when both have diversity.
         # Without this, the LLM creates TWO separate questions:
         #   Q1: entity_type (บุคคลธรรมดา vs นิติบุคคล)
@@ -2485,6 +2719,15 @@ class AcademicPersonaService:
                 # global map: last-write wins (used only for single-question fallback)
                 choice_map[lbl] = c
                 choice_map[lbl.lower()] = c
+            # Choice overflow (issue #4): only 4 letters exist (ก/ข/ค/ง), so choices beyond
+            # the 4th are never shown or lettered — but they're still valid answers. Store the
+            # FULL list under synthetic (non-lettered) keys so _save_slots_best_effort's
+            # free-text substring/token/LLM matching can still resolve a reply naming one of
+            # them, even though it never appeared on screen.
+            if len(choices) > 4:
+                for j, c in enumerate(choices):
+                    per_slot.setdefault(f"_full_{j}", c)
+                lines.append("   หรือพิมพ์บอกมาได้เลยว่าต้องการเรื่องอะไรครับ")
             slot_choice_maps[key] = per_slot
         if state is not None:
             ctx = state.context or {}
@@ -2492,6 +2735,11 @@ class AcademicPersonaService:
                 ctx["dynamic_slot_choice_maps"] = slot_choice_maps  # per-slot (authoritative)
             if choice_map:
                 ctx["dynamic_slot_choice_map"] = choice_map          # global (backward compat)
+            # Stash the slot dict being shown so the overflow-retry path (issue #4: LLM
+            # couldn't resolve a free-text answer against >4 real choices) can re-render this
+            # exact question with an apology prefix — no extra LLM call needed to re-ask.
+            if len(needed) == 1:
+                ctx["academic_current_slot"] = needed[0]
             state.context = ctx
         return "\n".join(lines)
 
@@ -2722,6 +2970,11 @@ class AcademicPersonaService:
         # ── registration_type / entity_type_normalized value normalization ──────────────
         # Purpose: consolidate data-quality variants into canonical Chroma keys, filter
         # entity-level duplicates, and supplement missing options from full Chroma scan.
+        #
+        # One of 3 independent registration_type/entity sites in this file (audit note,
+        # 2026-08-05) — see the longer note at the top of _compute_diversity_from_docs for why
+        # they're kept separate rather than unified, and what the 3rd site (_build_final_
+        # prompt's _RT_FAMILIES) does.
         #
         # Known data issues in ใบทะเบียนพาณิชย์:
         #   "นิติบุคคล" stored as registration_type (should be entity_type — bad data)
@@ -3052,16 +3305,58 @@ class AcademicPersonaService:
         _LOG.info("[Academic] After key validation: %d slots remain (valid keys: %s)",
                   len(needed), list(_valid_diversity_keys))
 
-        # Hard cap: max 4 slots regardless of LLM output
-        needed = needed[:4]
+        # Cap slot questions to the number of known diversity dimensions (_DIVERSITY_FIELD_
+        # EQUIV), not an arbitrary number. Unlike choices[:4] in _render_slot_message (bounded
+        # by the ก/ข/ค/ง display limit), there's no display constraint here — slots are asked
+        # ONE AT A TIME via the academic_pending_slots queue, so any count could in principle
+        # be shown. The old flat "4" looked copied from that unrelated limit without re-deriving
+        # whether it applied here. Deriving the cap from the taxonomy itself means it can never
+        # drift out of sync if a new diversity field is ever added — the exact class of bug this
+        # session found repeatedly elsewhere (registration_type/entity logic duplicated across
+        # multiple hand-synced places). Verified against the full corpus (2026-08-05): current
+        # max simultaneous diversity for any license_type is 4 fields, so this has never
+        # actually trimmed anything in practice — logged below so a future corpus change that
+        # does trigger it is visible instead of silently dropping a dimension (the same failure
+        # mode issue #4 fixed for choices[:4]).
+        _max_slot_questions = len(self._DIVERSITY_FIELD_EQUIV)
+        if len(needed) > _max_slot_questions:
+            _LOG.warning(
+                "[Academic] Slot-question cap trimmed %d → %d fields: %s",
+                len(needed), _max_slot_questions,
+                [s.get("key") for s in needed[_max_slot_questions:]],
+            )
+        needed = needed[:_max_slot_questions]
 
         # Override LLM-generated choices with ground-truth diversity_data values.
         # Prevents hallucination: LLM sometimes replaces e.g. "ห้างหุ้นส่วน" → "นิติบุคคล"
         # or omits options. diversity_data[key] is the authoritative list from Chroma metadata.
+        #
+        # Choice-overflow ranking (issue #4): _render_slot_message only letters/displays the
+        # first 4 choices (ก/ข/ค/ง — only 4 labels exist). For fields with >4 real values
+        # (e.g. ใบทะเบียนพาณิชย์'s operation_by_department has 29), plain alphabetical sort
+        # buried common choices like "แก้ไข กรรมการ"/"แก้ไข ชื่อ" past the visible cutoff while
+        # rarer ones like "ยกเลิกข้อบังคับ" happened to sort first. Rank by frequency in the
+        # CURRENT retrieval instead — values backed by more of the docs actually retrieved for
+        # this query are more likely to be what the user meant. Ties broken alphabetically for
+        # determinism. The full (unsliced) list is still kept — _render_slot_message stores it
+        # for free-text matching beyond the 4 shown (see _save_slots_best_effort).
         for _s in needed:
             _k = _s.get("key")
-            if _k and _k in diversity_data and diversity_data[_k]:
-                _s["choices"] = diversity_data[_k]
+            if not (_k and _k in diversity_data and diversity_data[_k]):
+                continue
+            _choices_full = diversity_data[_k]
+            if len(_choices_full) > 4:
+                _equiv_fields = self._DIVERSITY_FIELD_EQUIV.get(_k, frozenset({_k}))
+                _freq: Dict[str, int] = {}
+                for _dd in _diversity_docs:
+                    _dmd = _dd.get("metadata") or {}
+                    for _ef in _equiv_fields:
+                        _dv = str(_dmd.get(_ef) or "").strip()[:80]
+                        if _dv in _choices_full:
+                            _freq[_dv] = _freq.get(_dv, 0) + 1
+                            break
+                _choices_full = sorted(_choices_full, key=lambda v: (-_freq.get(v, 0), v))
+            _s["choices"] = _choices_full
 
         if not needed:
             # LLM confirmed no slots needed (question specific enough) OR both attempts failed
@@ -3107,11 +3402,15 @@ class AcademicPersonaService:
         # Empty string means all slots already known — signal caller to skip to sections
         return ""
 
-    def _save_slots_best_effort(self, state: ConversationState, user_text: str) -> None:
+    def _save_slots_best_effort(self, state: ConversationState, user_text: str) -> Set[str]:
+        """Returns the set of slot keys whose free-text answer could not be resolved by ANY
+        matching method (label/substring/LLM) — the caller should re-ask that specific slot
+        with an explicit "couldn't understand" message instead of silently moving on."""
         ctx = state.context or {}
         slots = ctx.get("academic_slots")
         if not isinstance(slots, dict):
             slots = {}
+        _unresolved_slots: Set[str] = set()
 
         raw = (user_text or "").strip()
         choice_map = ctx.get("dynamic_slot_choice_map") or {}
@@ -3122,7 +3421,14 @@ class AcademicPersonaService:
         # Labels repeat across questions (each question has its own ก/ข/ค/ง), so we must use
         # the per-slot map for the i-th answer → i-th slot key.
         # Also support numeric answers "1"/"2"/"3"/"4" → mapped to ก/ข/ค/ง index.
-        if slot_keys and slot_choice_maps:
+        #
+        # Guard (found while testing issue #4's overflow matcher): without _is_simple_selection_
+        # reply, a lone digit 1-4 ANYWHERE in free text — e.g. "1 ดวง" (1 seal), "2 คน" (2
+        # people) — was silently read as a menu-letter selection, immediately binding the WRONG
+        # value (the letter's choice) before substring/LLM matching ever got a chance to see the
+        # sentence. Same root cause and same fix as issue #3's _parse_numbers overreach, just in
+        # a second, independent token-parsing path this session hadn't touched yet.
+        if slot_keys and slot_choice_maps and self._is_simple_slot_label_reply(raw):
             tokens = re.split(r"[\s,/]+", raw)
             _valid_labels = set(self._CHOICE_LABELS) | {l.lower() for l in self._CHOICE_LABELS}
             _num_to_label = {"1": "ก", "2": "ข", "3": "ค", "4": "ง"}
@@ -3236,6 +3542,36 @@ class AcademicPersonaService:
                         state.save_collected_slot(_fb_key, _matched[0])
                     except Exception as _e:
                         _LOG.warning("[Academic] save_collected_slot(free-text) key=%r val=%r: %s", _fb_key, _matched[0], _e)
+                else:
+                    # Resolution fallback: substring/token matching found 0 or >1 candidates.
+                    # Try one more pass via LLM before giving up on this slot entirely.
+                    #
+                    # This used to run ONLY when the field had >4 real choices (issue #4's
+                    # overflow fields, gated on the presence of _full_N entries — see
+                    # _render_slot_message). That left the far more common ≤4-choice case with
+                    # NO fallback at all: an unmatched free-text answer was silently dropped —
+                    # no value saved, no acknowledgment, no re-ask signal — and the next turn
+                    # just showed a same-or-similar-looking question again with no explanation
+                    # of what went wrong. _fb_vals already holds every real choice for the field
+                    # regardless of count (≤4 fields only ever populate the lettered ก/ข/ค/ง
+                    # entries in per_slot; >4 fields additionally carry the _full_N entries), so
+                    # using it here — instead of the >4-only _full_N subset — closes that gap
+                    # uniformly. Same "return null rather than guess" discipline as
+                    # _match_section_by_text_llm — some choices are near-duplicates (e.g.
+                    # "แก้ไข ตราประทับ 1 ดวง" vs "...มากกว่า 1 ดวง") where a wrong guess is
+                    # worse than asking again.
+                    if len(_fb_vals) >= 2:
+                        _llm_match = self._match_slot_choice_by_text_llm(raw, _fb_vals)
+                        if _llm_match:
+                            slots[_fb_key] = _llm_match
+                            try:
+                                state.save_collected_slot(_fb_key, _llm_match)
+                            except Exception as _e:
+                                _LOG.warning("[Academic] save_collected_slot(llm-fallback) key=%r val=%r: %s", _fb_key, _llm_match, _e)
+                            _LOG.info("[Academic] Slot '%s' resolved via LLM fallback: %r", _fb_key, _llm_match)
+                        else:
+                            _unresolved_slots.add(_fb_key)
+                            _LOG.info("[Academic] Slot '%s' could not be resolved (raw=%r)", _fb_key, raw)
 
         # Fallback: resolve single-label/numeric input "ก"/"1" → actual text via global map
         resolved_raw = raw
@@ -3249,6 +3585,7 @@ class AcademicPersonaService:
         slots["raw"] = resolved_raw
         ctx["academic_slots"] = slots
         state.context = ctx
+        return _unresolved_slots
 
     def _re_retrieve_with_slots(self, state: ConversationState) -> None:
         """
@@ -3815,18 +4152,6 @@ class AcademicPersonaService:
             _LOG.info("[Academic] Only 1 section — auto-select all, skipping menu")
             return ""
 
-        # When user said "อย่างละเอียด" / "ทั้งหมด" style → supervisor sets
-        # academic_auto_select_all=True so we skip the menu and go straight to full answer.
-        if state.context.get("academic_auto_select_all"):
-            state.context.pop("academic_auto_select_all", None)
-            state.context["selected_sections"] = {"type": "all", "keys": [s["key"] for s in sections]}
-            state.context["section_catalog"] = sections
-            state.context["pending_options"] = {}
-            state.context["pending_question"] = ""
-            self._set_flow(state, stage="awaiting_sections")
-            _LOG.info("[Academic] auto_select_all: skipping menu, answering all %d sections", len(sections))
-            return ""
-
         lines = ["**คุณอยากรู้เรื่องไหนครับ**"]
         opts: Dict[int, str] = {}
         for i, sec in enumerate(sections, start=1):
@@ -4098,6 +4423,13 @@ class AcademicPersonaService:
         # a different registration family (e.g. บริษัทจำกัด forms when user chose ห้างหุ้นส่วน).
         # Uses family-key matching so ห้างหุ้นส่วนจำกัด and ห้างหุ้นส่วนสามัญนิติบุคคล
         # are treated as the same family and both included (they share the same forms หส.1/หส.2).
+        # 3rd of 3 independent registration_type/entity sites in this file (audit note,
+        # 2026-08-05) — see the note at the top of _compute_diversity_from_docs for the other
+        # two and why they're kept separate. This one only family-matches an ALREADY-ANSWERED
+        # registration_type to filter which link docs to attach — genuinely narrower values.
+        # Known gap: bare "นิติบุคคล" (no sub-type) matches no family here → no filter applied,
+        # all links kept (safe fallback, not a wrong-family pick) — checked against real corpus,
+        # not currently an active bug.
         _rt_known = (
             slots.get("registration_type")
             or (ctx.get("collected_slots") or {}).get("registration_type")
@@ -4264,12 +4596,28 @@ class AcademicPersonaService:
             if _ref_entries:
                 _agg_section += f"\n📚 REFERENCE_LINKS{_instruction} — copy เหล่านี้ตรงๆ under section '📚 แหล่งอ้างอิง':\n" + "\n".join(_fmt_link(d, u) for d, u in _ref_entries) + "\n"
 
+        # Confidence-tiered auto-fill (Part 2, 2026-07-31): entity_type was derived via
+        # persona_supervisor.py's LLM fallback from ambiguous/colloquial phrasing, not an
+        # explicit unambiguous term — one-shot flag set there, mirrors persona_practical.py's
+        # identical injection into _entity_filter_hint. See
+        # entity_false_positive_regex_tightening.md for why this matters ("no slot re-ask").
+        _entity_inferred_section = ""
+        if ctx.get("_entity_type_just_inferred"):
+            _et_ac = str(slots.get("entity_type_normalized") or slots.get("entity_type") or "").strip()
+            if _et_ac:
+                _entity_inferred_section = (
+                    f"\n⚠️ ENTITY TYPE WAS INFERRED, NOT EXPLICITLY STATED — MANDATORY:\n"
+                    f"- Begin your answer with a brief one-line confirmation of this assumption, "
+                    f"e.g. \"เข้าใจว่าร้านเป็น{_et_ac}นะครับ — \" then continue with the answer.\n"
+                    f"- Do NOT turn this into a question — it's a statement the user can correct, not something you're asking.\n"
+                )
+
         return f"""USER_QUESTION:
 {user_question}
 
 SLOTS:
 {json.dumps(slots, ensure_ascii=False)}
-
+{_entity_inferred_section}
 SELECTED_SECTIONS:
 {json.dumps(selected, ensure_ascii=False)}
 {_service_section}{_agg_section}
@@ -4359,7 +4707,9 @@ Return JSON:
         }
 
         try:
+            emit_progress("กำลังเรียบเรียงคำตอบ...")
             decision = self._call_llm_json(prompt, state=state)
+            emit_progress("กำลังตรวจสอบความครบถ้วนของคำตอบ...")
         except Exception as _fa_err:
             _LOG.error("[Academic] _finalize_answer: LLM call failed: %s", _fa_err)
             decision = {}
@@ -4372,8 +4722,15 @@ Return JSON:
                 _ex_raw = {}
         ex = _ex_raw if isinstance(_ex_raw, dict) else {}
         ans = (ex.get("answer") or "").strip()
-        if not ans:
+        if ans:
+            ans, _info_gap_tagged = _shared_extract_info_gap_tag(ans)
+            if _info_gap_tagged:
+                state.context["_info_gap_detected"] = True
+        else:
+            # Empty LLM output — Python-decided fallback, not LLM output, so it can
+            # never carry the tag; flag the gap directly (see text_patterns.py).
             ans = "ขอโทษครับ ตอนนี้ยังไม่พบข้อมูลในเอกสารที่เกี่ยวข้อง"
+            state.context["_info_gap_detected"] = True
         ans = self._fix_line_wrapping(ans)
 
         # Fix 6 (continued): Remove hallucinated URLs from the answer — any URL not in _allowed_urls.
@@ -4433,7 +4790,15 @@ Return JSON:
 
         cu = ex.get("context_update", {})
         if isinstance(cu, dict) and cu:
-            state.context.update(cu)
+            _cu_filtered = {k: v for k, v in cu.items() if k in self._CONTEXT_UPDATE_ALLOWLIST}
+            _cu_dropped = set(cu.keys()) - self._CONTEXT_UPDATE_ALLOWLIST
+            if _cu_dropped:
+                _LOG.warning(
+                    "[Academic] context_update dropped non-allowlisted key(s) from LLM output: %s",
+                    sorted(_cu_dropped),
+                )
+            if _cu_filtered:
+                state.context.update(_cu_filtered)
 
         self._mark_done(state)
 
@@ -4500,12 +4865,14 @@ Return JSON:
                 # C3: Pre-populate entity_type from explicit mention in the user's query.
                 # If user wrote "บุคคลธรรมดา" or "นิติบุคคล" directly in the question,
                 # skip asking for it — we already know the answer.
-                _qt_lower = (state.context.get("academic_question") or user_text or "").lower()
-                _entity_pre: Optional[str] = None
-                if "บุคคลธรรมดา" in _qt_lower:
-                    _entity_pre = "บุคคลธรรมดา"
-                elif any(kw in _qt_lower for kw in ("นิติบุคคล", "บริษัทจำกัด", "ห้างหุ้นส่วน")):
-                    _entity_pre = "นิติบุคคล"
+                # Negation-aware (see detect_entity_type_with_negation docstring): a plain
+                # substring/if-elif check here previously always picked "บุคคลธรรมดา" whenever
+                # BOTH terms appeared in the same message — including "ไม่ใช่บุคคลธรรมดา เป็น
+                # นิติบุคคล", where the user explicitly said the OPPOSITE. Since this pre-fill
+                # is treated as "already known" and never re-asked, that silently locked the
+                # whole session onto the wrong entity type.
+                _qt_for_entity = state.context.get("academic_question") or user_text or ""
+                _entity_pre = _detect_entity_type_with_negation(_qt_for_entity)
                 if _entity_pre:
                     _ctx3 = state.context or {}
                     _slots3 = _ctx3.get("academic_slots") or {}
@@ -4549,6 +4916,19 @@ Return JSON:
                         "[Academic] Bug1-fix: academic_selected_license_type=%r pre-injected — skipping topic menu",
                         _pre_selected_lt,
                     )
+                    # This bypass skips _ask_topic_selection() entirely, which is the ONLY place
+                    # that (re)populates academic_topic_catalog for the CURRENT retrieval. If an
+                    # earlier, unrelated Academic session in this same conversation left a stale
+                    # catalog/remaining-topics list behind, _filter_docs_by_selected_topic() below
+                    # would compute "remaining topics" from that stale catalog (filtering out only
+                    # _pre_selected_lt, which likely isn't even in it) — surfacing unrelated old
+                    # topics in the end-of-session "still have questions about X/Y?" follow-up.
+                    # Clear both here so the follow-up correctly sees "no other topics" instead of
+                    # carrying over a stale list from an earlier, unrelated topic-selection in the
+                    # same conversation. Verified live 2026-08-04: without this clear, a stale
+                    # academic_remaining_topics survived a Bug1-fix bypass completely untouched.
+                    state.context.pop("academic_topic_catalog", None)
+                    state.context.pop("academic_remaining_topics", None)
                     self._filter_docs_by_selected_topic(state, _pre_selected_lt)
                     self._ensure_flow(state, stage="awaiting_slots")
                 else:
@@ -4644,7 +5024,7 @@ Return JSON:
             opts = (state.context or {}).get("pending_options") or {}
             selected_key: Optional[str] = None
             _all_selected_keys: List[str] = []
-            nums = self._parse_numbers(user_text)
+            nums = self._parse_numbers(user_text) if self._is_simple_selection_reply(user_text) else []
             if nums:
                 for _n in nums:
                     _k = opts.get(_n)
@@ -4733,7 +5113,26 @@ Return JSON:
 
             else:
                 # Normal slot answer — save then check pending queue before re-retrieve
-                self._save_slots_best_effort(state, user_text)
+                _unresolved_slots = self._save_slots_best_effort(state, user_text)
+
+                # Unresolved free-text answer: neither the label path, substring/token
+                # matching, nor the LLM fallback could resolve the reply (originally only
+                # wired for issue #4's >4-choice overflow fields, later widened to every slot
+                # — see the comment in _save_slots_best_effort). Re-ask the SAME slot with an
+                # apology instead of silently advancing to the next queued slot (which would
+                # leave this one permanently unanswered) or falling through to re-retrieve with
+                # a still-missing value.
+                if _unresolved_slots:
+                    _cur_slot = (state.context or {}).get("academic_current_slot")
+                    if isinstance(_cur_slot, dict) and _cur_slot.get("key") in _unresolved_slots:
+                        _retry_q = self._render_slot_message([_cur_slot], state=state)
+                        _retry_msg = (
+                            "ขอโทษครับ ไม่แน่ใจว่าคุณหมายถึงข้อไหน ลองเลือกจากตัวเลือกด้านล่าง "
+                            "หรือพิมพ์ให้ชัดขึ้นอีกนิดได้ไหมครับ\n\n" + _retry_q
+                        )
+                        self._append_assistant(state, _retry_msg)
+                        state.round = int(getattr(state, "round", 0) or 0) + 1
+                        return state, _retry_msg
 
                 # One-at-a-time queue: if there are pre-computed slots still to ask, show the next
                 # one now without re-retrieving (saves LLM call + retrieval latency).
@@ -4801,19 +5200,21 @@ Return JSON:
             # User says "เปลี่ยนเป็นนิติบุคคล" or "บุคคลธรรมดาค่ะ" while at section menu
             # → update entity_type and restart intake with the same base query.
             # Guard: skip when input is a valid section number.
-            _ec_juristic = re.compile(r"นิติบุคคล|บริษัทจำกัด|ห้างหุ้นส่วน", re.IGNORECASE)
-            _ec_natural  = re.compile(r"บุคคลธรรมดา|กิจการเจ้าของคนเดียว|เจ้าของคนเดียว", re.IGNORECASE)
-            _ec_new_entity: Optional[str] = None
-            if _ec_juristic.search(user_text) and not _ec_natural.search(user_text):
-                _ec_new_entity = "นิติบุคคล"
-            elif _ec_natural.search(user_text) and not _ec_juristic.search(user_text):
-                _ec_new_entity = "บุคคลธรรมดา"
+            # Negation-aware (see detect_entity_type_with_negation docstring): the previous
+            # mutually-exclusive-but-not-negation-aware check silently dropped the correction
+            # entirely whenever BOTH terms appeared (e.g. "ไม่ใช่บุคคลธรรมดา เปลี่ยนเป็น
+            # นิติบุคคล") — neither branch fired, so the user's correction was ignored and the
+            # same section menu was shown again with no explanation.
+            _ec_new_entity = _detect_entity_type_with_negation(user_text)
 
             if _ec_new_entity:
                 _ec_ctx    = state.context or {}
                 _ec_slots  = _ec_ctx.get("academic_slots") or {}
                 _ec_cur    = (_ec_slots.get("entity_type_normalized") or _ec_slots.get("entity_type") or "").strip()
-                _ec_nums   = [n for n in self._parse_numbers(user_text) if n in (_ec_ctx.get("pending_options") or {})]
+                _ec_nums   = (
+                    [n for n in self._parse_numbers(user_text) if n in (_ec_ctx.get("pending_options") or {})]
+                    if self._is_simple_selection_reply(user_text) else []
+                )
                 if _ec_new_entity != _ec_cur and not _ec_nums:
                     _ec_base_q = (_ec_ctx.get("academic_question") or "").strip()
                     _LOG.info(

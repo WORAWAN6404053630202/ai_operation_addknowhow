@@ -65,7 +65,12 @@ import hashlib
 import concurrent.futures
 
 # Reused across turns — avoids per-request thread spin-up cost (~20-50ms).
-_CLASSIFIER_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="pw_classifier")
+# Sized to the worst-case in-flight count within one turn: tier-1 prewarm (≤6, may
+# still be running past its 1.5s wait()) + slot-change fallback (≤3) + legal-retrieval
+# gate (2) + slot-prefill (≤3) = 14. All submitted tasks are I/O-bound LLM calls
+# (see haiku_state_cost_tracking_gap / row9 investigations), so more workers than
+# CPU cores is safe — the shared httpx client (max_connections=1000) has no ceiling here.
+_CLASSIFIER_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=14, thread_name_prefix="pw_classifier")
 
 # Cross-session topic pool cache — topic pool is derived from static Chroma corpus.
 # Building it costs 5 × retriever.invoke() (~1-2s total). Cache across sessions so
@@ -86,9 +91,26 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 import conf
 from model.conversation_state import ConversationState
-from utils.llm_call import llm_invoke, extract_llm_text
+from model.clarification_flags import DYNAMIC_CLARIFICATION_SKIP_FLAGS, has_any_flag
+from utils.llm_call import llm_invoke, extract_llm_text, get_shared_http_client
 from utils.query_synonyms import SYNONYM_PATTERNS
 from utils.query_rewriter import enrich_query_for_retrieval, _needs_rewrite as _qr_needs_rewrite
+from utils.text_patterns import (
+    TH_DEE_RE as _SHARED_TH_DEE_RE,
+    EN_GREETING_RE as _SHARED_EN_GREETING_RE,
+    EN_GOOD_TIME_RE as _SHARED_EN_GOOD_TIME_RE,
+    TOKEN_SPLIT_RE as _SHARED_TOKEN_SPLIT_RE,
+    TH_SAWASDEE_FUZZY_RE as _SHARED_TH_SAWASDEE_FUZZY_RE,
+    TH_WATDEE_RE as _SHARED_TH_WATDEE_RE,
+    THANKS_RE as _SHARED_THANKS_RE,
+    LIKELY_SELECTION_RE as _SHARED_LIKELY_SELECTION_RE,
+    LEGAL_SIGNAL_RE as _SHARED_LEGAL_SIGNAL_RE,
+    ENTITY_NITI_RE as _SHARED_ENTITY_NITI_RE,
+    ENTITY_NATURAL_RE as _SHARED_ENTITY_NATURAL_RE,
+    ENTITY_HINT_RE as _SHARED_ENTITY_HINT_RE,
+    GENERIC_FOLLOWUP_KEYWORDS_RE as _SHARED_GENERIC_FOLLOWUP_KEYWORDS_RE,
+    SPECIFIC_TOPIC_RE as _SHARED_SPECIFIC_TOPIC_RE,
+)
 from utils.prompts_supervisor import (
     build_topic_picker_prompt,
     build_confirm_prompt,
@@ -181,6 +203,7 @@ class PersonaSupervisor:
         'จัดการการเงิน',
         'ใบอนุญาตจำหน่ายสุรา',
         'แบบแสดงรายการภาษีป้ายร้านอาหาร',
+        'ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร',
     ]
 
     # Keyword-to-license override: maps user vocabulary → canonical license_type.
@@ -205,6 +228,14 @@ class PersonaSupervisor:
          'แบบแสดงรายการภาษีป้ายร้านอาหาร'),
         (re.compile(r'กองทุนเงินทดแทน|เงินทดแทน(?!ที่ดิน)', re.IGNORECASE),
          'กองทุนเงินทดแทน'),
+        # Colloquial name — the formal license_type ("...จัดตั้งสถานที่จำหน่ายอาหาร") shares
+        # no substring with this common phrasing, so bare mentions (no "คือ"/question wording)
+        # fell through the name-match passes above into ambiguous multi-license matching,
+        # which then let an unrelated dynamic-clarification field (entity_type) get asked
+        # instead of the area-size question this license actually needs (see
+        # _AREA_SENSITIVE_LICENSES below).
+        (re.compile(r'สุขาภิบาล', re.IGNORECASE),
+         'ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร'),
     ]
 
     # Licenses where shop area size affects the answer (fees differ by area).
@@ -284,12 +315,10 @@ class PersonaSupervisor:
     # Matches any thanks expression. Removed the old negative lookahead (?![\u0E00-\u0E7F]{4,})
     # because it caused false negatives: "ขอบคุณสำหรับข้อมูล" (10 Thai chars) never matched,
     # routing legitimate thanks as legal questions. "ขอบคุณ" + Thai is always thanks.
-    _THANKS_RE = re.compile(
-        r"(ขอบคุณ|ขอบใจ|thx|thanks)",
-        re.IGNORECASE,
-    )
+    # Shared with persona_practical.py/persona_academic.py — see utils/text_patterns.py.
+    _THANKS_RE = _SHARED_THANKS_RE
 
-    _LIKELY_SELECTION_RE = re.compile(r"^\s*(?=.*\d)[\d\s,/-]+\s*$")
+    _LIKELY_SELECTION_RE = _SHARED_LIKELY_SELECTION_RE
 
     _QUESTION_MARKERS_RE = re.compile(
         r"(\?|ไหม|มั้ย|มั้ง|หรือไม่|หรือเปล่า|ยังไง|ทำไง|อย่างไร|ได้ไหม|ควร|ต้อง|คืออะไร"
@@ -297,30 +326,10 @@ class PersonaSupervisor:
         re.IGNORECASE,
     )
 
-    _LEGAL_SIGNAL_RE = re.compile(
-        r"(ใบอนุญาต|จดทะเบียน|ทะเบียนพาณิชย์|ภาษี|vat|ภพ\.?20|สรรพากร|เทศบาล|สำนักงานเขต|สุขาภิบาล|กรม|ค่าธรรมเนียม|เอกสาร|ขั้นตอน|บทลงโทษ|ประกาศ|พ\.ร\.บ|ประกันสังคม|กองทุน|เปิดร้าน|ขึ้นทะเบียน"
-        r"|เงินสมทบ|สมทบ|แยกยื่น|ยื่นรวม|ส่งเงินสมทบ|ส่งข้อมูลเงินสมทบ"
-        r"|qr.?pay|qr.?payment|คิวอาร์|คิวอาเพย|เพย์เมนต์|edc|รูดบัตร|merchant.?id|partner.?id|pos.?id|ระบบชำระเงิน|กสิกร|kbank|ไทยพาณิช(?:ย์)?|ไทยพานิช|scb|ประกอบกิจการ|สุขาภิบาลอาหาร"
-        # Domain entities: company/business types (จดทะเบียน/หุ้น/ห้างฯ all in-scope)
-        r"|หุ้น|นิติบุคคล|บุคคลธรรมดา|บริษัท|มหาชนจำกัด|ห้างหุ้นส่วน|พาณิชยกิจ"
-        # Shop/business operations (in-scope topics about running the business)
-        r"|ร้านค้า|กิจการ|พนักงาน"
-        # Payment / banking topics (QR, refund, mobile banking changes)
-        r"|บัญชีธนาคาร|คืนเงิน|ยกเลิกบิล|ยกเลิกใช้บริการ|refund|wechat"
-        # Document/meeting terms in business registration context
-        r"|หนังสือนัดประชุม|บริคณห์|มอบฉันทะ|มาตรฐานร้านอาหาร|san\b"
-        # Remaining generic operational topics (สุรา/ภาษี context: ชื่อและที่อยู่, เพิ่ม/ลด, สำนักงาน, เบอร์)
-        r"|สำนักงาน|เบอร์มือถือ|แก้ไขเปลี่ยนแปลง|ชื่อและที่อยู่|เพิ่ม.*ลด|ลด.*เพิ่ม|ประเภทสินค้า|จำนวนชื่อ"
-        # Sub-step/case phrases in registration procedures (กรณีเลือก... etc.)
-        r"|กรณี"
-        # Consequence/impact/risk topics — user asking about effects/penalties/risks
-        r"|งบการเงิน|ผลกระทบ|ความเสี่ยง"
-        # Reference/source queries — user asking where info comes from (Fix A)
-        r"|อ้างอิง|แหล่งที่มา|แหล่งข้อมูล|แหล่งอ้างอิง|ที่มาของข้อมูล"
-        # Alcohol/tobacco/food restriction domain (common restaurant regulatory topics)
-        r"|สุรา|เหล้า|แอลกอฮอล์|บุหรี่|ห้ามขาย|จำหน่ายสุรา|ขายสุรา|ขายเหล้า|วันหยุดนักขัตฤกษ์)",
-        re.IGNORECASE,
-    )
+    # Shared with persona_practical.py/persona_academic.py — see utils/text_patterns.py.
+    # (This was supervisor's own version, which already was the most complete of the
+    # three — adopted as the canonical shared version unchanged.)
+    _LEGAL_SIGNAL_RE = _SHARED_LEGAL_SIGNAL_RE
 
     _NOISE_ONLY_RE = re.compile(r"^(?:[a-z]+|[!?.]+)$", re.IGNORECASE)
     _TH_LAUGH_5_RE = re.compile(r"^\s*5{3,}\s*$")
@@ -546,24 +555,13 @@ class PersonaSupervisor:
         re.IGNORECASE,
     )
     # Entity type explicit in query text — used for auto-inference without asking
-    _ENTITY_NITI_RE = re.compile(
-        r"นิติบุคคล|(?:แบบ|เป็น(?:แบบ)?|ประเภท|รูปแบบ|ถ้า(?:เป็น)?|ถ้าแบบ)\s*นิติ|บริษัท(?:\s*จำกัด|\s*มหาชน)?|ห้าง(?:หุ้นส่วน(?:\s*จำกัด|\s*สามัญ)?)?",
-        re.IGNORECASE,
-    )
-    _ENTITY_NATURAL_RE = re.compile(
-        r"บุคคลธรรมดา|บุคคล.{0,4}มดา|บุคคลทั่วไป|ร้านค้าทั่วไป|เจ้าของ\s*คนเดียว"
-        r"|ทำ\s*คนเดียว|เปิด\s*เอง|ทำ\s*เอง|คนเดียว\s*(เลย|ครับ|ค่ะ|นะ)?"
-        r"|ร้านส่วนตัว|กิจการเจ้าของ\s*คนเดียว"
-        r"|(?:ถ้า(?:เป็น)?|ถ้าแบบ)\s*(?:บุคคล)?ธรรมดา",
-        re.IGNORECASE,
-    )
+    # Shared with persona_practical.py/persona_academic.py — see utils/text_patterns.py.
+    _ENTITY_NITI_RE = _SHARED_ENTITY_NITI_RE
+    _ENTITY_NATURAL_RE = _SHARED_ENTITY_NATURAL_RE
     # Guard: query must contain at least one entity-hint word before calling LLM fallback.
     # Prevents false positives from pronouns (ฉัน/ผม/หนู) or entity-neutral questions.
     # Catches abbreviations (บจก, หจก) and partial entity words the main regex misses.
-    _ENTITY_HINT_RE = re.compile(
-        r"นิติ|บุคคล|บจก\.?|หจก\.?|บมจ\.?|ห\.?พ\.?|ส่วนตัว|คนเดียว|เจ้าของ|ประเภท(?:นิติ|ธุรกิจ|กิจการ|ผู้ประกอบการ)|รูปแบบ(?:ธุรกิจ|กิจการ|นิติ)",
-        re.IGNORECASE,
-    )
+    _ENTITY_HINT_RE = _SHARED_ENTITY_HINT_RE
     # Location auto-infer from query text (Bug 1)
     _LOCATION_BKK_RE = re.compile(
         r"กรุงเทพ(?:ฯ|มหานคร)?|กทม\.?|\bbangkok\b|\bBKK\b|เขต(?:พื้นที่)?กรุงเทพ|ในกรุงเทพ",
@@ -578,6 +576,34 @@ class PersonaSupervisor:
     _LOCATION_PROVINCE_RE = re.compile(
         r"ต่างจังหวัด|ต่างหวัด|จังหวัดอื่น|ต่างพื้นที่|นอกกรุงเทพ",
         re.IGNORECASE,
+    )
+    # Document-CONTENT location-timeline scan (used by _discover_slots_for_license to spot
+    # "กทม: 8-14 วัน / ต่างจังหวัด: 14-21 วัน"-style differences inside retrieved doc text).
+    # Deliberately separate from _LOCATION_BKK_RE/_LOCATION_PROVINCE_RE above, which scan the
+    # USER's query text — a 2026-07-31 audit initially mistook these for a duplicate of those,
+    # but they serve a genuinely different purpose (broader/looser matching is fine here since
+    # it's just a scan for whether the topic is mentioned at all, not parsing user intent) and
+    # merging them risked changing this doc-scan's behavior. Hoisted to class level here only to
+    # fix them being recompiled on every _discover_slots_for_license() call — same patterns,
+    # same behavior, just compiled once.
+    _DOC_SCAN_LOC_BKK_RE = re.compile(r"กรุงเทพ|กทม|bkk", re.IGNORECASE)
+    _DOC_SCAN_LOC_PROV_RE = re.compile(r"ต่างจังหวัด|ภูมิภาค|จังหวัดอื่น", re.IGNORECASE)
+    _DOC_SCAN_NUM_RE = re.compile(r"(\d+)\s*(?:-\s*(\d+))?\s*(?:วัน|วันทำการ|ชั่วโมง)")
+    _DOC_SCAN_SEQ_FWD_RE = re.compile(
+        r"(?:กรุงเทพ|กทม|bkk)[^0-9]*(\d+)(?:\s*-\s*(\d+))?"
+        r"[^0-9]{0,30}(?:วัน|วันทำการ)"
+        r".{0,300}?"
+        r"(?:ต่างจังหวัด|ภูมิภาค|จังหวัดอื่น)[^0-9]*(\d+)(?:\s*-\s*(\d+))?"
+        r"[^0-9]{0,30}(?:วัน|วันทำการ)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    _DOC_SCAN_SEQ_REV_RE = re.compile(
+        r"(\d+)(?:\s*-\s*(\d+))?[^0-9\n]{0,30}(?:วัน|วันทำการ)"
+        r"[^\n]{0,60}(?:กรุงเทพ|กทม|bkk)"
+        r".{0,300}?"
+        r"(\d+)(?:\s*-\s*(\d+))?[^0-9\n]{0,30}(?:วัน|วันทำการ)"
+        r"[^\n]{0,60}(?:ต่างจังหวัด|ภูมิภาค|จังหวัดอื่น)",
+        re.IGNORECASE | re.DOTALL,
     )
     # Shop area size auto-infer from query text (Bug 2)
     _AREA_SMALL_RE = re.compile(
@@ -686,6 +712,26 @@ class PersonaSupervisor:
         "ไม่เปลี่ยน", "ไม่สลับ",
     )
 
+    # Feedback → Google Sheets: detection moved 2026-08-04 from a keyword scan over the
+    # visible reply text (matching one of ~6 hardcoded Thai phrases — false-positive-prone,
+    # since ordinary content could contain one of those phrases, and false-negative-prone,
+    # since LLM replies paraphrase "no info" in unbounded ways a fixed list can't keep up
+    # with) to state.context["_info_gap_detected"], a flag set upstream by
+    # persona_practical.py/persona_academic.py right after they receive raw LLM output —
+    # either by finding utils.text_patterns.INFO_GAP_TAG (a dedicated marker the prompt
+    # instructs the LLM to emit, extracted via extract_info_gap_tag before any other
+    # cleanup runs) or, for Python-level fallback strings that are never LLM output
+    # (empty answer field, retry-loop abort), by setting the flag directly in code. The
+    # flag is reset per-turn in _handle_inner (see "_direct_topic_match" nearby) so it
+    # can never bleed into a later turn that didn't itself hit a gap.
+    _FEEDBACK_MENU_TEXT = (
+        "หากต้องการให้ทีมงานติดตามเรื่องนี้ต่อ เลือกหมวดได้เลยครับ\n\n"
+        "1️⃣ Requirement (แจ้งความต้องการเพิ่มเติม)\n"
+        "2️⃣ Troubleshoot (แจ้งปัญหาการใช้งาน)\n"
+        "3️⃣ ข้ามไป (ไม่ต้องการบันทึก)\n\n"
+        "พิมพ์เลข 1-3 เพื่อเลือกครับ"
+    )
+
     # Helpers: message append (Supervisor ONLY)
     def _add_user(self, state: ConversationState, text: str) -> None:
         state.messages = state.messages or []
@@ -709,6 +755,137 @@ class PersonaSupervisor:
         state.display_messages = state.display_messages or []
         state.display_messages.append(msg)
         _LOG.debug("[Supervisor] assistant_msg_len=%d", len(text))
+
+    # Feedback → Google Sheets
+    # Below this length, user_input is treated as a probable slot-fill answer (e.g.
+    # "นิติบุคคล", "กรุงเทพ", "20 ตรม.") rather than a standalone question, for Query
+    # capture in _maybe_offer_feedback. NOTE: a pre-turn pending_slot snapshot was tried
+    # first and rejected — the FSM has its own dynamic "bypass pending slot for a fresh
+    # legal question" logic (see "2.9" branch) that a static snapshot can't see, and even
+    # last_user_legal_query isn't reliable here since bare slot answers like "นิติบุคคล"
+    # also match _LEGAL_SIGNAL_RE and overwrite it. Text-shape (length) sidesteps needing
+    # to know which internal FSM branch handled the turn.
+    _STANDALONE_QUESTION_MIN_LEN = 15
+
+    def _maybe_offer_feedback(self, state: ConversationState, user_input: str, reply: str) -> str:
+        """Called once per turn from handle() (the single choke point every persona reply
+        passes through). Reads state.context["_info_gap_detected"], a flag set upstream by
+        the persona that produced `reply` (tag-based for genuine LLM content, direct
+        flag-set for Python-level fallback strings) — see the comment above
+        _FEEDBACK_MENU_TEXT for the full mechanism and why it replaced the older keyword
+        scan. No synchronous LLM confirm round-trip either way: the flag is decided as a
+        side effect of the same call that generated `reply`, not a second call."""
+        if not reply or state.context.get("pending_feedback_choice"):
+            return reply
+        if not state.context.get("_info_gap_detected"):
+            return reply
+
+        _raw_input = (user_input or "").strip()
+        if len(_raw_input) >= self._STANDALONE_QUESTION_MIN_LEN:
+            query = (_raw_input or state.get_last_retrieval_query() or "").strip()
+        else:
+            query = (state.get_last_retrieval_query() or _raw_input or "").strip()
+        if not query:
+            return reply
+
+        augmented = self._normalize_male(reply.rstrip() + "\n\n---\n" + self._FEEDBACK_MENU_TEXT)
+        state.context["pending_feedback_choice"] = True
+        state.context["pending_feedback_query"] = query
+
+        # Mutate the just-appended assistant message in place (exact-content guard,
+        # same pattern as _add_assistant's own dedup check) so stored history matches
+        # what's actually returned to the caller.
+        if state.messages and state.messages[-1].get("role") == "assistant" \
+                and (state.messages[-1].get("content") or "").strip() == reply.strip():
+            state.messages[-1]["content"] = augmented
+        if state.display_messages and state.display_messages[-1].get("role") == "assistant" \
+                and (state.display_messages[-1].get("content") or "").strip() == reply.strip():
+            state.display_messages[-1]["content"] = augmented
+
+        return augmented
+
+    def _append_pending_slot_reminder(self, state: ConversationState, reply: str) -> str:
+        """If a pending_slot is still armed after a feedback-menu detour (e.g. the slot-mismatch
+        path below never clears it so the original question isn't lost), re-surface that question
+        so the user knows how to continue instead of being left at a dead-end "anything else?"."""
+        _ps = (state.context or {}).get("pending_slot")
+        if not isinstance(_ps, dict) or not str(_ps.get("question") or "").strip():
+            return reply
+        _raw_opts = [str(o).strip() for o in (_ps.get("options") or []) if str(o).strip()]
+        _disp_opts = [str(o).strip() for o in (_ps.get("display_options") or []) if str(o).strip()]
+        _opts = _disp_opts if len(_disp_opts) == len(_raw_opts) else _raw_opts
+        _q = str(_ps.get("question") or "").strip()
+        if _opts:
+            _opts_str = "\n".join(f"{i + 1}) {o}" for i, o in enumerate(_opts))
+            return f"{reply.rstrip()}\n\n{_q}\n{_opts_str}"
+        return f"{reply.rstrip()}\n\n{_q}"
+
+    def _build_slot_mismatch_message(self, pending: Dict[str, Any], user_input: str) -> str:
+        """Graceful reply for when a pending_slot answer names something genuinely outside the
+        known options (e.g. a bank we have no data for), instead of the blunt "answer with a
+        number" reask. Mirrors the info-gap wording used in _maybe_offer_feedback and offers the
+        same Requirement/Troubleshoot/skip menu so the request can be logged."""
+        _raw_opts = [str(o).strip() for o in (pending.get("options") or []) if str(o).strip()]
+        _disp_opts = [str(o).strip() for o in (pending.get("display_options") or []) if str(o).strip()]
+        _opts = _disp_opts if len(_disp_opts) == len(_raw_opts) else _raw_opts
+        if len(_opts) == 1:
+            _opts_str = _opts[0]
+        elif len(_opts) == 2:
+            _opts_str = f"{_opts[0]} และ {_opts[1]}"
+        elif _opts:
+            _opts_str = ", ".join(_opts[:-1]) + f" และ {_opts[-1]}"
+        else:
+            _opts_str = ""
+        _ans = (user_input or "").strip()
+        if _opts_str:
+            _body = f"ขออภัยครับ ข้อมูลที่ผมมีครอบคลุมเฉพาะ {_opts_str} เท่านั้น — ไม่มีข้อมูลเฉพาะของ \"{_ans}\" ในระบบครับ"
+        else:
+            _body = f"ขออภัยครับ ไม่มีข้อมูลเฉพาะของ \"{_ans}\" ในระบบครับ"
+        return f"{_body}\n\n---\n{self._FEEDBACK_MENU_TEXT}"
+
+    def _build_slot_mismatch_query(self, state: ConversationState, user_input: str) -> str:
+        """Builds the Query string saved to Google Sheets for a slot-mismatch feedback log.
+        The bare slot reply alone (e.g. "ธนาคารทหารไทย") loses the surrounding question — a
+        reader of the sheet can't tell what the user was even trying to do. Prefixing the topic
+        that led into this slot (e.g. "วิธีการลงทะเบียน QR-Payment API") makes the row read like
+        a standalone question, matching how a fresh legal question is logged elsewhere."""
+        _topic = str((state.context or {}).get("last_user_legal_query") or (state.context or {}).get("last_topic") or "").strip()
+        _ans = (user_input or "").strip()
+        if _topic and _topic != _ans:
+            return f"{_topic} - {_ans}"
+        return _ans
+
+    def _handle_feedback_selection(self, state: ConversationState, msg: str) -> Tuple[ConversationState, str]:
+        """Handles the user's reply to the feedback menu armed by _maybe_offer_feedback.
+        Caller is responsible for appending the returned reply via _add_assistant."""
+        msg_norm = (msg or "").strip().lower()
+        query = str(state.context.get("pending_feedback_query") or "").strip()
+
+        if msg_norm in ("1", "requirement"):
+            category_abbr, category_name = "REQ", "Requirement"
+        elif msg_norm in ("2", "troubleshoot", "ปัญหา"):
+            category_abbr, category_name = "TRB", "Troubleshoot"
+        elif msg_norm in ("3", "ข้ามไป", "skip", "ข้าม"):
+            state.context.pop("pending_feedback_choice", None)
+            state.context.pop("pending_feedback_query", None)
+            reply = self._normalize_male("รับทราบครับ ข้ามการบันทึกข้อมูล มีอะไรให้ช่วยต่อไหมครับ?")
+            return state, self._append_pending_slot_reminder(state, reply)
+        else:
+            return state, self._FEEDBACK_MENU_TEXT
+
+        try:
+            from service.google_sheets_service import gsheets_service
+            gsheets_service.save_feedback_async(category_abbr, query, state.branch_id, state.branch_name)
+        except Exception:
+            _LOG.exception("[Supervisor] failed to dispatch feedback save")
+
+        state.context.pop("pending_feedback_choice", None)
+        state.context.pop("pending_feedback_query", None)
+        reply = self._normalize_male(
+            f"✅ รับทราบครับ บันทึกคำถามนี้เข้าหมวด {category_name} เพื่อให้ทีมงานติดตามต่อแล้วครับ "
+            "มีอะไรให้ช่วยต่อไหมครับ?"
+        )
+        return state, self._append_pending_slot_reminder(state, reply)
 
     def _handle_deflect(self, state: ConversationState, raw_input: str) -> Tuple[ConversationState, str]:
         """
@@ -821,6 +998,7 @@ class PersonaSupervisor:
             model=topic_model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=512,  # topic list JSON ต้องการพอ (5 topics + confidence + reasoning)
             request_timeout=timeout,
@@ -859,6 +1037,7 @@ class PersonaSupervisor:
             model=switch_model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=180,  # Increased from 150 to accommodate yes/no + reasoning
             request_timeout=timeout,
@@ -889,6 +1068,7 @@ class PersonaSupervisor:
             model=switch_model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=250,  # Increased from 200 to accommodate analysis + reasoning
             request_timeout=timeout,
@@ -926,6 +1106,7 @@ class PersonaSupervisor:
             model=switch_model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.35,
             max_tokens=200,  # Increased from 120 to accommodate context-aware greetings
             request_timeout=timeout,
@@ -980,6 +1161,7 @@ class PersonaSupervisor:
             model=topic_model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=1200,
             request_timeout=timeout,
@@ -1016,6 +1198,7 @@ class PersonaSupervisor:
             model=switch_model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=600,  # เพิ่มจาก 300 เพื่อรองรับ list ที่ยาวขึ้น
             request_timeout=timeout,
@@ -1071,6 +1254,7 @@ class PersonaSupervisor:
             model=switch_model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=180,  # Increased from 120 to accommodate slot mapping + confidence + reasoning
             request_timeout=timeout,
@@ -1138,6 +1322,7 @@ class PersonaSupervisor:
             model=topic_model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=250,  # Increased from 150 to accommodate intent classification + query generation + confidence + reasoning
             request_timeout=timeout,
@@ -1172,11 +1357,13 @@ class PersonaSupervisor:
         return t
 
     # Greeting/noise classification
-    _EN_GREETING_RE = re.compile(r"^\s*(hi+|hello+|hey+|yo+)\b", re.IGNORECASE)
-    _EN_GOOD_TIME_RE = re.compile(r"^\s*good\s+(morning|afternoon|evening|night)\b", re.IGNORECASE)
-    _TH_SAWASDEE_FUZZY_RE = re.compile(r"^\s*สว[^\s]{0,6}ดี", re.IGNORECASE)
-    _TH_WATDEE_RE = re.compile(r"^\s*หวัดดี", re.IGNORECASE)
-    _TH_DEE_RE = re.compile(r"^\s*ดี(?:ครับ|คับ|ค่ะ|คะ|งับ|จ้า|จ้ะ|ค่า)?", re.IGNORECASE)
+    # Shared with persona_practical.py/persona_academic.py — see utils/text_patterns.py.
+    # _TH_WATDEE_RE reconciled to practical's typo-tolerant version (was exact-match-only).
+    _EN_GREETING_RE = _SHARED_EN_GREETING_RE
+    _EN_GOOD_TIME_RE = _SHARED_EN_GOOD_TIME_RE
+    _TH_SAWASDEE_FUZZY_RE = _SHARED_TH_SAWASDEE_FUZZY_RE
+    _TH_WATDEE_RE = _SHARED_TH_WATDEE_RE
+    _TH_DEE_RE = _SHARED_TH_DEE_RE
 
     def _looks_like_greeting_or_thanks(self, s: str, state=None) -> bool:
         raw = (s or "").strip()
@@ -1194,12 +1381,21 @@ class PersonaSupervisor:
         if self._THANKS_RE.search(t):
             return True
 
+        # Legal/business signal must be checked BEFORE the short-input (len<=2) and
+        # all-English-letters "noise" checks below — otherwise short business terms/
+        # acronyms (e.g. "QR", "POS", "หุ้น" — all 2-3 chars) get misrouted to a greeting
+        # reply before ever getting a chance to be recognized as a real topic. Verified
+        # live: bare "POS"/"QR" (real license/payment-system names in this corpus) were
+        # both incorrectly greeted, because len<=2 and _NOISE_ONLY_RE (which matches ANY
+        # pure-English-letter string, not just gibberish) both ran first and never gave
+        # _LEGAL_SIGNAL_RE a chance to fire.
+        if self._LEGAL_SIGNAL_RE.search(t):
+            return False
+
         if len(t) <= 2:
             return True
 
         if self._QUESTION_MARKERS_RE.search(t):
-            return False
-        if self._LEGAL_SIGNAL_RE.search(t):
             return False
 
         if self._EN_GREETING_RE.match(t) or self._EN_GOOD_TIME_RE.match(t):
@@ -1253,6 +1449,14 @@ class PersonaSupervisor:
         if self._TH_LAUGH_5_RE.match(t):
             return True
         if self._LIKELY_SELECTION_RE.match(t):
+            return False
+        # Same fix as _looks_like_greeting_or_thanks above, and for the same reason:
+        # short business/license acronyms (e.g. "QR", exactly 2 chars) must not be
+        # short-circuited to "noise" before this function gets a chance to recognize
+        # them as a real topic. Without this, "QR" alone still fell through to a
+        # greeting reply via THIS separate len<=2 check even after _looks_like_greeting
+        # _or_thanks was fixed, since both functions had the same independent rule.
+        if self._LEGAL_SIGNAL_RE.search(t):
             return False
         if len(t) <= 2:
             return True
@@ -1313,6 +1517,7 @@ class PersonaSupervisor:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=300,
             request_timeout=timeout,
@@ -1346,6 +1551,7 @@ class PersonaSupervisor:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=200,  # was 150 — hit LengthFinishReasonError on longer inputs
             request_timeout=timeout,
@@ -1379,6 +1585,7 @@ class PersonaSupervisor:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=300,  # was 150 — hit LengthFinishReasonError on longer inputs
             request_timeout=timeout,
@@ -1412,6 +1619,7 @@ class PersonaSupervisor:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
@@ -1445,6 +1653,7 @@ class PersonaSupervisor:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=300,
             request_timeout=timeout,
@@ -1478,6 +1687,7 @@ class PersonaSupervisor:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=400,
             request_timeout=timeout,
@@ -1510,6 +1720,7 @@ class PersonaSupervisor:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
@@ -1542,6 +1753,7 @@ class PersonaSupervisor:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=300,
             request_timeout=timeout,
@@ -1574,6 +1786,7 @@ class PersonaSupervisor:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=300,
             request_timeout=timeout,
@@ -1606,6 +1819,7 @@ class PersonaSupervisor:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=300,  # was 150 — hit LengthFinishReasonError on longer inputs
             request_timeout=timeout,
@@ -1638,6 +1852,7 @@ class PersonaSupervisor:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=300,
             request_timeout=timeout,
@@ -1670,6 +1885,7 @@ class PersonaSupervisor:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
@@ -1702,6 +1918,7 @@ class PersonaSupervisor:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
@@ -1734,6 +1951,7 @@ class PersonaSupervisor:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
@@ -1766,6 +1984,7 @@ class PersonaSupervisor:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=300,
             request_timeout=timeout,
@@ -1798,6 +2017,7 @@ class PersonaSupervisor:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=300,
             request_timeout=timeout,
@@ -1830,6 +2050,7 @@ class PersonaSupervisor:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=300,
             request_timeout=timeout,
@@ -1862,6 +2083,7 @@ class PersonaSupervisor:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
@@ -1894,6 +2116,7 @@ class PersonaSupervisor:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=300,
             request_timeout=timeout,
@@ -1933,6 +2156,7 @@ class PersonaSupervisor:
             model=topic_model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=300,
             request_timeout=timeout,
@@ -1962,6 +2186,7 @@ class PersonaSupervisor:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
@@ -1994,6 +2219,7 @@ class PersonaSupervisor:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
@@ -2185,6 +2411,7 @@ class PersonaSupervisor:
             model=getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL),
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.7,
             max_tokens=200,
             request_timeout=int(getattr(conf, "LLM_TOPIC_PICKER_TIMEOUT", 8)),
@@ -2238,6 +2465,7 @@ class PersonaSupervisor:
             model=getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL),
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=50,
             request_timeout=int(getattr(conf, "LLM_TOPIC_PICKER_TIMEOUT", 8)),
@@ -2275,7 +2503,8 @@ class PersonaSupervisor:
         return random.Random(mixed)
 
     # Retrieval gate (Practical legal MUST retrieve)
-    _TOKEN_SPLIT_RE = re.compile(r"[\s/,\-–—|]+", re.UNICODE)
+    # Shared with persona_practical.py — see utils/text_patterns.py.
+    _TOKEN_SPLIT_RE = _SHARED_TOKEN_SPLIT_RE
 
     def _tokenize_loose(self, s: str) -> List[str]:
         t = self._normalize_for_intent(s)
@@ -2374,41 +2603,12 @@ class PersonaSupervisor:
 
     # Regex: at least one generic follow-up keyword present in the message.
     # Combined with length guard and no-specific-topic check below.
-    _GENERIC_FOLLOWUP_KEYWORDS_RE = re.compile(
-        r"(ขั้นตอน|การสมัคร|สมัคร|วิธีสมัคร|เอกสาร|ค่าธรรมเนียม|ค่าใช้จ่าย|"
-        r"ระยะเวลา|ช่องทางยื่น|ช่องทาง|สถานที่ยื่น|แบบฟอร์ม"
-        r"|ลิงก์|ลิงค์|ลิ้งก์|ลิ้งค์|ดาวน์โหลด|"
-        r"อยากรู้|อยากทราบ|ต้องใช้|ต้องทำ|ต้องเตรียม|"
-        # How-to follow-ups: user asks HOW to do the same process already in context
-        # e.g. "วิธีส่งทำไงคะ", "ทำยังไงครับ", "วิธีทำเป็นยังไง"
-        r"วิธีส่ง|วิธียื่น|วิธีทำ|วิธีชำระ|วิธีดำเนินการ|"
-        r"ทำไง|ทำยังไง|ทำอย่างไร|ยื่นไง|ส่งไง|ส่งยังไง|"
-        # Entity-switch follow-ups: user modifies entity_type/condition of the SAME topic
-        # e.g. "แล้วถ้าแบบบุคคลธรรมดาล่ะ", "ถ้าเป็นนิติบุคคลล่ะ"
-        r"แล้วถ้าแบบ|ถ้าแบบ|ถ้าเป็นแบบ|แล้วถ้าเป็น|แล้วแบบ|ส่วนแบบ|"
-        # Op-type follow-ups: user asks about different operation on SAME topic
-        # e.g. "แล้วถ้าจะยกเลิก", "แล้วถ้าจะต่ออายุ", "แล้วถ้าจะแก้ไข"
-        r"แล้วถ้าจะ)",
-        re.IGNORECASE,
-    )
+    # Shared with persona_practical.py/persona_academic.py — see utils/text_patterns.py
+    # (also exposed there as `is_bare_generic_followup()` for direct reuse).
+    _GENERIC_FOLLOWUP_KEYWORDS_RE = _SHARED_GENERIC_FOLLOWUP_KEYWORDS_RE
     # Regex: specific topic/license keywords that indicate the user is asking about a NEW topic.
     # If present, this is NOT a generic follow-up.
-    _SPECIFIC_TOPIC_RE = re.compile(
-        r"(ใบอนุญาต|จดทะเบียน|ภาษีมูลค่าเพิ่ม|ภาษีป้าย|vat|ภพ\.?20|สุรา|เหล้า|ประกันสังคม|ป้ายร้าน|"
-        r"ประกอบกิจการ|สถานที่จำหน่าย|ทะเบียนพาณิชย์|บริษัทจำกัด|ห้างหุ้นส่วน|qr.?pay|qr.?api|payment api|"
-        r"บัญชีธนาคาร|หาพนักงาน|edc|รูดบัตร|คิวอาร์เพย์|คิวอาเพ|คิวอาเอพีไอ|ระบบชำระเงิน|"
-        # Bank / department names: explicit bank mention means user is asking about that specific bank,
-        # NOT a generic follow-up to the previous topic (even if using link/step keywords).
-        r"กสิกร|kbank|ไทยพาณิช(?:ย์)?|ไทยพานิช|scb|กรุงไทย|ktb|กรุงเทพ|bbl|ออมสิน|gsb|ทหารไทย|ttb|ธ\.ก\.ส|kkp|"
-        # Accounting / bookkeeping — distinct enough to always be a new topic
-        r"สำนักงานบัญชี|ปิดงบ|งบบัญชี|งบการเงิน|ปิดบัญชี|ปิงบ|ตรวจสอบบัญชี|"
-        r"ทำบัญชี|นักบัญชี|ผู้สอบบัญชี|ผู้ทำบัญชี|จัดทำบัญชี|"
-        # HR / staffing topics — "สมัคร" in "รับสมัครงาน" must NOT anchor to prior topic
-        r"พนักงาน|รับสมัครงาน|ตำแหน่งงาน|ตำแหน่งรับสมัคร|จัดหาพนักงาน|ไทยมีงานทำ|ประกาศงาน|ลูกจ้าง|"
-        # Marketing/popularity goals — these are NEW topics, not regulatory follow-ups
-        r"มีกระแส|ยอดนิยม|โด่งดัง|ไวรัล|viral\b|ฮิต\b|ให้ดัง|ร้านดัง|ทำให้ดัง|คาเฟ่ดัง|กาแฟดัง)",
-        re.IGNORECASE,
-    )
+    _SPECIFIC_TOPIC_RE = _SHARED_SPECIFIC_TOPIC_RE
     # Marketing/popularity queries: these are NEVER an elaboration of a regulatory/legal topic.
     # "ดัง" uses negative-lookahead to exclude "ดังนั้น", "ดังกล่าว", "ดังต่อไปนี้" etc.
     _MARKETING_NOT_ELAB_RE = re.compile(
@@ -2547,11 +2747,21 @@ class PersonaSupervisor:
                     break
 
         # ── Detect entity_type ────────────────────────────────────────────────
+        # new_entity_source tracks how new_entity was derived — "explicit" (direct
+        # regex match or typo-tolerant fuzzy match against the exact formal term)
+        # vs "inferred" (LLM fallback on ambiguous/colloquial phrasing, resolved
+        # below). Used to tag state.context["entity_type_source"] when the switch
+        # is actually applied further down, so the answer prompt can add a brief
+        # implicit-confirmation line for LLM-inferred values only — see
+        # entity_false_positive_regex_tightening.md Part 2.
         new_entity: Optional[str] = None
+        new_entity_source: Optional[str] = None
         if self._ENTITY_NATURAL_RE.search(q_orig):
             new_entity = "บุคคลธรรมดา"
+            new_entity_source = "explicit"
         elif self._ENTITY_NITI_RE.search(q_orig):
             new_entity = "นิติบุคคล"
+            new_entity_source = "explicit"
         else:
             # Fuzzy fallback: regex missed due to typo (e.g. "บุคคละรรมดา" — ธ→ะ).
             # Slide a window over the Thai chars in the query and compare edit-distance
@@ -2573,35 +2783,15 @@ class PersonaSupervisor:
                         _best = _r
                 if _best >= 0.80:
                     new_entity = _fe
+                    new_entity_source = "explicit"  # typo-tolerant match of the exact formal term
                     _LOG.info(
                         "[Supervisor] entity fuzzy match: %r → %r (ratio=%.2f)",
                         _q_thai, new_entity, _best,
                     )
                     break
 
-        # ── LLM fallback (regex + fuzzy both missed) ──────────────────────────
-        # Only fires when the query contains at least one entity-hint word (บจก, นิติ,
-        # เจ้าของ, คนเดียว, etc.) that the main regex couldn't parse. This guard prevents
-        # false positives from pronouns (ฉัน/ผม/หนู) or entity-neutral questions where the
-        # LLM would over-infer บุคคลธรรมดา from a first-person pronoun.
-        if new_entity is None and self._ENTITY_HINT_RE.search(q_orig):
-            new_entity = self._entity_type_llm_fallback(q_orig, state)
-
-        # ── Detect department (bank) ──────────────────────────────────────────
-        new_dept: Optional[str] = None
-        for _bp, _bn in self._BANK_DEPT_PATTERNS:
-            if _bp.search(q_orig):
-                new_dept = _bn
-                break
-
-        # ── Detect registration sub-type (dynamic — values from Chroma) ───────
-        # Only relevant when effective entity is/will be นิติบุคคล
-        new_reg: Optional[str] = None
-        eff_entity_for_reg = new_entity if new_entity else old_entity
-        if eff_entity_for_reg == "นิติบุคคล":
-            new_reg = self._detect_reg_subtype_from_query(q_orig, state)
-
-        # ── Detect location switch (กรุงเทพฯ ↔ ต่างจังหวัด) ────────────────────
+        # ── Detect location switch (กรุงเทพฯ ↔ ต่างจังหวัด) — regex only here; ──
+        # LLM fallback (if needed) runs concurrently with entity/area below.
         # Only in ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร but handled generically.
         old_location = (cs.get("location") or "").strip()
         new_location: Optional[str] = None
@@ -2609,12 +2799,9 @@ class PersonaSupervisor:
             new_location = "กรุงเทพฯ"
         elif self._LOCATION_PROVINCE_RE.search(q_orig):
             new_location = "ต่างจังหวัด"
-        # LLM fallback: catches province names, landmark mentions, etc. that regex misses
-        if new_location is None and len(q_orig.strip()) >= 2:
-            new_location = self._location_llm_fallback(q_orig, state)
-        location_changed = bool(new_location and old_location and new_location != old_location)
 
-        # ── Detect shop_area_type switch (<200 ↔ >200 ตรม) ───────────────────
+        # ── Detect shop_area_type switch (<200 ↔ >200 ตรม) — regex/numeric only ──
+        # here; LLM fallback (if needed) runs concurrently with entity/location below.
         # Chroma area_size field is not a useful filter (all ใบอนุญาตจัดตั้ง docs share same value).
         # We only update the slot so practical's _area_hint prompt changes accordingly.
         old_area = (cs.get("shop_area_type") or "").strip()
@@ -2631,10 +2818,96 @@ class PersonaSupervisor:
                     new_area = "น้อยกว่า 200 ตารางเมตร" if _sqm_val < 200 else "มากกว่า 200 ตารางเมตร"
                 except ValueError:
                     pass
-        # LLM fallback: catches descriptive phrasing like "ร้านเล็กมาก", "พื้นที่กว้างมาก"
-        if new_area is None and old_area and len(q_orig.strip()) >= 2:
-            new_area = self._area_size_llm_fallback(q_orig, state)
+
+        # ── LLM fallbacks (entity/location/area) — run concurrently ───────────
+        # These three are mutually independent: each reads only (q_orig, state) and
+        # writes to its own dedicated state.context cache key (_et_llm_cache /
+        # _loc_llm_cache / _area_llm_cache — verified no overlap). Same
+        # _CLASSIFIER_POOL already used for the tier-1 greeting/thanks/etc. prewarm
+        # (see _handle_inner ~line 12297). The gate conditions below are UNCHANGED
+        # from before — they only decide whether a call happens at all, so this
+        # introduces zero extra Haiku calls vs. the prior sequential code, just
+        # lower wall-clock time when more than one gate is open at once.
+        #
+        # Entity guard: only fires when the query contains at least one entity-hint
+        # word (บจก, นิติ, เจ้าของ, คนเดียว, etc.) that the main regex couldn't parse.
+        # This prevents false positives from pronouns (ฉัน/ผม/หนู) or entity-neutral
+        # questions where the LLM would over-infer บุคคลธรรมดา from a first-person pronoun.
+        _need_entity_llm = new_entity is None and bool(self._ENTITY_HINT_RE.search(q_orig))
+        # Location guard: catches province names, landmark mentions, etc. that regex misses.
+        _need_location_llm = new_location is None and len(q_orig.strip()) >= 2
+        # Area guard: catches descriptive phrasing like "ร้านเล็กมาก", "พื้นที่กว้างมาก".
+        _need_area_llm = new_area is None and bool(old_area) and len(q_orig.strip()) >= 2
+
+        _et_fut = _loc_fut = _area_fut = None
+        try:
+            if _need_entity_llm:
+                _et_fut = _CLASSIFIER_POOL.submit(self._entity_type_llm_fallback, q_orig, state)
+            if _need_location_llm:
+                _loc_fut = _CLASSIFIER_POOL.submit(self._location_llm_fallback, q_orig, state)
+            if _need_area_llm:
+                _area_fut = _CLASSIFIER_POOL.submit(self._area_size_llm_fallback, q_orig, state)
+            _slot_pw_futs = [f for f in (_et_fut, _loc_fut, _area_fut) if f is not None]
+            if _slot_pw_futs:
+                # Timeout set slightly above LLM_TOPIC_PICKER_TIMEOUT (8s default) so this
+                # wait is a pure safety net — each future's own request_timeout is what
+                # actually bounds it; we don't want wait() to cut off a call that would
+                # otherwise have succeeded.
+                concurrent.futures.wait(_slot_pw_futs, timeout=10.0)
+        except Exception as _slot_pw_e:
+            _LOG.warning("[Supervisor] slot-change LLM fallback pool error: %s", _slot_pw_e)
+
+        def _resolve_slot_future(fut):
+            if fut is None:
+                return None
+            try:
+                return fut.result(timeout=0)
+            except Exception:
+                return None
+
+        if _et_fut is not None:
+            new_entity = _resolve_slot_future(_et_fut)
+            if new_entity:
+                new_entity_source = "inferred"
+        if _loc_fut is not None:
+            new_location = _resolve_slot_future(_loc_fut)
+        if _area_fut is not None:
+            new_area = _resolve_slot_future(_area_fut)
+
+        location_changed = bool(new_location and old_location and new_location != old_location)
         area_changed = bool(new_area and old_area and new_area != old_area)
+
+        # ── Detect department (bank) ──────────────────────────────────────────
+        # Multi-entity guard: if the query names MORE THAN ONE bank at once (e.g.
+        # "ทั้งกสิกรไทยและไทยพาณิชย์"), this is a genuine both/and question, not a
+        # switch away from the established one — collecting only the first pattern
+        # match (list order, not query order) would silently overwrite the
+        # established department and break the established-topic guarantee in
+        # persona_practical.py for it. Only treat this as a switch when exactly
+        # one bank is named.
+        new_dept: Optional[str] = None
+        _matched_depts_orig = [_bn for _bp, _bn in self._BANK_DEPT_PATTERNS if _bp.search(q_orig)]
+        if len(_matched_depts_orig) == 1:
+            new_dept = _matched_depts_orig[0]
+        # Surface the full multi-match list (when ≥2) to persona_practical.py so its
+        # established-topic guarantee can fetch docs for EVERY explicitly-named
+        # department this turn, not just the one that stays "established" in
+        # collected_slots — otherwise a genuine "compare bank A and bank B" question
+        # only gets a reliable answer for the established one and the other is left
+        # to unfiltered/noisy retrieval alone (see prompts_practical.py Exception B).
+        if state.context is not None:
+            if len(_matched_depts_orig) >= 2:
+                state.context["_multi_dept_mentioned"] = _matched_depts_orig
+            else:
+                state.context.pop("_multi_dept_mentioned", None)
+
+        # ── Detect registration sub-type (dynamic — values from Chroma) ───────
+        # Only relevant when effective entity is/will be นิติบุคคล.
+        # Must run AFTER the parallel block above — depends on the resolved new_entity.
+        new_reg: Optional[str] = None
+        eff_entity_for_reg = new_entity if new_entity else old_entity
+        if eff_entity_for_reg == "นิติบุคคล":
+            new_reg = self._detect_reg_subtype_from_query(q_orig, state)
 
         # ── Determine which slots actually changed ────────────────────────────
         entity_changed = bool(new_entity and old_entity and new_entity != old_entity)
@@ -2660,6 +2933,14 @@ class PersonaSupervisor:
             if entity_changed:
                 state.save_collected_slot("entity_type", new_entity)
                 state.save_collected_slot("entity_type_normalized", new_entity)
+                if isinstance(state.context, dict):
+                    _src = new_entity_source or "explicit"
+                    state.context["entity_type_source"] = _src
+                    if _src == "inferred":
+                        # See _prefill_slots_from_message's identical flag for the
+                        # implicit-confirmation contract consumed by
+                        # persona_practical.py/persona_academic.py's answer prompts.
+                        state.context["_entity_type_just_inferred"] = True
                 # Clear stale registration_type whenever entity changes.
                 # บุคคลธรรมดา: no sub-types. นิติบุคคล: must re-collect for the new license.
                 # Without this clear, a stale value from a prior topic/entity causes the
@@ -2913,6 +3194,36 @@ class PersonaSupervisor:
         if not q:
             return
 
+        # First-mention department capture: if the user already names a bank/department
+        # in free text (e.g. "อยากสมัคร QR Payment กับธนาคารกสิกรไทยครับ") and none is
+        # cached yet, save it now — BEFORE any of the chapter-retrieval shortcuts below
+        # (op_topic / operation_by_department exact match) run. Those shortcuts fetch by
+        # a topic key that is often shared across multiple departments/banks, with no
+        # department filter of their own, so without this the mentioned bank is only
+        # used for this turn's ranking and is never remembered for later follow-ups.
+        try:
+            _cs_dept_first = state.get_collected_slots() if hasattr(state, "get_collected_slots") else {}
+            if not str(_cs_dept_first.get("department") or "").strip():
+                _dept_candidates_first = self._get_all_departments_from_store()
+                _q_lower_dept_first = q.lower()
+                # Multi-entity guard (same reasoning as the dept-switch block below): if the
+                # opening message names more than one department at once (e.g. a comparison
+                # question), don't arbitrarily lock onto just one of them as "established" —
+                # only capture when exactly one department is named.
+                _dept_hits_first = [
+                    d for d in _dept_candidates_first
+                    if d and (d.lower() in _q_lower_dept_first
+                              or (d.startswith("ธนาคาร") and d[len("ธนาคาร"):].lower() in _q_lower_dept_first))
+                ]
+                _dept_hit_first = _dept_hits_first[0] if len(_dept_hits_first) == 1 else None
+                if _dept_hit_first:
+                    _LOG.info("[Supervisor] dept first-mention captured: %r (from query text)", _dept_hit_first)
+                    if hasattr(state, "save_collected_slot"):
+                        state.save_collected_slot("department", _dept_hit_first)
+                    state.context.setdefault("slots", {})["department"] = _dept_hit_first
+        except Exception as _e_dept_first:
+            _LOG.warning("[Supervisor] dept first-mention capture failed: %s", _e_dept_first)
+
         # Clear ephemeral flags: valid only for the single turn they were set.
         # Any new legal question must start fresh — flags will be re-set below if still relevant.
         state.context.pop("_obd_entity_override", None)
@@ -3134,6 +3445,44 @@ class PersonaSupervisor:
                                             " — asking entity_type first",
                                             _target_ot_e, _et_sorted_ot,
                                         )
+                            # Department filter: same reasoning as the OBD department-scope guard
+                            # below — if the session already knows which bank/department the user
+                            # means, scope these op_topic docs to it instead of mixing in another
+                            # bank's contact details/policies (e.g. QR Payment's
+                            # "แก้ไขเปลี่ยนแปลงข้อมูลส่วนตัว" op_topic exists once per bank with
+                            # otherwise near-identical content).
+                            _ot_session_dept = str(
+                                (state.context.get("collected_slots") or {}).get("department") or ""
+                            ).strip()
+                            if _ot_session_dept:
+                                _ot_doc_depts = {
+                                    str(d.get("metadata", {}).get("department") or "").strip()
+                                    for d in _ot_docs_e
+                                } - {""}
+                                if len(_ot_doc_depts) > 1 and _ot_session_dept in _ot_doc_depts:
+                                    try:
+                                        _ot_dept_res = _coll_e.get(
+                                            where={"$and": [
+                                                {"operation_topic": _target_ot_e},
+                                                {"department": _ot_session_dept},
+                                            ]},
+                                            include=["documents", "metadatas"],
+                                        )
+                                        _ot_dept_docs = [
+                                            {"content": (c or "")[:_ot_max_e], "metadata": m or {}}
+                                            for c, m in zip(
+                                                _ot_dept_res.get("documents") or [],
+                                                _ot_dept_res.get("metadatas") or [],
+                                            )
+                                        ]
+                                        if _ot_dept_docs:
+                                            _ot_docs_e = _ot_dept_docs
+                                            _LOG.info(
+                                                "[Supervisor] _ensure: op_topic department-scope %r → %d docs",
+                                                _ot_session_dept, len(_ot_dept_docs),
+                                            )
+                                    except Exception as _e_ot_dept:
+                                        _LOG.warning("[Supervisor] _ensure: op_topic department-scope failed: %s", _e_ot_dept)
                             state.current_docs = _ot_docs_e
                             state.last_retrieval_query = q
                             state.context["last_topic"] = _target_ot_e
@@ -3256,6 +3605,44 @@ class PersonaSupervisor:
                                         "[Supervisor] _ensure: OBD entity-mismatch, no same-entity doc"
                                         " → keeping original OBD docs, single-turn entity override=%r",
                                         _obd_new_et,
+                                    )
+                        # Department filter: if session already knows which bank/department the
+                        # user is asking about (captured earlier — see first-mention capture at
+                        # the top of this function, or an explicit slot answer), scope OBD docs
+                        # to it. Unlike entity_type, a department name is virtually always a full
+                        # partition across otherwise-identical rows (e.g. QR Payment rows exist
+                        # for both ธนาคารกสิกรไทย and ธนาคารไทยพาณิชย์ with no other
+                        # differentiation) — without this, an OBD match spanning multiple banks
+                        # would mix both banks' contact details/policies into one answer, or the
+                        # LLM would silently pick whichever bank's docs happen to rank first.
+                        _obd_session_dept = str(
+                            (state.context.get("collected_slots") or {}).get("department") or ""
+                        ).strip()
+                        if _obd_docs_e and _obd_session_dept:
+                            _obd_doc_depts = {
+                                str(d.get("metadata", {}).get("department") or "").strip()
+                                for d in _obd_docs_e
+                            } - {""}
+                            if len(_obd_doc_depts) > 1 and _obd_session_dept in _obd_doc_depts:
+                                _obd_dept_res = _coll_obd_e.get(
+                                    where={"$and": [
+                                        {"operation_by_department": _target_obd_e},
+                                        {"department": _obd_session_dept},
+                                    ]},
+                                    include=["documents", "metadatas"],
+                                )
+                                _obd_dept_docs = [
+                                    {"content": (c or "")[:_obd_max_e], "metadata": m or {}}
+                                    for c, m in zip(
+                                        _obd_dept_res.get("documents") or [],
+                                        _obd_dept_res.get("metadatas") or [],
+                                    )
+                                ]
+                                if _obd_dept_docs:
+                                    _obd_docs_e = _obd_dept_docs
+                                    _LOG.info(
+                                        "[Supervisor] _ensure: OBD department-scope %r → %d docs",
+                                        _obd_session_dept, len(_obd_dept_docs),
                                     )
                         if _obd_docs_e:
                             # Exact OBD match → clear stale slot queue from prior turns so
@@ -3506,11 +3893,31 @@ class PersonaSupervisor:
         # (e.g. "อยากเปิดบาร์") need two-pass broad retrieval, not license-specific multi-topic
         # retrieval — bypass the multi-license early return so they fall through to broad_q path.
         # Result is cached in state.context so second call at line ~3507 costs nothing.
-        _is_broad_q_pre = self._is_broad_question(q, state)
-
+        #
         # Multi-topic predictive retrieval: if query mentions ≥2 license types, retrieve ALL
         # their docs from Chroma by license_type filter and merge — lets LLM answer all in one response.
-        _detected_licenses = self._detect_license_types_from_query(q, state)
+        #
+        # These two classifiers are mutually independent (verified via RAW/WAW/WAR analysis:
+        # each reads only (q, state), each writes to its own dedicated state.context cache key
+        # — _broad_q_llm_cache / _lt_llm_cache — no short-circuit between them) so they run
+        # concurrently via the same _CLASSIFIER_POOL used for tier-1 prewarm and slot-change
+        # fallbacks (see _handle_inner ~line 12297, _apply_slot_change_if_detected ~line 2841).
+        _broad_q_fut = _CLASSIFIER_POOL.submit(self._is_broad_question, q, state)
+        _license_fut = _CLASSIFIER_POOL.submit(self._detect_license_types_from_query, q, state)
+        try:
+            concurrent.futures.wait([_broad_q_fut, _license_fut], timeout=10.0)
+        except Exception as _bq_lt_pw_e:
+            _LOG.warning("[Supervisor] broad_q/license_type pool error: %s", _bq_lt_pw_e)
+
+        try:
+            _is_broad_q_pre = _broad_q_fut.result(timeout=0)
+        except Exception:
+            _is_broad_q_pre = False
+        try:
+            _detected_licenses = _license_fut.result(timeout=0)
+        except Exception:
+            _detected_licenses = []
+
         if len(_detected_licenses) >= 2 and not _is_broad_q_pre:
             try:
                 _vstore_mt = getattr(self.retriever, "vectorstore", None)
@@ -3524,8 +3931,8 @@ class PersonaSupervisor:
                         "operation_steps", "identification_documents", "research_reference",
                     })
                     _SUPERVISOR_FC_MT = {
-                        "operation_steps": 600, "identification_documents": 4000,
-                        "research_reference": 3200, "fees": 120, "service_channel": 200,
+                        "operation_steps": 1500, "identification_documents": 4000,
+                        "research_reference": 3200, "fees": 900, "service_channel": 600,
                     }
                     # Read collected_slots to filter docs by entity_type/registration_type.
                     # multi-topic path previously ignored slots → leaked docs for wrong sub-types
@@ -3657,7 +4064,10 @@ class PersonaSupervisor:
                                 from utils.reranker import rerank as _do_rerank
                                 _rr_model = getattr(conf, "RERANKER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
                                 _rr_top_k = int(getattr(conf, "RERANKER_TOP_K", len(_raw_docs)))
-                                _raw_docs = _do_rerank(q, _raw_docs, model_name=_rr_model, top_k=_rr_top_k)
+                                _rr_backend = getattr(conf, "RERANKER_BACKEND", "pytorch")
+                                _rr_onnx_file = getattr(conf, "RERANKER_ONNX_FILE", "model_quint8_avx2.onnx")
+                                _rr_min_score = getattr(conf, "RERANKER_MIN_SCORE", None)
+                                _raw_docs = _do_rerank(q, _raw_docs, model_name=_rr_model, top_k=_rr_top_k, backend=_rr_backend, onnx_file=_rr_onnx_file, min_score=_rr_min_score)
                             except Exception as _rr_e:
                                 _LOG.warning("[Supervisor] rare-license reranker failed (%s) — continuing without rerank", _rr_e)
 
@@ -3670,8 +4080,8 @@ class PersonaSupervisor:
                                 "identification_documents", "operation_steps", "research_reference",
                             })
                             _SUPERVISOR_FC2 = {
-                                "operation_steps": 600, "identification_documents": 4000,
-                                "research_reference": 3200, "fees": 120, "service_channel": 200,
+                                "operation_steps": 1500, "identification_documents": 4000,
+                                "research_reference": 3200, "fees": 900, "service_channel": 600,
                             }
                             _filtered = []
                             for _rd in _raw_docs:
@@ -3911,17 +4321,23 @@ class PersonaSupervisor:
         _sv_rrf_k = int(getattr(conf, "HYBRID_RRF_K", 60))
         _sv_vstore = getattr(self.retriever, "vectorstore", None)
 
-        def _sv_search(q: str, k: int) -> list:
+        def _sv_search(q: str, k: int, metadata_filter: Optional[dict] = None) -> list:
             """Hybrid or Dense retrieval for Supervisor broad-retrieval paths."""
             if _sv_hybrid and _sv_vstore is not None:
                 from utils.hybrid_retriever import hybrid_scored_search
-                return [d for d, _ in hybrid_scored_search(_sv_vstore, q, k=k, rrf_k=_sv_rrf_k)]
+                return [d for d, _ in hybrid_scored_search(
+                    _sv_vstore, q, k=k, rrf_k=_sv_rrf_k, metadata_filter=metadata_filter,
+                )]
+            if metadata_filter and _sv_vstore is not None:
+                try:
+                    return list(_sv_vstore.similarity_search(q, k=k, filter=metadata_filter) or [])
+                except Exception as _e_svf:
+                    _LOG.debug("[Supervisor] _sv_search filtered similarity_search failed (%s) — unfiltered", _e_svf)
             return list(self.retriever.invoke(q) or [])
 
         if _is_broad_q:
             # Pass 1: semantic retrieval on user's actual query — captures practical/marketing intent
             _p1_top_k = int(getattr(conf, "RETRIEVAL_TOP_K", 15) or 15)
-            _p1_docs = _sv_search(q_expanded, _p1_top_k)
 
             # Pure marketing/popularity queries (e.g. "ทำให้ร้านดัง", "มีกระแส") without any
             # regulatory/legal intent should skip Pass 2 + sweep — injecting regulatory docs
@@ -3930,36 +4346,71 @@ class PersonaSupervisor:
                 bool(self._MARKETING_NOT_ELAB_RE.search(q))
                 and not bool(self._LEGAL_SIGNAL_RE.search(q))
             )
-            if _is_marketing_only_broad:
-                _LOG.info(
-                    "[Supervisor] broad: marketing-only query %r — skipping regulatory Pass 2 + sweep",
-                    q[:50],
-                )
-                _p2_docs: list = []
-                _p3_docs: list = []
-                _sweep_docs: list = []
-            else:
 
-            # Pass 2: targeted retrieval on regulatory query — guarantees legal/license docs present.
-            # When specific license types were detected (e.g. "บาร์ → ใบอนุญาตสุรา"), prepend them
-            # to the regulatory query so Pass 2 also retrieves those specific license docs.
+            # Pass 2 query (regulatory): only needed when not marketing-only. When specific
+            # license types were detected (e.g. "บาร์ → ใบอนุญาตสุรา"), prepend them to the
+            # regulatory query so Pass 2 also retrieves those specific license docs.
+            _regulatory_q = ""
+            if not _is_marketing_only_broad:
                 _regulatory_q = str(
                     getattr(conf, "DEFAULT_RETRIEVAL_FALLBACK_QUERY", "")
                     or "กฎหมายร้านอาหาร ใบอนุญาต ภาษี VAT จดทะเบียน สุขาภิบาล ประกันสังคม"
                 )
                 if _detected_licenses:
                     _regulatory_q = " ".join(_detected_licenses) + " " + _regulatory_q
-                _p2_docs = _sv_search(_regulatory_q, 8)
 
             # Pass 3 (conditional): if query mentions alcohol/liquor, do a targeted retrieval for
             # ใบอนุญาตจำหน่ายสุรา docs separately — keeps Pass 2 composition intact so VAT/SAN/
             # food-handler docs are not displaced by สุรา docs ranking higher.
             # Note: "หล้า" catches typos like "ดหล้า" (mistyped เหล้า).
+            # Unconditional on _is_marketing_only_broad — matches original behavior where an
+            # alcohol-mentioning query still gets Pass 3 even if flagged marketing-only.
             _ALCOHOL_RE = re.compile(r"เหล้า|หล้า|สุรา|แอลกอฮอล์|เบียร์|ไวน์|บาร์|bar|pub|liquor|alcohol", re.IGNORECASE)
             _q_for_alcohol = q + " " + q_expanded
-            _p3_docs: list = []
-            if _ALCOHOL_RE.search(_q_for_alcohol):
-                _p3_docs = _sv_search("ใบอนุญาตจำหน่ายสุรา จำหน่ายสุรา กรมสรรพสามิต", 4)
+            _needs_p3 = bool(_ALCOHOL_RE.search(_q_for_alcohol))
+
+            # Pass 1/2/3 are independent of each other's results (Pass 2 depends only on
+            # _detected_licenses computed earlier, Pass 3 only on the alcohol regex — neither
+            # reads Pass 1's output), so they can run concurrently instead of one-after-another.
+            # This cuts wall-clock retrieval time without changing which documents get
+            # retrieved — same queries, same k, same results, just fetched in parallel.
+            # Chroma has been thread-safe for concurrent reads since v0.4, and this exact
+            # ThreadPoolExecutor-for-concurrent-similarity_search pattern is already used a
+            # few lines below for the coverage sweep.
+            _broad_tasks: List[tuple] = [("p1", q_expanded, _p1_top_k)]
+            if not _is_marketing_only_broad:
+                _broad_tasks.append(("p2", _regulatory_q, 8))
+            if _needs_p3:
+                _broad_tasks.append(("p3", "ใบอนุญาตจำหน่ายสุรา จำหน่ายสุรา กรมสรรพสามิต", 4))
+
+            _broad_results: Dict[str, list] = {"p1": [], "p2": [], "p3": []}
+            if len(_broad_tasks) > 1:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=len(_broad_tasks)) as _broad_pool:
+                    _broad_futures = {
+                        _broad_pool.submit(_sv_search, _tq, _tk): _tname
+                        for _tname, _tq, _tk in _broad_tasks
+                    }
+                    for _fut in concurrent.futures.as_completed(_broad_futures):
+                        _tname = _broad_futures[_fut]
+                        try:
+                            _broad_results[_tname] = _fut.result()
+                        except Exception as _bp_e:
+                            _LOG.warning("[Supervisor] broad Pass %s failed: %s", _tname, _bp_e)
+                            _broad_results[_tname] = []
+            else:
+                _tname0, _tq0, _tk0 = _broad_tasks[0]
+                _broad_results[_tname0] = _sv_search(_tq0, _tk0)
+
+            _p1_docs = _broad_results["p1"]
+            _p2_docs = _broad_results["p2"]
+            _p3_docs = _broad_results["p3"]
+
+            if _is_marketing_only_broad:
+                _LOG.info(
+                    "[Supervisor] broad: marketing-only query %r — skipping regulatory Pass 2 + sweep",
+                    q[:50],
+                )
+            if _needs_p3:
                 _LOG.info("[Supervisor] broad Pass3 สุรา retrieval: %d docs (query matched alcohol keyword)", len(_p3_docs))
 
             # Coverage Sweep: after Pass 1-3, find all regulatory license_types not yet
@@ -4087,8 +4538,42 @@ class PersonaSupervisor:
                 len(_p1_docs), len(_p2_docs), len(_p3_docs), len(_sweep_docs), top_k,
             )
         else:
-            docs = _sv_search(q_expanded, int(getattr(conf, "RETRIEVAL_TOP_K", 15) or 15))
             top_k = int(getattr(conf, "RETRIEVAL_TOP_K", 15) or 15)
+            # Scope this narrow/follow-up retrieval by whatever license_type + department are
+            # already known for this conversation — otherwise a plain follow-up question (no
+            # bank/license name repeated, no exact operation_topic phrase match) searches the
+            # ENTIRE corpus unfiltered and a specific, already-established topic's own docs can
+            # get crowded out by lexically-similar docs from other departments/license_types.
+            # Falls back to the previous unfiltered behavior when nothing is known yet, or when
+            # the filter turns up empty (stale/wrong slot) — so this can only add coverage, never
+            # regress a case that worked before.
+            _fb_cs = state.get_collected_slots() if hasattr(state, "get_collected_slots") else {}
+            _fb_license = ""
+            for _fb_d in (state.current_docs or []):
+                if isinstance(_fb_d, dict):
+                    _fb_lt = ((_fb_d.get("metadata") or {}).get("license_type") or "").strip()
+                    if _fb_lt:
+                        _fb_license = _fb_lt
+                        break
+            if not _fb_license:
+                _fb_license = str((state.context or {}).get("last_topic") or "").strip()
+            _fb_dept = str(
+                (_fb_cs or {}).get("department")
+                or (state.context or {}).get("slots", {}).get("department", "")
+                or ""
+            ).strip()
+            _fb_filter: dict = {}
+            if _fb_license:
+                _fb_filter["license_type"] = _fb_license
+            if _fb_dept:
+                _fb_filter["department"] = _fb_dept
+            docs = _sv_search(q_expanded, top_k, metadata_filter=_fb_filter or None)
+            if not docs and _fb_filter:
+                _LOG.info(
+                    "[Supervisor] fallback scoped retrieval empty (license=%r dept=%r) — relaxing to unfiltered",
+                    _fb_license, _fb_dept,
+                )
+                docs = _sv_search(q_expanded, top_k)
         _doc_chars = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700) or 700)
         # Token: cap long metadata fields before storing — prevent ×N token explosion
         _SUPERVISOR_META_WHITELIST = frozenset({
@@ -4108,8 +4593,8 @@ class PersonaSupervisor:
             "main_topic", "sub_topic", "answer_guideline",
         })
         _SUPERVISOR_FIELD_CAPS = {
-            "operation_steps": 600, "identification_documents": 4000,
-            "research_reference": 3200, "fees": 120, "service_channel": 200,
+            "operation_steps": 1500, "identification_documents": 4000,
+            "research_reference": 3200, "fees": 900, "service_channel": 600,
             "legal_regulatory": 2000, "terms_and_conditions": 800,
             # marketing / business_guide content fields
             "answer_guideline": 1500, "main_topic": 120, "sub_topic": 150,
@@ -4187,34 +4672,57 @@ class PersonaSupervisor:
 
         Covers: entity_type, registration_type, location, operation_group.
         shop_area_type is skipped — numeric area values are handled separately.
+
+        Pass 1 does the cheap regex checks and, only where regex misses, submits the LLM
+        fallback (entity/location/operation_group) to _CLASSIFIER_POOL instead of calling it
+        inline — these three fallbacks are mutually independent (each reads only
+        (user_input, state) and, when 2+ slots in the same queue are simultaneously
+        regex-ambiguous, previously ran one after another for no reason). Pass 2 waits for
+        and resolves any submitted futures. Pass 3 applies results in original queue order —
+        detection logic and results are unchanged, only wall-clock time when multiple slots
+        need an LLM fallback in the same message.
         """
         sq = list((state.context or {}).get("topic_slot_queue") or [])
         if not sq:
             return
 
         _cs = state.get_collected_slots() if hasattr(state, "get_collected_slots") else {}
-        remaining: List[Dict] = []
-        changed = False
+        _fast_results: Dict[int, str] = {}
+        # Tracks how each _fast_results[i] value was derived — "explicit" (direct
+        # unambiguous regex match) vs "inferred" (LLM fallback on ambiguous/colloquial
+        # phrasing). Only meaningful for entity_type today (see confidence-tiered
+        # auto-fill design, Part 2 of entity_false_positive_regex_tightening.md) —
+        # used below to tag state.context["entity_type_source"] so the answer prompt
+        # can add an implicit-confirmation line for LLM-inferred values only.
+        _fast_results_source: Dict[int, str] = {}
+        _pending_futures: Dict[int, "concurrent.futures.Future"] = {}
 
-        for slot in sq:
+        _OG_PAIRS = [
+            (re.compile(r"จดใหม่|เปิดใหม่|จดทะเบียนใหม่|ขอใหม่"), ["ใหม่"]),
+            (re.compile(r"แก้ไข|เปลี่ยนแปลง"),                      ["แก้ไข", "เปลี่ยน"]),
+            (re.compile(r"ยกเลิก|เลิก(?:กิจการ|ทำ)?|ปิดกิจการ"),   ["ยกเลิก", "เลิก"]),
+            (re.compile(r"ต่ออายุ|ต่อ(?:ใบ)?อนุญาต|ต่อทะเบียน"),  ["ต่ออายุ", "ต่อ"]),
+        ]
+
+        for i, slot in enumerate(sq):
             key = slot.get("key", "")
             options: List[str] = list(slot.get("options") or [])
-            matched_value: Optional[str] = None
 
             if key == "entity_type":
                 if not _cs.get("entity_type"):
                     if self._ENTITY_NATURAL_RE.search(user_input):
-                        matched_value = "บุคคลธรรมดา"
+                        _fast_results[i] = "บุคคลธรรมดา"
+                        _fast_results_source[i] = "explicit"
                     elif self._ENTITY_NITI_RE.search(user_input):
-                        matched_value = "นิติบุคคล"
+                        _fast_results[i] = "นิติบุคคล"
+                        _fast_results_source[i] = "explicit"
                     elif self._ENTITY_HINT_RE.search(user_input):
                         # LLM fallback: regex missed but there's an entity-hint word present
-                        _llm_et = self._entity_type_llm_fallback(user_input, state)
-                        if _llm_et:
-                            matched_value = _llm_et
+                        _pending_futures[i] = _CLASSIFIER_POOL.submit(self._entity_type_llm_fallback, user_input, state)
 
             elif key == "registration_type":
                 if not _cs.get("registration_type"):
+                    matched_value: Optional[str] = None
                     # Exact option substring match first
                     for opt in options:
                         if opt and len(opt) >= 4 and opt in user_input:
@@ -4226,35 +4734,28 @@ class PersonaSupervisor:
                             if opt and len(opt) >= 5 and opt[:5] in user_input:
                                 matched_value = opt
                                 break
+                    if matched_value:
+                        _fast_results[i] = matched_value
 
             elif key == "location":
                 if not _cs.get("location"):
                     if self._LOCATION_BKK_RE.search(user_input):
-                        matched_value = next(
+                        _fast_results[i] = next(
                             (o for o in options if "กรุงเทพ" in o or "กทม" in o),
                             "กรุงเทพฯ",
                         )
                     elif self._LOCATION_PROVINCE_RE.search(user_input):
-                        matched_value = next(
+                        _fast_results[i] = next(
                             (o for o in options if "ต่างจังหวัด" in o or "จังหวัด" in o),
                             "ต่างจังหวัด",
                         )
                     else:
                         # LLM fallback: handles province names regex misses ("ร้านอยู่เชียงใหม่")
-                        _llm_loc = self._location_llm_fallback(user_input, state)
-                        if _llm_loc == "กรุงเทพฯ":
-                            matched_value = next((o for o in options if "กรุงเทพ" in o or "กทม" in o), "กรุงเทพฯ")
-                        elif _llm_loc == "ต่างจังหวัด":
-                            matched_value = next((o for o in options if "ต่างจังหวัด" in o or "จังหวัด" in o), "ต่างจังหวัด")
+                        _pending_futures[i] = _CLASSIFIER_POOL.submit(self._location_llm_fallback, user_input, state)
 
             elif key == "operation_group":
                 if not _cs.get("operation_group"):
-                    _OG_PAIRS = [
-                        (re.compile(r"จดใหม่|เปิดใหม่|จดทะเบียนใหม่|ขอใหม่"), ["ใหม่"]),
-                        (re.compile(r"แก้ไข|เปลี่ยนแปลง"),                      ["แก้ไข", "เปลี่ยน"]),
-                        (re.compile(r"ยกเลิก|เลิก(?:กิจการ|ทำ)?|ปิดกิจการ"),   ["ยกเลิก", "เลิก"]),
-                        (re.compile(r"ต่ออายุ|ต่อ(?:ใบ)?อนุญาต|ต่อทะเบียน"),  ["ต่ออายุ", "ต่อ"]),
-                    ]
+                    matched_value = None
                     for pat, kws in _OG_PAIRS:
                         if pat.search(user_input):
                             matched_value = next(
@@ -4262,14 +4763,57 @@ class PersonaSupervisor:
                                 None,
                             )
                             break
-                    if not matched_value and options:
+                    if matched_value:
+                        _fast_results[i] = matched_value
+                    elif options:
                         # LLM fallback: catches "การต่อใบอนุญาต", "ย้ายสถานที่" that _OG_PAIRS miss
-                        matched_value = self._infer_operation_group_from_query(user_input, options, state)
+                        _pending_futures[i] = _CLASSIFIER_POOL.submit(self._infer_operation_group_from_query, user_input, options, state)
 
+        if _pending_futures:
+            # Timeout set slightly above LLM_TOPIC_PICKER_TIMEOUT (8s default) — pure safety
+            # net, each future's own request_timeout is what actually bounds it.
+            try:
+                concurrent.futures.wait(list(_pending_futures.values()), timeout=10.0)
+            except Exception as _pf_e:
+                _LOG.warning("[Supervisor] _prefill slot LLM fallback pool error: %s", _pf_e)
+
+            for i, fut in _pending_futures.items():
+                key = sq[i].get("key", "")
+                options = list(sq[i].get("options") or [])
+                try:
+                    _result = fut.result(timeout=0)
+                except Exception:
+                    _result = None
+                if not _result:
+                    continue
+                if key == "entity_type":
+                    _fast_results[i] = _result
+                    _fast_results_source[i] = "inferred"
+                elif key == "location":
+                    if _result == "กรุงเทพฯ":
+                        _fast_results[i] = next((o for o in options if "กรุงเทพ" in o or "กทม" in o), "กรุงเทพฯ")
+                    elif _result == "ต่างจังหวัด":
+                        _fast_results[i] = next((o for o in options if "ต่างจังหวัด" in o or "จังหวัด" in o), "ต่างจังหวัด")
+                elif key == "operation_group":
+                    _fast_results[i] = _result
+
+        remaining: List[Dict] = []
+        changed = False
+        for i, slot in enumerate(sq):
+            key = slot.get("key", "")
+            matched_value = _fast_results.get(i)
             if matched_value:
                 state.save_collected_slot(key, matched_value)
                 if key == "entity_type":
                     state.save_collected_slot("entity_type_normalized", matched_value)
+                    _src = _fast_results_source.get(i, "explicit")
+                    state.context["entity_type_source"] = _src
+                    if _src == "inferred":
+                        # One-shot flag: read by persona_practical.py/persona_academic.py's
+                        # answer-prompt builders to add a brief implicit-confirmation line
+                        # ("เข้าใจว่าร้านเป็น... นะครับ") to THIS turn's reply only — cleared
+                        # after being consumed so it never repeats on later turns.
+                        state.context["_entity_type_just_inferred"] = True
                 _LOG.info(
                     "[Supervisor] _prefill: slot %r = %r inferred from user message — skipping ask",
                     key, matched_value,
@@ -4313,17 +4857,32 @@ class PersonaSupervisor:
         # from a previous turn into a new procedural query.
         state.context.pop("_informational_query", None)
         state.context.pop("_link_request_query", None)
+        state.context.pop("_definition_query", None)
+        state.context.pop("_non_reg_dominant_query", None)
 
         # Re-classify immediately after reset using fast regex — must run BEFORE any early returns
         # so broad_question / non-reg-dominant paths don't exit without setting the flag.
         # LLM fallback (line ~3979) may override this later for edge cases not covered by regex.
         _info_q_re_match = bool(self._INFO_Q_RE.search(query or "")) and not bool(self._ACTION_Q_RE.search(query or ""))
         _universal_fact = not self._entity_slot_needed(query or "")
-        if _info_q_re_match or _universal_fact:
+        # Bare topic mention (e.g. "ใบอนุญาตสุขาภิบาลอาหาร" typed alone, no verb) — same
+        # deterministic signal used further below for _is_info_q. Must be checked here too:
+        # branches below this point (non-reg-dominant, broad_question) can `return` before
+        # ever reaching that later check, leaving _informational_query unset and letting
+        # Practical's own independent entity_type injection (persona_practical.py, guarded
+        # on this same flag) ask a slot question this bypass already ruled out.
+        _is_bare_topic_mention_early = bool(
+            query and len(query.strip()) <= 25 and "?" not in query and "？" not in query
+            and not bool(self._ACTION_Q_RE.search(query or ""))
+        )
+        if _info_q_re_match or _universal_fact or _is_bare_topic_mention_early:
             state.context["_informational_query"] = True
 
         # Always persist entity_type if explicitly stated in query — must run BEFORE any early returns
         # so broad_question / multi_topic paths don't skip the update.
+        # NOTE: _infer_entity_type_from_query is pure Tier-1 regex (no LLM fallback), so any
+        # value it returns is by construction an unambiguous explicit match — always tag
+        # "explicit" (never "inferred") for consistency with the other 2 write sites.
         _early_et = self._infer_entity_type_from_query(query)
         if _early_et:
             _early_cs = state.get_collected_slots() if hasattr(state, "get_collected_slots") else {}
@@ -4333,6 +4892,7 @@ class PersonaSupervisor:
                     state.save_collected_slot("entity_type", _early_et)
                 if state.context is not None:
                     state.context.setdefault("slots", {})["entity_type"] = _early_et
+                    state.context["entity_type_source"] = "explicit"
                 _LOG.info(
                     "[Supervisor] entity_type pre-persisted from query text: %r (was: %r)",
                     _early_et, _existing_et,
@@ -4414,6 +4974,14 @@ class PersonaSupervisor:
                 "[Supervisor] non-regulatory docs dominant (%d without license_type vs %d with) — skipping slot queue",
                 _docs_without_lt, _docs_with_lt,
             )
+            # Same protection as the definition-query bypass: this leaves topic_slot_queue
+            # empty, which is exactly the condition that lets _maybe_dynamic_clarification
+            # run next. That function has no idea the doc mix here is contaminated with
+            # marketing/business_guide docs (no license_type) — without this flag it would
+            # scan this same unreliable mix for e.g. entity_type divergence and ask about
+            # it, even though this branch just decided the mix isn't clean enough to trust
+            # for slot decisions at all.
+            state.context["_non_reg_dominant_query"] = True
             # Alcohol queries: non-regulatory docs dominate broad retrieval but answer lives
             # in สุรา regulatory docs. Supplement with relevant สุรา docs so LLM sees them.
             #
@@ -4462,11 +5030,17 @@ class PersonaSupervisor:
                 _dv_a = ((_da.get("metadata") or {}).get("department") or "").strip()
                 if _dv_a and _dv_a not in _available_depts_any:
                     _available_depts_any.append(_dv_a)
-            _query_dept_any = next(
-                (d for d in _available_depts_any
-                 if d and (d in query or (d.startswith("ธนาคาร") and d[len("ธนาคาร"):] in query))),
-                None,
-            )
+            # Multi-entity guard: if the query names MORE THAN ONE department at once
+            # (e.g. "ทั้งกสิกรไทยและไทยพาณิชย์"), this is a genuine both/and question, not
+            # a clean switch away from the established one — do NOT overwrite the cached
+            # department in that case (would silently drop the established bank and break
+            # the established-topic guarantee in persona_practical.py for it). Only treat
+            # this as a switch when exactly one department is named.
+            _query_depts_matched_any = [
+                d for d in _available_depts_any
+                if d and (d in query or (d.startswith("ธนาคาร") and d[len("ธนาคาร"):] in query))
+            ]
+            _query_dept_any = _query_depts_matched_any[0] if len(_query_depts_matched_any) == 1 else None
             if _query_dept_any and _query_dept_any != _cached_dept_any:
                 _LOG.info("[Supervisor] dept auto-update %r → %r (from query text)", _cached_dept_any, _query_dept_any)
                 if hasattr(state, "save_collected_slot"):
@@ -4534,8 +5108,20 @@ class PersonaSupervisor:
         _is_action_q_re = bool(self._ACTION_Q_RE.search(query))
         _is_link_req = bool(self._LINK_REQUEST_RE.search(query)) and not _is_action_q_re
         _is_info_q   = bool(self._INFO_Q_RE.search(query))       and not _is_action_q_re
+        # Bare topic mention (just a license/topic name typed alone, e.g. "ใบอนุญาตสุขาภิบาลอาหาร",
+        # no verb, no question word — already ruled out as action by _is_action_q_re above):
+        # treat deterministically as informational instead of falling back to the LLM
+        # classifier below. Verified live that _info_action_q_llm_check's classification for
+        # this exact query text varies run-to-run even at temperature=0 — sending the SAME
+        # bare mention down completely different code paths (direct answer vs. building a
+        # full slot queue asking entity_type/location) unpredictably on every retry.
+        _is_bare_topic_mention = bool(
+            query and len(query.strip()) <= 25 and "?" not in query and "？" not in query
+        )
         # LLM fallback: when regex caught neither info nor action
-        if not _is_info_q and not _is_action_q_re:
+        if not _is_info_q and not _is_action_q_re and _is_bare_topic_mention:
+            _is_info_q = True
+        elif not _is_info_q and not _is_action_q_re:
             _llm_info, _llm_action = self._info_action_q_llm_check(query, state)
             _is_info_q = _llm_info and not _llm_action
         if _is_info_q:
@@ -4689,6 +5275,14 @@ class PersonaSupervisor:
             # Practical's _is_bare_topic_info / _is_general_info_q already formats the answer.
             if self._DEFINITION_Q_RE.search(query):
                 _LOG.info("[Supervisor] info-query: definition query — skipping slot queue: %r", query[:60])
+                # This intentionally leaves topic_slot_queue empty, which is exactly the
+                # condition that lets _maybe_dynamic_clarification run next (see its call
+                # sites — guarded on `not topic_slot_queue`). That function has its own,
+                # independent divergence-based decision to ask entity_type and has no idea
+                # this turn was already classified as a definition query — flag it here so
+                # it can skip too, instead of re-asking a slot this bypass just decided is
+                # irrelevant.
+                state.context["_definition_query"] = True
                 return
 
             # Exception: if shop_area_type is unknown and docs have area-size keywords in
@@ -4733,10 +5327,46 @@ class PersonaSupervisor:
                 )
                 if _area_in_info_docs:
                     _LOG.info(
-                        "[Supervisor] info-query: shop_area_type unknown + area keywords in docs — falling through to slot queue"
+                        "[Supervisor] info-query: shop_area_type unknown, area-sensitive license — "
+                        "answering directly covering all area tiers instead of asking first: %r",
+                        query[:60],
                     )
-                else:
-                    return
+                    # Supplement with ALL area-tier docs for this license (not just whichever
+                    # one ranked #1 in retrieval) so Practical can give one answer covering
+                    # every tier and invite the user to specify their exact area for a precise
+                    # figure — same doc-supplement pattern as the fee/duration case above.
+                    try:
+                        if _dominant_lt_area:
+                            _coll_area = self._get_chroma_collection()
+                            if _coll_area is not None:
+                                _area_result = _coll_area.get(
+                                    where={"license_type": _dominant_lt_area},
+                                    include=["documents", "metadatas"],
+                                )
+                                _doc_chars_area = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700) or 700)
+                                _seen_rt: set = set()
+                                _area_docs: List[Dict] = []
+                                for _ac, _am in zip(
+                                    _area_result.get("documents") or [],
+                                    _area_result.get("metadatas") or [],
+                                ):
+                                    _rt = str((_am or {}).get("registration_type") or "").strip()
+                                    if not _rt or not any(kw in _rt for kw in self._AREA_KEYWORDS):
+                                        continue
+                                    if _rt in _seen_rt:
+                                        continue
+                                    _seen_rt.add(_rt)
+                                    _area_docs.append({"content": (_ac or "")[:_doc_chars_area], "metadata": dict(_am or {})})
+                                if _area_docs:
+                                    state.current_docs = _area_docs + [d for d in docs if isinstance(d, dict)]
+                                    _LOG.info(
+                                        "[Supervisor] info-query: supplemented %d area-tier docs for license=%r",
+                                        len(_area_docs), _dominant_lt_area,
+                                    )
+                    except Exception as _e_area_sup:
+                        _LOG.warning("[Supervisor] info-query area-tier doc supplement failed: %s", _e_area_sup)
+                    state.context["_definition_query"] = True
+                return
             else:
                 return
         if _is_link_req:
@@ -5018,14 +5648,20 @@ class PersonaSupervisor:
             _dv_lq = ((_d_lq.get("metadata") or {}).get("department") or "").strip()
             if _dv_lq and _dv_lq not in _available_depts_lq:
                 _available_depts_lq.append(_dv_lq)
-        _inferred_dept_lq = next((d for d in _available_depts_lq if d and d in query), None)
-        if not _inferred_dept_lq:
+        # Multi-entity guard (same reasoning as _apply_slot_change_if_detected above): if
+        # more than one known department appears in the query, this is a both/and question,
+        # not a single inferable bank — don't collapse it to just one via next()/break.
+        _depts_in_query_lq = [d for d in _available_depts_lq if d and d in query]
+        _inferred_dept_lq = _depts_in_query_lq[0] if len(_depts_in_query_lq) == 1 else None
+        if not _inferred_dept_lq and not _depts_in_query_lq:
             # Try abbreviated bank names via regex (e.g. "กสิกรไทย" → "ธนาคารกสิกรไทย").
-            for _bp_lq, _bn_lq in self._BANK_DEPT_PATTERNS:
-                if _bp_lq.search(query) and _bn_lq in _available_depts_lq:
-                    _inferred_dept_lq = _bn_lq
-                    _LOG.info("[Supervisor] legal_q department regex-inferred from query: %r", _inferred_dept_lq)
-                    break
+            _regex_matched_lq = [
+                _bn_lq for _bp_lq, _bn_lq in self._BANK_DEPT_PATTERNS
+                if _bp_lq.search(query) and _bn_lq in _available_depts_lq
+            ]
+            if len(_regex_matched_lq) == 1:
+                _inferred_dept_lq = _regex_matched_lq[0]
+                _LOG.info("[Supervisor] legal_q department regex-inferred from query: %r", _inferred_dept_lq)
         if not _inferred_dept_lq:
             # Scan recent user messages — last_user_legal_query is overwritten before this runs.
             _recent_user_text_lq = " ".join(
@@ -5033,13 +5669,16 @@ class PersonaSupervisor:
                 for m in (getattr(state, "messages", []) or [])[-6:]
                 if m.get("role") == "user"
             )
-            _inferred_dept_lq = next((d for d in _available_depts_lq if d and d in _recent_user_text_lq), None)
-            if not _inferred_dept_lq:
+            _depts_in_recent_lq = [d for d in _available_depts_lq if d and d in _recent_user_text_lq]
+            _inferred_dept_lq = _depts_in_recent_lq[0] if len(_depts_in_recent_lq) == 1 else None
+            if not _inferred_dept_lq and not _depts_in_recent_lq:
                 # Try abbreviated bank names in recent messages via regex.
-                for _bp_lq2, _bn_lq2 in self._BANK_DEPT_PATTERNS:
-                    if _bp_lq2.search(_recent_user_text_lq) and _bn_lq2 in _available_depts_lq:
-                        _inferred_dept_lq = _bn_lq2
-                        break
+                _regex_matched_lq2 = [
+                    _bn_lq2 for _bp_lq2, _bn_lq2 in self._BANK_DEPT_PATTERNS
+                    if _bp_lq2.search(_recent_user_text_lq) and _bn_lq2 in _available_depts_lq
+                ]
+                if len(_regex_matched_lq2) == 1:
+                    _inferred_dept_lq = _regex_matched_lq2[0]
             if _inferred_dept_lq:
                 _LOG.info(
                     "[Supervisor] legal_q department auto-inferred from recent messages: %r",
@@ -5712,10 +6351,23 @@ class PersonaSupervisor:
                 out.append(n)
         return out
 
-    def _fuzzy_match_option(self, user_input: str, options: List[Any], threshold: float = 0.30) -> Optional[str]:
+    def _fuzzy_match_option(
+        self, user_input: str, options: List[Any], threshold: float = 0.30, min_margin: float = 0.15
+    ) -> Optional[str]:
         """Fuzzy match user free-text to closest slot option using character bigram overlap.
         Used as fallback when LLM slot mapper fails or returns low confidence.
-        Threshold 0.30 works well for Thai text (no word boundaries)."""
+        Threshold 0.30 works well for Thai text (no word boundaries).
+
+        min_margin: the winning score must beat the runner-up option by at least this much.
+        Options sharing a long common prefix/suffix (e.g. Thai bank names all starting with
+        "ธนาคาร" and often ending in "ไทย") can ALL score deceptively high on raw bigram
+        overlap even when NONE of them is what the user actually said — confirmed case:
+        user typed "ธนาคารทหารไทย" (TMB, not in the option list at all) and scored 0.615
+        against "ธนาคารกสิกรไทย" vs 0.533 against "ธนาคารไทยพาณิชย์" — both clear the 0.50
+        threshold, but the 0.08 gap between them is itself the tell that neither is a
+        confident match (a genuine match isn't neck-and-neck with a wrong option). Requiring
+        a real margin over the runner-up catches this without needing to special-case bank
+        names or any other slot type."""
         raw_norm = self._normalize_for_intent(user_input)
         if not raw_norm or len(raw_norm) < 2:
             return None
@@ -5726,6 +6378,7 @@ class PersonaSupervisor:
 
         best_opt: Optional[str] = None
         best_score = 0.0
+        second_best_score = 0.0
 
         for opt in options:
             s = str(opt).strip()
@@ -5740,10 +6393,21 @@ class PersonaSupervisor:
             overlap = len(ngrams_raw & ngrams_opt)
             score = overlap / max(len(ngrams_raw), len(ngrams_opt))
             if score > best_score:
+                second_best_score = best_score
                 best_score = score
                 best_opt = s
+            elif score > second_best_score:
+                second_best_score = score
 
-        return best_opt if best_score >= threshold else None
+        if best_score < threshold:
+            return None
+        if (best_score - second_best_score) < min_margin:
+            _LOG.info(
+                "[Supervisor] fuzzy match rejected — ambiguous (best=%.3f second=%.3f margin<%.2f): %r",
+                best_score, second_best_score, min_margin, user_input[:40],
+            )
+            return None
+        return best_opt
 
     def _map_pending_slot_reply(self, pending: Dict[str, Any], user_input: str) -> Tuple[Optional[str], Optional[str]]:
         options = pending.get("options") or []
@@ -6131,11 +6795,57 @@ class PersonaSupervisor:
     # Area-size keywords used to detect shop-area dimension in registration_type
     _AREA_KEYWORDS: List[str] = ["น้อยกว่า", "มากกว่า", "ไม่เกิน", "เกิน", "ตารางเมตร"]
 
+    def _check_bare_recognition(self, text: str) -> Dict[str, Any]:
+        """
+        Check whether a user typing `text` bare (alone, no other context, no LLM
+        fallback since state=None) would be recognized deterministically as a legal/
+        business signal — or would be misrouted to greeting/noise (FAIL), or would
+        fall back entirely on the non-deterministic LLM classifier to be recognized
+        as informational (WARN, not a confirmed bug but an unverified reliance).
+
+        Single shared implementation for this check — used by both
+        _validate_license_types_at_startup() below (runs free on every server boot)
+        and code/scripts/license_coverage_check.py's --static layer (same check,
+        runnable standalone with a readable report) — kept as one implementation
+        so the two never drift apart from each other.
+        """
+        is_greet = self._looks_like_greeting_or_thanks(text, None)
+        is_noise = self._is_noise(text)
+        legal_match = bool(self._LEGAL_SIGNAL_RE.search(text))
+        kw_match = any(kw_re.search(text) for kw_re, _ in self._SUPERVISOR_KW_OVERRIDE)
+        if is_greet or is_noise:
+            verdict = "FAIL"
+        elif not legal_match and not kw_match:
+            verdict = "WARN"
+        else:
+            verdict = "OK"
+        return {
+            "text": text,
+            "is_greeting_misfire": is_greet,
+            "is_noise_misfire": is_noise,
+            "legal_signal_match": legal_match,
+            "kw_override_match": kw_match,
+            "verdict": verdict,
+        }
+
     def _validate_license_types_at_startup(self) -> None:
         """
-        Cross-check _KW_OVERRIDE_LICENSE_TYPES against Chroma at startup.
-        Logs WARNING for any hardcoded string with no matching docs — catches
-        stale mappings immediately after a re-ingest without blocking startup.
+        Two checks against Chroma, run once at startup:
+
+        1. (existing) Cross-check _KW_OVERRIDE_LICENSE_TYPES against Chroma — logs
+           WARNING for any hardcoded string with no matching docs, catching stale
+           mappings immediately after a re-ingest without blocking startup.
+
+        2. (new, 2026-08-04) The REVERSE direction: for every license_type actually
+           in Chroma, would a user typing its bare name be recognized deterministically
+           (see _check_bare_recognition), or silently fall back to non-deterministic
+           LLM classification, or get misrouted to a greeting reply? This automates
+           the manual investigation that found the "สุขาภิบาล"/"POS"/"QR" bugs on
+           2026-08-03 — re-run on every boot so a future corpus update that adds a
+           poorly-covered license_type is caught immediately in the logs instead of
+           waiting for a real user to hit it. This is the free, regex-only subset of
+           code/scripts/license_coverage_check.py — safe to run unconditionally on
+           every boot; its --live layer (real LLM calls) is deliberately NOT run here.
         """
         try:
             coll = self._get_chroma_collection()
@@ -6162,6 +6872,46 @@ class PersonaSupervisor:
                 _LOG.info(
                     "[Supervisor] startup: all %d KW_OVERRIDE license types verified in Chroma ✓",
                     len(self._KW_OVERRIDE_LICENSE_TYPES),
+                )
+
+            n_fail = n_warn = 0
+            for lt in sorted(chroma_lt_set):
+                check = self._check_bare_recognition(lt)
+                if check["verdict"] == "FAIL":
+                    n_fail += 1
+                    _LOG.warning(
+                        "[Supervisor] startup: license_type %r bare name is misrouted to "
+                        "greeting/noise (greeting=%s noise=%s) — add to LEGAL_SIGNAL_RE "
+                        "in utils/text_patterns.py. Run `python3 code/scripts/license_"
+                        "coverage_check.py --static` for the full report.",
+                        lt, check["is_greeting_misfire"], check["is_noise_misfire"],
+                    )
+                elif check["verdict"] == "WARN":
+                    n_warn += 1
+                    _LOG.info(
+                        "[Supervisor] startup: license_type %r has no deterministic bare-"
+                        "name recognition (relies on the LLM classifier fallback) — consider "
+                        "adding it to LEGAL_SIGNAL_RE or _SUPERVISOR_KW_OVERRIDE. Run `python3 "
+                        "code/scripts/license_coverage_check.py --static` for the full report.",
+                        lt,
+                    )
+            if n_fail:
+                _LOG.warning(
+                    "[Supervisor] startup: %d/%d license_type(s) in Chroma FAIL bare-name "
+                    "recognition — see warnings above.",
+                    n_fail, len(chroma_lt_set),
+                )
+            elif n_warn:
+                _LOG.info(
+                    "[Supervisor] startup: %d/%d license_type(s) in Chroma rely on the LLM "
+                    "fallback for bare-name recognition (no hard failures) — see info logs above.",
+                    n_warn, len(chroma_lt_set),
+                )
+            else:
+                _LOG.info(
+                    "[Supervisor] startup: all %d license_type(s) in Chroma have deterministic "
+                    "bare-name recognition ✓",
+                    len(chroma_lt_set),
                 )
         except Exception:
             _LOG.warning("[Supervisor] startup: license type validation failed", exc_info=True)
@@ -6332,9 +7082,11 @@ class PersonaSupervisor:
                 # Scan all doc contents for the pattern: Bangkok mention + provincial mention with DIFFERENT numeric values.
                 # If found → add a synthetic location slot so the user is asked which one applies.
                 if "location" not in seen_keys:
-                    _LOC_BKK_RE = re.compile(r"กรุงเทพ|กทม|bkk", re.IGNORECASE)
-                    _LOC_PROV_RE = re.compile(r"ต่างจังหวัด|ภูมิภาค|จังหวัดอื่น", re.IGNORECASE)
-                    _NUM_RE = re.compile(r"(\d+)\s*(?:-\s*(\d+))?\s*(?:วัน|วันทำการ|ชั่วโมง)")
+                    # Compiled once at class level as _DOC_SCAN_* — see definitions near
+                    # _LOCATION_PROVINCE_RE above (was recompiled on every call before).
+                    _LOC_BKK_RE = self._DOC_SCAN_LOC_BKK_RE
+                    _LOC_PROV_RE = self._DOC_SCAN_LOC_PROV_RE
+                    _NUM_RE = self._DOC_SCAN_NUM_RE
                     _content_has_bkk = False
                     _content_has_prov = False
                     _bkk_nums: set = set()
@@ -6344,22 +7096,8 @@ class PersonaSupervisor:
                     #   FWD: "กทม: 8-14 วันทำการ ... ต่างจังหวัด: 14-21 วันทำการ"
                     #   REV: "8-14 วันทำการ (กทม.) ... 14-21 วันทำการ (ต่างจังหวัด)"
                     # Uses DOTALL so it spans newlines between the two mentions.
-                    _SEQ_FWD = re.compile(
-                        r"(?:กรุงเทพ|กทม|bkk)[^0-9]*(\d+)(?:\s*-\s*(\d+))?"
-                        r"[^0-9]{0,30}(?:วัน|วันทำการ)"
-                        r".{0,300}?"
-                        r"(?:ต่างจังหวัด|ภูมิภาค|จังหวัดอื่น)[^0-9]*(\d+)(?:\s*-\s*(\d+))?"
-                        r"[^0-9]{0,30}(?:วัน|วันทำการ)",
-                        re.IGNORECASE | re.DOTALL,
-                    )
-                    _SEQ_REV = re.compile(
-                        r"(\d+)(?:\s*-\s*(\d+))?[^0-9\n]{0,30}(?:วัน|วันทำการ)"
-                        r"[^\n]{0,60}(?:กรุงเทพ|กทม|bkk)"
-                        r".{0,300}?"
-                        r"(\d+)(?:\s*-\s*(\d+))?[^0-9\n]{0,30}(?:วัน|วันทำการ)"
-                        r"[^\n]{0,60}(?:ต่างจังหวัด|ภูมิภาค|จังหวัดอื่น)",
-                        re.IGNORECASE | re.DOTALL,
-                    )
+                    _SEQ_FWD = self._DOC_SCAN_SEQ_FWD_RE
+                    _SEQ_REV = self._DOC_SCAN_SEQ_REV_RE
                     _location_diff_found = False
                     for _doc_text in docs_content:
                         _text = str(_doc_text or "")
@@ -6758,14 +7496,13 @@ class PersonaSupervisor:
         docs = state.current_docs or []
         if not docs:
             return None
-        # ISSUE 2: skip DC when multi-license retrieval is active — choices would mix licenses
+        # Skip DC whenever an earlier stage already decided this turn shouldn't get
+        # slot-based clarification (multi-topic/broad/definition/non-reg-dominant —
+        # see clarification_flags.py for why each flag is here and why this list is
+        # intentionally narrower than persona_practical.py's own injection-skip list).
+        if has_any_flag(state.context, DYNAMIC_CLARIFICATION_SKIP_FLAGS):
+            return None
         _ctx = state.context or {}
-        if _ctx.get("_multi_topic_retrieval") or _ctx.get("multi_license_topics"):
-            return None
-        # Broad questions ask "what licenses do I need?" — user wants an overview, not a menu.
-        # DC would show operation_by_department choices (ยกเลิก/ต่ออายุ/แก้ไข) which is wrong context.
-        if _ctx.get("_broad_question"):
-            return None
 
         collected = dict(state.get_collected_slots() if hasattr(state, "get_collected_slots") else {})
 
@@ -7966,6 +8703,37 @@ class PersonaSupervisor:
     _cached_sub_topics: Optional[List[str]] = None
     _cached_operation_topics: Optional[List[str]] = None
     _cached_unique_operation_by_depts: Optional[List[str]] = None
+    _cached_departments: Optional[List[str]] = None
+
+    def _get_all_departments_from_store(self) -> List[str]:
+        """
+        Returns a deduplicated list of all `department` metadata values in the Chroma
+        collection (e.g. "ธนาคารกสิกรไทย", "ธนาคารไทยพาณิชย์"). Cached after first call.
+        Used to detect a bank/department name mentioned in free text on the FIRST turn
+        of a topic (before any docs have been retrieved this turn), so it can be saved
+        to collected_slots immediately instead of only being captured later when the
+        user explicitly switches away from an already-cached department.
+        """
+        if self._cached_departments is not None:
+            return self._cached_departments
+        try:
+            _vstore = getattr(self.retriever, "vectorstore", None)
+            _coll = getattr(_vstore, "_collection", None) if _vstore else None
+            if _coll is None:
+                self._cached_departments = []
+                return []
+            _res = _coll.get(include=["metadatas"])
+            _seen: dict = {}
+            for _md in (_res.get("metadatas") or []):
+                _d = str(_md.get("department") or "").strip()
+                if _d and _d.lower() not in ("nan", "none", "") and len(_d) >= 4:
+                    _seen[_d] = True
+            self._cached_departments = list(_seen.keys())
+            _LOG.info("[Supervisor] cached %d distinct departments from store", len(self._cached_departments))
+        except Exception as _ex:
+            _LOG.warning("[Supervisor] _get_all_departments_from_store failed: %s", _ex)
+            self._cached_departments = []
+        return self._cached_departments
 
     def _get_all_operation_topics_from_store(self) -> List[str]:
         """
@@ -8291,6 +9059,7 @@ class PersonaSupervisor:
                 model=topic_model,
                 openai_api_key=conf.OPENROUTER_API_KEY,
                 openai_api_base=conf.OPENROUTER_BASE_URL,
+                http_client=get_shared_http_client(),
                 temperature=0.0,
                 max_tokens=800,
                 request_timeout=_timeout,
@@ -8420,6 +9189,18 @@ class PersonaSupervisor:
         mapped, err = self._map_pending_slot_reply(pending, user_input)
 
         if err:
+            # The generic "answer with a number" catch-all fires when the user's text matched
+            # none of the slot's options at all (e.g. named a bank we don't cover) — that's a
+            # real info gap, not a formatting mistake, so offer the feedback menu instead of
+            # repeating a rigid reask (see round7+ feedback thread for the rigid-loop complaint).
+            if err == "กรุณาตอบเป็นตัวเลขตามตัวเลือกครับ":
+                msg = self._normalize_male(self._build_slot_mismatch_message(pending, user_input))
+                self._add_assistant(state, msg)
+                state.context = state.context or {}
+                state.context["pending_feedback_choice"] = True
+                state.context["pending_feedback_query"] = self._build_slot_mismatch_query(state, user_input)
+                state.last_action = "pending_slot_mismatch_feedback_offer"
+                return state, msg
             msg = self._normalize_male(err)
             self._add_assistant(state, msg)
             state.last_action = "pending_slot_invalid_reply"
@@ -8529,8 +9310,8 @@ class PersonaSupervisor:
                             "operation_steps", "identification_documents", "research_reference",
                         })
                         _SUPERVISOR_FC_MT2 = {
-                            "operation_steps": 600, "identification_documents": 4000,
-                            "research_reference": 3200, "fees": 120, "service_channel": 200,
+                            "operation_steps": 1500, "identification_documents": 4000,
+                            "research_reference": 3200, "fees": 900, "service_channel": 600,
                         }
                         _per_lt_cap2 = int(getattr(conf, "LLM_DOCS_MAX_BROAD", 20))
                         _total_cap2 = _per_lt_cap2 * 2
@@ -8773,8 +9554,8 @@ class PersonaSupervisor:
                     "terms_and_conditions", # หน้าที่และเงื่อนไขของผู้ประกอบการ
                 })
                 _PT_FIELD_CAPS = {
-                    "operation_steps": 600, "identification_documents": 4000,
-                    "research_reference": 3200, "fees": 120, "service_channel": 200,
+                    "operation_steps": 1500, "identification_documents": 4000,
+                    "research_reference": 3200, "fees": 900, "service_channel": 600,
                     "legal_regulatory": 2000, "terms_and_conditions": 800,
                 }
                 for _lt_item in _lt_unique:
@@ -8886,20 +9667,23 @@ class PersonaSupervisor:
                             if m.get("role") == "user"
                         )
                         _q_for_dept_ts = (str(mapped).strip() + " " + (user_input or "") + " " + _recent_user_text).strip()
-                        _inferred_dept_ts = next(
-                            (d for d in _available_depts_ts if d and d in _q_for_dept_ts),
-                            None,
-                        )
-                        if not _inferred_dept_ts:
+                        # Multi-entity guard (same reasoning as the other _BANK_DEPT_PATTERNS
+                        # sites): more than one bank named at once is a both/and question, not
+                        # a single inferable department — don't collapse to just one.
+                        _depts_in_q_ts = [d for d in _available_depts_ts if d and d in _q_for_dept_ts]
+                        _inferred_dept_ts = _depts_in_q_ts[0] if len(_depts_in_q_ts) == 1 else None
+                        if not _inferred_dept_ts and not _depts_in_q_ts:
                             # Try abbreviated bank names via regex (e.g. "กสิกรไทย" → "ธนาคารกสิกรไทย").
-                            for _bp_ts, _bn_ts in self._BANK_DEPT_PATTERNS:
-                                if _bp_ts.search(_q_for_dept_ts) and _bn_ts in _available_depts_ts:
-                                    _inferred_dept_ts = _bn_ts
-                                    _LOG.info(
-                                        "[Supervisor] topic-slot department regex-inferred: %r",
-                                        _inferred_dept_ts,
-                                    )
-                                    break
+                            _regex_matched_ts = [
+                                _bn_ts for _bp_ts, _bn_ts in self._BANK_DEPT_PATTERNS
+                                if _bp_ts.search(_q_for_dept_ts) and _bn_ts in _available_depts_ts
+                            ]
+                            if len(_regex_matched_ts) == 1:
+                                _inferred_dept_ts = _regex_matched_ts[0]
+                                _LOG.info(
+                                    "[Supervisor] topic-slot department regex-inferred: %r",
+                                    _inferred_dept_ts,
+                                )
                         if _inferred_dept_ts:
                             state.save_collected_slot("department", _inferred_dept_ts)
                             state.context.setdefault("slots", {})["department"] = _inferred_dept_ts
@@ -9861,10 +10645,14 @@ class PersonaSupervisor:
                     except Exception as e:
                         _LOG.warning("[Supervisor] area-slot retrieval failed: %s", e)
 
-            elif _pending_key == "registration_type" and (state.context or {}).get("_multi_topic_retrieval"):
+            elif _pending_key == "registration_type" and (state.context or {}).get("multi_license_topics"):
                 # Multi-topic scenario: user just answered registration_type (e.g. บริษัทจำกัด).
                 # Re-merge docs for ALL detected license types, now filtered by the chosen registration_type.
                 # The single-license path (elif _entity_val) would drop all but _prior_license's docs.
+                # NOTE: guard on multi_license_topics, not _multi_topic_retrieval — the latter is in
+                # StateManager._EPHEMERAL_CTX_KEYS and is stripped from state.context on every save(),
+                # so by the time a slot-answer turn reaches here it is always None. multi_license_topics
+                # is not ephemeral and survives across turns, so it's the reliable signal here.
                 _raw_rt = _raw
                 _cs_rt = state.get_collected_slots() if hasattr(state, "get_collected_slots") else {}
                 _entity_for_mt = (
@@ -9893,8 +10681,8 @@ class PersonaSupervisor:
                                 "research_reference",
                             })
                             _SUPERVISOR_FC_MT_RT = {
-                                "operation_steps": 600, "identification_documents": 4000,
-                                "research_reference": 3200, "fees": 120, "service_channel": 200,
+                                "operation_steps": 1500, "identification_documents": 4000,
+                                "research_reference": 3200, "fees": 900, "service_channel": 600,
                             }
 
                             def _build_slim_mt_rt(fc: str, fm: dict) -> Dict:
@@ -9941,6 +10729,82 @@ class PersonaSupervisor:
                                 )
                     except Exception as _e_mt_rt:
                         _LOG.warning("[Supervisor] multi-topic registration_type re-merge failed: %s", _e_mt_rt)
+                state.context.pop("topic_slot_queue", None)
+
+            elif _pending_key == "entity_type" and (state.context or {}).get("multi_license_topics"):
+                # Multi-topic scenario: user just answered entity_type (e.g. นิติบุคคล).
+                # Re-merge docs for ALL detected license types, now filtered by the chosen entity_type.
+                # The single-license path (elif _entity_val below) would drop all but the first-detected
+                # license's docs — e.g. "เปิดร้านเหล้า...vat มั้ย" loses ใบอนุญาตจำหน่ายสุรา because VAT
+                # sorts first in _MULTI_TOPIC_LICENSE_KEYWORDS, and the supplement step that used to
+                # compensate only recognized "ขึ้นทะเบียน|จดทะเบียน|จดภาษี|สมัคร" phrasing, not
+                # "ยื่นใบอนุญาต..." docs.
+                # NOTE: guard on multi_license_topics, not _multi_topic_retrieval — see comment on the
+                # registration_type branch above; the latter is stripped from context on every save().
+                _entity_for_mt2 = _entity_val or _raw
+                _mt_lts2: List[str] = []
+                for _d_mt2 in (state.current_docs or []):
+                    if not isinstance(_d_mt2, dict):
+                        continue
+                    _lt_mt2 = ((_d_mt2.get("metadata") or {}).get("license_type") or "").strip()
+                    if _lt_mt2 and _lt_mt2 not in _mt_lts2:
+                        _mt_lts2.append(_lt_mt2)
+                if not _mt_lts2:
+                    _mt_lts2 = list((state.context or {}).get("multi_license_topics") or [])
+                if _mt_lts2:
+                    try:
+                        _coll_mt_et = self._get_chroma_collection()
+                        if _coll_mt_et is not None:
+                            _doc_chars_mt_et = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700) or 700)
+                            _SUPERVISOR_META_WL_MT_ET = frozenset({
+                                "license_type", "operation_topic", "entity_type_normalized",
+                                "registration_type", "department", "fees", "operation_duration",
+                                "service_channel", "operation_steps", "identification_documents",
+                                "research_reference",
+                            })
+                            _SUPERVISOR_FC_MT_ET = {
+                                "operation_steps": 1500, "identification_documents": 4000,
+                                "research_reference": 3200, "fees": 900, "service_channel": 600,
+                            }
+
+                            def _build_slim_mt_et(fc: str, fm: dict) -> Dict:
+                                _sm: Dict = {}
+                                for _k, _v in (fm or {}).items():
+                                    if _k not in _SUPERVISOR_META_WL_MT_ET or _v in (None, "", "nan", "None"):
+                                        continue
+                                    _vs = str(_v)
+                                    _cap = _SUPERVISOR_FC_MT_ET.get(_k)
+                                    _sm[_k] = _vs[:_cap] if _cap and len(_vs) > _cap else _vs
+                                return {"content": (fc or "")[:_doc_chars_mt_et], "metadata": _sm}
+
+                            _merged_mt_et: List[Dict] = []
+                            for _lt_et in _mt_lts2:
+                                _r_et = _coll_mt_et.get(
+                                    where={"license_type": _lt_et},
+                                    include=["documents", "metadatas"],
+                                )
+                                _all_lt_et = [
+                                    _build_slim_mt_et(_fc, _fm)
+                                    for _fc, _fm in zip(_r_et.get("documents") or [], _r_et.get("metadatas") or [])
+                                ]
+                                # Apply entity_type filter (generic docs "" pass through)
+                                if _entity_for_mt2:
+                                    _ent_match2 = [
+                                        d for d in _all_lt_et
+                                        if (d.get("metadata") or {}).get("entity_type_normalized", "") in ("", _entity_for_mt2)
+                                    ]
+                                    if _ent_match2:
+                                        _all_lt_et = _ent_match2
+                                _merged_mt_et.extend(_all_lt_et)
+                            if _merged_mt_et:
+                                state.current_docs = _merged_mt_et
+                                state.last_retrieval_query = base_q or getattr(state, "last_retrieval_query", "")
+                                _LOG.info(
+                                    "[Supervisor] multi-topic entity_type re-merge: entity=%r licenses=%s docs=%d",
+                                    _entity_for_mt2, _mt_lts2, len(_merged_mt_et),
+                                )
+                    except Exception as _e_mt_et:
+                        _LOG.warning("[Supervisor] multi-topic entity_type re-merge failed: %s", _e_mt_et)
                 state.context.pop("topic_slot_queue", None)
 
             elif _entity_val:
@@ -10196,8 +11060,8 @@ class PersonaSupervisor:
                                 "research_reference",
                             })
                             _SUPERVISOR_FC_RT = {
-                                "operation_steps": 600, "identification_documents": 4000,
-                                "research_reference": 3200, "fees": 120, "service_channel": 200,
+                                "operation_steps": 1500, "identification_documents": 4000,
+                                "research_reference": 3200, "fees": 900, "service_channel": 600,
                             }
                             _rt_raw_docs: List[Dict] = []
                             for _fc_rt, _fm_rt in zip(_rt_result.get("documents") or [], _rt_result.get("metadatas") or []):
@@ -11498,12 +12362,6 @@ class PersonaSupervisor:
         state.persona_id = "academic"
         state.context["persona_id"] = "academic"
         state.last_action = "academic_auto_switch"
-        # Do NOT set academic_auto_select_all here.
-        # Academic Phase 2 (section menu) is a core feature — user must always pick sections
-        # so the answer is scoped to their actual case, not a dump of all sections.
-        # auto_select_all=True caused irrelevant sections (ยกเลิก/แก้ไข/ต่ออายุ) to appear
-        # when user only asked about new registration.
-        state.context.pop("academic_auto_select_all", None)
 
         # Reset any stale academic flow so a fresh intake starts (not stuck at stage='done'
         # from a previous session, which would cause academic to return the generic fallback).
@@ -11679,6 +12537,7 @@ class PersonaSupervisor:
         import time as _time
         _t0 = _time.perf_counter()
         st, reply = self._handle_inner(state, user_input)
+        reply = self._maybe_offer_feedback(st, user_input, reply)
         if hasattr(st, "trim_messages"):
             st.trim_messages(keep_last=12)  # เก็บ state 12 (ไม่ใช่ส่งไป LLM ทั้งหมด)
         # Trim large context fields that bloat the prompt (topic_pool can be 100+ items)
@@ -11703,6 +12562,7 @@ class PersonaSupervisor:
 
         # Clear per-turn flags that must not bleed into the next query.
         state.context.pop("_direct_topic_match", None)
+        state.context.pop("_info_gap_detected", None)
 
         if not state.context.get("did_greet") and not raw_stripped and not self._is_academic_intake_active(state):
             state.context["did_greet"] = True
@@ -11736,6 +12596,16 @@ class PersonaSupervisor:
             self._add_assistant(state, _limit_msg)
             state.last_action = "max_rounds_reached"
             return state, _limit_msg
+
+        # 1.9) Pending feedback choice — higher priority than academic intake lock,
+        # confirm/switch, and legal routing (mirrors pending_slot's precedence) so a
+        # bare "1"/"2"/"3" answering the feedback menu isn't swallowed by other routing.
+        if state.context.get("pending_feedback_choice"):
+            st2, reply2 = self._handle_feedback_selection(state, raw_stripped)
+            reply2 = self._normalize_male(reply2)
+            self._add_assistant(st2, reply2)
+            st2.last_action = "feedback_selection"
+            return st2, reply2
 
         # 2.1) Academic intake lock
         if self._is_academic_intake_active(state) and not state.context.get("awaiting_persona_confirmation"):

@@ -10,11 +10,25 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 import conf
 from model.conversation_state import ConversationState
-from utils.llm_call import llm_invoke, extract_llm_text
+from model.clarification_flags import ENTITY_INJECTION_SKIP_FLAGS, has_any_flag
+from utils.llm_call import llm_invoke, extract_llm_text, build_speed_extra_body, build_cached_system_message, build_thinking_extra_body, get_shared_http_client
 from utils.prompts_practical import SYSTEM_PROMPT as SYSTEM_PROMPT_PRACTICAL, build_lqs_license_detect_prompt, build_satisfaction_detect_prompt, build_dont_know_detect_prompt, build_short_followup_detect_prompt
 from utils.prompts_supervisor import build_legal_q_detect_prompt, build_greeting_detect_prompt
 from utils.query_synonyms import SYNONYM_PATTERNS
 from utils.query_rewriter import enrich_query_for_retrieval, _needs_rewrite as _qr_needs_rewrite
+from utils.progress import emit_progress
+from utils.text_patterns import (
+    TH_DEE_RE as _SHARED_TH_DEE_RE,
+    TOKEN_SPLIT_RE as _SHARED_TOKEN_SPLIT_RE,
+    TH_WATDEE_RE as _SHARED_TH_WATDEE_RE,
+    THANKS_RE as _SHARED_THANKS_RE,
+    LIKELY_SELECTION_RE as _SHARED_LIKELY_SELECTION_RE,
+    LEGAL_SIGNAL_RE as _SHARED_LEGAL_SIGNAL_RE,
+    ENTITY_NITI_RE as _SHARED_ENTITY_NITI_RE,
+    ENTITY_NATURAL_RE as _SHARED_ENTITY_NATURAL_RE,
+    is_bare_generic_followup as _shared_is_bare_generic_followup,
+    extract_info_gap_tag as _shared_extract_info_gap_tag,
+)
 
 # Import professional logging
 from utils.logger import get_logger, log_function_call, TimingContext
@@ -405,29 +419,36 @@ class PracticalPersonaService:
     persona_id = "practical"
 
     _EN_GREET_RE = re.compile(r"^\s*(hi+|hello+|hey+|yo+)\b", re.IGNORECASE)
-    _TH_WATDEE_RE = re.compile(r"^\s*หวัด[^\s]{0,6}", re.IGNORECASE)
+    # Shared with persona_supervisor.py/persona_academic.py — see utils/text_patterns.py.
+    _TH_WATDEE_RE = _SHARED_TH_WATDEE_RE
     _TH_SAWASDEE_RE = re.compile(r"^\s*สว[^\s]{0,8}ดี", re.IGNORECASE)
-    _TH_DEE_RE = re.compile(r"^\s*ดี(?:ครับ|คับ|ค่ะ|คะ|งับ|จ้า|จ้ะ|ค่า)?", re.IGNORECASE)
+    _TH_DEE_RE = _SHARED_TH_DEE_RE
 
-    _THANKS_RE = re.compile(
-        r"(ขอบคุณ|ขอบใจ|ขอบพระคุณ|ขอบคุณมาก|ขอบคุณนะ|thx|thanks|thank you)",
-        re.IGNORECASE,
-    )
+    _THANKS_RE = _SHARED_THANKS_RE
     _OK_RE = re.compile(
         r"^\s*(โอเค|ok|okay|รับทราบ|เข้าใจแล้ว|เข้าใจ|ได้เลย|เรียบร้อย|เคลียร์|เคลียแล้ว|พอแล้ว|พอครับ|พอค่ะ|ครบแล้ว|got\s*it|clear)\s*(ครับ|คับ|ค่ะ|คะ)?\s*$",
         re.IGNORECASE,
     )
 
-    _LEGAL_SIGNAL_RE = re.compile(
-        r"(ใบอนุญาต|จดทะเบียน|ทะเบียนพาณิชย์|ภาษี|vat|ภพ\.?20|สรรพากร|เทศบาล|สำนักงานเขต|สุขาภิบาล|กรม|ค่าธรรมเนียม|เอกสาร|ขั้นตอน|บทลงโทษ|ประกาศ|พ\.ร\.บ|เปิดร้าน|ประกันสังคม|กองทุน|งบการเงิน|ผลกระทบ|ความเสี่ยง)",
-        re.IGNORECASE,
-    )
+    # Shared with persona_supervisor.py/persona_academic.py — see utils/text_patterns.py.
+    # (This was supervisor's own version, adopted as canonical — it was already a strict
+    # superset of this file's terms.)
+    _LEGAL_SIGNAL_RE = _SHARED_LEGAL_SIGNAL_RE
+
+    # Entity-type (นิติบุคคล/บุคคลธรรมดา) detection. Shared with persona_supervisor.py/
+    # persona_academic.py — see utils/text_patterns.py. Used by _ENTITY_SWITCH_PATTERNS
+    # (the safety-net switch detection defined inline where it's used, further below).
+    _ENTITY_NITI_RE = _SHARED_ENTITY_NITI_RE
+    _ENTITY_NATURAL_RE = _SHARED_ENTITY_NATURAL_RE
 
     _DONT_KNOW_RE = re.compile(r"^\s*(ไม่รู้|ไม่แน่ใจ|ไม่ทราบ|งง|แล้วแต่|อะไรก็ได้)\s*$")
     _ASK_TYPES_RE = re.compile(r"(มีประเภทอะไรบ้าง|ประเภทอะไรบ้าง|มีแบบไหนบ้าง|มีอะไรบ้าง)\s*$")
 
     _NUM_OPTION_LINE_RE = re.compile(r"^\s*(\d{1,2})\)\s*(.+?)\s*$")
-    _LIKELY_SELECTION_RE = re.compile(r"^\s*[\d\s,/-]+\s*$")
+    # Shared with persona_supervisor.py — see utils/text_patterns.py. Reconciled to
+    # supervisor's stricter version (requires >=1 digit) — this file's copy was missing
+    # that lookahead, so an empty/separator-only string would have matched as "a selection".
+    _LIKELY_SELECTION_RE = _SHARED_LIKELY_SELECTION_RE
 
     # Topic menu sanitation (STRICT)
     _TOPIC_MIN_LEN = 3
@@ -482,6 +503,15 @@ class PracticalPersonaService:
         state.messages.append(msg)
         state.display_messages.append(msg)
         self._set_last_bot_owner(state, "practical")
+        # One-shot implicit-confirmation flag (see entity_type_source in
+        # persona_supervisor.py) is consumed by _entity_filter_hint's prompt
+        # injection above — clear it here, at the point a reply is actually
+        # committed, rather than at prompt-build time, since handle() can
+        # recurse/rebuild the prompt more than once within the same turn
+        # (see persona_practical_retrieve_retry_loop_bug.md) and only the
+        # reply that's actually shown to the user should consume it.
+        if isinstance(state.context, dict):
+            state.context.pop("_entity_type_just_inferred", None)
 
     # Greeting prefix (Practical fallback)
     _GREET_PREFIX_FALLBACKS: Dict[str, str] = {
@@ -501,6 +531,7 @@ class PracticalPersonaService:
             model=switch_model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.35,
             max_tokens=120,
             request_timeout=timeout,
@@ -566,6 +597,7 @@ class PracticalPersonaService:
             model=switch_model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=100,
             request_timeout=timeout,
@@ -595,6 +627,7 @@ class PracticalPersonaService:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
@@ -631,6 +664,7 @@ class PracticalPersonaService:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
@@ -667,6 +701,7 @@ class PracticalPersonaService:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
@@ -703,6 +738,7 @@ class PracticalPersonaService:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
@@ -739,6 +775,7 @@ class PracticalPersonaService:
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
@@ -1332,7 +1369,8 @@ class PracticalPersonaService:
     }
 
     # Retrieval reuse/new-topic heuristic (unchanged)
-    _TOKEN_SPLIT_RE = re.compile(r"[\s/,\-–—|]+", re.UNICODE)
+    # Shared with persona_supervisor.py — see utils/text_patterns.py.
+    _TOKEN_SPLIT_RE = _SHARED_TOKEN_SPLIT_RE
     _FOLLOWUP_SHORT_RE = re.compile(
         r"^(แล้ว(ไง|ล่ะ)?|แล้ว(เอกสาร|ขั้นตอน|ค่าธรรมเนียม)?|ต่อไปล่ะ|มีอะไรบ้าง|ขอ(เอกสาร|ขั้นตอน|ค่าธรรมเนียม|ระยะเวลา|ช่องทาง))\s*$"
     )
@@ -1350,6 +1388,13 @@ class PracticalPersonaService:
         r"(?:เอกสาร|ขั้นตอน|ค่าธรรมเนียม|ค่าใช้จ่าย|ระยะเวลา|ช่องทาง(?:ยื่น|ติดต่อ)?|แบบฟอร์ม|ลิงก์)",
         re.IGNORECASE,
     )
+    # Bare generic-dimension follow-up detection (e.g. "ต้องใช้เอกสารอะไรบ้าง" right after
+    # a ใบอนุญาตขายสุรา answer) is now handled by the shared `is_bare_generic_followup()`
+    # helper — see utils/text_patterns.py (GENERIC_FOLLOWUP_KEYWORDS_RE/SPECIFIC_TOPIC_RE)
+    # and its call site in `_is_short_followup` below. Previously this file had its own
+    # narrower `_BARE_GENERIC_DIM_RE`/`_SPECIFIC_TOPIC_NAME_RE` pair; consolidated into the
+    # shared module during Phase 3 of the classifier-duplication cleanup so
+    # persona_academic.py gets the same protection (it previously had none).
     # ── License-query scoring patterns (used in _license_query_score inside handle()) ──
     # Defined as class attributes so they are compiled once at class load, not per handle() call.
     _LQS_ABBREV_CHECK = [
@@ -1443,14 +1488,25 @@ class PracticalPersonaService:
         model_name = getattr(conf, "OPENROUTER_MODEL_PRACTICAL", conf.OPENROUTER_MODEL)
         timeout = int(getattr(conf, "LLM_REQUEST_TIMEOUT_PRACTICAL",
                               getattr(conf, "LLM_REQUEST_TIMEOUT", 60)))
+        # Claude extended thinking (opt-in, see conf.py) — disabled by default (budget=0).
+        # Hard Anthropic requirement: temperature must be exactly 1.0 whenever thinking
+        # is enabled, so this overrides TEMPERATURE_PRACTICAL only for that case.
+        _thinking_budget = int(getattr(conf, "OPENROUTER_PRACTICAL_THINKING_BUDGET", 0))
+        _temperature = 1.0 if _thinking_budget > 0 else getattr(conf, "TEMPERATURE_PRACTICAL", 0.2)
+        _extra_body = {
+            **build_speed_extra_body(model_name),
+            **build_thinking_extra_body(model_name, _thinking_budget),
+        }
         self.llm = ChatOpenAI(
             model=model_name,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
-            temperature=getattr(conf, "TEMPERATURE_PRACTICAL", 0.2),
+            http_client=get_shared_http_client(),
+            temperature=_temperature,
             max_tokens=getattr(conf, "MAX_TOKENS_PRACTICAL", 4000),
             request_timeout=timeout,
             model_kwargs={"response_format": {"type": "json_object"}},
+            extra_body=_extra_body,
         )
 
     # Normalization / detectors
@@ -1688,6 +1744,16 @@ class PracticalPersonaService:
         # "แค่ + keyword" or "แล้วถ้า/เรื่อง + keyword" anywhere in a short query.
         # Length guard (≤ 60) prevents false positives on longer topic-switch sentences.
         if len(n) <= 60 and (self._SINGLE_ASPECT_RE.search(n) or self._THEN_ASPECT_RE.search(n)):
+            return True
+        # Bare generic-dimension question with no แค่/แล้ว prefix — shared with
+        # persona_supervisor.py/persona_academic.py, see utils/text_patterns.py
+        # (is_bare_generic_followup) for the failure mode this closes (confirmed
+        # via live reproduction). Excludes queries that ALSO name a specific topic
+        # (SPECIFIC_TOPIC_RE) — e.g. "ค่าธรรมเนียมทะเบียนพาณิชย์เท่าไหร่" right after
+        # a liquor-license answer must still fall through to the overlap-ratio check
+        # below so the genuine topic switch is caught, not silently answered from the
+        # wrong (liquor-license) docs.
+        if _shared_is_bare_generic_followup(n):
             return True
         # LLM fallback: catches other short continuation phrasings regex misses.
         # High threshold (0.80) — false positive = reusing stale docs for a new topic.
@@ -2044,7 +2110,8 @@ class PracticalPersonaService:
         last_err = None
         for _ in range(max_retries):
             try:
-                resp = llm_invoke(self.llm, [SystemMessage(content=SYSTEM_PROMPT_PRACTICAL), HumanMessage(content=prompt)], logger=_LOG, label="Practical/json", state=state)
+                _sys_msg = build_cached_system_message(SYSTEM_PROMPT_PRACTICAL, getattr(self.llm, "model", ""))
+                resp = llm_invoke(self.llm, [_sys_msg, HumanMessage(content=prompt)], logger=_LOG, label="Practical/json", state=state)
                 text = extract_llm_text(resp).strip()
 
                 if "```json" in text:
@@ -2440,6 +2507,20 @@ class PracticalPersonaService:
                 _deduped.append(_d)
         docs = _deduped
 
+        # ── Retrieval-stage category filter ───────────────────────────────────
+        # Runs BEFORE reranking — drops minority-data_type docs when the candidate
+        # pool is heavily concentrated in one category (regulatory/business_guide/
+        # marketing). See utils.reranker.filter_by_category_concentration and
+        # conf.RETRIEVAL_CATEGORY_FILTER_ENABLED for why this exists.
+        if getattr(conf, "RETRIEVAL_CATEGORY_FILTER_ENABLED", False):
+            from utils.reranker import filter_by_category_concentration
+            docs = filter_by_category_concentration(
+                docs,
+                concentration_threshold=getattr(conf, "RETRIEVAL_CATEGORY_CONCENTRATION_THRESHOLD", 0.75),
+                min_pool_size=getattr(conf, "RETRIEVAL_CATEGORY_MIN_POOL_SIZE", 5),
+                min_keep=getattr(conf, "RETRIEVAL_CATEGORY_MIN_KEEP", 3),
+            )
+
         # ── Cross-encoder reranker (Level 3) ─────────────────────────────────
         # Rerank raw retrieval results BEFORE metadata boost so the learned model
         # has the final say on relevance ordering. Metadata boost then acts only as
@@ -2449,8 +2530,11 @@ class PracticalPersonaService:
                 from utils.reranker import rerank as _do_rerank
                 _rr_model = getattr(conf, "RERANKER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
                 _rr_top_k = int(getattr(conf, "RERANKER_TOP_K", len(docs)))
+                _rr_backend = getattr(conf, "RERANKER_BACKEND", "pytorch")
+                _rr_onnx_file = getattr(conf, "RERANKER_ONNX_FILE", "model_quint8_avx2.onnx")
+                _rr_min_score = getattr(conf, "RERANKER_MIN_SCORE", None)
                 # Use original query (Thai only) not expanded_query which may contain English synonyms
-                docs = _do_rerank(query, docs, model_name=_rr_model, top_k=_rr_top_k)
+                docs = _do_rerank(query, docs, model_name=_rr_model, top_k=_rr_top_k, backend=_rr_backend, onnx_file=_rr_onnx_file, min_score=_rr_min_score)
                 _LOG.debug("[Practical] reranker applied — %d docs kept", len(docs))
             except Exception as _rr_exc:
                 _LOG.warning("[Practical] reranker failed (%s) — continuing without rerank", _rr_exc)
@@ -2890,8 +2974,8 @@ class PracticalPersonaService:
         # If supervisor's _apply_slot_change_if_detected failed (e.g. old_entity was empty),
         # state.current_docs still has the old entity's docs. Detect the switch here and re-retrieve.
         _ENTITY_SWITCH_PATTERNS = [
-            (r"นิติบุคคล|(?:แบบ|เป็น(?:แบบ)?|ประเภท|รูปแบบ)\s*นิติ|บริษัท(?:\s*จำกัด|\s*มหาชน)?|ห้าง(?:หุ้นส่วน)?", "นิติบุคคล"),
-            (r"บุคคลธรรมดา|บุคคล.{0,4}มดา|บุคคลทั่วไป|เจ้าของคนเดียว|กิจการเจ้าของคนเดียว", "บุคคลธรรมดา"),
+            (_SHARED_ENTITY_NITI_RE, "นิติบุคคล"),
+            (_SHARED_ENTITY_NATURAL_RE, "บุคคลธรรมดา"),
         ]
         _stored_et = (
             (state.context or {}).get("slots", {}).get("entity_type_normalized")
@@ -2900,7 +2984,7 @@ class PracticalPersonaService:
         ).strip()
         _query_et_override = ""
         for _epat, _eval in _ENTITY_SWITCH_PATTERNS:
-            if re.search(_epat, user_text, re.IGNORECASE) and _eval != _stored_et:
+            if _epat.search(user_text) and _eval != _stored_et:
                 _query_et_override = _eval
                 break
 
@@ -4104,7 +4188,7 @@ class PracticalPersonaService:
                     for _d in _docs_to_process
                 }
                 _et_in_docs.discard("")
-                if len(_et_pre_sibling) >= 2 and not state.get_collected_slot("entity_type") and not (state.context or {}).get("_informational_query") and not (state.context or {}).get("_link_request_query") and not (state.context or {}).get("_broad_question") and not (state.context or {}).get("_direct_topic_match"):
+                if len(_et_pre_sibling) >= 2 and not state.get_collected_slot("entity_type") and not has_any_flag(state.context, ENTITY_INJECTION_SKIP_FLAGS):
                     _sq_now = list((state.context or {}).get("topic_slot_queue") or [])
                     if not any(s.get("key") == "entity_type" for s in _sq_now):
                         _et_display = {"บุคคลธรรมดา": "บุคคลธรรมดา", "นิติบุคคล": "นิติบุคคล"}
@@ -4216,6 +4300,76 @@ class PracticalPersonaService:
                 return (_rt_match, _richness)
             _docs_to_process = sorted(_docs_to_process, key=_doc_rank)
             state.current_docs = _docs_to_process
+
+        # Established-topic guarantee: when the session already has a department locked in
+        # (e.g. "ธนาคารกสิกรไทย", saved once the user names a bank — see persona_supervisor.py
+        # first-mention capture) but NONE of the docs retrieved for THIS turn belong to it,
+        # directly fetch that department's docs for the active topic (state.context["last_topic"],
+        # which persists the operation_by_department label like "QR PAYMENT" across turns) via a
+        # metadata filter — bypassing embedding/BM25 ranking entirely — and merge them in.
+        #
+        # Root cause this addresses: short/ambiguous follow-up queries (e.g. a typo'd "ชื่อบัญ"
+        # instead of "ชื่อบัญชี") were measured to retrieve a DIFFERENT, sometimes completely
+        # unrelated set of candidate docs on repeated identical input (confirmed via live re-runs —
+        # OpenRouter's embedding endpoint has documented ~40-50% transient failure rates, and BM25
+        # term overlap on ambiguous short queries is itself noisy). No prompt instruction can
+        # recover information that was never present in DOCUMENTS to begin with — only a filter
+        # is deterministic and immune to that ranking noise. This step only ADDS candidates; it
+        # never removes the docs semantic/BM25 search already found, so a genuine topic switch
+        # (where the established department has no docs for the new query at all) is unaffected —
+        # the merged-in docs simply won't match and the LLM's topic-drift instruction (see
+        # prompts_practical.py) handles picking the right ones when both are present.
+        try:
+            _cs_established_dept = str(
+                state.get_collected_slot("department") if hasattr(state, "get_collected_slot") else ""
+            ).strip()
+            _established_topic = str((state.context or {}).get("last_topic") or "").strip()
+            # Multi-entity case: supervisor's slot-change guard surfaces EVERY department
+            # explicitly named in a single turn here (e.g. "ทั้งกสิกรไทยและไทยพาณิชย์") when
+            # there were ≥2 — guarantee docs for all of them, not just whichever one stayed
+            # "established" in collected_slots (only one can be established at a time; see
+            # persona_supervisor.py multi-entity guard next to _BANK_DEPT_PATTERNS).
+            _multi_depts_mentioned = list((state.context or {}).get("_multi_dept_mentioned") or [])
+            _target_depts = list(dict.fromkeys(
+                ([_cs_established_dept] if _cs_established_dept else []) + _multi_depts_mentioned
+            ))
+            if _target_depts and _established_topic:
+                _depts_present = {
+                    str((d.get("metadata") or {}).get("department") or "").strip()
+                    for d in _docs_to_process
+                }
+                _vs_guarantee = getattr(self.retriever, "vectorstore", None)
+                _coll_guarantee = getattr(_vs_guarantee, "_collection", None) if _vs_guarantee else None
+                if _coll_guarantee is not None:
+                    _guar_max_chars = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700))
+                    for _target_dept in _target_depts:
+                        if _target_dept in _depts_present:
+                            continue
+                        _guar_res = _coll_guarantee.get(
+                            where={"$and": [
+                                {"operation_by_department": _established_topic},
+                                {"department": _target_dept},
+                            ]},
+                            include=["documents", "metadatas"],
+                        )
+                        _guar_docs = [
+                            {"content": (c or "")[:_guar_max_chars], "metadata": m or {}}
+                            for c, m in zip(
+                                _guar_res.get("documents") or [],
+                                _guar_res.get("metadatas") or [],
+                            )
+                        ]
+                        if _guar_docs:
+                            _docs_to_process = _guar_docs + _docs_to_process
+                            state.current_docs = _docs_to_process
+                            _depts_present.add(_target_dept)
+                            _LOG.info(
+                                "[Practical] established-topic guarantee: dept=%r topic=%r → +%d doc(s) "
+                                "(none of that department were in the retrieved set)",
+                                _target_dept, _established_topic, len(_guar_docs),
+                            )
+        except Exception as _e_guarantee:
+            _LOG.warning("[Practical] established-topic guarantee failed: %s", _e_guarantee)
 
         # Pass 1: classify research_reference + restaurant_ai_document links → SERVICE / FORM / GUIDE / REF
         # Same _classify_link logic as Academic — hybrid desc+URL classification, no URL pattern rules in prompt
@@ -4786,7 +4940,7 @@ Rules:
 - Section headers must NOT be questions (no ไหม/อย่างไร/ตอนไหน in headers)
 - Under each header, write the actual steps/requirements/documents — NOT just the header alone
 - Put the most important / legally required items FIRST (e.g. ใบอนุญาตหลักก่อน ใบรับรองเสริมทีหลัง)
-- If a topic has no DOCUMENTS, write EXACTLY: "ยังไม่พบข้อมูลในเอกสาร" — do NOT add any URL, website, phone number, office name, or contact info that is not in the DOCUMENTS above
+- If a topic has no DOCUMENTS, write EXACTLY: [[INFO_GAP]] — do NOT add any URL, website, phone number, office name, or contact info that is not in the DOCUMENTS above
 - Do NOT stop after writing just one section header
 - Close with a 1-sentence summary: which items are MANDATORY vs optional
 """
@@ -4961,6 +5115,21 @@ Rules:
                     f"- Show fee/requirement for {_area_hint} ONLY. Do NOT list other area tiers.\n"
                     f"- NEVER reclassify area values mentioned in earlier conversation turns — each turn's area is independent."
                 )
+            # Confidence-tiered auto-fill (Part 2, 2026-07-31): entity_type was derived
+            # via the LLM fallback from ambiguous/colloquial phrasing, not an explicit
+            # unambiguous term — one-shot flag set by persona_supervisor.py. Ask the LLM
+            # to briefly confirm the assumption in this turn's reply so the user has a
+            # low-friction chance to correct it, instead of it being silently locked in
+            # forever (this project's "no slot re-ask" rule — see
+            # entity_false_positive_regex_tightening.md). Only applies when _et_hint
+            # (not a registration_type-only case) actually drove the entity assumption.
+            if _et_hint and (state.context or {}).get("_entity_type_just_inferred"):
+                _entity_filter_hint += (
+                    f"\n\n⚠️ ENTITY TYPE WAS INFERRED, NOT EXPLICITLY STATED — MANDATORY:\n"
+                    f"- Begin your answer with a brief one-line confirmation of this assumption, "
+                    f"e.g. \"เข้าใจว่าร้านเป็น{_et_hint}นะครับ — \" then continue with the answer.\n"
+                    f"- Do NOT turn this into a question — it's a statement the user can correct, not something you're asking."
+                )
         else:
             _has_entity_docs = any(
                 (d.get("metadata") or {}).get("entity_type_normalized", "") in ("บุคคลธรรมดา", "นิติบุคคล")
@@ -4982,6 +5151,28 @@ Rules:
                 f"- NEVER reclassify area values mentioned in earlier conversation turns — each turn's area is independent."
             )
             _entity_filter_hint = _entity_filter_hint + _area_only_hint if _entity_filter_hint else _area_only_hint
+
+        # User-stated conditions instruction: unlike the entity_type/area_size hints above (which
+        # read from tracked slots), this reads the user's CURRENT free-text message for facts that
+        # resolve a conditional/tiered item embedded in a single doc field (e.g. fees text with
+        # "ถ้าจด VAT... / ถ้าไม่จด VAT..."). Always appended — no tracked slot exists for this
+        # because such conditions are one-off per document, not reused across the corpus like
+        # entity_type/area_size, so building a formal slot for each would be over-engineering.
+        _user_condition_hint = (
+            "\n\n⚠️ USER-STATED CONDITIONS — MANDATORY RULE:\n"
+            "- This rule applies ONLY when the user's OWN message contains an explicit first-person statement\n"
+            "  of their own status for a SPECIFIC condition (e.g. \"ฉันไม่ได้จด vat\", \"ยังไม่ได้จดทะเบียน\",\n"
+            "  \"มีพนักงาน 15 คน\") — a literal statement from the user about themselves, not something implied,\n"
+            "  guessed, or discussed elsewhere in your OWN answer text.\n"
+            "- CRITICAL: your own answer explaining that a registration/condition is legally required\n"
+            "  (e.g. \"ต้องจด VAT ถ้ารายได้เกิน 1.8 ล้านบาท\") is NOT the user confirming they meet it.\n"
+            "  Never treat your own explanation of a requirement as if the user had stated their status.\n"
+            "- When a DOCUMENT shows a price/requirement as multiple tiers or conditions (e.g. \"ถ้าจด VAT... /\n"
+            "  ถ้าไม่จด VAT...\"), show ONLY the tier matching a status the user explicitly stated for THAT\n"
+            "  SPECIFIC condition. If unstated, show ALL applicable tiers for that condition.\n"
+            "- When in doubt whether the user explicitly stated the relevant fact, default to showing ALL tiers."
+        )
+        _entity_filter_hint = (_entity_filter_hint + _user_condition_hint) if _entity_filter_hint else _user_condition_hint
 
         # Cut-off time query instruction: force LLM to read terms_and_conditions metadata directly.
         # Needed when user asks about ตัดรอบ / cut-off time — the data lives in terms_and_conditions
@@ -5139,7 +5330,9 @@ Your JSON response:
             _LOG.info("[Practical] slot_queue has askable slot — skipping LLM, action=ask")
             decision = {"action": "ask", "execution": {"question": "", "slot_options": [], "answer": "", "query": "", "context_update": {}}}
         else:
+            emit_progress("กำลังเรียบเรียงคำตอบ...")
             decision = self._call_llm_json(prompt, state=state)
+            emit_progress("กำลังตรวจสอบความครบถ้วนของคำตอบ...")
         action = (decision.get("action") or "ask").strip()
         _exec_raw = decision.get("execution", {})
         # Gemini may return execution as a JSON string instead of a dict — parse it
@@ -5172,7 +5365,20 @@ Your JSON response:
                     [s.get("key") for s in _pending_queue] if _pending_queue else [],
                     _rblk,
                 )
-                if _rblk >= 2:
+                # Skip the "gentle" same-docs retry round below when we're blocked purely
+                # because _internal=True (already inside a recursive call — e.g. right after
+                # persona_practical's own new-topic retrieval at line ~2825 — not a genuine
+                # pending-slot-menu wait). Re-asking the LLM with byte-identical DOCUMENTS in
+                # that situation is a provable no-op: verified via live reproduction that the
+                # LLM returns the same 'retrieve' verdict every time, since nothing about its
+                # input changed between calls — so it just burns one full paid LLM call
+                # (~10-20s, several cents) to advance a counter with zero chance of a
+                # different outcome. Go straight to the corrective retry with a cleaned-up
+                # query instead. The _pending_queue case is different and keeps the gentle
+                # round: collected_slots may have just changed (e.g. a slot was just filled),
+                # which CAN change the LLM's answer even on unchanged docs.
+                _skip_gentle_round = bool(_internal and not _pending_queue)
+                if _rblk >= 2 or _skip_gentle_round:
                     # LLM is stuck in retrieve loop — break by forcing a non-internal call.
                     # Setting _internal=False lets handle() call the LLM without the "retrieve blocked"
                     # guard, so LLM is forced to answer with current docs on next turn.
@@ -5196,6 +5402,9 @@ Your JSON response:
                         )
                         state.context["_force_answer_count"] = 0
                         state.context["_retrieve_blocked_count"] = 0
+                        # Code-decided abort, not LLM output — flag the gap directly (see
+                        # extract_info_gap_tag's docstring in text_patterns.py).
+                        state.context["_info_gap_detected"] = True
                         _fb = "ขอโทษครับ ไม่พบข้อมูลที่ตรงกับคำถามนี้ในฐานข้อมูลของเรา กรุณาลองถามใหม่หรือระบุรายละเอียดเพิ่มเติมครับ"
                         state.add_assistant_message(_fb)
                         return state, _fb
@@ -5205,7 +5414,21 @@ Your JSON response:
                         _safe_query[:60],
                     )
                     state.context["_retrieve_blocked_count"] = 0
-                    return self.handle(state, _safe_query, _internal=True)
+                    # BUG FIX: this must be _internal=False (matching the comment above —
+                    # "Setting _internal=False lets handle() call the LLM without the
+                    # 'retrieve blocked' guard"). It was passing _internal=True, which is
+                    # the OPPOSITE of that stated intent — the guard at the top of this
+                    # block is `if state.current_docs and (_pending_queue or _internal):`,
+                    # so _internal=True unconditionally re-triggers the SAME block on the
+                    # very next call regardless of _safe_query, guaranteeing the retry can
+                    # never reach the actual retrieval code further down and just re-asks
+                    # the LLM the same question against the same wrong docs until the
+                    # hard-abort fallback fires. Confirmed via live reproduction: 3 wasted
+                    # Sonnet calls, session token budget blown (80k), ~$0.5 for zero
+                    # progress, before returning a generic "no info found" message —
+                    # even though _safe_query (the clean, non-anchored original topic
+                    # question) was right there and would have found the correct docs.
+                    return self.handle(state, _safe_query, _internal=False)
                 return self.handle(state, "__auto_post_retrieve__", _internal=True)
 
             if action == "retrieve":
@@ -5442,8 +5665,15 @@ Your JSON response:
 
         if action == "answer":
             ans = (exec_.get("answer") or "").strip()
-            if not ans:
+            if ans:
+                ans, _info_gap_tagged = _shared_extract_info_gap_tag(ans)
+                if _info_gap_tagged:
+                    state.context["_info_gap_detected"] = True
+            else:
+                # Empty LLM output — Python-decided fallback, not LLM output, so it can
+                # never carry the tag; flag the gap directly (see text_patterns.py).
                 ans = "ตอนนี้ยังไม่พบข้อมูลที่ยืนยันได้ในเอกสารครับ"
+                state.context["_info_gap_detected"] = True
 
             if isinstance(exec_.get("context_update", {}), dict):
                 _cu = dict(exec_.get("context_update", {}))
@@ -6091,6 +6321,7 @@ Your JSON response:
                 if _lt_snap:
                     state.context["last_answered_license_type"] = _lt_snap
                     state.context.pop("last_answered_license_types", None)
+
             return state, ans
 
         fallback = "ผมยังไม่เข้าใจครับ บอกหัวข้อที่อยากรู้เกี่ยวกับร้านอาหารหน่อยครับ"

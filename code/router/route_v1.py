@@ -7,6 +7,7 @@ import asyncio
 import datetime
 import json
 import logging
+import queue
 import uuid
 from typing import AsyncGenerator, Optional
 
@@ -20,7 +21,7 @@ from model.state_manager import StateManager
 from model.persona_supervisor import PersonaSupervisor
 from utils.simple_cache import get_cache
 from utils.rate_limiter import get_rate_limiter
-from utils.llm_call import estimate_cost
+from utils.progress import set_progress_callback, clear_progress_callback
 
 import conf
 
@@ -35,6 +36,11 @@ SESSION_RETENTION_DAYS = 7
 class ChatRequest(BaseModel):
     message: str = Field(..., max_length=5000, description="User message to chatbot")
     session_id: Optional[str] = Field(None, description="Session ID for conversation continuity")
+    # Always sent by the caller (can be ""). A non-empty value updates the session's
+    # stored branch identity; "" leaves whatever was captured on a prior turn untouched
+    # (see _merge_branch_fields in chat()/_stream_reply()).
+    branch_id: str = Field(default="", description="Branch identifier of the caller (may be empty string)")
+    branch_name: str = Field(default="", description="Branch display name of the caller (may be empty string)")
 
 
 class SessionRequest(BaseModel):
@@ -42,6 +48,8 @@ class SessionRequest(BaseModel):
 
 
 class NewSessionRequest(BaseModel):
+    branch_id: str = Field(default="", description="Branch identifier of the caller (may be empty string)")
+    branch_name: str = Field(default="", description="Branch display name of the caller (may be empty string)")
     persona_id: str = Field(default="practical", description="practical or academic")
 
 
@@ -71,19 +79,10 @@ try:
 
     logger.info("Services initialized successfully")
 
-    # Pre-warm cross-encoder reranker in background so first request doesn't pay
-    # the 1-2s model-load cost. Daemon thread — does not block server startup.
-    if getattr(conf, "RERANKER_ENABLED", False):
-        import threading
-        def _prewarm_reranker():
-            try:
-                from utils.reranker import _get_reranker
-                _rr_model = getattr(conf, "RERANKER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
-                _get_reranker(_rr_model)
-                logger.info("Reranker pre-warmed: %s", _rr_model)
-            except Exception as _rr_e:
-                logger.warning("Reranker pre-warm failed (non-blocking): %s", _rr_e)
-        threading.Thread(target=_prewarm_reranker, daemon=True, name="reranker_prewarm").start()
+    # Reranker preload lives in app.py's lifespan hook only (was duplicated here too —
+    # both called _get_reranker() for the same model, racing at startup; harmless under
+    # normal single-process boot since _get_reranker double-checks its cache, but wasteful
+    # and confusing to have two independent trigger points for the same one-time load).
 
     # Pre-warm topic pool in background — populates global cross-session cache so the
     # first user greeting doesn't pay the 5-retrieval build cost (~1-2s).
@@ -161,6 +160,102 @@ def _get_session_lock(session_id: str) -> asyncio.Lock:
     return _session_locks[session_id]
 
 
+# state_manager.load/save/delete/list_sessions do real blocking disk I/O (file open,
+# json parse/dump, os.rename, and — for save — a cross-process lock acquired via a
+# busy-poll loop with time.sleep). FastAPI/uvicorn runs on a single-threaded asyncio
+# event loop, so calling these directly inside an `async def` handler (unlike
+# supervisor.handle(), which already correctly goes through run_in_executor) stalls
+# the ENTIRE event loop for that duration — blocking every other concurrent session's
+# request, not just this one. These wrappers move the exact same calls onto the
+# executor thread pool; behavior/return values are unchanged, only which thread runs
+# them.
+async def _load_state_async(session_id: str) -> Optional[ConversationState]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, state_manager.load, session_id)
+
+
+async def _save_state_async(session_id: str, state: ConversationState) -> None:
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, state_manager.save, session_id, state)
+
+
+async def _delete_state_async(session_id: str) -> None:
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, state_manager.delete, session_id)
+
+
+async def _list_sessions_async(limit: int = 20) -> list:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, state_manager.list_sessions, limit)
+
+
+async def _cleanup_old_sessions_async() -> None:
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _cleanup_old_sessions)
+
+
+def _consume_pending_token_budget(state: ConversationState, session_id: str) -> bool:
+    """Runs the deferred summarize/trim check (see llm_call.py's
+    run_pending_token_budget_check) on a worker thread. Returns True if it actually
+    ran, so the caller knows the state changed and needs re-saving."""
+    ctx = state.context or {}
+    if not ctx.get("_needs_token_budget_check"):
+        return False
+    ctx.pop("_needs_token_budget_check", None)
+    from utils.llm_call import run_pending_token_budget_check
+    run_pending_token_budget_check(state, label=f"TokenBudget/{session_id}", log=logger)
+    return True
+
+
+# asyncio.create_task() only keeps a weak reference to the task it returns — if
+# nothing else references it, the task can be garbage-collected mid-run before it
+# finishes (a documented asyncio pitfall). Hold a strong reference here for the
+# deferred summarize/lock-release tasks below, since a GC'd task would leak the
+# session lock forever (never released).
+_background_tasks: set = set()
+
+
+def _spawn_background(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _release_session_lock_after_deferred_work(
+    session_id: str, lock: asyncio.Lock, state: ConversationState
+) -> None:
+    """Fire-and-forget task: finishes the deferred token-budget summarize/trim (an
+    LLM call that can take 1-3s) in the background AFTER the turn's response has
+    already been returned to the client, persists the result, then releases the
+    per-session lock. The lock is deliberately held for this whole window so a
+    second message arriving for the SAME session can't start mutating
+    state.messages concurrently with this background summarize/trim — see the
+    manual acquire/release (not `async with`) in chat() and _stream_reply()."""
+    try:
+        loop = asyncio.get_running_loop()
+        changed = await loop.run_in_executor(None, _consume_pending_token_budget, state, session_id)
+        if changed:
+            await _save_state_async(session_id, state)
+    except Exception:
+        logger.warning("[%s] Deferred token-budget summarize failed (non-blocking)", session_id, exc_info=True)
+    finally:
+        lock.release()
+
+
+def _merge_branch_fields(state: ConversationState, branch_id: str, branch_name: str) -> None:
+    """The caller sends branch_id/branch_name on every /chat turn (may be "").
+    A non-empty value updates the session's stored branch identity; "" is a no-op
+    so a turn that doesn't carry it (e.g. a mid-conversation slot answer) never
+    erases what an earlier turn already captured. Branch is conversation-scoped,
+    not per-turn, so this is a merge, not a replace."""
+    bid = (branch_id or "").strip()
+    bname = (branch_name or "").strip()
+    if bid:
+        state.branch_id = bid
+    if bname:
+        state.branch_name = bname
+
+
 def _cleanup_old_sessions():
     global _last_cleanup_ts
     import time
@@ -204,19 +299,27 @@ async def start_session(payload: Optional[NewSessionRequest] = None):
     if supervisor is None or state_manager is None:
         raise HTTPException(status_code=503, detail="Services not initialized")
 
-    _cleanup_old_sessions()
+    await _cleanup_old_sessions_async()
 
     persona_id = "practical"
     if payload and payload.persona_id in {"practical", "academic"}:
         persona_id = payload.persona_id
 
     session_id = f"s_{uuid.uuid4().hex[:8]}"
-    state = ConversationState(session_id=session_id, persona_id=persona_id, context={})
+    branch_id = ((payload.branch_id if payload else "") or "").strip() or None
+    branch_name = ((payload.branch_name if payload else "") or "").strip() or None
+    state = ConversationState(
+        session_id=session_id,
+        persona_id=persona_id,
+        context={},
+        branch_id=branch_id,
+        branch_name=branch_name,
+    )
 
     try:
         loop = asyncio.get_running_loop()
         state, greeting_text = await loop.run_in_executor(None, supervisor.handle, state, "")
-        state_manager.save(session_id, state)
+        await _save_state_async(session_id, state)
     except Exception:
         logger.error(f"[{session_id}] Greeting failed", exc_info=True)
         raise HTTPException(
@@ -241,7 +344,7 @@ async def reset_session(request: SessionRequest):
     if supervisor is None or state_manager is None:
         raise HTTPException(status_code=503, detail="Services not initialized")
 
-    _cleanup_old_sessions()
+    await _cleanup_old_sessions_async()
 
     session_id = request.session_id or f"s_{uuid.uuid4().hex[:8]}"
     state = ConversationState(session_id=session_id, persona_id="practical", context={})
@@ -249,7 +352,7 @@ async def reset_session(request: SessionRequest):
     try:
         loop = asyncio.get_running_loop()
         state, greeting_text = await loop.run_in_executor(None, supervisor.handle, state, "")
-        state_manager.save(session_id, state)
+        await _save_state_async(session_id, state)
     except Exception:
         logger.error(f"[{session_id}] Reset failed", exc_info=True)
         raise HTTPException(
@@ -273,9 +376,9 @@ async def list_sessions():
     if state_manager is None:
         raise HTTPException(status_code=503, detail="State manager not initialized")
 
-    _cleanup_old_sessions()
+    await _cleanup_old_sessions_async()
 
-    sessions = state_manager.list_sessions(limit=20)
+    sessions = await _list_sessions_async(limit=20)
     return HandleSuccess(
         message="Sessions loaded",
         sessions=sessions,
@@ -291,7 +394,7 @@ async def load_session(request: SessionRequest):
     if not request.session_id:
         raise HTTPException(status_code=400, detail="session_id is required")
 
-    state = state_manager.load(request.session_id)
+    state = await _load_state_async(request.session_id)
     if state is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -311,7 +414,7 @@ async def delete_session(request: SessionRequest):
     if not request.session_id:
         raise HTTPException(status_code=400, detail="session_id is required")
 
-    state_manager.delete(request.session_id)
+    await _delete_state_async(request.session_id)
 
     return HandleSuccess(
         message="Session deleted",
@@ -357,14 +460,14 @@ async def chat(request: ChatRequest):
             detail="Message cannot be empty",
         )
 
-    _cleanup_old_sessions()
+    await _cleanup_old_sessions_async()
 
     session_id = request.session_id or f"s_{uuid.uuid4().hex[:8]}"
-    
+
     # Rate limiting check
     rate_limiter = get_rate_limiter()
     allowed, rate_info = rate_limiter.is_allowed(session_id)
-    
+
     if not allowed:
         logger.warning(f"[{session_id}] Rate limit exceeded - blocking request")
         raise HTTPException(
@@ -377,97 +480,115 @@ async def chat(request: ChatRequest):
                 "Retry-After": str(rate_info["retry_after"])
             }
         )
-    
+
     logger.info(f"[{session_id}] Rate limit OK - {rate_info['remaining']}/{rate_info['limit']} remaining")
 
+    lock = _get_session_lock(session_id)
+    await lock.acquire()
+    _lock_deferred = False
     try:
         # Load state
-        async with _get_session_lock(session_id):
-            saved = state_manager.load(session_id)
-            state = saved if saved else ConversationState(session_id=session_id, persona_id="practical", context={})
+        saved = await _load_state_async(session_id)
+        state = saved if saved else ConversationState(session_id=session_id, persona_id="practical", context={})
+        _merge_branch_fields(state, request.branch_id, request.branch_name)
 
-            # Session-level token budget: monitor-only (no blocking).
-            _pre_prompt = getattr(state, "total_prompt_tokens", 0) or 0
-            _pre_completion = getattr(state, "total_completion_tokens", 0) or 0
-            _pre_tokens = _pre_prompt + _pre_completion
-            _session_budget = int(getattr(conf, "TOKEN_BUDGET_PER_SESSION", 0) or 0)
-            if _session_budget > 0 and _pre_tokens >= _session_budget:
+        # Session-level token budget: monitor-only (no blocking).
+        _pre_prompt = getattr(state, "total_prompt_tokens", 0) or 0
+        _pre_completion = getattr(state, "total_completion_tokens", 0) or 0
+        _pre_cost = getattr(state, "total_cost_usd", 0.0) or 0.0
+        _pre_tokens = _pre_prompt + _pre_completion
+        _session_budget = int(getattr(conf, "TOKEN_BUDGET_PER_SESSION", 0) or 0)
+        if _session_budget > 0 and _pre_tokens >= _session_budget:
+            logger.warning(
+                "[%s] Session token budget alert: used=%d limit=%d (continuing — monitoring only)",
+                session_id, _pre_tokens, _session_budget,
+            )
+
+        # Per-window token rate check (burst protection).
+        _window_token_limit = int(getattr(conf, "TOKEN_RATE_LIMIT_PER_WINDOW", 0) or 0)
+        if _window_token_limit > 0:
+            _token_rate_ok, _window_tokens_used = rate_limiter.is_token_rate_allowed(session_id, _window_token_limit)
+            if not _token_rate_ok:
                 logger.warning(
-                    "[%s] Session token budget alert: used=%d limit=%d (continuing — monitoring only)",
-                    session_id, _pre_tokens, _session_budget,
+                    "[%s] Token rate limit exceeded: window_tokens=%d limit=%d",
+                    session_id, _window_tokens_used, _window_token_limit,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Token rate limit exceeded. Please wait before sending more messages.",
+                    headers={"Retry-After": "60"},
                 )
 
-            # Per-window token rate check (burst protection).
-            _window_token_limit = int(getattr(conf, "TOKEN_RATE_LIMIT_PER_WINDOW", 0) or 0)
-            if _window_token_limit > 0:
-                _token_rate_ok, _window_tokens_used = rate_limiter.is_token_rate_allowed(session_id, _window_token_limit)
-                if not _token_rate_ok:
-                    logger.warning(
-                        "[%s] Token rate limit exceeded: window_tokens=%d limit=%d",
-                        session_id, _window_tokens_used, _window_token_limit,
-                    )
-                    raise HTTPException(
-                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                        detail="Token rate limit exceeded. Please wait before sending more messages.",
-                        headers={"Retry-After": "60"},
-                    )
+        cache = get_cache()
+        has_pending_slot = bool((state.context or {}).get("pending_slot"))
+        _collected_slots = (state.context or {}).get("collected_slots") or {}
+        # First-turn queries with no prior user messages and no collected slots
+        # produce identical LLM context across sessions (same system prompt +
+        # same greeting + same retrieved docs). Use a shared cache key so
+        # different users asking the same first question share one cache entry.
+        _prior_user_msgs = [
+            m for m in (state.messages or [])
+            if (m.get("role") if isinstance(m, dict) else getattr(m, "role", "")) == "user"
+        ]
+        _is_context_free = not _collected_slots and not _prior_user_msgs and not has_pending_slot
+        _cache_session_id = "__shared__" if _is_context_free else session_id
+        cached_result = (
+            None
+            if has_pending_slot
+            else cache.get(_cache_session_id, request.message, state.persona_id, _collected_slots)
+        )
 
-            cache = get_cache()
-            has_pending_slot = bool((state.context or {}).get("pending_slot"))
-            _collected_slots = (state.context or {}).get("collected_slots") or {}
-            # First-turn queries with no prior user messages and no collected slots
-            # produce identical LLM context across sessions (same system prompt +
-            # same greeting + same retrieved docs). Use a shared cache key so
-            # different users asking the same first question share one cache entry.
-            _prior_user_msgs = [
-                m for m in (state.messages or [])
-                if (m.get("role") if isinstance(m, dict) else getattr(m, "role", "")) == "user"
-            ]
-            _is_context_free = not _collected_slots and not _prior_user_msgs and not has_pending_slot
-            _cache_session_id = "__shared__" if _is_context_free else session_id
-            cached_result = (
-                None
-                if has_pending_slot
-                else cache.get(_cache_session_id, request.message, state.persona_id, _collected_slots)
+        if cached_result is not None:
+            logger.info(f"[{session_id}] Cache HIT! Skipping LLM call (saved ${cached_result.get('cost', 0):.3f})")
+            state.add_user_message_once(request.message)
+            state.add_assistant_message_once(cached_result["response"])
+            await _save_state_async(session_id, state)
+            return HandleSuccess(
+                message="Chat completed (cached)",
+                response=cached_result["response"],
+                session_id=session_id,
+                persona_id=state.persona_id,
+                cached=True,
+                cache_stats=cache.get_stats()
             )
 
-            if cached_result is not None:
-                logger.info(f"[{session_id}] Cache HIT! Skipping LLM call (saved ${cached_result.get('cost', 0):.3f})")
-                state.add_user_message_once(request.message)
-                state.add_assistant_message_once(cached_result["response"])
-                state_manager.save(session_id, state)
-                return HandleSuccess(
-                    message="Chat completed (cached)",
-                    response=cached_result["response"],
-                    session_id=session_id,
-                    persona_id=state.persona_id,
-                    cached=True,
-                    cache_stats=cache.get_stats()
-                )
+        logger.info(f"[{session_id}] Cache MISS - Calling LLM")
+        loop = asyncio.get_running_loop()
+        state, bot_reply = await loop.run_in_executor(None, supervisor.handle, state, request.message)
+        await _save_state_async(session_id, state)
 
-            logger.info(f"[{session_id}] Cache MISS - Calling LLM")
-            loop = asyncio.get_running_loop()
-            state, bot_reply = await loop.run_in_executor(None, supervisor.handle, state, request.message)
-            state_manager.save(session_id, state)
+        # Record token delta and cache inside the lock — prevents stale reads
+        # when two requests for the same session overlap.
+        _post_tokens = (getattr(state, "total_prompt_tokens", 0) or 0) + (getattr(state, "total_completion_tokens", 0) or 0)
+        _delta_tokens = max(0, _post_tokens - _pre_tokens)
+        if _delta_tokens > 0:
+            rate_limiter.record_token_usage(session_id, _delta_tokens)
 
-            # Record token delta and cache inside the lock — prevents stale reads
-            # when two requests for the same session overlap.
-            _post_tokens = (getattr(state, "total_prompt_tokens", 0) or 0) + (getattr(state, "total_completion_tokens", 0) or 0)
-            _delta_tokens = max(0, _post_tokens - _pre_tokens)
-            if _delta_tokens > 0:
-                rate_limiter.record_token_usage(session_id, _delta_tokens)
-
-            _post_prompt = getattr(state, "total_prompt_tokens", 0) or 0
-            _post_completion = getattr(state, "total_completion_tokens", 0) or 0
-            _model_for_cost = {
-                "academic": conf.OPENROUTER_MODEL_ACADEMIC,
-                "practical": conf.OPENROUTER_MODEL_PRACTICAL,
-            }.get(state.persona_id, conf.OPENROUTER_MODEL)
-            _actual_cost = estimate_cost(
-                _model_for_cost,
-                max(0, _post_prompt - _pre_prompt),
-                max(0, _post_completion - _pre_completion),
-            )
+        # Real cost delta, not reconstructed from token counts: a turn often mixes
+        # one main-persona call (Sonnet/GPT-5.1) with several cheap Haiku classifier
+        # calls, and re-pricing that blended token delta at a single assumed model
+        # would misprice every Haiku token at the main model's (higher) rate. Each
+        # LLM call already accumulates its own correctly-priced cost onto
+        # state.total_cost_usd at the source (llm_call.py, where the real model for
+        # THAT call is known) — so the delta here is already accurate as-is.
+        _post_cost = getattr(state, "total_cost_usd", 0.0) or 0.0
+        _actual_cost = max(0.0, _post_cost - _pre_cost)
+        # Don't cache "no answer found" fallbacks — a transient retrieval/model
+        # hiccup would otherwise poison the shared (__shared__) cache key and
+        # serve the same wrong "not found" reply to every other user asking
+        # this question until the entry expires. Reuses the same
+        # state.context["_info_gap_detected"] flag the supervisor sets to gate its
+        # feedback-menu detection (see persona_supervisor.py's _maybe_offer_feedback) —
+        # already computed for this turn, no extra work needed here.
+        _is_no_answer_reply = bool((state.context or {}).get("_info_gap_detected"))
+        # Never cache a reply that leaves a pending_slot behind — the cache only stores
+        # the reply text, not the state.context side-effects (pending_slot, main_menu_shown,
+        # etc.) that a cache HIT skips by never calling supervisor.handle(). Caching such a
+        # reply under the shared key poisons every other brand-new session's first turn with
+        # a reply that looks identical but has no pending_slot, so a follow-up numeric menu
+        # pick ("1"/"2") can't be resolved and falls through to the unknown-input fallback.
+        _reply_has_pending_slot = bool((state.context or {}).get("pending_slot"))
+        if not _is_no_answer_reply and not _reply_has_pending_slot:
             cache.set(
                 session_id=_cache_session_id,
                 question=request.message,
@@ -480,7 +601,7 @@ async def chat(request: ChatRequest):
                 collected_slots=_collected_slots,
             )
 
-        return HandleSuccess(
+        response = HandleSuccess(
             message="Chat completed",
             response=bot_reply,
             session_id=session_id,
@@ -488,6 +609,14 @@ async def chat(request: ChatRequest):
             cached=False,
             cache_stats=cache.get_stats()
         )
+        # If the turn's answer call crossed the session token budget, the actual
+        # summarize/trim work (an LLM call) was deferred (see llm_call.py's
+        # run_pending_token_budget_check) — run it in the background now, AFTER
+        # the response is ready, instead of adding its latency to this turn.
+        if bool((state.context or {}).get("_needs_token_budget_check")):
+            _lock_deferred = True
+            _spawn_background(_release_session_lock_after_deferred_work(session_id, lock, state))
+        return response
 
     except HTTPException:
         raise
@@ -497,13 +626,31 @@ async def chat(request: ChatRequest):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Chat failed. Please try again.",
         )
+    finally:
+        if not _lock_deferred:
+            lock.release()
 
 
-async def _stream_reply(session_id: str, message: str) -> AsyncGenerator[str, None]:
+def _run_supervisor_with_progress(state, message, progress_cb):
+    """Runs supervisor.handle() on the executor's worker thread with the progress
+    callback set/cleared on that SAME thread — thread-locals set on the event-loop
+    thread would never be visible inside the worker thread that actually runs the
+    pipeline, so the set/clear must happen here, wrapping the call itself."""
+    set_progress_callback(progress_cb)
+    try:
+        return supervisor.handle(state, message)
+    finally:
+        clear_progress_callback()
+
+
+async def _stream_reply(
+    session_id: str, message: str, branch_id: str = "", branch_name: str = ""
+) -> AsyncGenerator[str, None]:
     """
     Generator ที่ส่งคำตอบทีละ chunk แบบ SSE (Server-Sent Events)
     Format: data: <json>\n\n
     Events:
+      - {"type": "status", "text": "..."}  ← สถานะการทำงานจริงระหว่างรอ (ไม่ใช่การเดา)
       - {"type": "chunk", "text": "..."}   ← ตัวอักษรที่ทยอยส่ง
       - {"type": "done", "session_id": "...", "persona_id": "..."}  ← จบ
       - {"type": "error", "message": "..."}  ← กรณี error
@@ -520,92 +667,114 @@ async def _stream_reply(session_id: str, message: str) -> AsyncGenerator[str, No
     _stream_error: str = ""
     _stream_cost: float = 0.0
 
+    lock = _get_session_lock(session_id)
+    await lock.acquire()
+    _lock_deferred = False
+    state: Optional[ConversationState] = None
     try:
-        async with _get_session_lock(session_id):
-            saved = state_manager.load(session_id)
-            state = saved if saved else ConversationState(
-                session_id=session_id, persona_id="practical", context={}
+        saved = await _load_state_async(session_id)
+        state = saved if saved else ConversationState(
+            session_id=session_id, persona_id="practical", context={}
+        )
+        _merge_branch_fields(state, branch_id, branch_name)
+
+        # Session-level token budget: monitor-only (no blocking).
+        _pre_prompt_st = getattr(state, "total_prompt_tokens", 0) or 0
+        _pre_completion_st = getattr(state, "total_completion_tokens", 0) or 0
+        _pre_cost_st = getattr(state, "total_cost_usd", 0.0) or 0.0
+        _pre_tokens_st = _pre_prompt_st + _pre_completion_st
+        _session_budget_st = int(getattr(conf, "TOKEN_BUDGET_PER_SESSION", 0) or 0)
+        if _session_budget_st > 0 and _pre_tokens_st >= _session_budget_st:
+            logger.warning(
+                "[%s] Session token budget alert (stream): used=%d limit=%d (continuing — monitoring only)",
+                session_id, _pre_tokens_st, _session_budget_st,
             )
 
-            # Session-level token budget: monitor-only (no blocking).
-            _pre_prompt_st = getattr(state, "total_prompt_tokens", 0) or 0
-            _pre_completion_st = getattr(state, "total_completion_tokens", 0) or 0
-            _pre_tokens_st = _pre_prompt_st + _pre_completion_st
-            _session_budget_st = int(getattr(conf, "TOKEN_BUDGET_PER_SESSION", 0) or 0)
-            if _session_budget_st > 0 and _pre_tokens_st >= _session_budget_st:
+        # Per-window token rate check (burst protection).
+        _window_token_limit_st = int(getattr(conf, "TOKEN_RATE_LIMIT_PER_WINDOW", 0) or 0)
+        if _window_token_limit_st > 0:
+            _rl_st = get_rate_limiter()
+            _token_ok_st, _window_used_st = _rl_st.is_token_rate_allowed(session_id, _window_token_limit_st)
+            if not _token_ok_st:
                 logger.warning(
-                    "[%s] Session token budget alert (stream): used=%d limit=%d (continuing — monitoring only)",
-                    session_id, _pre_tokens_st, _session_budget_st,
+                    "[%s] Token rate limit exceeded (stream): window_tokens=%d limit=%d",
+                    session_id, _window_used_st, _window_token_limit_st,
                 )
+                _stream_error = "Token rate limit exceeded. Please wait before sending more messages."
 
-            # Per-window token rate check (burst protection).
-            _window_token_limit_st = int(getattr(conf, "TOKEN_RATE_LIMIT_PER_WINDOW", 0) or 0)
-            if _window_token_limit_st > 0:
-                _rl_st = get_rate_limiter()
-                _token_ok_st, _window_used_st = _rl_st.is_token_rate_allowed(session_id, _window_token_limit_st)
-                if not _token_ok_st:
-                    logger.warning(
-                        "[%s] Token rate limit exceeded (stream): window_tokens=%d limit=%d",
-                        session_id, _window_used_st, _window_token_limit_st,
-                    )
-                    _stream_error = "Token rate limit exceeded. Please wait before sending more messages."
-                    # lock released at end of with block
+        if not _stream_error:
+            # Skip cache only when a slot question is pending (mid-collection).
+            # collected_slots is included in the cache key so different slot combos
+            # never share a cache entry — no need to skip cache when slots are present.
+            # First-turn + no-slot queries use a shared key so different users
+            # asking the same question share one cache entry (see /chat endpoint).
+            cache = get_cache()
+            has_pending_slot = bool((state.context or {}).get("pending_slot"))
+            _collected_slots = (state.context or {}).get("collected_slots") or {}
+            _prior_user_msgs_st = [
+                m for m in (state.messages or [])
+                if (m.get("role") if isinstance(m, dict) else getattr(m, "role", "")) == "user"
+            ]
+            _is_context_free_st = not _collected_slots and not _prior_user_msgs_st and not has_pending_slot
+            _cache_session_id_st = "__shared__" if _is_context_free_st else session_id
+            cached_result = (
+                None
+                if has_pending_slot
+                else cache.get(_cache_session_id_st, message, state.persona_id, _collected_slots)
+            )
 
-            if not _stream_error:
-                # Skip cache only when a slot question is pending (mid-collection).
-                # collected_slots is included in the cache key so different slot combos
-                # never share a cache entry — no need to skip cache when slots are present.
-                # First-turn + no-slot queries use a shared key so different users
-                # asking the same question share one cache entry (see /chat endpoint).
-                cache = get_cache()
-                has_pending_slot = bool((state.context or {}).get("pending_slot"))
-                _collected_slots = (state.context or {}).get("collected_slots") or {}
-                _prior_user_msgs_st = [
-                    m for m in (state.messages or [])
-                    if (m.get("role") if isinstance(m, dict) else getattr(m, "role", "")) == "user"
-                ]
-                _is_context_free_st = not _collected_slots and not _prior_user_msgs_st and not has_pending_slot
-                _cache_session_id_st = "__shared__" if _is_context_free_st else session_id
-                cached_result = (
-                    None
-                    if has_pending_slot
-                    else cache.get(_cache_session_id_st, message, state.persona_id, _collected_slots)
+            if cached_result is not None:
+                logger.info(f"[{session_id}] Cache HIT (stream)")
+                _full_text = cached_result["response"]
+                state.add_user_message_once(message)
+                state.add_assistant_message_once(_full_text)
+                await _save_state_async(session_id, state)
+                _stream_persona_id = state.persona_id
+                _stream_cached = True
+            else:
+                logger.info(f"[{session_id}] Cache MISS (stream) - Calling LLM")
+                loop = asyncio.get_running_loop()
+                progress_q: "queue.Queue[str]" = queue.Queue()
+                future = loop.run_in_executor(
+                    None, _run_supervisor_with_progress, state, message,
+                    lambda t: progress_q.put(t),
                 )
+                while not future.done():
+                    try:
+                        _progress_text = progress_q.get_nowait()
+                        yield f"data: {json.dumps({'type': 'status', 'text': _progress_text}, separators=(',', ':'))}\n\n"
+                    except queue.Empty:
+                        await asyncio.sleep(0.15)
+                while True:
+                    try:
+                        _progress_text = progress_q.get_nowait()
+                        yield f"data: {json.dumps({'type': 'status', 'text': _progress_text}, separators=(',', ':'))}\n\n"
+                    except queue.Empty:
+                        break
+                state, bot_reply = future.result()
+                await _save_state_async(session_id, state)
 
-                if cached_result is not None:
-                    logger.info(f"[{session_id}] Cache HIT (stream)")
-                    _full_text = cached_result["response"]
-                    state.add_user_message_once(message)
-                    state.add_assistant_message_once(_full_text)
-                    state_manager.save(session_id, state)
-                    _stream_persona_id = state.persona_id
-                    _stream_cached = True
-                else:
-                    logger.info(f"[{session_id}] Cache MISS (stream) - Calling LLM")
-                    loop = asyncio.get_running_loop()
-                    state, bot_reply = await loop.run_in_executor(
-                        None, supervisor.handle, state, message
-                    )
-                    state_manager.save(session_id, state)
+                # Token delta and cost — computed inside lock while state is still valid
+                _post_tokens_st = (getattr(state, "total_prompt_tokens", 0) or 0) + (getattr(state, "total_completion_tokens", 0) or 0)
+                _delta_tokens_st = max(0, _post_tokens_st - _pre_tokens_st)
+                if _delta_tokens_st > 0:
+                    get_rate_limiter().record_token_usage(session_id, _delta_tokens_st)
 
-                    # Token delta and cost — computed inside lock while state is still valid
-                    _post_tokens_st = (getattr(state, "total_prompt_tokens", 0) or 0) + (getattr(state, "total_completion_tokens", 0) or 0)
-                    _delta_tokens_st = max(0, _post_tokens_st - _pre_tokens_st)
-                    if _delta_tokens_st > 0:
-                        get_rate_limiter().record_token_usage(session_id, _delta_tokens_st)
+                # Real cost delta — see matching comment in the non-streaming /chat
+                # handler above (a turn often mixes one main-persona call with several
+                # cheap Haiku classifier calls; each already accumulates its own
+                # correctly-priced cost onto state.total_cost_usd at the source).
+                _post_cost_st = getattr(state, "total_cost_usd", 0.0) or 0.0
+                _stream_cost = max(0.0, _post_cost_st - _pre_cost_st)
 
-                    _post_prompt_st = getattr(state, "total_prompt_tokens", 0) or 0
-                    _post_completion_st = getattr(state, "total_completion_tokens", 0) or 0
-                    _model_for_cost_st = {
-                        "academic": conf.OPENROUTER_MODEL_ACADEMIC,
-                        "practical": conf.OPENROUTER_MODEL_PRACTICAL,
-                    }.get(state.persona_id, conf.OPENROUTER_MODEL)
-                    _stream_cost = estimate_cost(
-                        _model_for_cost_st,
-                        max(0, _post_prompt_st - _pre_prompt_st),
-                        max(0, _post_completion_st - _pre_completion_st),
-                    )
-
+                # See matching comment in the non-streaming /chat handler above —
+                # never cache a "no answer found" fallback under the shared key.
+                _is_no_answer_reply_st = bool((state.context or {}).get("_info_gap_detected"))
+                # See matching comment in the non-streaming /chat handler above — never
+                # cache a reply that leaves a pending_slot behind (cache HIT skips
+                # supervisor.handle() entirely, so the pending_slot side-effect is lost).
+                _reply_has_pending_slot_st = bool((state.context or {}).get("pending_slot"))
+                if not _is_no_answer_reply_st and not _reply_has_pending_slot_st:
                     cache.set(
                         session_id=_cache_session_id_st,
                         question=message,
@@ -614,15 +783,30 @@ async def _stream_reply(session_id: str, message: str) -> AsyncGenerator[str, No
                         collected_slots=_collected_slots,
                     )
 
-                    _full_text = bot_reply
-                    _stream_persona_id = state.persona_id
-                    _stream_cached = False
-        # lock released — now stream the reply
+                _full_text = bot_reply
+                _stream_persona_id = state.persona_id
+                _stream_cached = False
 
     except Exception:
         logger.error(f"[{session_id}] Stream failed", exc_info=True)
         yield f"data: {json.dumps({'type': 'error', 'message': 'Stream failed. Please try again.'})}\n\n"
         return
+    finally:
+        # If the turn's answer call crossed the session token budget, run the
+        # deferred summarize/trim (see llm_call.py's run_pending_token_budget_check)
+        # in the background, holding the lock until it's done, instead of adding
+        # its latency here. See _release_session_lock_after_deferred_work.
+        _needs_defer_st = False
+        try:
+            _needs_defer_st = bool(state is not None and (state.context or {}).get("_needs_token_budget_check"))
+        except Exception:
+            pass
+        if _needs_defer_st:
+            _lock_deferred = True
+            _spawn_background(_release_session_lock_after_deferred_work(session_id, lock, state))
+        if not _lock_deferred:
+            lock.release()
+    # lock released (or handed off to the deferred task) — now stream the reply
 
     if _stream_error:
         yield f"data: {json.dumps({'type': 'error', 'message': _stream_error})}\n\n"
@@ -650,7 +834,7 @@ async def chat_stream(request: ChatRequest):
     if not request.message or not request.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
-    _cleanup_old_sessions()
+    await _cleanup_old_sessions_async()
 
     session_id = request.session_id or f"s_{uuid.uuid4().hex[:8]}"
 
@@ -664,7 +848,7 @@ async def chat_stream(request: ChatRequest):
         )
 
     return StreamingResponse(
-        _stream_reply(session_id, request.message.strip()),
+        _stream_reply(session_id, request.message.strip(), request.branch_id, request.branch_name),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
