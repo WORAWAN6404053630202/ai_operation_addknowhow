@@ -255,7 +255,7 @@ def main():
               f"Documents will still be ingested; fix the source sheet to suppress warnings.")
 
     print(f"\n[Ingest] Total docs to index: {len(docs)}")
-    print("[Ingest] Model: multilingual-e5-large (better Thai retrieval accuracy)")
+    print(f"[Ingest] Model: {conf.EMBEDDING_MODEL} (via OpenRouter)")
 
     # Show breakdown by data_type
     reg_docs   = [d for d in docs if d.metadata.get("data_type") != "marketing"

@@ -6,10 +6,7 @@ from pathlib import Path
 from typing import List, Dict, Optional
 
 from langchain_core.documents import Document
-try:
-    from langchain_huggingface import HuggingFaceEmbeddings  # type: ignore
-except ImportError:
-    from langchain_community.embeddings import HuggingFaceEmbeddings  # type: ignore
+from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
 
 import conf
@@ -63,42 +60,11 @@ class LocalVectorStoreManager:
     def initialize_embeddings(self) -> None:
         if self.embedding_model is not None:
             return
-        print(f"[Embedding] Loading: {conf.EMBEDDING_MODEL}")
-        _model = conf.EMBEDDING_MODEL
-        _is_e5 = "e5" in _model.lower()
-
-        # Prefer MPS (Apple Silicon) > CUDA > CPU for embedding speed
-        import torch
-        if torch.backends.mps.is_available():
-            _device = "mps"
-        elif torch.cuda.is_available():
-            _device = "cuda"
-        else:
-            _device = "cpu"
-        print(f"[Embedding] Using device: {_device}")
-
-        # langchain-huggingface รองรับ query_encode_kwargs แยกจาก encode_kwargs
-        # ทำให้ document ใช้ "passage: " prefix และ query ใช้ "query: " prefix
-        # ซึ่งตรงตาม spec ของ intfloat/multilingual-e5-* ทุก variant
-        _encode_kw = {"normalize_embeddings": True}
-        _query_encode_kw = {"normalize_embeddings": True}
-        if _is_e5:
-            _encode_kw["prompt"] = "passage: "
-            _query_encode_kw["prompt"] = "query: "
-
-        # Use model_cache dir to avoid re-downloading on every startup
-        import os
-        _cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "model_cache")
-        # Set env var so SentenceTransformer picks up cached model automatically
-        os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", _cache_dir)
-        os.environ["HF_HOME"] = _cache_dir
-
-        self.embedding_model = HuggingFaceEmbeddings(
-            model_name=_model,
-            model_kwargs={"device": _device},
-            encode_kwargs=_encode_kw,
-            query_encode_kwargs=_query_encode_kw,
-            cache_folder=_cache_dir,
+        print(f"[Embedding] Loading via OpenRouter: {conf.EMBEDDING_MODEL}")
+        self.embedding_model = OpenAIEmbeddings(
+            model=conf.EMBEDDING_MODEL,
+            openai_api_key=conf.OPENROUTER_API_KEY,
+            openai_api_base=conf.OPENROUTER_BASE_URL,
         )
         print("[Embedding] Loaded successfully")
 
@@ -148,7 +114,7 @@ class LocalVectorStoreManager:
         if fail_if_empty and (count is None or count == 0):
             raise RuntimeError(
                 "Local Chroma collection is empty. You must ingest documents first.\n"
-                "Fix: run `PYTHONPATH=\"$PWD\" python -m code.scripts.ingest_local`"
+                "Fix: run `python code/scripts/ingest_local.py` from the project root"
             )
 
         return self._build_retriever()
