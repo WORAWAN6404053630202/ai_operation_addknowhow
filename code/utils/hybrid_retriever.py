@@ -11,6 +11,7 @@ Thai tokenization requires: pythainlp, rank_bm25
 """
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import threading
 import time
@@ -24,6 +25,11 @@ _INDEX_LOCK = threading.Lock()
 _INDEX_CACHE: Dict[str, "_BM25Index"] = {}  # collection_name → BM25Index
 _COUNT_CACHE: Dict[str, tuple] = {}  # collection_name → (count, monotonic_timestamp)
 _COUNT_TTL_S = 30.0  # refresh coll.count() at most every 30s
+
+# Dedicated pool so BM25 (local CPU) can run while Dense (network call + retries)
+# is in flight. Separate from persona_supervisor.py's _CLASSIFIER_POOL (LLM calls
+# only) to keep pool ownership/capacity semantics independent.
+_BM25_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="bm25search")
 
 
 # ── Thai tokenizer ────────────────────────────────────────────────────────────
@@ -245,36 +251,53 @@ def hybrid_scored_search(
     # Normalize filter once: Chroma Dense rejects flat multi-field dicts and None values
     _eff_filter = _normalize_chroma_filter(metadata_filter)
 
-    # Dense search
+    # BM25 is pure local CPU (index lookup/build + scoring) and doesn't depend on
+    # Dense's result — submit it to run concurrently while Dense's network call
+    # (and its retries below) is in flight, then join at the end.
+    def _run_bm25() -> Optional[List[Tuple[Document, float]]]:
+        bm25_index = _get_bm25_index(vectorstore)
+        if bm25_index is None:
+            _LOG.debug("[Hybrid] BM25 unavailable — Dense-only fallback")
+            return None
+        try:
+            # Oversample BM25 before post-filter — use k*5 when a metadata filter is
+            # present (filter may be very selective, e.g. entity_type=นิติบุคคล)
+            _bm25_oversample = k * 5 if _eff_filter else k * 2
+            raw_bm25 = bm25_index.search(query, k=_bm25_oversample)
+            if _eff_filter:
+                raw_bm25 = [
+                    (doc, s) for doc, s in raw_bm25
+                    if _matches_metadata_filter(doc.metadata or {}, _eff_filter)
+                ]
+            return raw_bm25[:k]
+        except Exception as e:
+            _LOG.warning("[Hybrid] BM25 search failed: %s — Dense-only", e)
+            return None
+
+    bm25_future = _BM25_POOL.submit(_run_bm25)
+
+    # Dense search — retry on failure. The OpenRouter embedding endpoint (baai/bge-m3)
+    # measured ~40-50% transient HTTP 422 ("Input should be a valid string") failure rate
+    # in production, independent of query content (confirmed via direct benchmark — even
+    # trivial English strings failed at the same rate). This is not a malformed-query bug
+    # on our side; it's provider-side flakiness, so a few quick retries recover most calls.
     dense_pairs: List[Tuple[Document, float]] = []
-    try:
-        kwargs: Dict[str, Any] = {"k": k}
-        if _eff_filter:
-            kwargs["filter"] = _eff_filter
-        dense_pairs = vectorstore.similarity_search_with_relevance_scores(query, **kwargs)
-    except Exception as e:
-        _LOG.warning("[Hybrid] Dense search failed: %s", e)
+    kwargs: Dict[str, Any] = {"k": k}
+    if _eff_filter:
+        kwargs["filter"] = _eff_filter
+    _dense_max_attempts = 3
+    for _attempt in range(1, _dense_max_attempts + 1):
+        try:
+            dense_pairs = vectorstore.similarity_search_with_relevance_scores(query, **kwargs)
+            break
+        except Exception as e:
+            if _attempt < _dense_max_attempts:
+                _LOG.info("[Hybrid] Dense search attempt %d/%d failed: %s — retrying", _attempt, _dense_max_attempts, e)
+            else:
+                _LOG.warning("[Hybrid] Dense search failed after %d attempts: %s", _dense_max_attempts, e)
 
-    # BM25 search
-    bm25_index = _get_bm25_index(vectorstore)
-    if bm25_index is None:
-        _LOG.debug("[Hybrid] BM25 unavailable — Dense-only fallback")
-        return dense_pairs
-
-    bm25_pairs: List[Tuple[Document, float]] = []
-    try:
-        # Oversample BM25 before post-filter — use k*5 when a metadata filter is
-        # present (filter may be very selective, e.g. entity_type=นิติบุคคล)
-        _bm25_oversample = k * 5 if _eff_filter else k * 2
-        raw_bm25 = bm25_index.search(query, k=_bm25_oversample)
-        if _eff_filter:
-            raw_bm25 = [
-                (doc, s) for doc, s in raw_bm25
-                if _matches_metadata_filter(doc.metadata or {}, _eff_filter)
-            ]
-        bm25_pairs = raw_bm25[:k]
-    except Exception as e:
-        _LOG.warning("[Hybrid] BM25 search failed: %s — Dense-only", e)
+    bm25_pairs = bm25_future.result()
+    if bm25_pairs is None:
         return dense_pairs
 
     fused = _rrf_fuse(dense_pairs, bm25_pairs, rrf_k=rrf_k)

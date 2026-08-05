@@ -78,11 +78,22 @@ class ConversationSummarizer:
             api_key = 'dummy'
             base_url = 'https://openrouter.ai/api/v1'
             timeout = 30
-        
+
+        # Shared httpx client (see utils/llm_call.py) so this classifier reuses the
+        # same connection pool as every other persona/supervisor LLM call instead of
+        # opening its own. Falls back to no shared client (langchain's own per-instance
+        # default) if the import fails, matching the try/except-fallback style above.
+        try:
+            from utils.llm_call import get_shared_http_client
+            _http_client = get_shared_http_client()
+        except Exception:
+            _http_client = None
+
         self.llm = ChatOpenAI(
             model=model,
             openai_api_key=api_key,
             openai_api_base=base_url,
+            http_client=_http_client,
             temperature=0.3,
             max_tokens=300,  # summary สั้นๆ
             request_timeout=timeout
