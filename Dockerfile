@@ -28,7 +28,12 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 3000
 
 # รัน uvicorn ด้วย auto-reload สำหรับ development
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "3000", "--reload"]
+# --reload-exclude: code/data/* holds runtime-written files (session state json/lock,
+# chroma dirs) — without this, every chat request's state write is picked up as a "code
+# change" and restarts the worker mid-request (confirmed: a live pilot test triggered a
+# restart that made the in-flight request wait 250s+ for a fresh reranker/BM25/embedding
+# reload). Restricting to *.py changes only fixes this without weakening reload for real edits.
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "3000", "--reload", "--reload-exclude", "*/data/*"]
 
 # STAGE: STAGING (Pre-production Testing)
 FROM python:3.11-slim AS staging

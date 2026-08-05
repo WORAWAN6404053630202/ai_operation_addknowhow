@@ -65,10 +65,12 @@ def _get_llm():
     try:
         import conf
         from langchain_openai import ChatOpenAI
+        from utils.llm_call import get_shared_http_client
         _llm = ChatOpenAI(
             model=getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL),
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
             temperature=0.0,
             max_tokens=100,
             request_timeout=int(getattr(conf, "LLM_TOPIC_PICKER_TIMEOUT", 8)),

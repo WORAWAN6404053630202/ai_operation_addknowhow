@@ -96,6 +96,19 @@ function getHeaders() {
   };
 }
 
+// ─── Branch identity (placeholder) ─────────────────────────────────────────────
+// Restbiz's web UI has no source for real branch/store identity yet — pending
+// confirmation of which login/embed platform will supply it. The backend contract
+// requires these keys on every /chat turn (empty string is valid), so we send "" for
+// now. Once the real source is known, only these two functions need to change —
+// every call site below already reads through them.
+function getBranchId() {
+  return "";
+}
+function getBranchName() {
+  return "";
+}
+
 function setInputLocked(locked) {
   isSending = locked;
   messageInput.disabled = locked;
@@ -267,8 +280,14 @@ function appendMessage(role, content, { animate = true } = {}) {
   scrollToBottom();
 }
 
+// Initial wait-status text — honest starting assumption (retrieval always
+// happens before the answer-generation call in every flow), not a guess.
+// Real updates after this come only from actual "status" SSE events sent by
+// the backend at the moment those stages genuinely occur (see setStatus below).
+const INITIAL_WAIT_STATUS = "กำลังค้นหาข้อมูลที่เกี่ยวข้อง...";
+
 // Creates an empty streaming bubble with elapsed-time counter
-// Returns { row, bubble, stopTimer }
+// Returns { row, bubble, stopTimer, setStatus }
 function createStreamingBubble() {
   hideWelcome();
   const row = document.createElement("div");
@@ -282,6 +301,7 @@ function createStreamingBubble() {
         <div class="message-bubble">
           <span class="typing-dots"><span></span><span></span><span></span></span>
         </div>
+        <span class="wait-status">${INITIAL_WAIT_STATUS}</span>
         <span class="wait-timer">0s</span>
       </div>
     </div>
@@ -291,6 +311,7 @@ function createStreamingBubble() {
 
   const bubble = row.querySelector(".message-bubble");
   const timerEl = row.querySelector(".wait-timer");
+  const statusEl = row.querySelector(".wait-status");
   const bubbleWrap = row.querySelector(".message-bubble-wrap");
   let rawText = "";
 
@@ -310,9 +331,17 @@ function createStreamingBubble() {
       timerEl.textContent = `⏱ ${seconds}s`;
       timerEl.className = "think-time";
     }
+    // Status line is only meaningful while waiting — once the answer is in,
+    // "checking completeness..." etc. would be stale/misleading, so remove it.
+    if (statusEl) statusEl.remove();
   }
 
-  return { row, bubble, stopTimer };
+  // Called only when a real "status" SSE event arrives from the backend.
+  function setStatus(text) {
+    if (statusEl && text) statusEl.textContent = text;
+  }
+
+  return { row, bubble, stopTimer, setStatus };
 }
 
 // ─── API helpers ──────────────────────────────────────────────────────────────
@@ -352,7 +381,11 @@ async function createNewSession() {
   renderTopicCards([]);
 
   try {
-    const data = await apiPost("/api/v1/greeting", { persona_id: "practical" });
+    const data = await apiPost("/api/v1/greeting", {
+      persona_id: "practical",
+      branch_id: getBranchId(),
+      branch_name: getBranchName(),
+    });
 
     sessionId = data.session_id || "";
 
@@ -434,14 +467,19 @@ async function sendMessage() {
   autoResize();
   setInputLocked(true);
 
-  const { bubble, stopTimer } = createStreamingBubble();
+  const { bubble, stopTimer, setStatus } = createStreamingBubble();
   let fullText = "";
 
   try {
     const res = await fetch("/api/v1/chat/stream", {
       method: "POST",
       headers: getHeaders(),
-      body: JSON.stringify({ message: text, session_id: sessionId }),
+      body: JSON.stringify({
+        message: text,
+        session_id: sessionId,
+        branch_id: getBranchId(),
+        branch_name: getBranchName(),
+      }),
     });
 
     if (!res.ok) {
@@ -474,7 +512,10 @@ async function sendMessage() {
           continue;
         }
 
-        if (payload.type === "chunk") {
+        if (payload.type === "status") {
+          setStatus(payload.text);
+
+        } else if (payload.type === "chunk") {
           fullText += payload.text || "";
           // Show plain text while streaming; markdown rendered on done
           bubble.innerHTML = textToHtml(fullText) + '<span class="typing-cursor">▋</span>';

@@ -492,6 +492,13 @@ button, select, textarea {
   color: #9ca3af;
   user-select: none;
 }
+.wait-status {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+  color: #9ca3af;
+  user-select: none;
+}
 
 /* Fix 5: Animated typing dots */
 .typing-dots {

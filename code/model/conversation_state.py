@@ -42,6 +42,12 @@ class ConversationState(BaseModel):
     # Identity
     session_id: str = Field(default="", description="Conversation session identifier")
 
+    # Branch identity (optional — reserved for future multi-branch support; no
+    # current request path or caller populates these yet, so they stay None/blank
+    # until that's wired up on the API side)
+    branch_id: Optional[str] = Field(default=None, description="Branch identifier (not yet populated by any caller)")
+    branch_name: Optional[str] = Field(default=None, description="Branch display name (not yet populated by any caller)")
+
     # Persona & behavior
     persona_id: str = Field(default="practical", description="Active persona id (academic / practical)")
 
@@ -63,7 +69,6 @@ class ConversationState(BaseModel):
 
     # Context & memory
     context: Dict[str, Any] = Field(default_factory=dict, description="Structured context memory (facts, slots, flags)")
-    requirements: Dict[str, Any] = Field(default_factory=dict, description="Latest requirements inferred by LLM (optional)")
 
     # RAG
     current_docs: List[Dict[str, Any]] = Field(default_factory=list, description="Documents retrieved for current turn (RAG)")
@@ -75,6 +80,19 @@ class ConversationState(BaseModel):
     # Token budget tracking (L2: cost observability)
     total_prompt_tokens: int = Field(default=0, description="Cumulative prompt tokens used in this session")
     total_completion_tokens: int = Field(default=0, description="Cumulative completion tokens used in this session")
+    total_cache_read_tokens: int = Field(default=0, description="Cumulative cache-read tokens (subset of total_prompt_tokens) — used to compute cache-aware cost, not billed on top of prompt tokens")
+    total_cache_write_tokens: int = Field(default=0, description="Cumulative cache-write tokens (subset of total_prompt_tokens) — same note as above")
+    total_cost_usd: float = Field(
+        default=0.0,
+        description=(
+            "Cumulative real cost (USD) across all LLM calls in this session. Accumulated "
+            "per-call at the call site (llm_call.py), where the correct model/pricing for "
+            "THAT specific call is known — a turn often mixes one main-persona call (Sonnet/"
+            "GPT-5.1) with several cheap Haiku classifier calls, so this must NOT be "
+            "reconstructed later from a single blended token delta priced at one model, "
+            "which would misprice every Haiku token at the main model's (higher) rate."
+        ),
+    )
 
     # Control & debug
     round: int = Field(default=0, description="Current multi-step round counter")
@@ -202,10 +220,24 @@ class ConversationState(BaseModel):
         return self.get_collected_slots().get(str(key).strip())
 
     # Token budget tracking (NEW)
-    def add_token_usage(self, prompt_tokens: int = 0, completion_tokens: int = 0) -> None:
-        """Accumulate token usage across all LLM calls in this session."""
+    def add_token_usage(
+        self,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        cost_usd: float = 0.0,
+    ) -> None:
+        """Accumulate token usage (and real per-call cost) across all LLM calls in
+        this session. cost_usd must be the caller's already-computed, correctly-priced
+        cost for THIS specific call (its own model's rate) — accumulating it here at
+        the source, rather than reconstructing later from blended multi-model token
+        deltas, is what keeps total_cost_usd accurate when a turn mixes models."""
+        self.total_cost_usd += max(0.0, float(cost_usd or 0))
         self.total_prompt_tokens += max(0, int(prompt_tokens or 0))
         self.total_completion_tokens += max(0, int(completion_tokens or 0))
+        self.total_cache_read_tokens += max(0, int(cache_read_tokens or 0))
+        self.total_cache_write_tokens += max(0, int(cache_write_tokens or 0))
 
     @property
     def total_tokens(self) -> int:

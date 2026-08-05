@@ -20,6 +20,7 @@ venv/
 *.pem
 *.key
 env.properties
+credentials.json
 
 # ===== ML / HuggingFace Cache =====
 .cache/

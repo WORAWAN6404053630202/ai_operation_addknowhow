@@ -16,8 +16,18 @@ services:
       # Production: ไม่ mount code (เพื่อความปลอดภัย)
       # Mount เฉพาะ env file
       - ./env.properties:/app/env.properties
+      # Google service-account key for Sheets feedback logging — never baked into the
+      # image (see .gitignore), must exist on the host at this path before `up`
+      - ./credentials.json:/app/credentials.json
       # Persist HuggingFace model cache across container restarts/redeploys
       - /opt/huggingface-cache:/root/.cache/huggingface
+      # Persist session state (data/states/*.json) across redeploys — without this,
+      # every `docker-compose up` after a new image pull starts from an empty
+      # writable layer and silently wipes all conversations before the claimed
+      # 7-day retention (SESSION_RETENTION_DAYS in router/route_v1.py).
+      # Host dir must be owned by uid:gid 1000:1000 (appuser in Dockerfile) — see
+      # deploy_ec2.md one-time setup step.
+      - /opt/restbiz-data:/app/code/data
     environment:
       - PYTHONPATH=/app/code
     env_file:
