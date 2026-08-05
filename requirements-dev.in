@@ -1,0 +1,13 @@
+# Development-only dependencies (not needed in production image)
+# Source file — see requirements.in's header for the .in/.txt lockfile convention.
+# Regenerate requirements-dev.txt with:
+#   uv pip compile requirements-dev.in --generate-hashes --python-version 3.11 \
+#     --python-platform x86_64-unknown-linux-gnu -o requirements-dev.txt
+-r requirements.in
+
+# --- Web UI ---
+gradio>=6,<7
+gradio-client>=2,<3
+
+# --- Testing ---
+pytest>=7.4.0

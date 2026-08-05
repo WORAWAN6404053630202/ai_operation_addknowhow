@@ -1,0 +1,60 @@
+#/Users/w.worawan/Downloads/ai-operation-microservice3_v2ori/requirements.in
+#
+# Source file for the version ranges the project accepts. This is NOT what Docker
+# installs from — Docker installs from the generated, exact-pinned + hash-locked
+# requirements.txt (targets linux/amd64 + Python 3.11, matching docker-compose.prod.yaml
+# and the Dockerfile's `python:3.11-slim` base). Edit ranges here, then regenerate:
+#
+#   uv pip compile requirements.in --generate-hashes --python-version 3.11 \
+#     --python-platform x86_64-unknown-linux-gnu -o requirements.txt
+#
+# (requirements.txt itself also carries this exact command in its own header.)
+# --- Core ---
+python-dotenv>=1.0.1
+pydantic>=2.6,<3.0
+rich>=13.7.0
+
+# --- FastAPI ---
+fastapi>=0.115.2,<1
+uvicorn>=0.27,<1
+uvloop>=0.19.0
+httptools>=0.6.0
+
+# --- LangChain (new architecture) ---
+# Upper-bounded below the 1.0 line (2026-08-05): langchain 1.x is a breaking
+# rearchitecture — mixing it with the pre-1.0 langchain-core API (which this
+# codebase's LLM-init code still uses) crashes at startup with
+# `AttributeError: module 'langchain' has no attribute 'verbose'`. An
+# unbounded range let a fresh install silently pick up 1.x and break.
+langchain>=0.2.14,<1.0
+langchain-core>=0.2.36,<1.0
+langchain-community>=0.2.12,<1.0
+langchain-openai>=0.1.22,<1.0
+langchain-huggingface>=0.1.0,<1.0
+
+# --- LLM / OpenRouter ---
+openai>=1.40.0
+
+# --- Vector / RAG ---
+chromadb>=0.5.0
+sentence-transformers>=3.0.1,<4
+transformers>=4.41.0,<5.0.0
+huggingface-hub>=0.23.0,<1.0
+
+# --- Reranker ONNX backend (optional, RERANKER_BACKEND=onnx — off by default) ---
+optimum[onnxruntime]>=1.20.0
+
+# --- Hybrid RAG (BM25 + Thai tokenizer) ---
+rank-bm25>=0.2.2
+pythainlp>=5.0.0
+
+# --- Data Processing ---
+pandas>=2.0.0
+
+# --- Utilities ---
+psutil>=5.9.0  # System monitoring (CPU, memory, disk)
+requests>=2.31.0
+tqdm>=4.66.0
+
+# --- Feedback logging (Google Sheets) ---
+gspread>=6.0.0
