@@ -43,17 +43,29 @@ async def lifespan(app: FastAPI):
     import conf as _conf
     if getattr(_conf, "RERANKER_ENABLED", False):
         model_name = getattr(_conf, "RERANKER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
+        backend = getattr(_conf, "RERANKER_BACKEND", "pytorch")
 
         def _load():
             try:
-                from utils.reranker import _get_reranker
-                _get_reranker(model_name)
-                logger.info("[Startup] Reranker model ready: %s", model_name)
+                if backend == "onnx":
+                    # Preload the ONNX path actually being used — preloading the
+                    # pytorch model here (the old unconditional behavior) would waste
+                    # startup time/RAM on a model no request will ever call, while
+                    # leaving the real (ONNX) model to cold-load on the first live
+                    # request instead.
+                    from utils.reranker import _get_onnx_reranker
+                    onnx_file = getattr(_conf, "RERANKER_ONNX_FILE", "model_quint8_avx2.onnx")
+                    _get_onnx_reranker(model_name, onnx_file)
+                    logger.info("[Startup] Reranker (onnx) model ready: %s (onnx/%s)", model_name, onnx_file)
+                else:
+                    from utils.reranker import _get_reranker
+                    _get_reranker(model_name)
+                    logger.info("[Startup] Reranker (pytorch) model ready: %s", model_name)
             except Exception as e:
                 logger.warning("[Startup] Reranker preload failed (will retry on first request): %s", e)
 
         threading.Thread(target=_load, daemon=True, name="reranker-preload").start()
-        logger.info("[Startup] Reranker preload started in background (model=%s)", model_name)
+        logger.info("[Startup] Reranker preload started in background (model=%s, backend=%s)", model_name, backend)
     yield
 
 
@@ -123,4 +135,7 @@ async def serve_index():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=3000, reload=True)
+    # reload_excludes: data/* holds runtime-written files (session state json/lock,
+    # chroma dirs) — without this, every chat request's state write is picked up as a
+    # "code change" and restarts the worker mid-request. See Dockerfile dev CMD comment.
+    uvicorn.run("app:app", host="0.0.0.0", port=3000, reload=True, reload_excludes=["data/*"])

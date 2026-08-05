@@ -58,7 +58,7 @@ MAX_TOKENS_PRACTICAL = _safe_int("MAX_TOKENS_PRACTICAL", 4500)
 
 EMBEDDING_MODEL = os.getenv(
     "EMBEDDING_MODEL",
-    "intfloat/multilingual-e5-large"
+    "baai/bge-m3"
 )
 
 MAX_ROUNDS = _safe_int("MAX_ROUNDS", 15)
@@ -68,7 +68,7 @@ RETRIEVAL_TOP_K = _safe_int("RETRIEVAL_TOP_K", 20)
 # เดิม: Practical=5/500, Academic=8/700 → ใช้ ~8,000-12,000 tokens
 # ใหม่: Practical=3/400, Academic=5/500 → ใช้ ~5,000-7,000 tokens (ประหยัด 40%!)
 LLM_DOCS_MAX_PRACTICAL = _safe_int("LLM_DOCS_MAX_PRACTICAL", 6)    # raised 4→6: more docs = richer, more complete answers
-LLM_DOCS_MAX_BROAD = _safe_int("LLM_DOCS_MAX_BROAD", 20)          # total docs cap for broad open-ended questions — covers two-pass merged result (pass1=10 + pass2=8 = up to 18 unique)
+LLM_DOCS_MAX_BROAD = _safe_int("LLM_DOCS_MAX_BROAD", 25)          # total docs cap for broad open-ended questions — covers multi-pass merged result (pass1=RETRIEVAL_TOP_K currently 15 + pass2=8 = up to 23 unique, before sweep/pass3). Was 20, sized for a stale pass1=10 assumption; raised so the simple-branch total cap doesn't silently truncate pass2 below its actual current yield.
 LLM_DOCS_MAX_ACADEMIC = _safe_int("LLM_DOCS_MAX_ACADEMIC", 12)    # raised: 5 → 12 (academic needs full coverage)
 
 LLM_DOC_CHARS_PRACTICAL = _safe_int("LLM_DOC_CHARS_PRACTICAL", 700)   # reduced 1200→700: metadata fields carry key info
@@ -87,11 +87,84 @@ HYBRID_RRF_K = _safe_int("HYBRID_RRF_K", 60)
 
 # Cross-encoder reranker (Level 3 RAG quality improvement)
 # Set RERANKER_ENABLED=true in env.properties to activate.
-# Model: multilingual cross-encoder trained on MS-MARCO (supports Thai).
+# Model: multilingual cross-encoder (mmarco-mMiniLMv2). NOTE (2026-07 research): its
+# mMARCO training data covers 14 languages and Thai is NOT one of them (verified against
+# the mMARCO paper, arXiv:2108.13897) — Thai behavior is zero-shot cross-lingual transfer
+# from the base encoder, never fine-tuned or benchmarked directly. Keep this in mind before
+# trusting English-only accuracy claims (incl. quantization "no accuracy loss" claims) for
+# this model on Thai queries without separately validating on a Thai eval set.
 # RERANKER_TOP_K: how many docs to keep after reranking (applied to both practical + academic).
 RERANKER_ENABLED = os.getenv("RERANKER_ENABLED", "false").lower() == "true"
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
 RERANKER_TOP_K = _safe_int("RERANKER_TOP_K", 10)
+
+# Reranker inference backend: "pytorch" (default, current behavior, sentence-transformers
+# CrossEncoder float32) or "onnx" (quantized INT8 via Hugging Face Optimum + ONNX Runtime,
+# ~2-3x faster on CPU per sbert.net docs). OFF by default pending live validation — same
+# pattern as OPENROUTER_ACADEMIC_REASONING_EFFORT / OPENROUTER_PRACTICAL_THINKING_BUDGET
+# above: code is ready, but a config flip is required after measuring on the real deploy
+# target, not assumed safe by default.
+#
+# Own measurement (2026-07, code/scripts — see reranker_onnx_eval notes) on a 23-query
+# Thai golden set built from this project's own corpus (ground truth = Chroma license_type
+# metadata, candidate pools = the real embedding retriever's top-30, NOT synthetic):
+#   nDCG@10   float32=0.615  vs  quint8_avx2=0.614 (delta -0.001, effectively noise)
+#                            vs  qint8_avx512_vnni/arm64=0.600 (delta -0.016)
+#   MRR       float32=0.677  vs  quint8_avx2=0.680 (+0.003)  vs qint8 variants=0.670 (-0.007)
+#   Recall@5  float32=0.644  vs  all quantized variants=0.635 (-0.009)
+#   Top-1 doc agreement (float32 vs quantized): 74% (17/23) across ALL quantized variants —
+#     aggregate metrics barely move, but the #1 doc genuinely changes in ~1/4 of queries.
+# Conclusion: the quint8_avx2 file measurably beats the qint8 (avx512_vnni/arm64) files on
+# THIS eval — use it as the default candidate if this is ever turned on. 23 queries is a
+# real but small sample; treat this as a directional green light, not a final guarantee —
+# expand the eval set from real production queries before trusting this at scale.
+RERANKER_BACKEND = os.getenv("RERANKER_BACKEND", "pytorch").strip().lower()
+RERANKER_ONNX_FILE = os.getenv("RERANKER_ONNX_FILE", "model_quint8_avx2.onnx")
+
+# Minimum reranker score to keep a doc (applied before RERANKER_TOP_K truncation).
+# "" (default) = disabled, unchanged behavior — top_k docs are kept purely by rank
+# regardless of score.
+#
+# Why this exists (2026-07 EC2 live test, RERANKER_BACKEND=onnx): a Practical-persona
+# marketing question ("อยากทำการตลาดออนไลน์ให้ร้านอาหารทำยังไงดี") pulled in an entire
+# unrelated licensing/permit section under onnx (18 regulatory-keyword hits) that
+# float32 correctly excluded (0 hits) — same candidate pool from retrieval both times,
+# same rank cutoff (top_k=10), the only difference was the quantized reranker's score
+# for that borderline doc landing just inside the top-10 instead of just outside it.
+# Consistent with the eval-set finding that float32/onnx agree on the #1 doc only 74%
+# of the time — this is that measured disagreement rate showing up as a visible
+# content difference. Retested across 14 business_guide/marketing queries total: this
+# pattern recurred in ~7% of them (1/14), not eliminated by more samples — it's an
+# inherent property of the quantized model's weaker score separation on Thai (a
+# language this model's mMARCO training data never included — see RERANKER_MODEL
+# comment above), not a fluke tied to one query.
+#
+# 0.0 is a reasoned starting point, not an arbitrary guess: this is a raw MS-MARCO-
+# style cross-encoder logit (no sigmoid applied), where 0 is the model's own
+# decision-boundary convention (positive leans relevant, negative leans not) — and
+# negative scores were observed correlating with genuinely off-topic docs in ad hoc
+# testing. Tune from here based on further live measurement, not assumed correct.
+_RERANKER_MIN_SCORE_RAW = os.getenv("RERANKER_MIN_SCORE", "").strip()
+RERANKER_MIN_SCORE = float(_RERANKER_MIN_SCORE_RAW) if _RERANKER_MIN_SCORE_RAW else None
+
+# Retrieval-stage category filter (see utils.reranker.filter_by_category_concentration).
+# OFF by default pending live validation — same "code ready, flag flip requires
+# measurement first" convention as the flags above.
+#
+# Why this exists (2026-07 EC2 live test, root-cause follow-up to RERANKER_MIN_SCORE
+# above): RERANKER_MIN_SCORE fixed the one tracked case but a retest showed the same
+# leak just relocated to a different query — because retrieval itself has NO
+# data_type filter (regulatory/business_guide/marketing) at all, so an off-category
+# doc can enter the candidate pool on pure embedding proximity and score confidently
+# high enough that no reranker threshold would catch it. This filter runs on the raw
+# candidate pool, BEFORE reranking: when the pool is heavily concentrated in one
+# data_type, the minority docs are almost certainly retrieval noise and are dropped;
+# genuinely mixed pools (a real cross-category question) are left untouched. No LLM
+# call involved — reads a field already on every doc's metadata, no added latency.
+RETRIEVAL_CATEGORY_FILTER_ENABLED = os.getenv("RETRIEVAL_CATEGORY_FILTER_ENABLED", "false").lower() == "true"
+RETRIEVAL_CATEGORY_CONCENTRATION_THRESHOLD = _safe_float("RETRIEVAL_CATEGORY_CONCENTRATION_THRESHOLD", 0.75)
+RETRIEVAL_CATEGORY_MIN_POOL_SIZE = _safe_int("RETRIEVAL_CATEGORY_MIN_POOL_SIZE", 5)
+RETRIEVAL_CATEGORY_MIN_KEEP = _safe_int("RETRIEVAL_CATEGORY_MIN_KEEP", 3)
 
 # Iterative Retrieval: minimum number of missing coverage fields that triggers Round 3 gap-fill.
 ITERATIVE_RETRIEVAL_MIN_MISSING_FIELDS = _safe_int("ITERATIVE_RETRIEVAL_MIN_MISSING_FIELDS", 2)
@@ -110,6 +183,36 @@ LLM_TOPIC_PICKER_TIMEOUT = _safe_int("LLM_TOPIC_PICKER_TIMEOUT", 8)
 SHEETS_REQUEST_TIMEOUT = _safe_int("SHEETS_REQUEST_TIMEOUT", 20)
 
 DEBUG_LATENCY = os.getenv("DEBUG_LATENCY", "true").lower() == "true"
+
+# Latency-only speedups (never change answer content — see utils.llm_call.build_speed_extra_body):
+# 1) OpenRouter provider routing — route to the fastest-throughput provider for a given
+#    model. Same model/weights/output, just a different serving path. "" disables it.
+PROVIDER_ROUTING_SORT = os.getenv("PROVIDER_ROUTING_SORT", "throughput").strip().lower()
+# 2) Anthropic top-level prompt caching for the (large, static) system prompt prefix.
+#    No-op for non-Anthropic models (e.g. GPT-5.1 already gets implicit OpenAI-side
+#    caching with no request change needed). Applied only to the main answer-generation
+#    LLM instances (Practical), not the many short classifier calls, since those prompts
+#    are typically below the ~1024-token minimum for caching to engage anyway.
+PROMPT_CACHING_ENABLED = os.getenv("PROMPT_CACHING_ENABLED", "true").lower() == "true"
+
+# GPT-5.1 (Academic) reasoning effort override. Empty string (default) = leave the
+# model's own default behavior untouched — this is NOT validated for answer completeness
+# yet (needs A/B testing against real Academic questions, especially ones with fee-tier
+# arithmetic, before enabling in production). Valid values: none/low/medium/high.
+# Research (2026): low ~10.5s mean latency, medium ~28.8s, high ~65.6s per call — large
+# potential win, but must be verified against real output before trusting it live.
+OPENROUTER_ACADEMIC_REASONING_EFFORT = os.getenv("OPENROUTER_ACADEMIC_REASONING_EFFORT", "").strip().lower()
+
+# Claude extended thinking for Practical/Sonnet. 0 (default) = disabled, untouched
+# behavior. A positive value is the thinking token budget (Anthropic's minimum
+# effective budget is ~1024). NOT validated for production yet — being A/B tested
+# against real Practical questions. Two hard API constraints if enabled:
+#   1) temperature must be forced to 1.0 for this call (Anthropic requirement on
+#      Sonnet 4.5 — thinking rejects any other temperature with a 400 error).
+#   2) MAX_TOKENS_PRACTICAL must exceed this budget with enough room left for the
+#      actual visible answer, or the call can hit the same token-ceiling failure
+#      seen when testing GPT-5.1's reasoning_effort for Academic.
+OPENROUTER_PRACTICAL_THINKING_BUDGET = _safe_int("OPENROUTER_PRACTICAL_THINKING_BUDGET", 0)
 
 USE_ZILLIZ = os.getenv("USE_ZILLIZ", "false").lower() == "true"
 
@@ -138,6 +241,12 @@ SHEET_URL_BAKERY = os.getenv(
     "SHEET_URL_BAKERY",
     "https://docs.google.com/spreadsheets/d/1YnLKV7gJXCu7jvcH1sUL9crMlBCJKOpQfp2wtulMszE/edit?pli=1&gid=610069215#gid=610069215",
 )
+
+# Feedback → Google Sheets logging (optional feature — soft-disables if unset,
+# same pattern as USE_ZILLIZ / RERANKER_ENABLED, no hard fail at startup).
+GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
+FEEDBACK_SHEET_ID = os.getenv("FEEDBACK_SHEET_ID", "")
+BOT_TYPE = os.getenv("BOT_TYPE", "Restbiz")
 
 # State manager configuration
 STATE_DIR = os.getenv("STATE_DIR") or None
@@ -240,5 +349,29 @@ def validate_config() -> None:
         errors.append(f"RETRIEVAL_TOP_K={RETRIEVAL_TOP_K} must be >= 1")
     if LLM_REQUEST_TIMEOUT < 5:
         errors.append(f"LLM_REQUEST_TIMEOUT={LLM_REQUEST_TIMEOUT} is very short (min 5s)")
+    if PROVIDER_ROUTING_SORT not in ("", "throughput", "latency", "price"):
+        errors.append(f"PROVIDER_ROUTING_SORT={PROVIDER_ROUTING_SORT!r} must be one of: '', throughput, latency, price")
+    if RERANKER_BACKEND not in ("pytorch", "onnx"):
+        errors.append(f"RERANKER_BACKEND={RERANKER_BACKEND!r} must be one of: pytorch, onnx")
+    if not (0.0 < RETRIEVAL_CATEGORY_CONCENTRATION_THRESHOLD <= 1.0):
+        errors.append(
+            f"RETRIEVAL_CATEGORY_CONCENTRATION_THRESHOLD={RETRIEVAL_CATEGORY_CONCENTRATION_THRESHOLD} must be in (0, 1]"
+        )
+    if RETRIEVAL_CATEGORY_MIN_POOL_SIZE < 1:
+        errors.append(f"RETRIEVAL_CATEGORY_MIN_POOL_SIZE={RETRIEVAL_CATEGORY_MIN_POOL_SIZE} must be >= 1")
+    if RETRIEVAL_CATEGORY_MIN_KEEP < 1:
+        errors.append(f"RETRIEVAL_CATEGORY_MIN_KEEP={RETRIEVAL_CATEGORY_MIN_KEEP} must be >= 1")
+    if OPENROUTER_ACADEMIC_REASONING_EFFORT not in ("", "none", "low", "medium", "high"):
+        errors.append(
+            f"OPENROUTER_ACADEMIC_REASONING_EFFORT={OPENROUTER_ACADEMIC_REASONING_EFFORT!r} "
+            "must be one of: '' (unset), none, low, medium, high"
+        )
+    if OPENROUTER_PRACTICAL_THINKING_BUDGET < 0:
+        errors.append(f"OPENROUTER_PRACTICAL_THINKING_BUDGET={OPENROUTER_PRACTICAL_THINKING_BUDGET} must be >= 0")
+    if 0 < OPENROUTER_PRACTICAL_THINKING_BUDGET >= MAX_TOKENS_PRACTICAL:
+        errors.append(
+            f"OPENROUTER_PRACTICAL_THINKING_BUDGET={OPENROUTER_PRACTICAL_THINKING_BUDGET} must be < "
+            f"MAX_TOKENS_PRACTICAL={MAX_TOKENS_PRACTICAL} (thinking tokens count against the same budget)"
+        )
     if errors:
         raise RuntimeError("Config validation failed:\n" + "\n".join(f"  - {e}" for e in errors))

@@ -95,10 +95,16 @@ def main():
     import conf as _conf
     if getattr(_conf, "RERANKER_ENABLED", False):
         _rr_model = getattr(_conf, "RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+        _rr_backend = getattr(_conf, "RERANKER_BACKEND", "pytorch")
         def _preload_reranker() -> None:
             try:
-                from utils.reranker import _get_reranker
-                _get_reranker(_rr_model)
+                if _rr_backend == "onnx":
+                    from utils.reranker import _get_onnx_reranker
+                    _rr_onnx_file = getattr(_conf, "RERANKER_ONNX_FILE", "model_quint8_avx2.onnx")
+                    _get_onnx_reranker(_rr_model, _rr_onnx_file)
+                else:
+                    from utils.reranker import _get_reranker
+                    _get_reranker(_rr_model)
             except Exception as _e:
                 logging.getLogger(__name__).warning("[Startup] Reranker preload failed: %s", _e)
         threading.Thread(target=_preload_reranker, daemon=True, name="reranker-preload").start()
