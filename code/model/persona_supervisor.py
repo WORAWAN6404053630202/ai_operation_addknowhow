@@ -554,6 +554,21 @@ class PersonaSupervisor:
         r"|(?:วัน|เวลา|โมง)(?:ไหน|ใด).{0,20}(?:ขาย|จำหน่าย).{0,20}(?:เหล้า|สุรา|แอลกอฮอล์|เบียร์|ไวน์)",
         re.IGNORECASE,
     )
+    # Post-submission follow-up query: user already applied/submitted documents and is
+    # asking about status/contact/expediting — not "what do I need to submit". These
+    # answers draw from entity-neutral fields (service_channel, contact, timeline), even
+    # when the underlying topic's OTHER fields (e.g. identification_documents) do split
+    # by entity_type. e.g. "ส่งเอกสารไปแล้วไม่มีการติดต่อกลับ" for a QR Payment application
+    # should not ask นิติบุคคล/บุคคลธรรมดา — the contact channels are identical either way.
+    _STATUS_FOLLOWUP_RE = re.compile(
+        r"ส่ง(?:เอกสาร|ไฟล์|ครบ)?.{0,25}(?:แล้ว|เรียบร้อย)(?:ครบ)?.{0,40}"
+        r"(?:ไม่มีการติดต่อกลับ|ไม่ได้รับการติดต่อกลับ|ยังไม่(?:มีการ|ได้รับการ)?ติดต่อกลับ|ไม่มีการติดต่อ|เงียบ(?:หายไป)?)"
+        r"|(?:ยัง)?ไม่(?:ได้รับการ|มีการ)?ติดต่อกลับ(?:มา)?(?:เลย)?"
+        r"|โทร(?!ศัพท์)(?:ไป)?.{0,20}?ไม่ติด"
+        r"|(?:เช็ค|ตรวจสอบ|ติดตาม)(?:ความคืบหน้า|สถานะ)(?:การสมัคร|เอกสาร|คำขอ)?"
+        r"|สถานะ(?:การสมัคร|เอกสาร|คำขอ)",
+        re.IGNORECASE,
+    )
     # Entity type explicit in query text — used for auto-inference without asking
     # Shared with persona_practical.py/persona_academic.py — see utils/text_patterns.py.
     _ENTITY_NITI_RE = _SHARED_ENTITY_NITI_RE
@@ -767,6 +782,12 @@ class PersonaSupervisor:
     # to know which internal FSM branch handled the turn.
     _STANDALONE_QUESTION_MIN_LEN = 15
 
+    # Feedback→Google Sheets menu, disabled for now (2026-08-11). Single switch: flip
+    # to True to restore both the menu offer below and the selection handler in
+    # _handle_inner (search "pending_feedback_choice"). Feature code itself (this
+    # method, _handle_feedback_selection, google_sheets_service.py) is left intact.
+    _FEEDBACK_MENU_ENABLED = False
+
     def _maybe_offer_feedback(self, state: ConversationState, user_input: str, reply: str) -> str:
         """Called once per turn from handle() (the single choke point every persona reply
         passes through). Reads state.context["_info_gap_detected"], a flag set upstream by
@@ -775,6 +796,8 @@ class PersonaSupervisor:
         _FEEDBACK_MENU_TEXT for the full mechanism and why it replaced the older keyword
         scan. No synchronous LLM confirm round-trip either way: the flag is decided as a
         side effect of the same call that generated `reply`, not a second call."""
+        if not self._FEEDBACK_MENU_ENABLED:
+            return reply
         if not reply or state.context.get("pending_feedback_choice"):
             return reply
         if not state.context.get("_info_gap_detected"):
@@ -2829,13 +2852,33 @@ class PersonaSupervisor:
         # introduces zero extra Haiku calls vs. the prior sequential code, just
         # lower wall-clock time when more than one gate is open at once.
         #
+        # Dead-call guard: every "_changed" signal computed below requires its own
+        # old_* value to already be truthy (entity_changed needs old_entity,
+        # location_changed needs old_location, reg_changed needs old_reg,
+        # reg_first_with_entity_change needs entity_changed which itself needs
+        # old_entity) except dept_changed, which needs old_dept OR current_docs.
+        # So when ALL of these are empty — i.e. nothing has been collected yet
+        # and no retrieval has happened this session (the first turn of a fresh
+        # conversation) — the early return a few lines below is mathematically
+        # guaranteed to fire no matter what entity_type/location resolve to,
+        # including the "opportunistic first-mention" save path further down
+        # (new_reg/new_location are only ever used AFTER that early return).
+        # Skipping the entity/location LLM fallbacks in that case discards no
+        # information (their results could never have been used) and costs
+        # nothing elsewhere: entity's fallback has no other caller, and
+        # location's other caller (~line 9807) has its own gate and will call
+        # it itself if it actually needs a value — see
+        # supervisor_dead_slot_call_fix.md.
+        _could_signal_change = bool(
+            old_entity or old_location or old_dept or old_reg or getattr(state, "current_docs", None)
+        )
         # Entity guard: only fires when the query contains at least one entity-hint
         # word (บจก, นิติ, เจ้าของ, คนเดียว, etc.) that the main regex couldn't parse.
         # This prevents false positives from pronouns (ฉัน/ผม/หนู) or entity-neutral
         # questions where the LLM would over-infer บุคคลธรรมดา from a first-person pronoun.
-        _need_entity_llm = new_entity is None and bool(self._ENTITY_HINT_RE.search(q_orig))
+        _need_entity_llm = _could_signal_change and new_entity is None and bool(self._ENTITY_HINT_RE.search(q_orig))
         # Location guard: catches province names, landmark mentions, etc. that regex misses.
-        _need_location_llm = new_location is None and len(q_orig.strip()) >= 2
+        _need_location_llm = _could_signal_change and new_location is None and len(q_orig.strip()) >= 2
         # Area guard: catches descriptive phrasing like "ร้านเล็กมาก", "พื้นที่กว้างมาก".
         _need_area_llm = new_area is None and bool(old_area) and len(q_orig.strip()) >= 2
 
@@ -3497,6 +3540,8 @@ class PersonaSupervisor:
                                     _is_def_q_ot = True
                                 elif re.search(r"คือ|หมายถึง|แปลว่า|หมายความว่า|ขยายความ|อธิบาย", _ot_remainder, re.UNICODE):
                                     _is_def_q_ot = True
+                                elif self._DOC_REQUIREMENT_Q_RE.search(_ot_remainder):
+                                    pass  # entity/registration-dependent — never an overview, skip LLM tier
                                 elif not self._ACTION_Q_RE.search(_ot_remainder):
                                     _llm_info_ot, _llm_action_ot = self._info_action_q_llm_check(_ot_remainder, state)
                                     if _llm_info_ot and not _llm_action_ot:
@@ -3654,7 +3699,11 @@ class PersonaSupervisor:
                             # slot into topic_slot_queue so Practical asks before answering.
                             # _direct_topic_match blocks the same check inside Practical (line 3742)
                             # so we must do it here, before returning from _ensure.
-                            if not _obd_session_et:
+                            # _entity_slot_needed guards against asking when the query is a
+                            # universal-fact / post-submission follow-up (see _STATUS_FOLLOWUP_RE)
+                            # whose answer doesn't depend on entity_type even though this OBD
+                            # bucket contains other entity-split rows (e.g. required documents).
+                            if not _obd_session_et and self._entity_slot_needed(q):
                                 _et_in_obd = {
                                     str(d.get("metadata", {}).get("entity_type_normalized") or "").strip()
                                     for d in _obd_docs_e
@@ -3710,6 +3759,8 @@ class PersonaSupervisor:
                                     _is_def_q_obd = True
                                 elif re.search(r"คือ|หมายถึง|แปลว่า|หมายความว่า|ขยายความ|อธิบาย", _obd_remainder, re.UNICODE):
                                     _is_def_q_obd = True
+                                elif self._DOC_REQUIREMENT_Q_RE.search(_obd_remainder):
+                                    pass  # entity/registration-dependent — never an overview, skip LLM tier
                                 elif not self._ACTION_Q_RE.search(_obd_remainder):
                                     # Tier 3: LLM fallback on the shorter remainder text — more reliable
                                     # than calling LLM on the full query because (a) shorter text gives
@@ -4278,6 +4329,8 @@ class PersonaSupervisor:
                                         _is_def_q_st = True
                                     elif re.search(r"คือ|หมายถึง|แปลว่า|หมายความว่า|ขยายความ|อธิบาย", _st_remainder, re.UNICODE):
                                         _is_def_q_st = True
+                                    elif self._DOC_REQUIREMENT_Q_RE.search(_st_remainder):
+                                        pass  # entity/registration-dependent — never an overview, skip LLM tier
                                     elif not self._ACTION_Q_RE.search(_st_remainder):
                                         _llm_info_st, _llm_action_st = self._info_action_q_llm_check(_st_remainder, state)
                                         if _llm_info_st and not _llm_action_st:
@@ -4663,6 +4716,18 @@ class PersonaSupervisor:
         r"(?:ขอ|ยื่น(?:\s*ขอ)?)\s*ใบ(?:อนุญาต)?(?!.{0,20}(?:ต่ออายุ|ต่อ\s*อายุ|หมดอายุ|สิ้นอายุ)))",
         re.IGNORECASE,
     )
+    # Document/requirement question — "เอกสารอะไรบ้าง", "ต้องใช้เอกสารอะไรบ้าง" etc. These
+    # always have an entity/registration-type-dependent answer (the required-documents list
+    # is exactly the field that splits by entity_type in the source data), so they must never
+    # be treated as a pure informational overview. Used by the OT/OBD exact-match Tier-3 checks
+    # below to bypass _info_action_q_llm_check for this phrasing — that LLM call was observed
+    # to classify this exact pattern inconsistently run-to-run (same input, different verdict),
+    # which made asking-vs-not-asking entity_type non-deterministic for this common question type.
+    _DOC_REQUIREMENT_Q_RE = re.compile(
+        r"(?:เอกสาร|หลักฐาน)(?:ที่ต้อง(?:ใช้|เตรียม|มี))?.{0,15}(?:อะไรบ้าง|มีอะไรบ้าง|ต้องใช้อะไร|ต้องเตรียมอะไร)"
+        r"|ต้อง(?:ใช้|เตรียม)(?:เอกสาร|หลักฐาน).{0,15}(?:อะไรบ้าง|อะไร)",
+        re.IGNORECASE,
+    )
 
     def _prefill_slots_from_message(self, state: ConversationState, user_input: str) -> None:
         """
@@ -4863,7 +4928,15 @@ class PersonaSupervisor:
         # Re-classify immediately after reset using fast regex — must run BEFORE any early returns
         # so broad_question / non-reg-dominant paths don't exit without setting the flag.
         # LLM fallback (line ~3979) may override this later for edge cases not covered by regex.
-        _info_q_re_match = bool(self._INFO_Q_RE.search(query or "")) and not bool(self._ACTION_Q_RE.search(query or ""))
+        # _DOC_REQUIREMENT_Q_RE exclusion: "เอกสารอะไรบ้าง" matches _INFO_Q_RE's broad
+        # "อะไรบ้าง" alternative and would otherwise be misclassified as a pure overview
+        # here too — this is the general (non-exact-match) retrieval path's version of the
+        # same guard already applied at the OT/OBD/ST chapter-retrieval and menu-bypass sites.
+        _info_q_re_match = (
+            bool(self._INFO_Q_RE.search(query or ""))
+            and not bool(self._ACTION_Q_RE.search(query or ""))
+            and not bool(self._DOC_REQUIREMENT_Q_RE.search(query or ""))
+        )
         _universal_fact = not self._entity_slot_needed(query or "")
         # Bare topic mention (e.g. "ใบอนุญาตสุขาภิบาลอาหาร" typed alone, no verb) — same
         # deterministic signal used further below for _is_info_q. Must be checked here too:
@@ -5107,7 +5180,12 @@ class PersonaSupervisor:
         # Action signals override: "อยากจด/วิธีจด" always builds slot queue regardless.
         _is_action_q_re = bool(self._ACTION_Q_RE.search(query))
         _is_link_req = bool(self._LINK_REQUEST_RE.search(query)) and not _is_action_q_re
-        _is_info_q   = bool(self._INFO_Q_RE.search(query))       and not _is_action_q_re
+        # _DOC_REQUIREMENT_Q_RE: "เอกสารอะไรบ้าง" matches _INFO_Q_RE's broad "อะไรบ้าง"
+        # alternative and would otherwise be misclassified as informational below — same
+        # entity/registration-dependent guard already applied at the other call sites of
+        # this pattern (OT/OBD/ST chapter retrieval, menu-bypass, general slot-queue builder).
+        _is_doc_requirement_q = bool(self._DOC_REQUIREMENT_Q_RE.search(query))
+        _is_info_q   = bool(self._INFO_Q_RE.search(query))       and not _is_action_q_re and not _is_doc_requirement_q
         # Bare topic mention (just a license/topic name typed alone, e.g. "ใบอนุญาตสุขาภิบาลอาหาร",
         # no verb, no question word — already ruled out as action by _is_action_q_re above):
         # treat deterministically as informational instead of falling back to the LLM
@@ -5118,8 +5196,12 @@ class PersonaSupervisor:
         _is_bare_topic_mention = bool(
             query and len(query.strip()) <= 25 and "?" not in query and "？" not in query
         )
-        # LLM fallback: when regex caught neither info nor action
-        if not _is_info_q and not _is_action_q_re and _is_bare_topic_mention:
+        # LLM fallback: when regex caught neither info nor action. _is_doc_requirement_q skips
+        # both the bare-mention tier and the LLM tier too — never treat a document-requirement
+        # question as informational, regardless of which tier would otherwise have caught it.
+        if _is_doc_requirement_q:
+            pass
+        elif not _is_info_q and not _is_action_q_re and _is_bare_topic_mention:
             _is_info_q = True
         elif not _is_info_q and not _is_action_q_re:
             _llm_info, _llm_action = self._info_action_q_llm_check(query, state)
@@ -5741,10 +5823,20 @@ class PersonaSupervisor:
             _LOG.debug("[Supervisor] legal_q entity_type/registration_type skipped — universal-fact query: %r", query[:60])
 
         # Step 4: auto-infer location from query text (Bug 1)
+        # LLM fallback is submitted to _CLASSIFIER_POOL rather than called inline —
+        # it runs concurrently with Step 6's operation_group inference below instead
+        # of sequentially after it. Verified independent: reads only query/state
+        # (never Step 6's op_group output), writes only to its own dedicated
+        # state.context["_loc_llm_cache"] key (Step 6 writes _op_type_llm_cache),
+        # same isolation guarantee already relied on for the sibling fix in
+        # _prefill_slots_from_message. Gate condition (whether the call happens at
+        # all) is unchanged — only *when* it runs relative to Step 6 changed.
         _location_slot_lq = next((s for s in all_slots if s.get("key") == "location"), None)
+        _loc_opts_lq: list = []
+        _inferred_loc_lq = None
+        _s4_loc_fut = None
         if _location_slot_lq and "location" not in collected_keys:
             _loc_opts_lq = _location_slot_lq.get("options") or []
-            _inferred_loc_lq = None
             if self._LOCATION_BKK_RE.search(query):
                 _inferred_loc_lq = next((o for o in _loc_opts_lq if "กรุงเทพ" in o), "กรุงเทพฯ")
             elif self._LOCATION_METRO_RE.search(query):
@@ -5757,18 +5849,7 @@ class PersonaSupervisor:
                 _inferred_loc_lq = next((o for o in _loc_opts_lq if "จังหวัด" in o or "ต่าง" in o), "ต่างจังหวัด")
             # LLM fallback: catches province names ("สงขลา"), BKK districts ("ลาดพร้าว"), etc.
             if _inferred_loc_lq is None and len(query.strip()) >= 4:
-                _llm_loc_lq = self._location_llm_fallback(query, state)
-                if _llm_loc_lq == "กรุงเทพฯ":
-                    _inferred_loc_lq = next((o for o in _loc_opts_lq if "กรุงเทพ" in o), "กรุงเทพฯ")
-                elif _llm_loc_lq == "ต่างจังหวัด":
-                    _inferred_loc_lq = next((o for o in _loc_opts_lq if "จังหวัด" in o or "ต่าง" in o), "ต่างจังหวัด")
-            if _inferred_loc_lq:
-                state.save_collected_slot("location", _inferred_loc_lq)
-                state.context.setdefault("slots", {})["location"] = _inferred_loc_lq
-                if "collected_slots" in state.context:
-                    state.context["collected_slots"]["location"] = _inferred_loc_lq
-                collected_keys = collected_keys | {"location"}
-                _LOG.info("[Supervisor] legal_q location auto-inferred from query: %r", _inferred_loc_lq)
+                _s4_loc_fut = _CLASSIFIER_POOL.submit(self._location_llm_fallback, query, state)
 
         # Step 5: auto-infer shop_area_type from query text (Bug 2)
         _area_slot_lq = next((s for s in all_slots if s.get("key") == "shop_area_type"), None)
@@ -5804,10 +5885,49 @@ class PersonaSupervisor:
         # Risk-2 mitigation: also override a STALE stored operation_group when current query
         # implies a DIFFERENT operation (e.g. follow-up "ถ้าจะเปลี่ยนแปลงข้อมูลล่ะ" after
         # turn 1 stored "ยื่นขอใหม่").
+        # _infer_operation_group_from_query does its own regex-then-LLM gating
+        # internally (see its body), so submitting the whole call to the pool is
+        # safe/cheap even on the common case where it resolves via regex/history-scan
+        # alone inside the worker thread — no extra LLM call is added either way.
         _og_slot_6 = next((s for s in all_slots if s.get("key") == "operation_group"), None)
+        _og_opts_6: list = []
+        _s6_og_fut = None
         if _og_slot_6:
             _og_opts_6 = _og_slot_6.get("options") or []
-            _inferred_og_6 = self._infer_operation_group_from_query(query, _og_opts_6, state)
+            _s6_og_fut = _CLASSIFIER_POOL.submit(self._infer_operation_group_from_query, query, _og_opts_6, state)
+
+        # Resolve Step 4 + Step 6 together — wall-clock cost is whichever call is
+        # slower, not the sum of both (was fully sequential before this fix).
+        if _s4_loc_fut is not None or _s6_og_fut is not None:
+            try:
+                concurrent.futures.wait(
+                    [f for f in (_s4_loc_fut, _s6_og_fut) if f is not None], timeout=10.0
+                )
+            except Exception as _pf_e_46:
+                _LOG.warning("[Supervisor] legal_q Step4/6 LLM fallback pool error: %s", _pf_e_46)
+
+        if _s4_loc_fut is not None:
+            try:
+                _llm_loc_lq = _s4_loc_fut.result(timeout=0)
+            except Exception:
+                _llm_loc_lq = None
+            if _llm_loc_lq == "กรุงเทพฯ":
+                _inferred_loc_lq = next((o for o in _loc_opts_lq if "กรุงเทพ" in o), "กรุงเทพฯ")
+            elif _llm_loc_lq == "ต่างจังหวัด":
+                _inferred_loc_lq = next((o for o in _loc_opts_lq if "จังหวัด" in o or "ต่าง" in o), "ต่างจังหวัด")
+        if _inferred_loc_lq:
+            state.save_collected_slot("location", _inferred_loc_lq)
+            state.context.setdefault("slots", {})["location"] = _inferred_loc_lq
+            if "collected_slots" in state.context:
+                state.context["collected_slots"]["location"] = _inferred_loc_lq
+            collected_keys = collected_keys | {"location"}
+            _LOG.info("[Supervisor] legal_q location auto-inferred from query: %r", _inferred_loc_lq)
+
+        if _og_slot_6:
+            try:
+                _inferred_og_6 = _s6_og_fut.result(timeout=0) if _s6_og_fut is not None else None
+            except Exception:
+                _inferred_og_6 = None
             if _inferred_og_6:
                 _cur_og_6 = (
                     _cs_lq.get("operation_group")
@@ -6593,11 +6713,19 @@ class PersonaSupervisor:
             if self._check_select_all_intent_llm(key, raw.strip(), [str(x).strip() for x in options]):
                 return ", ".join([str(x).strip() for x in options if str(x).strip()]), None
 
+        # Audit finding, 2026-08-05: free-text matching below (LLM + fuzzy) uses the FULL
+        # candidate pool when the caller provided one (e.g. operation_sub_type's >5-option
+        # cap — see persona_supervisor.py ~10327), not just the capped "options" shown on
+        # screen — same class of fix as _resolve_dynamic_clarification's values_full. Numeric-
+        # index and "ทั้งหมด" matching above intentionally still use "options" only, since
+        # those are inherently tied to what's actually displayed/numbered.
+        _match_pool = pending.get("options_full") or options
+
         # 3) non-topic: allow free-text mapping via LLM (no hardcode)
         # Example: location slot with options ["กรุงเทพฯ", "ต่างจังหวัด"] and user says "กทม"
-        if isinstance(options, list) and len(options) >= 2 and self.llm_slot_mapper_call:
+        if isinstance(_match_pool, list) and len(_match_pool) >= 2 and self.llm_slot_mapper_call:
             try:
-                res = self.llm_slot_mapper_call(key, raw.strip(), [str(x).strip() for x in options]) or {}
+                res = self.llm_slot_mapper_call(key, raw.strip(), [str(x).strip() for x in _match_pool]) or {}
             except Exception:
                 res = {}
             try:
@@ -6612,15 +6740,15 @@ class PersonaSupervisor:
                     idx = int(res.get("choice_index", 0) or 0)
                 except Exception:
                     idx = 0
-                if 1 <= idx <= len(options):
-                    return str(options[idx - 1]).strip(), None
+                if 1 <= idx <= len(_match_pool):
+                    return str(_match_pool[idx - 1]).strip(), None
 
                 choice_text = str(res.get("choice_text") or "").strip()
                 if choice_text:
                     # map back to options if same/contains; require ≥4 chars to avoid
                     # false-matches on short Thai syllables like "นิติ", "บุคคล"
                     ct = self._normalize_for_intent(choice_text)
-                    for opt in options:
+                    for opt in _match_pool:
                         s = str(opt).strip()
                         if not s:
                             continue
@@ -6634,7 +6762,7 @@ class PersonaSupervisor:
         # Works for Thai text where word boundaries are ambiguous.
         # Helps when user types natural text (e.g. "แก้ไขหุ้นส่วน") for option "การแก้ไขข้อมูลหุ้นส่วน"
         # Threshold 0.50 (up from 0.30) to reduce false-matches on short/common Thai bigrams.
-        fuzzy_match = self._fuzzy_match_option(raw, options, threshold=0.50)
+        fuzzy_match = self._fuzzy_match_option(raw, _match_pool, threshold=0.50)
         if fuzzy_match is not None:
             _LOG.info("[Supervisor] pending_slot fuzzy match: %r → %r", raw[:40], fuzzy_match[:40])
             return fuzzy_match, None
@@ -7639,6 +7767,10 @@ class PersonaSupervisor:
             "collected_key":  diverge.get("collected_key", diverge["metadata_key"]),
             "filter_mode":    diverge.get("filter_mode", "chroma"),
             "values":         diverge["values"],
+            # Audit finding, 2026-08-05: "values" is capped at 4 for display; "values_full"
+            # (added in _detect_divergence) carries everything so _resolve_dynamic_clarification
+            # can still match a free-text answer naming one of the un-displayed options.
+            "values_full":    diverge.get("values_full") or diverge["values"],
             "original_query": query,
         }
         question = self._practical._build_clarification_question(diverge, docs)
@@ -7659,9 +7791,36 @@ class PersonaSupervisor:
         filter_key = pending_dc.get("filter_key", field)
         collected_key = pending_dc.get("collected_key", field)
         values = pending_dc.get("values") or []
+        # Audit finding, 2026-08-05: match against the FULL candidate list, not just the ≤4
+        # shown on screen (see _detect_divergence/_build_clarification_question) — otherwise a
+        # user who correctly names one of the un-displayed options can never be matched, even
+        # via exact free-text, and falls straight into the "treat as a new question" branch
+        # below for an answer they actually got right.
+        values_full = pending_dc.get("values_full") or values
         original_query = pending_dc.get("original_query", "").strip() or user_input
 
-        matched = self._practical._match_clarification_answer(user_input, values)
+        matched = self._practical._match_clarification_answer(user_input, values_full)
+
+        # LLM fallback (audit finding, 2026-08-05): the deterministic exact/substring/numeric
+        # matcher above has no way to recognize a valid-but-differently-phrased answer (e.g.
+        # "กทม" for "กรุงเทพฯ"). Reuses the same confidence-thresholded slot-mapper LLM already
+        # used for pending_slot resolution elsewhere in this file (~line 6598), same ≥0.60 bar
+        # — deliberately NOT a new mechanism, this one was already proven in production.
+        if not matched and values_full and len(values_full) >= 2 and self.llm_slot_mapper_call:
+            try:
+                _dc_res = self.llm_slot_mapper_call(field, user_input.strip(), [str(v).strip() for v in values_full]) or {}
+                _dc_confv = float(_dc_res.get("confidence", 0.0) or 0.0)
+            except Exception:
+                _dc_res, _dc_confv = {}, 0.0
+            if _dc_confv >= 0.60:
+                try:
+                    _dc_idx = int(_dc_res.get("choice_index", 0) or 0)
+                except Exception:
+                    _dc_idx = 0
+                if 1 <= _dc_idx <= len(values_full):
+                    matched = str(values_full[_dc_idx - 1]).strip()
+                    _LOG.info("[Supervisor] DC resolved via LLM fallback: %r (conf=%.2f)", matched, _dc_confv)
+
         filter_mode = pending_dc.get("filter_mode", "chroma")
 
         state.context.pop("pending_dynamic_clarification", None)
@@ -7716,10 +7875,20 @@ class PersonaSupervisor:
             except Exception as _re:
                 _LOG.warning("[Supervisor] DC: re-retrieve failed: %s — using existing docs", _re)
         else:
+            # No match even via LLM — the user's message is very likely a NEW question, not a
+            # garbled answer to the old one. Audit finding, 2026-08-05: this branch previously
+            # fell through to `_practical.handle(state, original_query, ...)` below using the
+            # STALE query saved when the DC question was first asked — e.g. a user who typed
+            # "ไม่เอาแล้วค่ะ ขอถามเรื่องภาษีมูลค่าเพิ่มแทน" (never mind, I want to ask about VAT
+            # instead) got the exact same old clarification question re-shown with zero
+            # acknowledgment of what they'd just said; their real message was silently
+            # discarded. Answer what they actually typed instead of what they said before the
+            # clarification question fired.
             _LOG.info(
-                "[Supervisor] DC: answer %r did not match values=%r — answering unfiltered",
+                "[Supervisor] DC: answer %r did not match values=%r — treating as a new question",
                 user_input[:40], values,
             )
+            original_query = user_input
 
         if state.current_docs:
             state.context["_supervisor_retrieval_done"] = True
@@ -8693,11 +8862,13 @@ class PersonaSupervisor:
     def _entity_slot_needed(self, query: str) -> bool:
         """
         Returns False if the entity_type slot should be skipped for this query.
-        Universal-fact queries (e.g. "มีอายุกี่ปี", "หมดอายุไหม") have answers
-        that are identical across entity types — asking entity_type adds no value.
-        Returns True (ask) by default; only False for matched universal-fact patterns.
+        Universal-fact queries (e.g. "มีอายุกี่ปี", "หมดอายุไหม") and post-submission
+        follow-up queries (e.g. "ส่งเอกสารไปแล้วไม่มีการติดต่อกลับ") have answers that
+        are identical across entity types — asking entity_type adds no value.
+        Returns True (ask) by default; only False for matched patterns.
         """
-        return not self._UNIVERSAL_FACT_RE.search(query or "")
+        q = query or ""
+        return not (self._UNIVERSAL_FACT_RE.search(q) or self._STATUS_FOLLOWUP_RE.search(q))
 
     _cached_main_topics: Optional[List[str]] = None
     _cached_sub_topics: Optional[List[str]] = None
@@ -10283,15 +10454,25 @@ class PersonaSupervisor:
                                 len(_sub_ops), len(_grp_opts), _grp_opts,
                             )
                         else:
-                            # Grouper returned ≤1 group — cap flat list to 5
+                            # Grouper returned ≤1 group — cap flat list to 5 for DISPLAY only.
+                            # Audit finding, 2026-08-05: same class as the already-fixed
+                            # _detect_divergence/values_full bug — this fires precisely when
+                            # both LLM and regex grouping failed to categorize a long raw list
+                            # (up to 26 sub-ops per the docstring above), so it's exactly the
+                            # scenario where losing items 6+ to an unmatchable cap matters most.
+                            # "options_full" keeps everything so _map_pending_slot_reply's
+                            # matching (deterministic + its own LLM fallback) can still resolve
+                            # a free-text answer naming one of the un-displayed sub-ops; the
+                            # displayed menu itself ("options") is untouched, still capped at 5.
                             _capped = _sub_ops[:5]
                             state.context["topic_slot_queue"] = [{
                                 "key": "operation_sub_type",
                                 "options": _capped,
+                                "options_full": _sub_ops,
                                 "question": "ต้องการดำเนินการรายการใดครับ?",
-                                "raw_sub_map": {v: v for v in _capped},
+                                "raw_sub_map": {v: v for v in _sub_ops},
                             }]
-                            _LOG.info("[Supervisor] operation_sub_type capped to 5: %s", _capped)
+                            _LOG.info("[Supervisor] operation_sub_type capped to 5 (of %d): %s", len(_sub_ops), _capped)
                     else:
                         state.context["topic_slot_queue"] = [{
                             "key": "operation_sub_type",
@@ -12108,25 +12289,25 @@ class PersonaSupervisor:
                     f"ครั้งก่อนเราคุยเรื่อง{_lt} อยู่ครับ\n"
                     "💡 **ต้องการสอบถามต่อ หรืออยากให้น้องสุดยอดช่วยเรื่องอื่นครับ?**"
                 )
-            else:
-                intro = (
-                    "👋 **สวัสดีครับ!** ผม **\"น้องสุดยอด Consult Restbiz\"**\n"
-                    "ช่วยได้ทั้งเรื่องใบอนุญาต/ภาษี/กฎหมายร้านอาหาร, กลยุทธ์การตลาด และคู่มือเปิดร้าน/เบเกอรี่/คาเฟ่ครับ\n"
-                    "💡 **อยากให้น้องสุดยอดช่วยอะไรครับ?**"
-                )
-            _EMOJI_NUM = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
-            topic_lines = []
-            # Use topic_descs passed via state.context if available (returning-user path);
-            # fall back to _FIXED_GREETING_MENU descriptions for brand-new users.
-            _ctx_descs = (state.context or {}).get("last_menu_topic_descs") or []
-            _fixed_descs = [d for _, d in self._FIXED_GREETING_MENU]
-            _descs = _ctx_descs if (len(_ctx_descs) == len(menu_topics)) else _fixed_descs
-            for i, t in enumerate(menu_topics):
-                num = _EMOJI_NUM[i] if i < len(_EMOJI_NUM) else f"{i+1}."
-                desc = _descs[i] if i < len(_descs) else ""
-                topic_lines.append(f"{num} **{t}** - {desc}" if desc else f"{num} **{t}**")
-            footer = "พิมพ์ตัวเลข หรือบอกผมได้เลยว่าต้องการข้อมูลใบอนุญาติ หรือ ทริคการจัดการร้านอาหารด้านใดสำหรับร้านของคุณครับ 😊"
-            msg = intro + "\n" + "\n".join(topic_lines) + "\n" + footer
+                _EMOJI_NUM = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+                topic_lines = []
+                # Use topic_descs passed via state.context if available (returning-user path);
+                # fall back to _FIXED_GREETING_MENU descriptions for brand-new users.
+                _ctx_descs = (state.context or {}).get("last_menu_topic_descs") or []
+                _fixed_descs = [d for _, d in self._FIXED_GREETING_MENU]
+                _descs = _ctx_descs if (len(_ctx_descs) == len(menu_topics)) else _fixed_descs
+                for i, t in enumerate(menu_topics):
+                    num = _EMOJI_NUM[i] if i < len(_EMOJI_NUM) else f"{i+1}."
+                    desc = _descs[i] if i < len(_descs) else ""
+                    topic_lines.append(f"{num} **{t}** - {desc}" if desc else f"{num} **{t}**")
+                footer = "พิมพ์ตัวเลข หรือบอกผมได้เลยว่าต้องการข้อมูลใบอนุญาติ หรือ ทริคการจัดการร้านอาหารด้านใดสำหรับร้านของคุณครับ 😊"
+                msg = intro + "\n" + "\n".join(topic_lines) + "\n" + footer
+                return self._normalize_male(msg)
+            # Brand-new session, first turn: short welcome only — no topic menu/footer.
+            msg = (
+                "👋 **สวัสดีครับ!** ผม **\"น้องสุดยอด Consult Restbiz\"** ยินดีให้บริการครับ!\n\n"
+                "💡 **อยากให้น้องสุดยอดช่วยอะไรครับ?**"
+            )
             return self._normalize_male(msg)
         prefix = self._get_prefix_llm(kind, state, include_intro=False)
         menu = "\n".join(f"{i+1}) **{t}**" for i, t in enumerate((menu_topics or [])[:9]) if t)
@@ -12600,7 +12781,10 @@ class PersonaSupervisor:
         # 1.9) Pending feedback choice — higher priority than academic intake lock,
         # confirm/switch, and legal routing (mirrors pending_slot's precedence) so a
         # bare "1"/"2"/"3" answering the feedback menu isn't swallowed by other routing.
-        if state.context.get("pending_feedback_choice"):
+        # Gated by _FEEDBACK_MENU_ENABLED (see that flag's comment) — guarded here too,
+        # not just at the offer site, so a pending_feedback_choice left over in an old
+        # session (from before the feature was disabled) doesn't still get intercepted.
+        if self._FEEDBACK_MENU_ENABLED and state.context.get("pending_feedback_choice"):
             st2, reply2 = self._handle_feedback_selection(state, raw_stripped)
             reply2 = self._normalize_male(reply2)
             self._add_assistant(st2, reply2)
@@ -13164,9 +13348,16 @@ class PersonaSupervisor:
                         # never reaching the LLM-check that would normally set this flag.
                         _has_action = bool(self._ACTION_Q_RE.search(raw_stripped))
                         if (
-                            (self._INFO_Q_RE.search(raw_stripped) and not _has_action)
-                            or (not _has_action and self._info_action_q_llm_check(raw_stripped, state)[0])
+                            not self._DOC_REQUIREMENT_Q_RE.search(raw_stripped)
+                            and (
+                                (self._INFO_Q_RE.search(raw_stripped) and not _has_action)
+                                or (not _has_action and self._info_action_q_llm_check(raw_stripped, state)[0])
+                            )
                         ):
+                            # _DOC_REQUIREMENT_Q_RE exclusion: "เอกสารอะไรบ้าง" matches _INFO_Q_RE's
+                            # broad "อะไรบ้าง" alternative and would otherwise be misclassified as a
+                            # pure overview here — same entity/registration-dependent reasoning as the
+                            # OT/OBD/ST exact-match Tier-3 guards above.
                             state.context["_skip_op_topic_for_info"] = True
                             state.context["_informational_query"] = True
                     # fall through to legal question handler below

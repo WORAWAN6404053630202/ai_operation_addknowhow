@@ -1,6 +1,5 @@
 # code/adapter/response/response_custom.py
 
-from fastapi import HTTPException
 from pydantic import BaseModel
 from fastapi.responses import JSONResponse
 
@@ -20,7 +19,3 @@ def HandleSuccess(message: str, **kwargs):
         **kwargs,
     }
     return JSONResponse(content=response_data, status_code=200)
-
-
-def HandleError(message: str, status_code: int):
-    raise HTTPException(status_code=status_code, detail=message)

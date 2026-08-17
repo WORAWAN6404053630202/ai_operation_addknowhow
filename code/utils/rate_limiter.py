@@ -13,7 +13,7 @@ disabled entirely, preserving backward compatibility.
 """
 
 import time
-from collections import defaultdict, deque
+from collections import deque, OrderedDict
 from typing import Dict, Tuple
 import threading
 
@@ -24,62 +24,100 @@ class RateLimiter:
     """
     Sliding window rate limiter with optional per-window token budget.
 
+    Identifiers should be something a single caller cannot cheaply rotate
+    (e.g. client IP) — a client-supplied value like a self-issued session_id
+    lets an attacker reset their own limit on every request.
+
     Example:
         limiter = RateLimiter(max_requests=10, window_seconds=60)
 
-        allowed, info = limiter.is_allowed("session_123")
+        allowed, info = limiter.is_allowed("1.2.3.4")
         if not allowed:
             raise HTTPException(429, "Rate limit exceeded")
 
         # After LLM call completes:
-        limiter.record_token_usage("session_123", tokens_used=4200)
+        limiter.record_token_usage("1.2.3.4", tokens_used=4200)
     """
 
-    def __init__(self, max_requests: int = 10, window_seconds: int = 60):
+    def __init__(self, max_requests: int = 10, window_seconds: int = 60, max_identifiers: int = 5000):
         """
         Initialize rate limiter.
 
         Args:
             max_requests:   Maximum requests allowed per window (default: 10).
             window_seconds: Sliding window duration in seconds (default: 60).
+            max_identifiers: Hard cap on distinct identifiers tracked at once.
+                LRU-evicts the least-recently-seen identifier past this —
+                without a cap, an identifier that rotates freely (or just a
+                lot of distinct real callers) grows these dicts forever.
         """
         self.max_requests = max_requests
         self.window_seconds = window_seconds
+        self.max_identifiers = max_identifiers
 
         # Request timestamps per identifier: {id: deque([ts, ...])}
-        self._requests: Dict[str, deque] = defaultdict(deque)
+        self._requests: "OrderedDict[str, deque]" = OrderedDict()
 
         # Token usage per identifier: {id: deque([(ts, tokens), ...])}
-        self._window_tokens: Dict[str, deque] = defaultdict(deque)
+        self._window_tokens: "OrderedDict[str, deque]" = OrderedDict()
 
         self._lock = threading.RLock()
 
         # Metrics
         self.total_requests = 0
         self.blocked_requests = 0
-    
+        self._checks_since_cleanup = 0
+
+    def _get_bucket(self, store: "OrderedDict[str, deque]", identifier: str) -> deque:
+        """Fetch (creating if needed) an identifier's deque and mark it
+        most-recently-used, evicting the oldest identifier if this pushes
+        `store` past max_identifiers."""
+        bucket = store.get(identifier)
+        if bucket is None:
+            bucket = deque()
+            store[identifier] = bucket
+            if len(store) > self.max_identifiers:
+                store.popitem(last=False)
+        else:
+            store.move_to_end(identifier)
+        return bucket
+
+    def _cleanup_expired(self, current_time: float) -> None:
+        """Drop identifiers whose window has fully elapsed, so one-shot or
+        rotated identifiers don't sit in memory until LRU eviction catches up."""
+        cutoff = current_time - self.window_seconds
+        for ident in [i for i, dq in self._requests.items() if not dq or dq[-1] < cutoff]:
+            del self._requests[ident]
+        for ident in [i for i, dq in self._window_tokens.items() if not dq or dq[-1][0] < cutoff]:
+            del self._window_tokens[ident]
+
     def is_allowed(self, identifier: str) -> Tuple[bool, Dict]:
         """
         Check if request is allowed for given identifier.
-        
+
         Args:
-            identifier: Unique identifier (session_id, IP, user_id, etc.)
-        
+            identifier: Unique identifier — use client IP, not a client-supplied value.
+
         Returns:
             (allowed: bool, info: dict)
-            
+
         Example:
-            allowed, info = limiter.is_allowed("session_123")
+            allowed, info = limiter.is_allowed("1.2.3.4")
             # info = {"remaining": 7, "reset_in": 42, "limit": 10}
         """
         current_time = time.time()
-        
+
         with self._lock:
             self.total_requests += 1
-            
+
+            self._checks_since_cleanup += 1
+            if self._checks_since_cleanup >= 500:
+                self._checks_since_cleanup = 0
+                self._cleanup_expired(current_time)
+
             # Get request timestamps for this identifier
-            timestamps = self._requests[identifier]
-            
+            timestamps = self._get_bucket(self._requests, identifier)
+
             # Remove expired timestamps (outside window)
             cutoff_time = current_time - self.window_seconds
             while timestamps and timestamps[0] < cutoff_time:
@@ -132,7 +170,8 @@ class RateLimiter:
         if tokens <= 0:
             return
         with self._lock:
-            self._window_tokens[identifier].append((time.time(), int(tokens)))
+            bucket = self._get_bucket(self._window_tokens, identifier)
+            bucket.append((time.time(), int(tokens)))
 
     def get_window_tokens(self, identifier: str) -> int:
         """
@@ -142,7 +181,7 @@ class RateLimiter:
         current_time = time.time()
         cutoff = current_time - self.window_seconds
         with self._lock:
-            q = self._window_tokens[identifier]
+            q = self._get_bucket(self._window_tokens, identifier)
             while q and q[0][0] < cutoff:
                 q.popleft()
             return sum(t for _, t in q)

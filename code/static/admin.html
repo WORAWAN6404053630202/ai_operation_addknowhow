@@ -302,8 +302,24 @@
     return String(t || "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
   }
 
+  function getAdminKey() {
+    let key = localStorage.getItem("admin_key");
+    if (!key) {
+      key = window.prompt("กรอก Admin API Key (X-Admin-Key):") || "";
+      if (key) localStorage.setItem("admin_key", key);
+    }
+    return key;
+  }
+
   async function apiGet(url) {
-    const r = await fetch(url);
+    const key = getAdminKey();
+    if (!key) return {};
+    const r = await fetch(url, { headers: { "X-Admin-Key": key } });
+    if (r.status === 401) {
+      localStorage.removeItem("admin_key");
+      alert("Admin key ไม่ถูกต้อง กรุณาโหลดหน้านี้ใหม่แล้วกรอกใหม่อีกครั้ง");
+      return {};
+    }
     return r.json();
   }
 

@@ -14,13 +14,18 @@ try:
 except Exception:
     _conf = None
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from model.state_manager import StateManager
+from utils.admin_auth import require_admin_key
 from utils.simple_cache import get_cache
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+# API routes need the admin key; the dashboard shell below stays open since it
+# renders no data itself (a bare page load can't attach a custom header) —
+# static/admin.html's apiGet() attaches the key to every /admin/api/* call.
+_auth = Depends(require_admin_key)
 
 _state_manager = StateManager()
 
@@ -51,7 +56,7 @@ async def admin_dashboard():
     return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
 
-@router.get("/api/sessions")
+@router.get("/api/sessions", dependencies=[_auth])
 async def admin_sessions(limit: int = Query(default=50, le=200)):
     """List all sessions with message count and preview."""
     sessions = _state_manager.list_sessions(limit=limit)
@@ -92,7 +97,7 @@ async def admin_sessions(limit: int = Query(default=50, le=200)):
     return JSONResponse({"sessions": result, "total": len(result)})
 
 
-@router.get("/api/session/{session_id}")
+@router.get("/api/session/{session_id}", dependencies=[_auth])
 async def admin_session_detail(session_id: str):
     """Full message history for a session."""
     state = _state_manager.load(session_id)
@@ -125,7 +130,7 @@ async def admin_session_detail(session_id: str):
     })
 
 
-@router.get("/api/stats")
+@router.get("/api/stats", dependencies=[_auth])
 async def admin_stats():
     """Overall stats: session count, cache, log summary."""
     all_sessions = _state_manager.list_sessions(limit=500)
@@ -150,7 +155,7 @@ async def admin_stats():
     })
 
 
-@router.get("/api/logs")
+@router.get("/api/logs", dependencies=[_auth])
 async def admin_logs(lines: int = Query(default=100, le=500)):
     """Return last N lines from the server log file."""
     if not _LOG_FILE.exists():

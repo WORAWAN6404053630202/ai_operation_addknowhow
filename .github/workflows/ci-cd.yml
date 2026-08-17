@@ -9,6 +9,11 @@ on:
   pull_request:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      run_eval:
+        description: 'Also run the paid LLM eval suite (RAG faithfulness + prompt-injection) — costs real money, run after prompt changes'
+        type: boolean
+        default: false
 
 env:
   DOCKER_IMAGE: thai-regulatory-ai
@@ -52,6 +57,15 @@ jobs:
     name: Run Tests
     runs-on: ubuntu-latest
     needs: lint
+    env:
+      # conf.py hard-fails at import time (RuntimeError) if this is unset — it's
+      # required just to import the app modules, not to actually call the API.
+      # The pytest suite under tests/ is pure unit/logic tests (regex, slot-fill,
+      # entity detection) with zero live LLM calls, so a placeholder is correct
+      # here — never put a real key in this file. Real-money integration tests
+      # (see tests/test_rag_faithfulness.py) are excluded below via -m and are
+      # not meant to run in this job.
+      OPENROUTER_API_KEY: ci-placeholder-key-not-real
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -71,6 +85,7 @@ jobs:
       - name: Run pytest
         run: |
           pytest tests/ \
+            -m "not integration" \
             --cov=code \
             --cov-report=xml \
             --cov-report=html \
@@ -163,69 +178,40 @@ jobs:
             BUILD_DATE=${{ github.event.repository.updated_at }}
             VCS_REF=${{ github.sha }}
 
-  # Job 5: Deploy to Staging
-  deploy-staging:
-    name: Deploy to Staging
+  # Deployment is manual, not CI/CD-driven: build image on the dev machine, push
+  # to Docker Hub, SSH into the EC2 host, pull, and restart the container (see
+  # project deployment notes for the exact command sequence). The deploy-staging
+  # /deploy-production/load-test jobs that used to live here were never wired
+  # up — every step was a bare `echo "Deploying..."` placeholder pointing at
+  # unconfigured example.com URLs, and the load-test job referenced a
+  # locustfile.py that doesn't exist in this repo, so it would fail immediately
+  # if it ever ran. Removed rather than left as misleading dead scaffolding
+  # that looks automated but silently does nothing. If real CI-driven
+  # deployment is wanted later, it needs actual target infra (SSH key /
+  # kubeconfig / cloud credentials as GitHub secrets) wired into real commands
+  # here, not placeholder echo statements.
+
+  # Job: Paid LLM Eval Suite (on-demand only)
+  # RAG faithfulness (tests/test_rag_faithfulness.py) + prompt-injection
+  # resistance (tests/test_prompt_injection.py) — both marked
+  # @pytest.mark.integration and excluded from the `test` job above (which
+  # runs `-m "not integration"`) precisely because they fire real, paid LLM
+  # calls. Never runs on push/PR; only when someone manually triggers this
+  # workflow with run_eval=true (e.g. right after changing a prompt file) —
+  # matches the "run deliberately after prompt changes" convention already
+  # established by code/scripts/answer_type_pilot.py's own docstring.
+  #
+  # Requires a REAL OPENROUTER_API_KEY repo secret (Settings → Secrets and
+  # variables → Actions) — unlike the `test` job's placeholder key, this one
+  # actually calls the API and needs to work. Not configured by this file;
+  # someone with repo admin access has to add it once.
+  eval:
+    name: LLM Eval Suite (RAG faithfulness + prompt injection)
     runs-on: ubuntu-latest
-    needs: build
-    if: github.ref == 'refs/heads/develop'
-    environment:
-      name: staging
-      url: https://staging.your-domain.com
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Deploy to staging
-        run: |
-          echo "Deploying to staging environment..."
-          # Add your deployment script here
-          # Examples:
-          # - SSH to staging server
-          # - Run kubectl apply
-          # - Trigger cloud deployment
-          
-      - name: Run smoke tests
-        run: |
-          echo "Running smoke tests..."
-          # Add health check or basic API tests
-          # curl -f https://staging.your-domain.com/api/operation/healthcheck
-
-  # Job 6: Deploy to Production
-  deploy-production:
-    name: Deploy to Production
-    runs-on: ubuntu-latest
-    needs: build
-    if: github.ref == 'refs/heads/main'
-    environment:
-      name: production
-      url: https://your-domain.com
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Deploy to production
-        run: |
-          echo "Deploying to production environment..."
-          # Add your production deployment script here
-          
-      - name: Run smoke tests
-        run: |
-          echo "Running production smoke tests..."
-          # curl -f https://your-domain.com/api/operation/healthcheck
-
-      - name: Notify deployment
-        if: success()
-        run: |
-          echo "Production deployment successful!"
-          # Add notification (Slack, email, etc.)
-
-  # Job 7: Load Testing (Optional)
-  load-test:
-    name: Load Testing
-    runs-on: ubuntu-latest
-    needs: deploy-staging
-    if: github.ref == 'refs/heads/develop'
+    needs: lint
+    if: github.event_name == 'workflow_dispatch' && inputs.run_eval == true
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -234,22 +220,20 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      - name: Install Locust
-        run: pip install locust
-
-      - name: Run load tests
+      - name: Fail fast if OPENROUTER_API_KEY secret is missing
         run: |
-          locust -f locustfile.py \
-            --host=https://staging.your-domain.com \
-            --users=10 \
-            --spawn-rate=2 \
-            --run-time=2m \
-            --headless \
-            --html=load-test-report.html
+          if [ -z "$OPENROUTER_API_KEY" ]; then
+            echo "::error::OPENROUTER_API_KEY repo secret is not set — add a real key under Settings > Secrets and variables > Actions before running this job."
+            exit 1
+          fi
 
-      - name: Upload load test report
-        uses: actions/upload-artifact@v4
-        with:
-          name: load-test-report
-          path: load-test-report.html
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio httpx deepeval
+
+      - name: Run paid eval suite
+        run: pytest tests/test_rag_faithfulness.py tests/test_prompt_injection.py -m integration -v
