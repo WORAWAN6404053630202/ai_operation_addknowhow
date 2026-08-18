@@ -10,11 +10,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# uv is what generated requirements*.txt's hashes (see file header) — plain pip
+# fails on this lockfile's `uvicorn[standard]` extra under --require-hashes mode
+# even though the file itself is correct; installing with uv avoids that entirely.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
 # Copy requirements ก่อนเพื่อใช้ Docker cache
 COPY requirements.txt requirements-dev.txt /app/
 
 # ติดตั้ง Python dependencies รวม dev tools (gradio, pytest)
-RUN pip install --no-cache-dir -r requirements-dev.txt
+RUN uv pip install --system --no-cache -r requirements-dev.txt
 
 # Copy code และ data
 COPY code/ /app/code/
@@ -46,8 +51,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
 COPY requirements.txt /app/
-RUN pip install --no-cache-dir -r requirements.txt
+RUN uv pip install --system --no-cache -r requirements.txt
 
 COPY code/ /app/code/
 COPY local_chroma_v3/ /app/local_chroma_v3/
@@ -76,12 +83,14 @@ RUN useradd -m -u 1000 appuser
 
 WORKDIR /app
 
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
 # Install CPU-only PyTorch first to avoid pulling in the GPU build (~2.5 GB → ~500 MB)
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 
 # Copy and install requirements (torch already installed above, so sentence-transformers skips it)
 COPY requirements.txt /app/
-RUN pip install --no-cache-dir -r requirements.txt
+RUN uv pip install --system --no-cache -r requirements.txt
 
 # Copy application code
 COPY code/ /app/code/
