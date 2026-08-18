@@ -5,7 +5,14 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-ENV_PATH = os.path.join(BASE_DIR, "env.properties")
+# RESTBIZ_ENV_FILE lets local dev/testing point conf.py at an isolated config file
+# (e.g. env.dev.properties) instead of the real env.properties, without changing
+# production behavior at all — unset in prod (and in the Docker image), so prod
+# always loads env.properties exactly as before. feature/pdf-ingestion dev work
+# should set RESTBIZ_ENV_FILE=env.dev.properties before running anything that
+# imports conf, so every conf.* value comes from the isolated dev config.
+ENV_FILE_NAME = os.getenv("RESTBIZ_ENV_FILE", "env.properties")
+ENV_PATH = os.path.join(BASE_DIR, ENV_FILE_NAME)
 load_dotenv(ENV_PATH)
 
 # Production hygiene: disable noisy telemetry (Chroma/others)
@@ -247,6 +254,26 @@ SHEET_URL_BAKERY = os.getenv(
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
 FEEDBACK_SHEET_ID = os.getenv("FEEDBACK_SHEET_ID", "")
 BOT_TYPE = os.getenv("BOT_TYPE", "Restbiz")
+
+# PDF ingestion (S3 + Textract), feature/pdf-ingestion — optional, soft-disables if unset.
+# Empty defaults on purpose: no production S3/Textract usage exists yet, so there is no
+# real resource to silently fall back to (unlike SHEET_URL_*/LOCAL_VECTOR_DIR above).
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+AWS_REGION = os.getenv("AWS_REGION", "")
+PDF_INGESTION_S3_BUCKET = os.getenv("PDF_INGESTION_S3_BUCKET", "")
+# Keeps dev/test uploads scoped under a clearly-labeled sub-prefix, separate from
+# wherever a real production Lambda might eventually watch within this bucket.
+PDF_INGESTION_S3_PREFIX = os.getenv("PDF_INGESTION_S3_PREFIX", "")
+# Review-queue item storage (one JSON file per item, same pattern as STATE_DIR below).
+# Empty-string default resolves to data/pdf_review_queue at import time in
+# pdf_review_queue_manager.py — mirrors StateManager's own BASE_DIR fallback.
+PDF_REVIEW_QUEUE_DIR = os.getenv("PDF_REVIEW_QUEUE_DIR", "")
+# Deliberately SEPARATE from GOOGLE_CREDENTIALS_PATH above (which is the feedback-
+# logging service account, a different GCP project owned by another feature).
+# sheet_write_back.py uses this one — reusing GOOGLE_CREDENTIALS_PATH here would
+# silently cross-wire an unrelated feature's credential into this one.
+PDF_INGESTION_GOOGLE_CREDENTIALS_PATH = os.getenv("PDF_INGESTION_GOOGLE_CREDENTIALS_PATH", "")
 
 # State manager configuration
 STATE_DIR = os.getenv("STATE_DIR") or None

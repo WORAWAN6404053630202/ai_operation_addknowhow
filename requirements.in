@@ -58,3 +58,6 @@ tqdm>=4.66.0
 
 # --- Feedback logging (Google Sheets) ---
 gspread>=6.0.0
+
+# --- PDF ingestion (S3 + Textract), feature/pdf-ingestion ---
+boto3>=1.34.0
