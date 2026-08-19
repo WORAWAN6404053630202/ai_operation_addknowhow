@@ -92,9 +92,11 @@ def _get_worksheet():
 
 # Copied from data_loader.py's research_reference alias list — this column means
 # "which document is this row based on", and for a PDF-ingested row the answer is
-# simply the source PDF itself. Filled in deterministically from item.filename,
-# NOT via the LLM — there's nothing to guess, so routing it through the drafting
-# prompt would only add hallucination risk for zero benefit.
+# simply the source PDF itself (plus which page(s) of it, so a reviewer can jump
+# straight to the source without re-reading the whole PDF). Filled in
+# deterministically from item.filename/item.pages, NOT via the LLM — there's
+# nothing to guess, so routing it through the drafting prompt would only add
+# hallucination risk for zero benefit.
 _RESEARCH_REFERENCE_HEADER_VARIANTS = [
     "อ้างอิง Research",
     "อ้างอิง (Research) เอกสาร (Document)",
@@ -102,6 +104,17 @@ _RESEARCH_REFERENCE_HEADER_VARIANTS = [
     "อ้างอิง (Research) เอกสาร",
     "อ้างอิง (Research) เอกสาร(Document)",
 ]
+
+
+def _format_page_range(item: ReviewItem) -> str:
+    """"หน้า 4" for a single page, "หน้า 1-3" for a contiguous range — pages are
+    always numbered 1..N by the Lambda extractor, so a plain min/max is enough."""
+    page_nums = sorted(p.page_num for p in item.pages)
+    if not page_nums:
+        return ""
+    if page_nums[0] == page_nums[-1]:
+        return f"หน้า {page_nums[0]}"
+    return f"หน้า {page_nums[0]}-{page_nums[-1]}"
 
 
 def _resolve_value_for_header(raw_header: str, fields: dict[str, str], item: ReviewItem) -> str:
@@ -114,7 +127,8 @@ def _resolve_value_for_header(raw_header: str, fields: dict[str, str], item: Rev
     cleaned = _clean_header(raw_header)
 
     if cleaned in _RESEARCH_REFERENCE_HEADER_VARIANTS:
-        return item.filename
+        page_range = _format_page_range(item)
+        return f"{item.filename} ({page_range})" if page_range else item.filename
 
     for header_variants in DRAFTABLE_FIELDS.values():
         if cleaned in header_variants:
