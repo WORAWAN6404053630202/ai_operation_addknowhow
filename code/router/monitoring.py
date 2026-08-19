@@ -7,9 +7,10 @@ import time
 import psutil
 import os
 from datetime import datetime
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Depends, Response
 from typing import Dict, Any
 
+from utils.admin_auth import require_admin_key
 from utils.metrics import metrics
 from utils.logger import get_logger
 
@@ -204,7 +205,7 @@ async def prometheus_metrics():
     )
 
 
-@router.get("/debug/sessions")
+@router.get("/debug/sessions", dependencies=[Depends(require_admin_key)])
 async def list_sessions():
     """
     List active sessions (debug endpoint)
@@ -241,7 +242,7 @@ async def list_sessions():
         return {'error': str(e)}
 
 
-@router.post("/debug/reset-metrics")
+@router.post("/debug/reset-metrics", dependencies=[Depends(require_admin_key)])
 async def reset_metrics():
     """
     Reset all metrics (debug endpoint)

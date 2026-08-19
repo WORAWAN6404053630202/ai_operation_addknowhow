@@ -10,6 +10,7 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
 
 import conf
+from utils.llm_call import get_shared_http_client
 
 
 # Safe directories for rmtree — prevents accidental deletion outside project scope
@@ -65,6 +66,21 @@ class LocalVectorStoreManager:
             model=conf.EMBEDDING_MODEL,
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
+            # Root-cause fix, live-verified 2026-08-05 (see hybrid_retriever.py's
+            # "40-50% transient HTTP 422" comment — same bug, not actually provider
+            # flakiness): OpenAIEmbeddings defaults to tiktoken-encoding the input into
+            # integer token-ID arrays before sending (the real OpenAI embeddings API
+            # accepts that). OpenRouter's endpoint for this model rejects it outright
+            # ("Input should be a valid string"). Disabling ctx-length checking makes
+            # the client send plain text instead — confirmed 24/24 calls succeed with
+            # this flag vs. the ~40-50% failure rate without it, same query set.
+            check_embedding_ctx_length=False,
+            # Same shared connection pool every ChatOpenAI(...) instance already uses
+            # (see get_shared_http_client) — this client was the one OpenRouter caller
+            # left out of that pool.
+            http_client=get_shared_http_client(),
+            request_timeout=conf.EMBEDDING_REQUEST_TIMEOUT,
+            max_retries=3,
         )
         print("[Embedding] Loaded successfully")
 
@@ -105,6 +121,7 @@ class LocalVectorStoreManager:
             collection_name=collection_name,
             embedding_function=self.embedding_model,
             persist_directory=persist_dir,
+            collection_metadata={"hnsw:space": "cosine"},
         )
 
         count = self._collection_count()
@@ -164,6 +181,7 @@ class LocalVectorStoreManager:
             embedding=self.embedding_model,
             collection_name=collection_name,
             persist_directory=write_dir,
+            collection_metadata={"hnsw:space": "cosine"},
         )
 
         try:
@@ -184,6 +202,7 @@ class LocalVectorStoreManager:
                 collection_name=collection_name,
                 embedding_function=self.embedding_model,
                 persist_directory=str(p),
+                collection_metadata={"hnsw:space": "cosine"},
             )
             print(f"[VectorStore] Atomic swap complete — new corpus is live")
             try:

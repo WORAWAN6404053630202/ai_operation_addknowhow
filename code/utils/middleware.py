@@ -130,6 +130,94 @@ class MonitoringMiddleware(BaseHTTPMiddleware):
             clear_request_context()
 
 
+class BodySizeLimitMiddleware:
+    """
+    Raw ASGI middleware enforcing a hard cap on POST/PUT/PATCH body size.
+
+    Must run BEFORE any downstream code reads the body — including
+    MonitoringMiddleware.dispatch()'s own `await request.body()` peek (used
+    just to log session_id), which wraps that read in a bare
+    `except Exception: pass`. A naive approach that raises once a streamed
+    body exceeds the cap would get silently swallowed right there and never
+    actually protect anything. Instead this middleware drains and
+    bound-checks the real ASGI stream itself, then hands downstream code a
+    small in-memory replay of the already-verified-safe body — so nothing
+    downstream can read more than max_bytes no matter how many times (or
+    where) it calls request.body().
+
+    Must be the outermost middleware (added LAST in app.py — Starlette runs
+    add_middleware() calls in reverse order, most-recently-added first) so
+    every layer below it — CORS, monitoring, health-check, routing — only
+    ever sees the bounded replay, never the raw stream.
+    """
+
+    def __init__(self, app: ASGIApp, max_bytes: int):
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("method") not in ("POST", "PUT", "PATCH"):
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers") or [])
+        content_length = headers.get(b"content-length")
+        if content_length is not None:
+            try:
+                if int(content_length) > self.max_bytes:
+                    await self._reject(send)
+                    return
+            except ValueError:
+                pass  # malformed header — fall through to the real byte count below
+
+        chunks = []
+        total = 0
+        more_body = True
+        while more_body:
+            message = await receive()
+            if message["type"] != "http.request":
+                break
+            chunk = message.get("body", b"")
+            total += len(chunk)
+            if total > self.max_bytes:
+                await self._reject(send)
+                return
+            chunks.append(chunk)
+            more_body = message.get("more_body", False)
+
+        body = b"".join(chunks)
+        already_sent = False
+
+        async def replay_receive():
+            nonlocal already_sent
+            if not already_sent:
+                already_sent = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            # After the replayed body, proxy further calls to the real
+            # transport instead of synthesizing http.disconnect. Starlette's
+            # StreamingResponse (used by /chat/stream's SSE) runs a
+            # concurrent task that calls receive() again almost immediately
+            # to watch for a real client disconnect — a synthetic disconnect
+            # here would fire that instantly and kill the stream mid-flight
+            # (caught by testing the SSE endpoint end-to-end: response
+            # started fine but the body came back empty).
+            return await receive()
+
+        await self.app(scope, replay_receive, send)
+
+    @staticmethod
+    async def _reject(send):
+        await send({
+            "type": "http.response.start",
+            "status": 413,
+            "headers": [(b"content-type", b"application/json")],
+        })
+        await send({
+            "type": "http.response.body",
+            "body": b'{"detail":"Request body too large"}',
+        })
+
+
 class HealthCheckMiddleware(BaseHTTPMiddleware):
     """
     Fast path for health checks

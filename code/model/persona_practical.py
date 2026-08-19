@@ -3,7 +3,7 @@ import json
 import logging
 import re
 from difflib import SequenceMatcher
-from typing import Tuple, Dict, Any, List, Optional, Callable
+from typing import Tuple, Dict, Any, List, Optional, Callable, FrozenSet
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -449,6 +449,20 @@ class PracticalPersonaService:
     # supervisor's stricter version (requires >=1 digit) — this file's copy was missing
     # that lookahead, so an empty/separator-only string would have matched as "a selection".
     _LIKELY_SELECTION_RE = _SHARED_LIKELY_SELECTION_RE
+
+    # Allowlist for the LLM-answer "context_update" merge (two call sites below). Audit
+    # finding, 2026-08-05: prompts_practical.py's JSON schema shows "context_update": {} only
+    # as an empty example and documents exactly ONE rule about it — "Do NOT set pending_slot"
+    # (line ~77) — never a positive list of keys the LLM should populate. Grepping this file's
+    # own 3 internal fallback constructions of context_update (~lines 2211, 2243, 5358) shows
+    # they're always {} too — there's no legitimate use anywhere, internal or LLM-driven, to
+    # preserve. state.context is shared globally across Practical/Academic/Supervisor, so any
+    # LLM-emitted key colliding with another persona's control state (academic_flow,
+    # pending_dynamic_clarification, any of the 23+ clarification flags, etc.) would corrupt
+    # it silently. The previous denylist (pending_slot + topic_slot_queue, still applied below
+    # for logging/back-compat clarity) only ever covered 2 of those risks. Empty allowlist =
+    # default-deny everything, consistent with persona_academic.py's equivalent fix today.
+    _CONTEXT_UPDATE_ALLOWLIST: FrozenSet[str] = frozenset()
 
     # Topic menu sanitation (STRICT)
     _TOPIC_MIN_LEN = 3
@@ -1065,7 +1079,17 @@ class PracticalPersonaService:
                                         break
                     if not _any_diff:
                         continue  # no meaningful divergence in steps or id_docs → skip DC
-                return {**cfg, "values": vals[:4]}
+                # Audit finding, 2026-08-05: "values" stays capped at 4 (unchanged — still the
+                # right number to actually show in a clarification question, same Hick's-Law
+                # reasoning as Academic mode's choices[:4] fix). But previously the values
+                # beyond the 4th were dropped ENTIRELY — if the user's real answer was one of
+                # them, _match_clarification_answer could never find it even from an exact
+                # free-text match, and (before finding #1's fix) that silently discarded their
+                # message. "values_full" preserves everything so _resolve_dynamic_clarification
+                # can still match against it — vals is already in retrieval-rank order (docs
+                # are pre-sorted by relevance), so the first 4 shown are already the most
+                # relevant ones, not an arbitrary/alphabetical subset.
+                return {**cfg, "values": vals[:4], "values_full": vals}
         return None
 
     def _build_clarification_question(
@@ -1086,7 +1110,15 @@ class PracticalPersonaService:
             header = prefix or "ช่วยบอกข้อมูลเพิ่มเติมครับ"
             q = f"**{header}**\n{opts}"
         first_line = q.split("\n")[0]
-        return q if re.search(r"(ครับ|ค่ะ|คะ)\s*\??\s*\*{0,2}\s*$", first_line) else q.rstrip(" .") + "ครับ"
+        q = q if re.search(r"(ครับ|ค่ะ|คะ)\s*\??\s*\*{0,2}\s*$", first_line) else q.rstrip(" .") + "ครับ"
+        # Audit finding, 2026-08-05: "values" is capped at 4 for display (see
+        # _detect_divergence), but "values_full" may hold more. Tell the user there's a
+        # free-text escape hatch instead of letting them assume these are the only choices.
+        # Appended after the polite-suffix logic above so it can never produce a doubled
+        # "ครับครับ" regardless of how the header/prefix is worded.
+        if len(diverge_info.get("values_full") or values) > len(values):
+            q += "\n\nหรือพิมพ์บอกมาได้เลยว่าต้องการแบบไหนครับ"
+        return q
 
     def _match_clarification_answer(
         self,
@@ -1971,12 +2003,21 @@ class PracticalPersonaService:
             if key == self._PHASE3_SLOT_KEY:
                 return "INVALID"
 
-            if user_text.strip() and not self._LIKELY_SELECTION_RE.match(user_text.strip()):
-                slots[key] = user_text.strip()
-                ctx.pop("pending_slot", None)
-                state.context = ctx
-                return "FILLED"
-
+            # Audit finding, 2026-08-05: this used to accept ANY free text here as the slot's
+            # value, unconditionally — e.g. answering "ธุรกิจของคุณเป็นรูปแบบใดครับ?" (options:
+            # บุคคลธรรมดา/นิติบุคคล) with "เป็นร้านอาหารเล็กๆครับ" silently saved entity_type=
+            # "เป็นร้านอาหารเล็กๆครับ". Because of this project's "no slot re-ask" rule, that
+            # garbage value then persists for the rest of the session and silently breaks every
+            # later entity_type-filtered retrieval. By this point in the function, exact/
+            # substring/numeric matching against `options` has already been tried and failed —
+            # there is no remaining signal that the text answers THIS question at all, so
+            # return INVALID and let the caller's existing re-ask path (line ~2779: shows the
+            # numbered menu again) handle it, instead of guessing. A more complete fix would
+            # route this through persona_supervisor.py's _map_pending_slot_reply/
+            # llm_slot_mapper_call (the more thorough sibling resolver for the same pending_slot
+            # key, which already has an LLM fallback for paraphrases like "กทม" → "กรุงเทพฯ") —
+            # left as-is for now since PersonaPractical has no reference back to the supervisor;
+            # unifying the two pending_slot resolvers is a separate, larger change.
             return "INVALID"
 
         if user_text.strip():
@@ -5473,11 +5514,14 @@ Your JSON response:
 
             if isinstance(exec_.get("context_update", {}), dict):
                 _ctx_update = dict(exec_.get("context_update", {}))
-                # Strip pending_slot and topic_slot_queue: these are managed by Supervisor/queue logic.
-                # LLM must NOT overwrite them via context_update — it would corrupt slot ordering.
-                _ctx_update.pop("pending_slot", None)
-                _ctx_update.pop("topic_slot_queue", None)
-                state.context.update(_ctx_update)
+                # Allowlist (audit finding, 2026-08-05 — see _CONTEXT_UPDATE_ALLOWLIST):
+                # currently empty, so nothing from the LLM merges here. Was previously a
+                # denylist covering only pending_slot/topic_slot_queue — those two are kept
+                # in the dropped-keys log below for continuity, but every other key was
+                # already unchecked before this fix.
+                _ctx_update = {k: v for k, v in _ctx_update.items() if k in self._CONTEXT_UPDATE_ALLOWLIST}
+                if _ctx_update:
+                    state.context.update(_ctx_update)
                 # Sanitize: if anything wrote a non-dict pending_slot, remove it
                 if not isinstance(state.context.get("pending_slot"), (dict, type(None))):
                     state.context.pop("pending_slot", None)
@@ -5677,9 +5721,14 @@ Your JSON response:
 
             if isinstance(exec_.get("context_update", {}), dict):
                 _cu = dict(exec_.get("context_update", {}))
-                _cu.pop("pending_slot", None)  # never let LLM overwrite pending_slot on answer
-                _cu.pop("topic_slot_queue", None)  # never let LLM overwrite the slot queue
-                state.context.update(_cu)
+                # Allowlist (audit finding, 2026-08-05 — see _CONTEXT_UPDATE_ALLOWLIST):
+                # currently empty, so nothing from the LLM merges here. Was previously a
+                # denylist covering only pending_slot/topic_slot_queue — every other key
+                # (any of Academic/Supervisor's shared state.context keys included) was
+                # unchecked before this fix.
+                _cu = {k: v for k, v in _cu.items() if k in self._CONTEXT_UPDATE_ALLOWLIST}
+                if _cu:
+                    state.context.update(_cu)
                 # Sanitize: ensure pending_slot is always dict or absent
                 if not isinstance(state.context.get("pending_slot"), (dict, type(None))):
                     state.context.pop("pending_slot", None)
@@ -6224,8 +6273,13 @@ Your JSON response:
                     _LOG.debug("[Practical] Safety net: appended %d guide link(s) omitted by LLM", len(_guide_lines))
 
             # Safety net: inject 📚 reference links if LLM did not include them.
+            # Guards audit finding, 2026-08-05: this block was missing the same _is_contact_q
+            # and _suppress_non_form_links guards its 🌐/📖 siblings above already have (see
+            # the guide block's comment ~line 6236-6239 for why: reference material is exactly
+            # as irrelevant to a pure contact/address query, and exactly as much "not what was
+            # asked" when the user explicitly wants forms only, as service/guide links are).
             _ref_urls_in_ans = any(u and u in ans for _, u in _link_ref)
-            if _link_ref and not _suppress_links_broad and (_user_wants_reference or _user_wants_links) and not _ref_urls_in_ans and not _ans_is_error_fallback:
+            if _link_ref and not _suppress_links_broad and not _is_contact_q and not _suppress_non_form_links and (_user_wants_reference or _user_wants_links) and not _ref_urls_in_ans and not _ans_is_error_fallback:
                 _ref_lines = []
                 for _r_desc, _r_url in _link_ref:
                     _r_desc_clean = re.sub(r'^[•\-\*]\s*', '', _r_desc).strip() if _r_desc else ""
@@ -6272,17 +6326,29 @@ Your JSON response:
                     _LOG.debug("[Practical] Link-req strip: removed 📄/📖 lines generated by LLM from doc content")
 
             if _suppress_non_form_links and not _ans_is_error_fallback:
-                # user asked for document/form links only — strip 🌐 and 📖 from LLM output
+                # user asked for document/form links only — strip 🌐, 📖, and 📚 from LLM
+                # output (📚 added — audit finding, 2026-08-05: reference-material links are
+                # exactly as "not what the user asked for" here as 🌐 general service links;
+                # previously only 🌐/📖 were stripped, so an LLM-written 📚 block could leak
+                # through even when the user explicitly asked for forms only).
                 ans = re.sub(r'(?m)^🌐[^\n]*(?:\n[ \t]+[^\n]*)*', '', ans)
                 ans = re.sub(r'(?m)^📖[^\n]*(?:\n[ \t]+https?://[^\n]*)?', '', ans)
+                ans = re.sub(r'(?m)^📚[^\n]*(?:\n[ \t]+https?://[^\n]*)?', '', ans)
                 ans = re.sub(r'\n{3,}', '\n\n', ans).strip()
 
             if _suppress_links_broad and not _ans_is_error_fallback:
-                # broad/informational query — strip ALL link types (🌐/📖/📄) that the LLM
-                # may have generated from doc JSON; user did not ask for links.
+                # broad/informational query — strip ALL link types (🌐/📖/📄/📚) that the LLM
+                # may have generated from doc JSON; user did not ask for links. 📚 added — audit
+                # finding, 2026-08-05: the earlier narrower pass above (~line 5941, gated on
+                # _is_broad_q specifically) already strips 📚, but this broader flag also covers
+                # informational-without-steps and bare-topic-info cases where _is_broad_q is
+                # False — an LLM-written 📚 block survived in exactly those two sub-cases before
+                # this fix, while 🌐/📖/📄 were correctly stripped. The 📚 safety-net injection
+                # (~line 6255) already respects this same flag; stripping now matches it.
                 ans = re.sub(r'(?m)^🌐[^\n]*(?:\n[ \t]+[^\n]*)*', '', ans)
                 ans = re.sub(r'(?m)^📖[^\n]*(?:\n[ \t]+https?://[^\n]*)?', '', ans)
                 ans = re.sub(r'(?m)^📄[^\n]*(?:\n[ \t]+https?://[^\n]*)?', '', ans)
+                ans = re.sub(r'(?m)^📚[^\n]*(?:\n[ \t]+https?://[^\n]*)?', '', ans)
                 ans = re.sub(r'\n{3,}', '\n\n', ans).strip()
 
             self._append_assistant(state, ans)

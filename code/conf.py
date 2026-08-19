@@ -181,6 +181,12 @@ LLM_REQUEST_TIMEOUT_PRACTICAL = _safe_int("LLM_REQUEST_TIMEOUT_PRACTICAL",
 # Shorter timeout for topic_picker (non-critical, fast-fail to fallback)
 LLM_TOPIC_PICKER_TIMEOUT = _safe_int("LLM_TOPIC_PICKER_TIMEOUT", 8)
 SHEETS_REQUEST_TIMEOUT = _safe_int("SHEETS_REQUEST_TIMEOUT", 20)
+# Query-embedding calls (OpenRouter). Live-measured 2026-08-05: 410-2129ms per call
+# under normal conditions — 15s gives generous headroom for a slow provider response
+# while still failing fast enough for callers (hybrid_retriever's own retry loop,
+# the many direct similarity_search call sites in persona_supervisor.py) to fall
+# back to BM25/other retrieval paths instead of hanging the whole turn.
+EMBEDDING_REQUEST_TIMEOUT = _safe_int("EMBEDDING_REQUEST_TIMEOUT", 15)
 
 DEBUG_LATENCY = os.getenv("DEBUG_LATENCY", "true").lower() == "true"
 
@@ -196,11 +202,18 @@ PROVIDER_ROUTING_SORT = os.getenv("PROVIDER_ROUTING_SORT", "throughput").strip()
 PROMPT_CACHING_ENABLED = os.getenv("PROMPT_CACHING_ENABLED", "true").lower() == "true"
 
 # GPT-5.1 (Academic) reasoning effort override. Empty string (default) = leave the
-# model's own default behavior untouched — this is NOT validated for answer completeness
-# yet (needs A/B testing against real Academic questions, especially ones with fee-tier
-# arithmetic, before enabling in production). Valid values: none/low/medium/high.
-# Research (2026): low ~10.5s mean latency, medium ~28.8s, high ~65.6s per call — large
-# potential win, but must be verified against real output before trusting it live.
+# model's own default behavior untouched. Valid values: none/low/medium/high.
+# Live-tested 2026-08-05 against the real Academic/json final-answer call (the
+# ~10K-input-token structured evidence answer, not a generic benchmark prompt):
+# reasoning_effort=low was SLOWER than the untouched default on both real test
+# cases (66.2s/87.8s vs 52.3s/45.9s baseline) and produced MORE completion tokens
+# (3426/4031 vs 2488/2334), raising cost too — the opposite of the effect the
+# generic "low ~10.5s / medium ~28.8s" research estimate below predicted. Content
+# quality looked intact both times, but speed/cost went the wrong way, so this is
+# NOT recommended for production on this call site. Left OFF (empty) by default.
+# Superseded research estimate, kept for reference only — did not hold for this
+# specific structured-JSON-style call: low ~10.5s mean latency, medium ~28.8s,
+# high ~65.6s per call (generic benchmark, not this project's own prompt shape).
 OPENROUTER_ACADEMIC_REASONING_EFFORT = os.getenv("OPENROUTER_ACADEMIC_REASONING_EFFORT", "").strip().lower()
 
 # Claude extended thinking for Practical/Sonnet. 0 (default) = disabled, untouched
@@ -247,6 +260,17 @@ SHEET_URL_BAKERY = os.getenv(
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
 FEEDBACK_SHEET_ID = os.getenv("FEEDBACK_SHEET_ID", "")
 BOT_TYPE = os.getenv("BOT_TYPE", "Restbiz")
+
+# Admin/debug endpoint auth (code/router/admin.py, debug routes in
+# code/router/monitoring.py). Required header: X-Admin-Key.
+# Unset = those endpoints fail closed (401) rather than being left open.
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
+
+# Hard cap on POST/PUT/PATCH request body size (utils/middleware.py's
+# BodySizeLimitMiddleware) — the largest legitimate payload is a /chat
+# message (Pydantic max_length=5000 chars, well under 100KB), so 1MB is
+# generous headroom, not a tight fit.
+MAX_REQUEST_BODY_BYTES = _safe_int("MAX_REQUEST_BODY_BYTES", 1_000_000)
 
 # State manager configuration
 STATE_DIR = os.getenv("STATE_DIR") or None

@@ -11,6 +11,9 @@ Usage:
     # After both passes exist as chat_results_<tag>.json:
     python3 reranker_backend_compare.py --report pytorch_baseline onnx_backend
 
+    # To limit spend when only one category is affected by the flag under test:
+    python3 reranker_backend_compare.py --tag academic_low --categories academic --url http://localhost:3000
+
 Background: RERANKER_BACKEND=onnx (see conf.py) swaps the float32 CrossEncoder
 reranker for a quantized ONNX Runtime path. It was validated for RANKING ACCURACY
 on a 23-query Thai golden eval set (built from this project's own Chroma license_type
@@ -115,10 +118,11 @@ def new_session(base_url: str, http: requests.Session, persona_id: str) -> str:
     return resp.json()["session_id"]
 
 
-def run(base_url: str, tag: str):
+def run(base_url: str, tag: str, categories=None):
     http = requests.Session()
     results = []
-    for i, sc in enumerate(SCENARIOS):
+    scenarios = SCENARIOS if not categories else [s for s in SCENARIOS if s["category"] in categories]
+    for i, sc in enumerate(scenarios):
         session_id = new_session(base_url, http, sc["persona_id"])
         step_results = []
         for msg in sc["steps"]:
@@ -190,6 +194,7 @@ def main():
     ap.add_argument("--tag", help="Label for this run's output file, e.g. pytorch_baseline")
     ap.add_argument("--url", default="http://localhost:3000", help="Base URL of the running server")
     ap.add_argument("--report", nargs="+", help="Compare N previously-saved tags instead of running")
+    ap.add_argument("--categories", nargs="+", help="Only run scenarios in these categories (e.g. --categories academic), to avoid spending on unaffected categories")
     args = ap.parse_args()
 
     if args.report:
@@ -200,7 +205,7 @@ def main():
         print("Need --tag (or --report <tag1> <tag2>)", file=sys.stderr)
         sys.exit(1)
 
-    run(args.url.rstrip("/"), args.tag)
+    run(args.url.rstrip("/"), args.tag, categories=args.categories)
 
 
 if __name__ == "__main__":
