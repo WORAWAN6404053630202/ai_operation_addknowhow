@@ -29,6 +29,7 @@ import boto3
 import conf
 from model.pdf_review_item import PageExtractionRecord, ReviewItem
 from model.pdf_review_queue_manager import PdfReviewQueueManager
+from service.pdf_candidate_matching import find_candidate_matches
 from service.pdf_extraction_validation import validate_extraction
 from service.pdf_field_drafting import draft_fields_from_pages
 from utils.logger import get_logger
@@ -93,6 +94,15 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
         pages=pages,
         llm_drafted_fields=llm_drafted_fields,
     )
+
+    # Best-effort: a Sheet/embedding hiccup here must not lose the extraction
+    # work already done above — the item still saves with candidate_matches=None,
+    # reviewer just won't see duplicate-hint suggestions for this one item.
+    try:
+        item.candidate_matches = find_candidate_matches(item)
+    except Exception as e:
+        logger.error(f"[SQSConsumer] Candidate matching failed for {filename}, continuing without it: {e}")
+
     _queue_manager.save(item)
     logger.info(f"[SQSConsumer] Saved review item {item.id} for {filename} ({len(pages)} pages)")
     return item

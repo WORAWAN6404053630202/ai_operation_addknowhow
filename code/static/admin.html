@@ -275,6 +275,19 @@
     .pq-header h2 { font-size: 14px; color: var(--text); margin-bottom: 6px; word-break: break-all; }
     .pq-header-meta { color: var(--muted); font-size: 11px; display: flex; gap: 14px; flex-wrap: wrap; }
 
+    /* ── Candidate matches (duplicate-detection hint) ── */
+    .candidate-matches { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; overflow: hidden; }
+    .cm-title { padding: 10px 12px; background: var(--panel); font-size: 12px; font-weight: 700; color: var(--text); border-bottom: 1px solid var(--border); }
+    .cm-empty { padding: 10px 12px; color: var(--muted); font-size: 12px; }
+    .cm-row { padding: 8px 12px; border-bottom: 1px solid var(--border); display: flex; gap: 10px; align-items: baseline; font-size: 12px; }
+    .cm-row:last-child { border-bottom: none; }
+    .cm-score { font-weight: 700; min-width: 42px; }
+    .cm-score.high { color: var(--red); }
+    .cm-score.medium { color: var(--orange); }
+    .cm-score.low { color: var(--muted); }
+    .cm-info { color: var(--text); }
+    .cm-info .cm-row-num { color: var(--accent); }
+
     .page-card { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; overflow: hidden; }
     .page-card-header {
       background: var(--panel);
@@ -778,6 +791,35 @@
     return edited;
   }
 
+  function candidateMatchesHtml(item) {
+    const matches = item.candidate_matches;
+    // null = not computed for this item (e.g. saved before this feature shipped);
+    // [] = computed, genuinely nothing similar found — both worth telling the
+    // reviewer apart, so only skip the whole section for the null case.
+    if (matches === null || matches === undefined) return "";
+
+    if (matches.length === 0) {
+      return `<div class="candidate-matches"><div class="cm-title">🔍 รายการที่อาจซ้ำ/เกี่ยวข้อง</div><div class="cm-empty">ไม่พบรายการที่คล้ายกันในชีท — น่าจะเป็นข้อมูลใหม่จริง</div></div>`;
+    }
+
+    const rowsHtml = matches.map(m => {
+      const pct = Math.round(m.similarity * 100);
+      const tier = m.similarity >= 0.85 ? "high" : m.similarity >= 0.7 ? "medium" : "low";
+      const parts = [m.department, m.license_type, m.operation_topic].filter(Boolean).map(escHtml).join(" — ");
+      return `
+        <div class="cm-row">
+          <span class="cm-score ${tier}">${pct}%</span>
+          <span class="cm-info"><span class="cm-row-num">แถวที่ ${m.row_number}</span>${parts ? ": " + parts : ""}</span>
+        </div>`;
+    }).join("");
+
+    return `
+      <div class="candidate-matches">
+        <div class="cm-title">🔍 รายการที่อาจซ้ำ/เกี่ยวข้อง (เทียบจากความคล้ายเนื้อหา — ไม่ใช่การตัดสินใจอัตโนมัติ)</div>
+        ${rowsHtml}
+      </div>`;
+  }
+
   function renderPdfQueueDetail(item) {
     const panel = document.getElementById("pdfQueueDetailPanel");
     const totalFlags = item.pages.reduce((s, p) => s + (p.flags || []).length, 0);
@@ -819,6 +861,7 @@
         </div>
       </div>
       <div style="flex:1;overflow-y:auto;padding:16px">
+        ${candidateMatchesHtml(item)}
         ${item.pages.map((p, idx) => pageCard(p, idx)).join("")}
         ${item.review_status === "pending" ? fieldsEditorHtml(item) : ""}
         ${decisionHtml}
