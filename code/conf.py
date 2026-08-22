@@ -32,6 +32,11 @@ Prefix = "/api/operation"
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
+# Same Typhoon OCR key the Lambda extractor uses (lambda/pdf_extraction/handler.py) —
+# needed here too by service/pdf_large_extraction.py, which does the identical OCR
+# step on EC2 for documents too large for Lambda's 15-minute cap (feature/pdf-ingestion).
+TYPHOON_OCR_API_KEY = os.getenv("TYPHOON_OCR_API_KEY", "")
+
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-4-5")
 
 OPENROUTER_MODEL_ACADEMIC = os.getenv("OPENROUTER_MODEL_ACADEMIC", "openai/gpt-5.1")
@@ -274,6 +279,11 @@ PDF_REVIEW_QUEUE_DIR = os.getenv("PDF_REVIEW_QUEUE_DIR", "")
 # sheet_write_back.py uses this one — reusing GOOGLE_CREDENTIALS_PATH here would
 # silently cross-wire an unrelated feature's credential into this one.
 PDF_INGESTION_GOOGLE_CREDENTIALS_PATH = os.getenv("PDF_INGESTION_GOOGLE_CREDENTIALS_PATH", "")
+# Must match lambda/pdf_extraction/handler.py's HANDOFF_S3_PREFIX env var (same
+# default there) — that's where it writes a small marker (not the extraction
+# itself) for documents over MAX_PAGES_FOR_LAMBDA, for sqs_consumer.py /
+# pdf_large_extraction.py to pick up and fully OCR here with no time limit.
+PDF_HANDOFF_S3_PREFIX = os.getenv("PDF_HANDOFF_S3_PREFIX", "restbiz/pending_large/")
 
 # State manager configuration
 STATE_DIR = os.getenv("STATE_DIR") or None

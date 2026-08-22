@@ -22,15 +22,28 @@ Requires these Lambda environment variables (set in the console, NOT read from
 this repo's conf.py/env.properties — this function has no access to those):
   TYPHOON_OCR_API_KEY, OPENROUTER_API_KEY
 Optional:
-  OPENROUTER_BASE_URL   (default: https://openrouter.ai/api/v1)
-  OPENROUTER_MODEL      (default: anthropic/claude-sonnet-4-5)
-  OUTPUT_S3_PREFIX      (default: restbiz/extracted/)
+  OPENROUTER_BASE_URL     (default: https://openrouter.ai/api/v1)
+  OPENROUTER_MODEL        (default: anthropic/claude-sonnet-4-5)
+  OUTPUT_S3_PREFIX        (default: restbiz/extracted/)
+  HANDOFF_S3_PREFIX       (default: restbiz/pending_large/)
+  MAX_PAGES_FOR_LAMBDA    (default: 35)
 
-KNOWN LIMITATION: pages are processed concurrently (ThreadPoolExecutor) to fit
-within Lambda's execution time limit, but a very large PDF (100+ pages) could
-still exceed even the 15-minute Lambda maximum. Not solved here — would need
-splitting into one invocation per page (e.g. via Step Functions) if that case
-becomes real. Today's real test document (66 pages) was sized with this in mind."""
+LARGE-DOCUMENT HANDLING (was "KNOWN LIMITATION: not solved here" before
+2026-08-22): a real test (66-page PDF) confirmed Lambda's 15-minute hard cap
+gets hit around ~55-60 pages even with 4-way page concurrency, and that cap
+cannot be raised — it's a platform limit, not a config knob. Rather than
+building the fan-out/Step-Functions machinery to split one document across
+many Lambda invocations, large documents instead hand off to the EC2 instance
+(already running 24/7 for the SQS consumer, so this adds zero marginal
+infrastructure cost, and a long-lived process has no 15-minute ceiling at
+all): this Lambda does a CHEAP screen — OCR + relevance-check just the first
+2 pages — and either (a) writes a "not worth the spend" skip marker if that
+partial content is clearly out of scope, saving the cost of the remaining
+~30+ pages entirely, or (b) writes a small handoff marker (not the extraction
+itself) to HANDOFF_S3_PREFIX for service/pdf_large_extraction.py on the EC2
+side to pick up and fully process with no time pressure. Small/typical
+documents (the common case) are completely unaffected — same one Lambda
+invocation, same output shape, same downstream SQS path as before."""
 
 import base64
 import json
@@ -54,8 +67,11 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet-4-5")
 OUTPUT_S3_PREFIX = os.environ.get("OUTPUT_S3_PREFIX", "restbiz/extracted/")
+HANDOFF_S3_PREFIX = os.environ.get("HANDOFF_S3_PREFIX", "restbiz/pending_large/")
+MAX_PAGES_FOR_LAMBDA = int(os.environ.get("MAX_PAGES_FOR_LAMBDA", "35"))
 
 _MAX_WORKERS = 4  # concurrent pages — keep modest, each page = 2 API calls already
+_SCREEN_PAGE_COUNT = 2  # pages OCR'd for the cheap pre-screen on oversized docs
 
 _CLAUDE_PROMPT = (
     "ถอดข้อความภาษาไทย (และอังกฤษถ้ามี) ทั้งหมดในภาพเอกสารนี้ให้ครบถ้วนและถูกต้องที่สุด "
@@ -64,6 +80,25 @@ _CLAUDE_PROMPT = (
     "ถ้าตัวอักษร/ตัวเลขจุดไหนอ่านไม่ออกจริงๆ ให้ใส่ [อ่านไม่ชัด] แทนตรงจุดนั้น "
     "แทนที่จะเดาคำที่ดูสมเหตุสมผล"
 )
+
+# Deliberately a plain yes/no triage prompt, NOT the full 3-tier relevant/
+# uncertain/not_relevant judgment code/service/pdf_relevance_check.py already
+# does properly on the complete document later in the EC2 pipeline — this one
+# only exists to answer "worth spending ~30 more pages of OCR on?", so it's
+# biased to say yes when unsure (a wrongly-skipped real document is a much
+# worse outcome than a few extra dollars of OCR on a false positive).
+_SCREEN_PROMPT_TEMPLATE = """นี่คือ 2 หน้าแรกของเอกสารขนาดใหญ่ (หลายสิบหน้า) ที่อัปโหลดเข้าระบบฐานความรู้
+ของ Restbiz ซึ่งเป็นระบบ AI ให้คำปรึกษาด้านกฎหมาย/ใบอนุญาต/ข้อบังคับสำหรับธุรกิจร้านอาหารในไทย
+
+จากแค่ 2 หน้านี้ ประเมินคร่าวๆ ว่าเอกสารทั้งฉบับ**น่าจะ**เกี่ยวข้องกับธุรกิจร้านอาหาร/อาหารในไทยหรือไม่
+(ใบอนุญาต, กฎหมาย, know-how ที่เกี่ยวข้อง) — ถ้าไม่แน่ใจ ให้ตอบว่าเกี่ยวข้องไว้ก่อนเสมอ (ป้องกันการข้าม
+เอกสารที่จริงๆ มีประโยชน์ไปอย่างผิดพลาด)
+
+ตอบเป็น JSON เท่านั้น: {{"worth_processing": true หรือ false, "reason": "เหตุผลสั้นๆ 1 ประโยค"}}
+
+=== เนื้อหา 2 หน้าแรก ===
+{combined_text}
+"""
 
 
 def _render_page_to_png_bytes(pdf_bytes: bytes, page_num: int, dpi: int = 200) -> bytes:
@@ -121,6 +156,32 @@ def _extract_one_page(pdf_bytes: bytes, page_num: int) -> dict:
     return {"page_num": page_num, "typhoon_markdown": typhoon_markdown, "claude_markdown": claude_markdown}
 
 
+def _screen_worth_processing(pdf_bytes: bytes, num_pages: int) -> dict:
+    """OCRs just the first _SCREEN_PAGE_COUNT pages and asks a cheap yes/no
+    triage question — the whole point is spending a little to potentially
+    avoid spending a lot (OCR on the remaining 30+ pages of something
+    out-of-scope). Never raises: any failure here defaults to "process it
+    anyway" (see caller), since a broken screen must not silently drop a real
+    document."""
+    screen_pages = min(_SCREEN_PAGE_COUNT, num_pages)
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+        futures = {pool.submit(_extract_one_page, pdf_bytes, p): p for p in range(1, screen_pages + 1)}
+        results = {futures[f]: f.result() for f in as_completed(futures)}
+    ordered = [results[p] for p in sorted(results)]
+
+    combined_text = "\n\n---\n\n".join(p["typhoon_markdown"] for p in ordered)
+    client = OpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL)
+    resp = client.chat.completions.create(
+        model=OPENROUTER_MODEL,
+        messages=[{"role": "user", "content": _SCREEN_PROMPT_TEMPLATE.format(combined_text=combined_text)}],
+        max_tokens=300,
+    )
+    raw = (resp.choices[0].message.content or "{}").strip()
+    raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    parsed = json.loads(raw)
+    return {"worth_processing": bool(parsed.get("worth_processing", True)), "reason": str(parsed.get("reason", ""))}
+
+
 def lambda_handler(event, context):
     if not TYPHOON_OCR_API_KEY or not OPENROUTER_API_KEY:
         raise RuntimeError("TYPHOON_OCR_API_KEY and OPENROUTER_API_KEY must be set as Lambda environment variables.")
@@ -139,6 +200,49 @@ def lambda_handler(event, context):
         num_pages = len(doc)
         doc.close()
         logger.info(f"{filename}: {num_pages} page(s)")
+
+        if num_pages > MAX_PAGES_FOR_LAMBDA:
+            logger.info(f"{filename}: {num_pages} pages exceeds MAX_PAGES_FOR_LAMBDA={MAX_PAGES_FOR_LAMBDA}, screening first")
+            try:
+                screen = _screen_worth_processing(pdf_bytes, num_pages)
+            except Exception as e:
+                logger.error(f"Screening failed, defaulting to worth_processing=True (fail open, not closed): {e}")
+                screen = {"worth_processing": True, "reason": f"screen error, defaulted to processing: {e}"}
+
+            if not screen["worth_processing"]:
+                skip_output = {
+                    "filename": filename,
+                    "s3_raw_pdf_path": key,
+                    "skipped": True,
+                    "skip_reason": screen["reason"],
+                    "page_count": num_pages,
+                }
+                output_key = f"{OUTPUT_S3_PREFIX}{filename}.json"
+                s3.put_object(
+                    Bucket=bucket, Key=output_key,
+                    Body=json.dumps(skip_output, ensure_ascii=False).encode("utf-8"),
+                    ContentType="application/json",
+                )
+                logger.info(f"{filename}: skipped after cheap screen ({screen['reason']}) — wrote {output_key}, saved OCR on remaining {num_pages - _SCREEN_PAGE_COUNT} page(s)")
+                results.append({"input_key": key, "output_key": output_key, "page_count": num_pages, "skipped": True})
+                continue
+
+            handoff = {
+                "filename": filename,
+                "s3_raw_pdf_path": key,
+                "bucket": bucket,
+                "page_count": num_pages,
+                "screen_reason": screen["reason"],
+            }
+            handoff_key = f"{HANDOFF_S3_PREFIX}{filename}.json"
+            s3.put_object(
+                Bucket=bucket, Key=handoff_key,
+                Body=json.dumps(handoff, ensure_ascii=False).encode("utf-8"),
+                ContentType="application/json",
+            )
+            logger.info(f"{filename}: {num_pages} pages, screen passed ({screen['reason']}) — handed off to EC2 via {handoff_key}, not processed in Lambda")
+            results.append({"input_key": key, "handoff_key": handoff_key, "page_count": num_pages, "handed_off": True})
+            continue
 
         pages = [None] * num_pages
         with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:

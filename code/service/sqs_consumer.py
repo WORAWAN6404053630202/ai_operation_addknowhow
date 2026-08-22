@@ -32,6 +32,7 @@ from model.pdf_review_queue_manager import PdfReviewQueueManager
 from service.pdf_candidate_matching import find_candidate_matches
 from service.pdf_extraction_validation import validate_extraction
 from service.pdf_field_drafting import draft_fields_from_pages
+from service.pdf_large_extraction import extract_full_document
 from service.pdf_relevance_check import check_relevance
 from utils.logger import get_logger
 
@@ -50,24 +51,16 @@ def _assert_dev_environment() -> None:
         )
 
 
-def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = False) -> ReviewItem:
-    """Downloads one Lambda-produced extraction-result JSON from S3, runs the
-    same validation + field-drafting pipeline used everywhere else in this
-    feature, and saves the resulting ReviewItem to the review queue. Safe to
-    call directly (bypassing SQS) for local testing against a known S3 key —
-    this is the actual processing logic; poll_and_process_forever() below is
-    just the SQS event loop wrapped around this function."""
-    _assert_dev_environment()
-
-    s3 = boto3.client("s3", region_name=conf.AWS_REGION or None)
-    logger.info(f"[SQSConsumer] Fetching extraction result s3://{bucket}/{key}")
-    obj = s3.get_object(Bucket=bucket, Key=key)
-    data = json.loads(obj["Body"].read().decode("utf-8"))
-
-    filename = data["filename"]
-    s3_raw_pdf_path = data.get("s3_raw_pdf_path", "")
-    raw_pages = data["pages"]
-
+def _build_and_save_review_item(
+    filename: str, s3_raw_pdf_path: str, raw_pages: list[dict], use_llm_comparison: bool = False
+) -> ReviewItem:
+    """Shared tail end of the pipeline (validate → draft fields → relevance
+    check → candidate matching → save) — identical regardless of whether
+    raw_pages came from Lambda's normal-size path or
+    pdf_large_extraction.extract_full_document()'s oversized-document path.
+    Keeping this as one function is what makes the handoff path "free" from
+    downstream code's perspective: nothing past this point needs to know or
+    care which extractor produced the pages."""
     pages: list[PageExtractionRecord] = []
     for p in raw_pages:
         flags = validate_extraction(
@@ -116,6 +109,69 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
     _queue_manager.save(item)
     logger.info(f"[SQSConsumer] Saved review item {item.id} for {filename} ({len(pages)} pages)")
     return item
+
+
+def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = False) -> ReviewItem:
+    """Downloads one Lambda-produced S3 object and routes it to the right
+    handling, based on what Lambda actually did with this document (see
+    lambda/pdf_extraction/handler.py's MAX_PAGES_FOR_LAMBDA branch):
+
+    1. Normal completed extraction (the common case, unchanged since this
+       feature's original build) — pages already OCR'd by Lambda, just run
+       the validate/draft/review pipeline on them.
+    2. Skip marker ({"skipped": true, ...}) — Lambda's cheap pre-screen on an
+       oversized document judged it not worth the remaining OCR spend. Saves
+       a lightweight, zero-page ReviewItem carrying the skip reason in
+       relevance_check (reusing the same admin-UI banner candidate items
+       use) so it's still visible/overridable, not silently dropped.
+    3. Handoff marker (key under conf.PDF_HANDOFF_S3_PREFIX) — Lambda's
+       screen passed but the document is too large for Lambda's 15-minute
+       cap to process itself. Runs the full OCR here on EC2 (no such time
+       limit), then continues through the identical pipeline as case 1.
+
+    Safe to call directly (bypassing SQS) for local testing against a known
+    S3 key — this is the actual processing logic; poll_and_process_forever()
+    below is just the SQS event loop wrapped around this function."""
+    _assert_dev_environment()
+
+    s3 = boto3.client("s3", region_name=conf.AWS_REGION or None)
+    logger.info(f"[SQSConsumer] Fetching s3://{bucket}/{key}")
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    data = json.loads(obj["Body"].read().decode("utf-8"))
+
+    if key.startswith(conf.PDF_HANDOFF_S3_PREFIX):
+        filename = data["filename"]
+        s3_raw_pdf_path = data["s3_raw_pdf_path"]
+        logger.info(
+            f"[SQSConsumer] {filename}: handoff marker ({data.get('page_count')} pages, "
+            f"screen_reason={data.get('screen_reason')!r}) — running full extraction on EC2"
+        )
+        raw_pages = extract_full_document(bucket, s3_raw_pdf_path)
+        return _build_and_save_review_item(filename, s3_raw_pdf_path, raw_pages, use_llm_comparison)
+
+    filename = data["filename"]
+    s3_raw_pdf_path = data.get("s3_raw_pdf_path", "")
+
+    if data.get("skipped"):
+        reason = data.get("skip_reason", "")
+        logger.info(f"[SQSConsumer] {filename}: skip marker from Lambda's cheap screen — {reason!r}")
+        item = ReviewItem(
+            filename=filename,
+            s3_raw_pdf_path=s3_raw_pdf_path,
+            extraction_completed_at=time.time(),
+            pages=[],
+            relevance_check={
+                "tier": "not_relevant",
+                "reasoning": f"ข้ามการประมวลผลอัตโนมัติ (เอกสารมี {data.get('page_count', '?')} หน้า, "
+                f"เช็คแค่ 2 หน้าแรกแล้วพบว่าไม่น่าเกี่ยวข้อง): {reason}",
+            },
+        )
+        _queue_manager.save(item)
+        logger.info(f"[SQSConsumer] Saved skip-marker review item {item.id} for {filename}")
+        return item
+
+    raw_pages = data["pages"]
+    return _build_and_save_review_item(filename, s3_raw_pdf_path, raw_pages, use_llm_comparison)
 
 
 def process_sqs_message(message_body: str) -> Optional[ReviewItem]:
