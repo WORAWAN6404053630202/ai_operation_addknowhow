@@ -32,6 +32,7 @@ from model.pdf_review_queue_manager import PdfReviewQueueManager
 from service.pdf_candidate_matching import find_candidate_matches
 from service.pdf_extraction_validation import validate_extraction
 from service.pdf_field_drafting import draft_fields_from_pages
+from service.pdf_relevance_check import check_relevance
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -85,7 +86,8 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
         )
         logger.info(f"[SQSConsumer] {filename} page {p['page_num']}: {len(flags)} flag(s)")
 
-    llm_drafted_fields = draft_fields_from_pages([p["typhoon_markdown"] for p in raw_pages])
+    page_markdowns = [p["typhoon_markdown"] for p in raw_pages]
+    llm_drafted_fields = draft_fields_from_pages(page_markdowns)
 
     item = ReviewItem(
         filename=filename,
@@ -95,9 +97,17 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
         llm_drafted_fields=llm_drafted_fields,
     )
 
-    # Best-effort: a Sheet/embedding hiccup here must not lose the extraction
-    # work already done above — the item still saves with candidate_matches=None,
-    # reviewer just won't see duplicate-hint suggestions for this one item.
+    # Both best-effort: a Sheet/embedding/LLM hiccup here must not lose the
+    # extraction work already done above — the item still saves with the
+    # relevant field left None, reviewer just won't see that particular hint
+    # for this one item (check_relevance itself already never raises; the
+    # try/except here is defense-in-depth against an unexpected bug, not the
+    # primary safety net).
+    try:
+        item.relevance_check = check_relevance(page_markdowns)
+    except Exception as e:
+        logger.error(f"[SQSConsumer] Relevance check failed for {filename}, continuing without it: {e}")
+
     try:
         item.candidate_matches = find_candidate_matches(item)
     except Exception as e:

@@ -279,14 +279,32 @@
     .candidate-matches { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; overflow: hidden; }
     .cm-title { padding: 10px 12px; background: var(--panel); font-size: 12px; font-weight: 700; color: var(--text); border-bottom: 1px solid var(--border); }
     .cm-empty { padding: 10px 12px; color: var(--muted); font-size: 12px; }
-    .cm-row { padding: 8px 12px; border-bottom: 1px solid var(--border); display: flex; gap: 10px; align-items: baseline; font-size: 12px; }
+    .cm-row { padding: 8px 12px; border-bottom: 1px solid var(--border); display: flex; gap: 10px; align-items: center; font-size: 12px; }
     .cm-row:last-child { border-bottom: none; }
     .cm-score { font-weight: 700; min-width: 42px; }
     .cm-score.high { color: var(--red); }
     .cm-score.medium { color: var(--orange); }
     .cm-score.low { color: var(--muted); }
-    .cm-info { color: var(--text); }
+    .cm-info { color: var(--text); flex: 1; }
     .cm-info .cm-row-num { color: var(--accent); }
+    .cm-use-btn { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); padding: 3px 10px; border-radius: 6px; cursor: pointer; font-size: 11px; white-space: nowrap; }
+    .cm-use-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+    /* ── Relevance check (in-scope-for-restaurant-business hint) ── */
+    .relevance-check { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; padding: 10px 12px; font-size: 12px; display: flex; gap: 8px; align-items: baseline; }
+    .relevance-check.relevant { border-color: var(--green); }
+    .relevance-check.uncertain { border-color: var(--orange); }
+    .relevance-check.not_relevant { border-color: var(--red); background: rgba(248, 113, 113, 0.08); }
+    .rc-tag { font-weight: 700; white-space: nowrap; }
+    .relevance-check.relevant .rc-tag { color: var(--green); }
+    .relevance-check.uncertain .rc-tag { color: var(--orange); }
+    .relevance-check.not_relevant .rc-tag { color: var(--red); }
+    .rc-reasoning { color: var(--muted); }
+
+    /* ── Decision box: old-row-ref input (shown only for "update") ── */
+    .old-row-ref-box { margin: 10px 0; }
+    .old-row-ref-label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+    .old-row-ref-input { width: 100%; background: var(--panel); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 6px 10px; font-size: 12px; }
 
     .page-card { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; overflow: hidden; }
     .page-card-header {
@@ -759,6 +777,17 @@
     });
     const approveBtn = document.getElementById("btnApproveDecision");
     if (approveBtn) approveBtn.disabled = false;
+    const oldRowBox = document.getElementById("oldRowRefBox");
+    if (oldRowBox) oldRowBox.style.display = t === "update" ? "block" : "none";
+  }
+
+  // Called from a candidate-match row's "ใช้เป็นแถวเดิม" button — jumps straight
+  // to "③ update" with the row number pre-filled, since that's the only decision
+  // type old_row_ref applies to. Reviewer can still edit the number by hand.
+  function useAsOldRowRef(rowNumber) {
+    selectDecisionType("update");
+    const input = document.getElementById("oldRowRefInput");
+    if (input) input.value = rowNumber;
   }
 
   function fieldsEditorHtml(item) {
@@ -810,6 +839,7 @@
         <div class="cm-row">
           <span class="cm-score ${tier}">${pct}%</span>
           <span class="cm-info"><span class="cm-row-num">แถวที่ ${m.row_number}</span>${parts ? ": " + parts : ""}</span>
+          <button class="cm-use-btn" onclick="useAsOldRowRef(${m.row_number})">③ ใช้เป็นแถวเดิม</button>
         </div>`;
     }).join("");
 
@@ -817,6 +847,22 @@
       <div class="candidate-matches">
         <div class="cm-title">🔍 รายการที่อาจซ้ำ/เกี่ยวข้อง (เทียบจากความคล้ายเนื้อหา — ไม่ใช่การตัดสินใจอัตโนมัติ)</div>
         ${rowsHtml}
+      </div>`;
+  }
+
+  function relevanceCheckHtml(item) {
+    const rc = item.relevance_check;
+    if (!rc || !rc.tier) return "";
+    const labels = {
+      relevant: "✅ เกี่ยวข้องกับธุรกิจร้านอาหาร",
+      uncertain: "⚠️ ไม่แน่ใจว่าเกี่ยวข้องกับร้านอาหารหรือไม่ — ควรตรวจสอบ",
+      not_relevant: "🚫 ดูเหมือนไม่เกี่ยวข้องกับธุรกิจร้านอาหารเลย",
+    };
+    const label = labels[rc.tier] || rc.tier;
+    return `
+      <div class="relevance-check ${escHtml(rc.tier)}">
+        <span class="rc-tag">${label}</span>
+        ${rc.reasoning ? `<span class="rc-reasoning">— ${escHtml(rc.reasoning)}</span>` : ""}
       </div>`;
   }
 
@@ -843,6 +889,10 @@
             <button class="dtype-btn" data-type="update" onclick="selectDecisionType('update')">③ อัปเดตแทนที่ของเก่า</button>
             <button class="dtype-btn new_category" data-type="new_category" onclick="selectDecisionType('new_category')">④ กฎหมายหมวดใหม่</button>
           </div>
+          <div class="old-row-ref-box" id="oldRowRefBox" style="display:none">
+            <label class="old-row-ref-label">เลขแถวเดิมในชีทที่จะถูกแทนที่ (จำเป็นสำหรับ "③ อัปเดต") — คลิก "ใช้เป็นแถวเดิม" จากรายการด้านบน หรือพิมพ์เองก็ได้</label>
+            <input type="text" class="old-row-ref-input" id="oldRowRefInput" placeholder="เช่น 181" inputmode="numeric">
+          </div>
           <textarea class="decision-notes" id="decisionNotes" placeholder="หมายเหตุ (ถ้ามี)"></textarea>
           <div class="decision-actions">
             <button class="btn-approve" id="btnApproveDecision" disabled onclick="submitDecision('${item.id}','approved')">✓ อนุมัติ (เขียนเพิ่มเข้า Sheet เท่านั้น ไม่ลบ/ทับของเดิม)</button>
@@ -861,6 +911,7 @@
         </div>
       </div>
       <div style="flex:1;overflow-y:auto;padding:16px">
+        ${relevanceCheckHtml(item)}
         ${candidateMatchesHtml(item)}
         ${item.pages.map((p, idx) => pageCard(p, idx)).join("")}
         ${item.review_status === "pending" ? fieldsEditorHtml(item) : ""}
@@ -874,12 +925,22 @@
       alert("กรุณาเลือกประเภทการตัดสินใจก่อนอนุมัติ");
       return;
     }
+    let oldRowRef = null;
+    if (reviewStatus === "approved" && selectedDecisionType === "update") {
+      const oldRowInput = document.getElementById("oldRowRefInput");
+      oldRowRef = oldRowInput ? oldRowInput.value.trim() : "";
+      if (!oldRowRef) {
+        alert('กรุณาระบุ "เลขแถวเดิมที่จะถูกแทนที่" ก่อนอนุมัติ (จำเป็นสำหรับ ③ อัปเดตแทนที่ของเก่า)');
+        return;
+      }
+    }
     const notesEl = document.getElementById("decisionNotes");
     const body = {
       review_status: reviewStatus,
       decision_type: reviewStatus === "approved" ? selectedDecisionType : null,
       reviewer_notes: notesEl ? notesEl.value : "",
       edited_fields: reviewStatus === "approved" ? collectEditedFields() : null,
+      old_row_ref: oldRowRef,
     };
     const r = await fetch(`/admin/api/pdf-queue/${itemId}/decision`, {
       method: "POST",

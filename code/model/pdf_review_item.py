@@ -65,9 +65,14 @@ class ReviewItem(BaseModel):
     # a dev to review before merging — not built yet.
     regex_draft_ref: Optional[str] = None
 
-    # Not built yet — embedding-based candidate matching against the existing
-    # Sheet data (top-3 similar rows + form-number/metadata signals, per design).
+    # Embedding-based candidate matching against the existing Sheet data (top-3
+    # similar rows, per design) — see service/pdf_candidate_matching.py.
     candidate_matches: Optional[list[dict[str, Any]]] = None
+
+    # LLM judgment of whether this document belongs in the restaurant-business
+    # regulatory knowledge base at all — {"tier": "relevant"|"uncertain"|
+    # "not_relevant", "reasoning": str}. See service/pdf_relevance_check.py.
+    relevance_check: Optional[dict[str, str]] = None
 
     # Not built yet — LLM-drafted structured fields (main_topic, sub_topic,
     # entity_type, ขั้นตอน, เอกสาร, ค่าธรรมเนียม, ระยะเวลา, เงื่อนไข) for the reviewer
