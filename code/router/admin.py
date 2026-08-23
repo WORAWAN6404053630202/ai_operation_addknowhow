@@ -283,4 +283,25 @@ async def pdf_queue_decide(item_id: str, decision: PdfReviewDecision):
             )
 
     _pdf_queue_manager.save(item)
+
+    if decision.decision_type == "new_category":
+        # Deliberately NOT auto-generating routing/regex changes here — the
+        # original design note ("LLM-drafted regex diff for a dev to review")
+        # would mean an AI-authored change to the supervisor's core topic-
+        # routing logic going out with only sheet_write_back's per-row safety
+        # net, not the review this actually needs. This is the safe, scoped-
+        # down version: the row is written (same as "new" — the content isn't
+        # lost) and flagged loudly so a developer notices it needs manual
+        # topic-routing/classifier work, instead of silently looking like any
+        # other approved row. Search server logs for "NEW_CATEGORY" or check
+        # the admin UI's queue list for the ④ badge (item.decision_type ==
+        # "new_category") to find these.
+        _LOG.warning(
+            f"[pdf_queue_decide] NEW_CATEGORY flagged for dev attention: "
+            f"item={item.id} filename={item.filename!r} — content was written to the Sheet "
+            f"as a new row, but likely needs manual topic-routing/classifier updates "
+            f"(see persona_supervisor.py's topic classification) that this review flow "
+            f"does not attempt automatically."
+        )
+
     return JSONResponse({"ok": True, "item": item.model_dump(), "sheet_result": sheet_result})

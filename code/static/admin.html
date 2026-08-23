@@ -109,6 +109,7 @@
     .badge { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px; font-size: 10px; }
     .badge.practical { color: var(--blue); border-color: var(--blue); }
     .badge.academic { color: var(--orange); border-color: var(--orange); }
+    .new-category-badge { color: var(--red); border-color: var(--red); font-weight: 700; }
 
     /* ── Detail panel ── */
     .detail-panel {
@@ -723,6 +724,7 @@
         <div class="pq-meta">
           <span class="status-pill ${escHtml(i.review_status)}">${escHtml(i.review_status)}</span>
           ${flagCountPill(i.total_flag_count, i.high_severity_flag_count)}
+          ${i.decision_type === "new_category" ? '<span class="badge new-category-badge">④ ต้องตรวจสอบเพิ่ม</span>' : ""}
           <span style="color:var(--muted);font-size:11px">${fmt(i.uploaded_at)}</span>
         </div>
       </div>
