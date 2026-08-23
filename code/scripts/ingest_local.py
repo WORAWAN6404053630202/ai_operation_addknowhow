@@ -24,6 +24,7 @@ import conf
 SHEET_URL_REGULATORY = conf.SHEET_URL_REGULATORY
 SHEET_URL_MARKETING  = conf.SHEET_URL_MARKETING
 SHEET_URL_BAKERY     = conf.SHEET_URL_BAKERY
+SHEET_URL_KNOWHOW    = conf.SHEET_URL_KNOWHOW  # feature/pdf-ingestion — "" until configured, see conf.py
 
 # Legacy alias kept for backward compatibility if anything else imports it
 SHEET_URL = SHEET_URL_REGULATORY
@@ -117,7 +118,7 @@ def _normalize_metadata(md: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-_VALID_DATA_TYPES = {"regulatory", "marketing", "business_guide"}
+_VALID_DATA_TYPES = {"regulatory", "marketing", "business_guide", "know_how"}
 _VALID_ENTITY_TYPES = {"นิติบุคคล", "บุคคลธรรมดา", ""}
 
 
@@ -241,6 +242,22 @@ def main():
     all_docs.extend(dl_biz.documents)
     print(f"[Ingest]   → {len(dl_biz.documents)} business_guide docs")
 
+    # ── Source D: Know-how (from PDF ingestion review queue, feature/pdf-ingestion) ─
+    # Soft-optional: SHEET_URL_KNOWHOW is "" until someone points it at a real
+    # know_how tab (see conf.py) — skip cleanly rather than failing the whole
+    # ingest run over a feature most environments haven't set up yet.
+    if SHEET_URL_KNOWHOW:
+        print("\n[Ingest] Loading Sheet D — Know-how (จาก PDF ingestion)...")
+        try:
+            dl_kh = DataLoader(config={})
+            dl_kh.load_from_knowhow_sheet(SHEET_URL_KNOWHOW, source_name="know_how")
+            all_docs.extend(dl_kh.documents)
+            print(f"[Ingest]   → {len(dl_kh.documents)} know-how docs")
+        except Exception as e:
+            print(f"[Ingest]   ⚠️  Know-how sheet load failed, continuing without it: {e}")
+    else:
+        print("\n[Ingest] Sheet D — Know-how: SHEET_URL_KNOWHOW not set, skipping.")
+
     # ── Normalize all docs ───────────────────────────────────────────────────
     docs = all_docs
     normalize_documents(docs)
@@ -258,15 +275,16 @@ def main():
     print(f"[Ingest] Model: {conf.EMBEDDING_MODEL} (via OpenRouter)")
 
     # Show breakdown by data_type
-    reg_docs   = [d for d in docs if d.metadata.get("data_type") != "marketing"
-                                  and d.metadata.get("data_type") != "business_guide"]
+    reg_docs   = [d for d in docs if d.metadata.get("data_type") not in ("marketing", "business_guide", "know_how")]
     mkt_docs   = [d for d in docs if d.metadata.get("data_type") == "marketing"]
     biz_docs   = [d for d in docs if d.metadata.get("data_type") == "business_guide"]
+    kh_docs    = [d for d in docs if d.metadata.get("data_type") == "know_how"]
     locs       = [d for d in docs if d.metadata.get("location")]
     entities   = [d for d in docs if d.metadata.get("entity_type_normalized")]
     print(f"[Ingest]   regulatory docs : {len(reg_docs)}")
     print(f"[Ingest]   marketing docs  : {len(mkt_docs)}")
     print(f"[Ingest]   business_guide  : {len(biz_docs)}")
+    print(f"[Ingest]   know_how docs   : {len(kh_docs)}")
     print(f"[Ingest]   location populated: {len(locs)}/{len(docs)}")
     print(f"[Ingest]   entity_type populated: {len(entities)}/{len(docs)}")
 

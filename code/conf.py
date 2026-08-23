@@ -86,6 +86,7 @@ LLM_DOCS_MAX_ACADEMIC = _safe_int("LLM_DOCS_MAX_ACADEMIC", 12)    # raised: 5 �
 LLM_DOC_CHARS_PRACTICAL = _safe_int("LLM_DOC_CHARS_PRACTICAL", 700)   # reduced 1200→700: metadata fields carry key info
 LLM_DOC_CHARS_ACADEMIC = _safe_int("LLM_DOC_CHARS_ACADEMIC", 700)    # raised: 500 → 700 (need full metadata fields)
 LLM_DOC_CHARS_BUSINESS_GUIDE = _safe_int("LLM_DOC_CHARS_BUSINESS_GUIDE", 3500)  # business_guide: answer_guideline is sole content field — needs full coverage
+LLM_DOC_CHARS_KNOWHOW = _safe_int("LLM_DOC_CHARS_KNOWHOW", 4000)  # know_how (feature/pdf-ingestion): full_text is sole content field, same reasoning as above
 PAGE_CONTENT_MAX_CHARS = _safe_int("PAGE_CONTENT_MAX_CHARS", 2500)    # raised 1800→2500: fit legal_regulatory into embedding
 
 # RAG Quality: Minimum similarity threshold
@@ -253,6 +254,12 @@ SHEET_URL_BAKERY = os.getenv(
     "SHEET_URL_BAKERY",
     "https://docs.google.com/spreadsheets/d/1YnLKV7gJXCu7jvcH1sUL9crMlBCJKOpQfp2wtulMszE/edit?pli=1&gid=610069215#gid=610069215",
 )
+# know_how tab (feature/pdf-ingestion) — no production default: the tab only
+# exists in the dev/test spreadsheet so far (auto-created by
+# knowhow_write_back.ensure_knowhow_tab_exists()). Empty string = soft-
+# disabled, same convention as GOOGLE_CREDENTIALS_PATH; ingest_local.py skips
+# loading it rather than failing when unset.
+SHEET_URL_KNOWHOW = os.getenv("SHEET_URL_KNOWHOW", "")
 
 # Feedback → Google Sheets logging (optional feature — soft-disables if unset,
 # same pattern as USE_ZILLIZ / RERANKER_ENABLED, no hard fail at startup).

@@ -2610,6 +2610,11 @@ class PracticalPersonaService:
             "legal_regulatory",     # บทลงโทษ ค่าปรับ ข้อกำหนดทางกฎหมาย
             "terms_and_conditions", # หน้าที่และเงื่อนไขของผู้ประกอบการ
             "restaurant_ai_document",  # เอกสาร/ฟอร์ม AI ร้านอาหาร
+            # know_how docs (feature/pdf-ingestion) — separate lightweight schema,
+            # see data_loader.py's load_from_knowhow_sheet(). full_text is absent
+            # from metadata entirely (not just capped) when knowhow_write_back.py
+            # had to overflow it to S3 — see that method's docstring for why.
+            "title", "category", "page_range", "source_file", "full_text",
         })
         _STORE_FIELD_CAPS = {
             # Must be >= the per-field caps used in the handle() prompt loop below,
@@ -2620,6 +2625,12 @@ class PracticalPersonaService:
             "restaurant_ai_document": 800,
             # marketing / business_guide content fields
             "answer_guideline": 1500, "main_topic": 120, "sub_topic": 150,
+            # know_how docs: full_text is their ONLY substantive content (title/
+            # summary/category are short labels), same "sole content field"
+            # situation as business_guide's answer_guideline — generous cap for
+            # the same reason (_BG_ANSWER_GUIDELINE_CAP below).
+            "title": 200, "category": 100, "page_range": 20, "source_file": 200,
+            "full_text": int(getattr(conf, "LLM_DOC_CHARS_KNOWHOW", 4000)),
         }
         # Business guide docs (no license_type) store all content in answer_guideline.
         # Chroma metadata has the FULL value but _STORE_FIELD_CAPS["answer_guideline"]=1500

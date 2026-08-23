@@ -631,6 +631,63 @@ class DataLoader:
 
         return len(self.documents) - docs_before
 
+    def load_from_knowhow_sheet(self, sheet_url: str, source_name: str = None) -> int:
+        """Loads the "know_how" tab (feature/pdf-ingestion) — a separate,
+        lighter schema (title/summary/full_text/category/source_file/
+        page_range, see knowhow_write_back.py) than the regulatory 13-field
+        table this class was originally built around, so this is a distinct
+        method rather than a variant of _process_dataframe()/_build_column_map().
+
+        page_content is title+summary (what similarity search actually
+        matches against — short and cheap to embed, same "search tier" role
+        page_content plays for regulatory docs). full_text goes in metadata
+        for the LLM to read once this document is selected to answer a
+        query — EXCEPT when knowhow_write_back.py had to overflow it to S3
+        (topic too long for a Sheet cell): that pointer is deliberately left
+        OUT of metadata rather than passed through, since the main app has no
+        S3 client/credentials wired up to resolve it, and leaking a raw
+        s3://... string into an LLM prompt would be actively wrong output.
+        Retrieval falls back to title+summary alone for those (rare, only
+        very long topics) cases — a known, deliberate v1 limitation, not an
+        oversight; revisit only if that gap actually shows up as an answer-
+        quality issue in practice, not preemptively."""
+        print("\nLoading know-how data from Google Sheet...")
+        csv_url = self._build_csv_export_url(sheet_url)
+        df = pd.read_csv(csv_url)
+        df.rename(columns={c: self.clean_header(c) for c in df.columns}, inplace=True)
+
+        docs_before = len(self.documents)
+        for idx, row in df.iterrows():
+            title = self.to_json_safe(row.get("title"))
+            summary = self.to_json_safe(row.get("summary"))
+            full_text = self.to_json_safe(row.get("full_text"))
+            category = self.to_json_safe(row.get("category"))
+            source_file = self.to_json_safe(row.get("source_file"))
+            page_range = self.to_json_safe(row.get("page_range"))
+
+            if not summary:
+                print(f"[DataLoader] WARNING: Skipping know-how row {idx} with no summary")
+                continue
+
+            metadata = {
+                "row_id": int(idx),
+                "data_type": "know_how",
+                "title": title,
+                "category": category,
+                "source_file": source_file,
+                "page_range": page_range,
+                "source": source_name or csv_url,
+            }
+            if full_text and not full_text.startswith("s3://"):
+                metadata["full_text"] = full_text
+
+            page_content = f"{title}\n{summary}" if title else summary
+            self.documents.append(Document(page_content=page_content, metadata=metadata))
+
+        added = len(self.documents) - docs_before
+        print(f"Added {added} know-how documents")
+        return added
+
     def get_statistics(self):
         print("\n--- Data Statistics ---")
         print(f"Total documents: {len(self.documents)}")
