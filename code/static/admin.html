@@ -306,6 +306,22 @@
     .old-row-ref-label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
     .old-row-ref-input { width: 100%; background: var(--panel); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 6px 10px; font-size: 12px; }
 
+    /* ── Content-shape banner (structured vs know-how routing) ── */
+    .content-shape { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; padding: 10px 12px; font-size: 12px; }
+    .content-shape.know_how { border-color: var(--blue); }
+    .cs-reasoning { color: var(--muted); }
+
+    /* ── Know-how topics (read-only review cards) ── */
+    .knowhow-topics { margin-bottom: 14px; }
+    .kt-title { font-size: 12px; font-weight: 700; color: var(--text); margin-bottom: 8px; }
+    .kt-card { border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 10px; background: var(--panel); }
+    .kt-card-title { font-size: 13px; font-weight: 700; color: var(--accent); margin-bottom: 4px; }
+    .kt-card-meta { font-size: 11px; color: var(--muted); margin-bottom: 8px; }
+    .kt-card-summary { font-size: 12px; color: var(--text); line-height: 1.6; margin-bottom: 8px; }
+    .kt-fulltext-details summary { cursor: pointer; font-size: 11px; color: var(--blue); }
+    .kt-fulltext { margin-top: 8px; padding: 10px; background: var(--panel-2); border-radius: 6px; font-size: 12px; line-height: 1.6; white-space: pre-wrap; max-height: 300px; overflow-y: auto; }
+    .decision-subtitle { font-size: 11px; color: var(--muted); margin-bottom: 10px; }
+
     .page-card { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; overflow: hidden; }
     .page-card-header {
       background: var(--panel);
@@ -866,10 +882,76 @@
       </div>`;
   }
 
+  function contentShapeHtml(item) {
+    const cs = item.content_shape;
+    if (!cs || !cs.shape) return "";
+    const labels = {
+      structured_license: "📋 โครงสร้างใบอนุญาต/ขั้นตอนชัดเจน — ใช้ฟิลด์มาตรฐานด้านล่าง",
+      know_how: "📚 เนื้อหา Know-how — แยกเก็บเป็นหัวข้อย่อยแทน (ไม่ใช้ฟิลด์มาตรฐาน)",
+    };
+    return `
+      <div class="content-shape ${escHtml(cs.shape)}">
+        ${labels[cs.shape] || escHtml(cs.shape)}
+        ${cs.reasoning ? `<br><span class="cs-reasoning">${escHtml(cs.reasoning)}</span>` : ""}
+      </div>`;
+  }
+
+  function knowhowTopicsHtml(item) {
+    const topics = item.knowhow_topics;
+    if (!topics || !topics.length) return "";
+    const cards = topics.map((t, idx) => {
+      const fullText = t.full_text || "";
+      const isS3Pointer = fullText.startsWith("s3://");
+      return `
+        <div class="kt-card">
+          <div class="kt-card-title">${idx + 1}. ${escHtml(t.title)}</div>
+          <div class="kt-card-meta">หมวด: ${escHtml(t.category || "-")} · หน้า ${escHtml(t.page_range || "-")} · ${fullText.length.toLocaleString()} ตัวอักษร</div>
+          <div class="kt-card-summary">${escHtml(t.summary)}</div>
+          <details class="kt-fulltext-details">
+            <summary>${isS3Pointer ? "เนื้อหายาวเกินไป จะเก็บที่ S3 แยก (ไม่แสดงตรงนี้)" : "ดูเนื้อหาเต็ม"}</summary>
+            ${isS3Pointer ? `<div class="kt-fulltext">${escHtml(fullText)}</div>` : `<div class="kt-fulltext">${escHtml(fullText)}</div>`}
+          </details>
+        </div>`;
+    }).join("");
+
+    return `
+      <div class="knowhow-topics">
+        <div class="kt-title">📚 หัวข้อ Know-how ที่พบ (${topics.length} หัวข้อ — แต่ละหัวข้อจะเป็น 1 แถวใหม่ในแท็บ know_how)</div>
+        ${cards}
+      </div>`;
+  }
+
+  async function submitKnowhowDecision(itemId, reviewStatus) {
+    const notesEl = document.getElementById("decisionNotes");
+    const body = {
+      review_status: reviewStatus,
+      // No duplicate-detection built for the know_how tab yet (see
+      // pdf_candidate_matching.py's scope) — "new" is the only meaningful
+      // decision_type here for now, so it's fixed rather than exposed as a
+      // choice the reviewer has to make for no real reason.
+      decision_type: reviewStatus === "approved" ? "new" : null,
+      reviewer_notes: notesEl ? notesEl.value : "",
+    };
+    const r = await fetch(`/admin/api/pdf-queue/${itemId}/decision`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      alert("เกิดข้อผิดพลาด: " + (err.error || r.status));
+      return;
+    }
+    await loadPdfQueue();
+    selectPdfQueueItem(itemId);
+  }
+
   function renderPdfQueueDetail(item) {
     const panel = document.getElementById("pdfQueueDetailPanel");
     const totalFlags = item.pages.reduce((s, p) => s + (p.flags || []).length, 0);
     const highFlags = item.pages.reduce((s, p) => s + (p.flags || []).filter(f => f.severity === "high").length, 0);
+
+    const isKnowhow = !!(item.knowhow_topics && item.knowhow_topics.length);
 
     let decisionHtml;
     if (item.review_status !== "pending") {
@@ -878,6 +960,20 @@
           ✓ ตรวจสอบแล้ว: <b>${escHtml(item.review_status)}</b>
           ${item.decision_type ? ` — ประเภท: <b>${escHtml(item.decision_type)}</b>` : ""}
           ${item.reviewer_notes ? `<br>หมายเหตุ: ${escHtml(item.reviewer_notes)}` : ""}
+        </div>`;
+    } else if (isKnowhow) {
+      // Simpler decision box for know-how items — no decision-type selector
+      // or old_row_ref (see submitKnowhowDecision: decision_type is always
+      // fixed to "new", duplicate-detection isn't built for this tab yet).
+      decisionHtml = `
+        <div class="decision-box">
+          <div class="decision-title">การตัดสินใจ (Know-how)</div>
+          <div class="decision-subtitle">จะเขียนเข้าแท็บ know_how เป็น ${item.knowhow_topics.length} แถวใหม่ (แยกตามหัวข้อด้านบน) — เพิ่มเท่านั้น ไม่ลบ/ทับของเดิม</div>
+          <textarea class="decision-notes" id="decisionNotes" placeholder="หมายเหตุ (ถ้ามี)"></textarea>
+          <div class="decision-actions">
+            <button class="btn-approve" onclick="submitKnowhowDecision('${item.id}','approved')">✓ อนุมัติทั้งหมด</button>
+            <button class="btn-reject" onclick="submitKnowhowDecision('${item.id}','rejected')">✕ ปฏิเสธ</button>
+          </div>
         </div>`;
     } else {
       decisionHtml = `
@@ -912,9 +1008,10 @@
       </div>
       <div style="flex:1;overflow-y:auto;padding:16px">
         ${relevanceCheckHtml(item)}
-        ${candidateMatchesHtml(item)}
+        ${contentShapeHtml(item)}
+        ${isKnowhow ? knowhowTopicsHtml(item) : candidateMatchesHtml(item)}
         ${item.pages.map((p, idx) => pageCard(p, idx)).join("")}
-        ${item.review_status === "pending" ? fieldsEditorHtml(item) : ""}
+        ${!isKnowhow && item.review_status === "pending" ? fieldsEditorHtml(item) : ""}
         ${decisionHtml}
       </div>
     `;

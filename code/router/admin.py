@@ -263,9 +263,19 @@ async def pdf_queue_decide(item_id: str, decision: PdfReviewDecision):
     sheet_result = None
     if decision.review_status == "approved" and decision.decision_type != "duplicate":
         try:
-            from service.sheet_write_back import append_review_item_to_sheet
+            if item.knowhow_topics:
+                # know_how items skip the structured Sheet entirely — no
+                # duplicate-detection built for the know_how tab yet, so
+                # decision_type is effectively always "new" here regardless
+                # of what the UI sent (see admin.html: it always submits
+                # "new" for this path).
+                from service.knowhow_write_back import append_knowhow_topics
 
-            sheet_result = append_review_item_to_sheet(item)
+                sheet_result = append_knowhow_topics(item.knowhow_topics, item.filename)
+            else:
+                from service.sheet_write_back import append_review_item_to_sheet
+
+                sheet_result = append_review_item_to_sheet(item)
         except Exception as e:
             _LOG.error(f"[pdf_queue_decide] Sheet write-back failed for item {item_id}: {e}")
             return JSONResponse(

@@ -74,6 +74,20 @@ class ReviewItem(BaseModel):
     # "not_relevant", "reasoning": str}. See service/pdf_relevance_check.py.
     relevance_check: Optional[dict[str, str]] = None
 
+    # {"shape": "structured_license"|"know_how", "reasoning": str} — routes
+    # which drafting path ran (see service/pdf_content_shape.py). None means
+    # the classifier itself never ran (old item, or it failed before reaching
+    # this step) — treat the same as "structured_license" for display, since
+    # that's the fallback the classifier itself uses too.
+    content_shape: Optional[dict[str, str]] = None
+
+    # Populated instead of llm_drafted_fields when content_shape == "know_how"
+    # — one dict per identified topic: {title, summary, full_text, category,
+    # page_range}. A single PDF can produce several of these, unlike the
+    # structured path's one-PDF-one-row model. See
+    # service/pdf_knowhow_drafting.py + service/knowhow_write_back.py.
+    knowhow_topics: Optional[list[dict[str, Any]]] = None
+
     # Not built yet — LLM-drafted structured fields (main_topic, sub_topic,
     # entity_type, ขั้นตอน, เอกสาร, ค่าธรรมเนียม, ระยะเวลา, เงื่อนไข) for the reviewer
     # to edit before approval, per the original staging/review design.

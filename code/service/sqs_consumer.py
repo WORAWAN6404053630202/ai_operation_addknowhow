@@ -30,8 +30,10 @@ import conf
 from model.pdf_review_item import PageExtractionRecord, ReviewItem
 from model.pdf_review_queue_manager import PdfReviewQueueManager
 from service.pdf_candidate_matching import find_candidate_matches
+from service.pdf_content_shape import classify_content_shape
 from service.pdf_extraction_validation import validate_extraction
 from service.pdf_field_drafting import draft_fields_from_pages
+from service.pdf_knowhow_drafting import identify_knowhow_topics
 from service.pdf_large_extraction import extract_full_document
 from service.pdf_relevance_check import check_relevance
 from utils.logger import get_logger
@@ -80,14 +82,12 @@ def _build_and_save_review_item(
         logger.info(f"[SQSConsumer] {filename} page {p['page_num']}: {len(flags)} flag(s)")
 
     page_markdowns = [p["typhoon_markdown"] for p in raw_pages]
-    llm_drafted_fields = draft_fields_from_pages(page_markdowns)
 
     item = ReviewItem(
         filename=filename,
         s3_raw_pdf_path=s3_raw_pdf_path,
         extraction_completed_at=time.time(),
         pages=pages,
-        llm_drafted_fields=llm_drafted_fields,
     )
 
     # Both best-effort: a Sheet/embedding/LLM hiccup here must not lose the
@@ -101,13 +101,41 @@ def _build_and_save_review_item(
     except Exception as e:
         logger.error(f"[SQSConsumer] Relevance check failed for {filename}, continuing without it: {e}")
 
-    try:
-        item.candidate_matches = find_candidate_matches(item)
-    except Exception as e:
-        logger.error(f"[SQSConsumer] Candidate matching failed for {filename}, continuing without it: {e}")
+    # Routing decision: does this document fit the structured 13-field Sheet
+    # schema, or is it know-how/multi-topic content that would lose most of
+    # its substance forced into that shape? classify_content_shape() itself
+    # never raises (fails toward "structured_license", the longer-proven
+    # path) — no try/except needed here, unlike the calls above/below that
+    # wrap genuinely-fallible external services.
+    shape_check = classify_content_shape(page_markdowns)
+    item.content_shape = shape_check
+
+    if shape_check["shape"] == "know_how":
+        try:
+            topic_bounds = identify_knowhow_topics(page_markdowns)
+            item.knowhow_topics = [
+                {
+                    "title": t["title"],
+                    "summary": t["summary"],
+                    "category": t["category"],
+                    "page_range": f"{t['start_page']}-{t['end_page']}" if t["start_page"] != t["end_page"] else str(t["start_page"]),
+                    "full_text": "\n\n---\n\n".join(page_markdowns[t["start_page"] - 1 : t["end_page"]]),
+                }
+                for t in topic_bounds
+            ]
+            logger.info(f"[SQSConsumer] {filename}: know-how path, {len(item.knowhow_topics)} topic(s) identified")
+        except Exception as e:
+            logger.error(f"[SQSConsumer] Know-how topic-splitting failed for {filename}, item saved with no topics for manual handling: {e}")
+    else:
+        llm_drafted_fields = draft_fields_from_pages(page_markdowns)
+        item.llm_drafted_fields = llm_drafted_fields
+        try:
+            item.candidate_matches = find_candidate_matches(item)
+        except Exception as e:
+            logger.error(f"[SQSConsumer] Candidate matching failed for {filename}, continuing without it: {e}")
 
     _queue_manager.save(item)
-    logger.info(f"[SQSConsumer] Saved review item {item.id} for {filename} ({len(pages)} pages)")
+    logger.info(f"[SQSConsumer] Saved review item {item.id} for {filename} ({len(pages)} pages, shape={shape_check['shape']})")
     return item
 
 
