@@ -29,6 +29,7 @@ from openai import OpenAI
 
 import conf
 from utils.logger import get_logger
+from utils.prompt_safety import INJECTION_GUARD
 
 logger = get_logger(__name__)
 
@@ -65,7 +66,11 @@ _FAILURE_FALLBACK: ShapeCheck = {
 }
 
 _PROMPT_TEMPLATE = """เอกสารต่อไปนี้ (มีทั้งหมด {num_pages} หน้า) ถูกอัปโหลดเข้าระบบฐานความรู้ของ Restbiz
-(ผู้ช่วย AI ด้านกฎหมาย/ใบอนุญาต/ข้อบังคับสำหรับธุรกิจร้านอาหารในไทย) หน้าที่ของคุณมี 2 ส่วน:
+(ผู้ช่วย AI ด้านกฎหมาย/ใบอนุญาต/ข้อบังคับสำหรับธุรกิจร้านอาหารในไทย)
+
+""" + INJECTION_GUARD + """
+
+หน้าที่ของคุณมี 2 ส่วน:
 
 **ส่วนที่ 1 — จำแนกรูปแบบหลักของเอกสาร:**
 

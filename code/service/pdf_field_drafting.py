@@ -38,6 +38,7 @@ import conf
 from utils.logger import get_logger
 from utils.page_ranges import fuzzy_ratio as _fuzzy_ratio
 from utils.page_ranges import merge_topic_chunks
+from utils.prompt_safety import INJECTION_GUARD
 
 logger = get_logger(__name__)
 
@@ -70,6 +71,8 @@ DRAFTABLE_FIELDS: dict[str, list[str]] = {
 NOT_DRAFTED_FIELDS = ["restaurant_ai_document", "combined_links"]
 
 _PROMPT_TEMPLATE = """ต่อไปนี้คือข้อความที่สกัดได้จากเอกสารราชการ (PDF) ทุกหน้า
+
+""" + INJECTION_GUARD + """
 
 หน้าที่ของคุณ: กรอกข้อมูลลงในฟิลด์ต่อไปนี้ **เฉพาะข้อมูลที่มีอยู่จริงในเอกสารเท่านั้น**
 ห้ามเดาหรือแต่งเติมข้อมูลที่ไม่มีในเอกสารเด็ดขาด — ถ้าฟิลด์ไหนไม่มีข้อมูลในเอกสาร ให้ใส่ค่าว่าง ""
@@ -141,6 +144,8 @@ class LicenseTopicBounds(TypedDict):
 _TOPIC_SPLIT_PROMPT = """เอกสารต่อไปนี้ (มีทั้งหมด {num_pages} หน้า) ถูกจัดว่าเป็นเอกสารเกี่ยวกับใบอนุญาต/
 ขั้นตอนราชการ ซึ่งอาจพูดถึงใบอนุญาตหรือขั้นตอนมากกว่า 1 เรื่องปนกันอยู่ในไฟล์เดียวก็ได้ (เช่น เอกสารรวม
 ประกาศหลายฉบับ) หรืออาจไม่เกี่ยวกับใบอนุญาต/ขั้นตอนราชการเลยก็ได้
+
+""" + INJECTION_GUARD + """
 
 หน้าที่ของคุณ: **ระบุว่าเอกสารนี้พูดถึงใบอนุญาต/ขั้นตอนราชการกี่เรื่อง แต่ละเรื่องอยู่หน้าไหนถึงหน้าไหน**
 (ไม่ต้องกรอกรายละเอียดฟิลด์ทั้งหมดตรงนี้ แค่ระบุหน่วยงาน+ประเภทใบอนุญาตคร่าวๆ พอให้แยกเรื่องออกจากกันได้)

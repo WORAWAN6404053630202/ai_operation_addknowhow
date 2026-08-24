@@ -54,6 +54,7 @@ from service.pdf_field_drafting import DRAFTABLE_FIELDS
 from service.sheet_write_back import _clean_header, _get_worksheet
 from utils.logger import get_logger
 from utils.page_ranges import fuzzy_ratio
+from utils.prompt_safety import INJECTION_GUARD
 
 logger = get_logger(__name__)
 
@@ -214,6 +215,8 @@ def _identity_fuzzy_candidates(new_values: dict[str, str], rows: list[tuple[int,
 
 _LLM_SCAN_PROMPT = """คุณกำลังช่วยตรวจสอบว่าเอกสารกฎหมาย/ใบอนุญาตฉบับใหม่ เป็นเรื่องเดียวกัน (หน่วยงาน + ประเภทใบอนุญาต + หัวข้อการดำเนินการตรงกันจริง ไม่ใช่แค่หน่วยงานเดียวกัน) กับแถวข้อมูลเดิมแถวไหนบ้างในรายการต่อไปนี้
 
+""" + INJECTION_GUARD + """
+
 เอกสารใหม่:
 หน่วยงาน: {new_department}
 ประเภทใบอนุญาต: {new_license_type}
@@ -362,6 +365,8 @@ def find_candidate_matches(item: ReviewItem) -> list[dict[str, Any]]:
 
 
 _CATEGORY_FIT_PROMPT = """คุณกำลังช่วยตรวจสอบว่าเอกสารใหม่นี้ เข้าข่ายหมวดหมู่ (operation_topic) ที่มีอยู่แล้วในระบบหรือไม่
+
+""" + INJECTION_GUARD + """
 
 เอกสารใหม่:
 หน่วยงาน: {new_department}

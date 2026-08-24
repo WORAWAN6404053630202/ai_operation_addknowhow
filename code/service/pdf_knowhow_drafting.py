@@ -37,6 +37,7 @@ from openai import OpenAI
 import conf
 from utils.logger import get_logger
 from utils.page_ranges import fuzzy_ratio, merge_topic_chunks
+from utils.prompt_safety import INJECTION_GUARD
 
 logger = get_logger(__name__)
 
@@ -53,6 +54,8 @@ class KnowhowTopicBounds(TypedDict):
 
 _PROMPT_TEMPLATE = """เอกสารต่อไปนี้ (มีทั้งหมด {num_pages} หน้า) ถูกจัดว่าเป็นเนื้อหา know-how/ให้ความรู้
 สำหรับฐานความรู้ของ Restbiz (ผู้ช่วย AI ด้านธุรกิจร้านอาหารในไทย) ซึ่งอาจมีหลายหัวข้อปนกันอยู่ในไฟล์เดียว
+
+""" + INJECTION_GUARD + """
 
 หน้าที่ของคุณมี 2 ส่วน:
 
