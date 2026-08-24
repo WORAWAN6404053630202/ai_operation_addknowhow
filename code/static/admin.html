@@ -305,6 +305,7 @@
     .cm-diff-field { color: var(--muted); white-space: nowrap; }
     .cm-diff-old { color: var(--red); }
     .cm-diff-new { color: var(--green); }
+    .cm-diff-blank { color: var(--muted); font-style: italic; }
     .category-fit-banner { border: 1px solid var(--orange); border-radius: 8px; padding: 10px 12px; margin-bottom: 14px; font-size: 12px; color: var(--orange); }
     .category-fit-banner .cf-reasoning { color: var(--muted); }
 
@@ -889,8 +890,8 @@
     }
     const rows = diffs.map(d => `
       <tr>
-        <td class="cm-diff-field">${escHtml(_DIFF_FIELD_LABELS[d.field] || d.field)}</td>
-        <td class="cm-diff-old">${escHtml(d.old_value)}</td>
+        <td class="cm-diff-field">${escHtml(_DIFF_FIELD_LABELS[d.field] || d.field)}${d.change_type === "added" ? ' <span class="cm-badge">ข้อมูลใหม่</span>' : ""}</td>
+        <td class="cm-diff-old">${d.old_value ? escHtml(d.old_value) : '<span class="cm-diff-blank">(ว่าง)</span>'}</td>
         <td class="cm-diff-new">${escHtml(d.new_value)}</td>
       </tr>`).join("");
     return `

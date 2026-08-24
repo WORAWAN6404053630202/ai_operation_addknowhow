@@ -74,8 +74,20 @@ _PROCEDURAL_FIELD_KEYS = [
 _ALL_FIELD_KEYS = list(DRAFTABLE_FIELDS.keys())
 
 _EMBEDDING_BATCH_SIZE = 100
-_EMBEDDING_FLOOR = 0.45  # below this, not worth surfacing at all — pure noise
-_EMBEDDING_MAX_CANDIDATES = 15  # sanity cap even when no clear gap is found
+# Live-measured 2026-08-24 against 2 genuinely-unrelated test documents (NASA
+# rocket licensing, industrial fuel import — nothing like either exists in
+# this Sheet): baseline "noise" similarity for Thai regulatory text clustered
+# at 0.49-0.66 purely from shared bureaucratic boilerplate vocabulary (ยื่นคำขอ,
+# ค่าธรรมเนียม, หน่วยงาน, etc.), NOT real relatedness. The original 0.45 floor
+# was calibrated from only 3 examples and let 15 pure-noise rows through as
+# "candidates" for both unrelated documents. Floor raised well above the
+# observed noise ceiling — embedding's job here is now strictly "flag only
+# genuinely close matches" (E1's real near-duplicate scored 0.9575, nowhere
+# near this noise band); identity_match + llm_scan (independently verified
+# zero false positives on the same 2 test documents) carry the recall burden
+# for paraphrased/reworded real matches instead.
+_EMBEDDING_FLOOR = 0.70
+_EMBEDDING_MAX_CANDIDATES = 10  # sanity cap even when no clear gap is found
 _EMBEDDING_MIN_GAP = 0.05  # a gap smaller than this isn't trustworthy as a cutoff
 
 _IDENTITY_FUZZY_THRESHOLD = 0.82  # normalized SequenceMatcher ratio
@@ -275,12 +287,22 @@ def _llm_scan_candidates(new_values: dict[str, str], rows: list[tuple[int, dict[
 
 
 def _field_diff(new_values: dict[str, str], existing_values: dict[str, str]) -> list[dict[str, str]]:
+    """Live-tested 2026-08-24: the naive "both sides non-empty and different"
+    check silently dropped the case where the existing row's field was blank
+    and the new document actually has a value for it — real Sheet rows
+    commonly have several blank procedural fields (nothing wrong with that,
+    just not drafted at the time), and a reviewer deciding ③ update very much
+    wants to know "this document adds fee/duration/etc. info that was never
+    recorded before", not just "this document changes an existing value" —
+    so blank-old is surfaced too, tagged distinctly from a genuine change."""
     diffs = []
     for key in _PROCEDURAL_FIELD_KEYS:
         new_v = (new_values.get(key) or "").strip()
         old_v = (existing_values.get(key) or "").strip()
-        if new_v and old_v and new_v != old_v:
-            diffs.append({"field": key, "old_value": old_v, "new_value": new_v})
+        if new_v and not old_v:
+            diffs.append({"field": key, "old_value": "", "new_value": new_v, "change_type": "added"})
+        elif new_v and old_v and new_v != old_v:
+            diffs.append({"field": key, "old_value": old_v, "new_value": new_v, "change_type": "changed"})
     return diffs
 
 
