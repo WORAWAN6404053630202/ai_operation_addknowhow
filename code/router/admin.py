@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from model.state_manager import StateManager
 from model.pdf_review_queue_manager import PdfReviewQueueManager
 from utils.logger import get_logger
+from utils.page_ranges import format_page_ranges
 from utils.simple_cache import get_cache
 
 _LOG = get_logger(__name__)
@@ -220,16 +221,14 @@ class PdfReviewDecision(BaseModel):
 
 
 def _page_range_str(item) -> str:
-    """Same "N-M" logic as sheet_write_back.py's _format_page_range — surfaced
-    in the queue list so a structured_license PDF that split into several
-    independent review items (see sqs_consumer.py, 2026-08-24) doesn't just
-    show N identical filenames with no way to tell them apart at a glance."""
-    page_nums = sorted(p.page_num for p in item.pages)
-    if not page_nums:
-        return ""
-    if page_nums[0] == page_nums[-1]:
-        return str(page_nums[0])
-    return f"{page_nums[0]}-{page_nums[-1]}"
+    """Same gap-aware logic as sheet_write_back.py's _format_page_range —
+    surfaced in the queue list so a structured_license PDF that split into
+    several independent review items (see sqs_consumer.py, 2026-08-24)
+    doesn't just show N identical filenames with no way to tell them apart
+    at a glance. Uses format_page_ranges rather than plain min/max since an
+    item's pages aren't guaranteed contiguous (a topic can resume after an
+    interruption, see utils/page_ranges.py)."""
+    return format_page_ranges([p.page_num for p in item.pages])
 
 
 @router.get("/api/pdf-queue")

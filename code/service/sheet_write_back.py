@@ -28,6 +28,7 @@ import conf
 from model.pdf_review_item import ReviewItem
 from service.pdf_field_drafting import DRAFTABLE_FIELDS
 from utils.logger import get_logger
+from utils.page_ranges import format_page_ranges
 
 logger = get_logger(__name__)
 
@@ -107,14 +108,15 @@ _RESEARCH_REFERENCE_HEADER_VARIANTS = [
 
 
 def _format_page_range(item: ReviewItem) -> str:
-    """"หน้า 4" for a single page, "หน้า 1-3" for a contiguous range — pages are
-    always numbered 1..N by the Lambda extractor, so a plain min/max is enough."""
-    page_nums = sorted(p.page_num for p in item.pages)
-    if not page_nums:
-        return ""
-    if page_nums[0] == page_nums[-1]:
-        return f"หน้า {page_nums[0]}"
-    return f"หน้า {page_nums[0]}-{page_nums[-1]}"
+    """"หน้า 4" for a single page, "หน้า 1-3" for one contiguous range, "หน้า
+    1-2, 5" for disjoint pages — REVISED 2026-08-24: an item's pages are no
+    longer guaranteed contiguous (structured_license topic-splitting can
+    merge a topic that resumes after an interruption, see
+    utils/page_ranges.py), so a plain min/max would misleadingly claim
+    in-between pages are included when they aren't."""
+    page_nums = [p.page_num for p in item.pages]
+    formatted = format_page_ranges(page_nums)
+    return f"หน้า {formatted}" if formatted else ""
 
 
 def _resolve_value_for_header(raw_header: str, fields: dict[str, str], item: ReviewItem) -> str:

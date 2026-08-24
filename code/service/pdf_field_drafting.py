@@ -36,6 +36,8 @@ from openai import OpenAI
 
 import conf
 from utils.logger import get_logger
+from utils.page_ranges import fuzzy_ratio as _fuzzy_ratio
+from utils.page_ranges import merge_topic_chunks
 
 logger = get_logger(__name__)
 
@@ -133,8 +135,7 @@ def draft_fields_from_pages(pages_markdown: list[str]) -> dict[str, str]:
 class LicenseTopicBounds(TypedDict):
     department: str
     license_type: str
-    start_page: int
-    end_page: int
+    page_ranges: list[tuple[int, int]]
 
 
 _TOPIC_SPLIT_PROMPT = """เอกสารต่อไปนี้ (มีทั้งหมด {num_pages} หน้า) ถูกจัดว่าเป็นเอกสารเกี่ยวกับใบอนุญาต/
@@ -147,6 +148,11 @@ _TOPIC_SPLIT_PROMPT = """เอกสารต่อไปนี้ (มีท�
 - ถ้าทั้งเอกสารพูดถึงเรื่องเดียวต่อเนื่องกัน ให้ตอบมาแค่ 1 รายการที่ครอบคลุมทุกหน้า
 - ถ้าเอกสารไม่เกี่ยวกับใบอนุญาต/ขั้นตอนราชการเลย ให้ตอบ list ว่างเปล่า [] ห้ามฝืนสร้างรายการที่ไม่มีจริง
 - แต่ละหน้าควรอยู่ในเรื่องใดเรื่องหนึ่งเท่านั้น ห้ามข้ามหน้าหรือซ้อนทับกันโดยไม่จำเป็น
+- **สำคัญ**: ถ้าเรื่องเดียวกันปรากฏอีกครั้งหลังถูกคั่นด้วยเรื่องอื่น (เช่น หน้า 1 กับหน้า 3 เป็นเรื่อง
+  เดียวกัน แต่หน้า 2 เป็นเรื่องอื่นคั่นอยู่) ให้ตอบเป็น**คนละรายการที่แยกกัน**ได้ตามปกติ (แต่ละรายการ
+  ยังต้องเป็นช่วงหน้าต่อเนื่อง) แต่ต้องใช้ค่า "department" และ "license_type" เป็น**ข้อความเดียวกันเป๊ะๆ**
+  กับรายการแรกที่พูดถึงเรื่องนี้ — **ห้ามเติมคำต่อท้ายเช่น "(ต่อ)" หรือเปลี่ยนคำแม้เล็กน้อย** เพราะระบบ
+  จะรวมรายการที่ department+license_type ตรงกันเป๊ะให้เป็นเรื่องเดียวโดยอัตโนมัติในภายหลัง
 
 ตอบเป็น JSON array เท่านั้น ไม่ต้องมีข้อความอื่น:
 [
@@ -165,14 +171,23 @@ _TOPIC_SPLIT_PROMPT = """เอกสารต่อไปนี้ (มีท�
 
 def identify_license_topics(pages_markdown: list[str]) -> list[LicenseTopicBounds]:
     """Splits a structured_license-shaped PDF into 0..N distinct license/
-    procedure topics by page range, mirroring pdf_knowhow_drafting.py's
+    procedure topics, mirroring pdf_knowhow_drafting.py's
     identify_knowhow_topics() — a single PDF is not guaranteed to be exactly
     one license (could be several combined announcements, or none at all).
-    Each returned bound gets sliced and passed to draft_fields_from_pages()
-    independently by the caller (sqs_consumer.py), producing one fully-
-    independent ReviewItem per topic — reuses the existing single-topic
-    review/candidate-matching/decision UI unchanged rather than needing a
-    new nested per-topic decision flow.
+    Each topic's page_ranges gets sliced (all ranges, joined) and passed to
+    draft_fields_from_pages() independently by the caller (sqs_consumer.py),
+    producing one fully-independent ReviewItem per topic — reuses the
+    existing single-topic review/candidate-matching/decision UI unchanged
+    rather than needing a new nested per-topic decision flow.
+
+    page_ranges (plural, list of (start,end) tuples) rather than a single
+    start_page/end_page — REVISED 2026-08-24: the same topic can legitimately
+    appear in non-contiguous chunks (interrupted by an unrelated topic), and
+    forcing that into one contiguous range would either wrongly include the
+    interrupting pages' content or silently drop pages; see
+    utils/page_ranges.py's merge_topic_chunks() for how same-topic chunks
+    (identified by department+license_type, fuzzy-matched so an LLM wording
+    slip like appending "(ต่อ)" still merges) get combined.
 
     Returns [] (never raises) on failure OR on a genuine "0 topics" verdict —
     the caller must not assume [] always means an error; see sqs_consumer.py
@@ -199,7 +214,7 @@ def identify_license_topics(pages_markdown: list[str]) -> list[LicenseTopicBound
         raise ValueError(f"identify_license_topics: LLM returned non-list JSON: {type(parsed)}")
 
     num_pages = len(pages_markdown)
-    topics: list[LicenseTopicBounds] = []
+    chunks: list[dict] = []
     for raw_topic in parsed:
         try:
             start_page = int(raw_topic["start_page"])
@@ -214,12 +229,13 @@ def identify_license_topics(pages_markdown: list[str]) -> list[LicenseTopicBound
             logger.warning(f"[pdf_field_drafting] Skipping license topic with out-of-range pages {raw_topic.get('start_page')}-{raw_topic.get('end_page')} (doc has {num_pages} pages)")
             continue
 
-        topics.append({
+        chunks.append({
             "department": str(raw_topic.get("department", "")).strip(),
             "license_type": str(raw_topic.get("license_type", "")).strip(),
             "start_page": start_page,
             "end_page": end_page,
         })
 
-    logger.info(f"[pdf_field_drafting] Identified {len(topics)} license topic(s) across {num_pages} page(s)")
+    topics: list[LicenseTopicBounds] = merge_topic_chunks(chunks, ("department", "license_type"), _fuzzy_ratio)
+    logger.info(f"[pdf_field_drafting] Identified {len(topics)} license topic(s) (from {len(chunks)} chunk(s)) across {num_pages} page(s)")
     return topics

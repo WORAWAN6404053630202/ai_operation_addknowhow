@@ -37,6 +37,7 @@ from service.pdf_knowhow_drafting import identify_knowhow_topics
 from service.pdf_large_extraction import extract_full_document
 from service.pdf_relevance_check import check_relevance
 from utils.logger import get_logger
+from utils.page_ranges import format_page_ranges
 
 logger = get_logger(__name__)
 
@@ -53,26 +54,148 @@ def _assert_dev_environment() -> None:
         )
 
 
+def _slice_by_ranges(
+    pages: list[PageExtractionRecord], page_markdowns: list[str], ranges: list[tuple[int, int]]
+) -> tuple[list[PageExtractionRecord], list[str]]:
+    """ranges are LOCAL 1-based indices into the given pages/page_markdowns
+    lists — NOT necessarily the original document's page numbers, since this
+    gets called on secondary sub-slices too (see _build_and_save_review_item).
+    Joins multiple ranges in order, e.g. [(1,1),(3,3)] for a topic that
+    resumed after an interruption."""
+    sliced_pages: list[PageExtractionRecord] = []
+    sliced_markdowns: list[str] = []
+    for s, e in ranges:
+        sliced_pages.extend(pages[s - 1 : e])
+        sliced_markdowns.extend(page_markdowns[s - 1 : e])
+    return sliced_pages, sliced_markdowns
+
+
+def _build_knowhow_items(
+    filename: str, s3_raw_pdf_path: str, pages: list[PageExtractionRecord], page_markdowns: list[str],
+    relevance_check: Optional[dict], content_shape: dict,
+) -> list[ReviewItem]:
+    """Builds ONE bundled ReviewItem (multiple knowhow_topics inside) from
+    this pages/page_markdowns slice. Safe to call on the full document OR a
+    secondary sub-slice of a mixed-shape document (see
+    _build_and_save_review_item) — identify_knowhow_topics()'s returned
+    page_ranges are always local to whatever page_markdowns was passed in,
+    and _slice_by_ranges resolves them against the SAME pages/page_markdowns
+    given here, so nesting composes correctly regardless of depth."""
+    item = ReviewItem(
+        filename=filename, s3_raw_pdf_path=s3_raw_pdf_path, extraction_completed_at=time.time(),
+        pages=pages, relevance_check=relevance_check, content_shape=content_shape,
+    )
+    try:
+        topic_bounds = identify_knowhow_topics(page_markdowns)
+        knowhow_topics = []
+        for t in topic_bounds:
+            topic_pages, topic_markdowns = _slice_by_ranges(pages, page_markdowns, t["page_ranges"])
+            knowhow_topics.append({
+                "document_title": t["document_title"],
+                "source_type": t["source_type"],
+                "main_topic": t["main_topic"],
+                "sub_topic": t["sub_topic"],
+                "summary": t["summary"],
+                "category": t["category"],
+                "page_range": format_page_ranges([p.page_num for p in topic_pages]),
+                "full_text": "\n\n---\n\n".join(topic_markdowns),
+            })
+        item.knowhow_topics = knowhow_topics
+        logger.info(f"[SQSConsumer] {filename}: know-how path, {len(knowhow_topics)} topic(s) identified")
+    except Exception as e:
+        logger.error(f"[SQSConsumer] Know-how topic-splitting failed for {filename}, item saved with no topics for manual handling: {e}")
+
+    _queue_manager.save(item)
+    logger.info(f"[SQSConsumer] Saved review item {item.id} for {filename} ({len(pages)} pages, shape=know_how)")
+    return [item]
+
+
+def _build_license_items(
+    filename: str, s3_raw_pdf_path: str, pages: list[PageExtractionRecord], page_markdowns: list[str],
+    relevance_check: Optional[dict], content_shape: dict,
+) -> list[ReviewItem]:
+    """Builds 0..N independent ReviewItems (own candidate-matching, own
+    decision each) from this pages/page_markdowns slice — a single slice is
+    not guaranteed to be exactly one regulatory topic (could be several
+    combined announcements, or none at all). Safe to call on the full
+    document OR a secondary sub-slice of a mixed-shape document; see
+    _build_knowhow_items for why nesting composes correctly."""
+    try:
+        topic_bounds = identify_license_topics(page_markdowns)
+    except Exception as e:
+        logger.error(
+            f"[SQSConsumer] License topic-splitting failed for {filename}, falling back to treating "
+            f"this slice as one topic (old single-topic behavior): {e}"
+        )
+        topic_bounds = [{"department": "", "license_type": "", "page_ranges": [(1, len(page_markdowns))]}]
+
+    if not topic_bounds:
+        # Genuinely 0 license topics found (not a failure) — save the whole-
+        # slice item anyway with no drafted fields, so it's still visible in
+        # the queue for a human to look at/reject rather than vanishing
+        # silently. Distinguishing this from the exception fallback above
+        # matters: an LLM failure must not look identical to "confirmed
+        # nothing here".
+        logger.info(f"[SQSConsumer] {filename}: no license topics identified in this slice — saving unlabeled item for manual review")
+        item = ReviewItem(
+            filename=filename, s3_raw_pdf_path=s3_raw_pdf_path, extraction_completed_at=time.time(),
+            pages=pages, relevance_check=relevance_check, content_shape=content_shape,
+        )
+        _queue_manager.save(item)
+        logger.info(f"[SQSConsumer] Saved review item {item.id} for {filename} ({len(pages)} pages, shape=structured_license, 0 topics)")
+        return [item]
+
+    items: list[ReviewItem] = []
+    for topic in topic_bounds:
+        topic_pages, topic_markdowns = _slice_by_ranges(pages, page_markdowns, topic["page_ranges"])
+
+        topic_item = ReviewItem(
+            filename=filename, s3_raw_pdf_path=s3_raw_pdf_path, extraction_completed_at=time.time(),
+            pages=topic_pages, relevance_check=relevance_check, content_shape=content_shape,
+        )
+        topic_item.llm_drafted_fields = draft_fields_from_pages(topic_markdowns)
+        page_str = format_page_ranges([p.page_num for p in topic_pages])
+        try:
+            topic_item.candidate_matches = find_candidate_matches(topic_item)
+        except Exception as e:
+            logger.error(f"[SQSConsumer] Candidate matching failed for {filename} ({topic['department']!r}/{topic['license_type']!r}), continuing without it: {e}")
+        try:
+            topic_item.category_fit_check = check_category_fit(topic_item)
+        except Exception as e:
+            logger.error(f"[SQSConsumer] Category-fit check failed for {filename} ({topic['department']!r}/{topic['license_type']!r}), continuing without it: {e}")
+
+        _queue_manager.save(topic_item)
+        logger.info(
+            f"[SQSConsumer] Saved review item {topic_item.id} for {filename} "
+            f"(pages {page_str}, dept={topic['department']!r}, license_type={topic['license_type']!r})"
+        )
+        items.append(topic_item)
+
+    return items
+
+
 def _build_and_save_review_item(
     filename: str, s3_raw_pdf_path: str, raw_pages: list[dict], use_llm_comparison: bool = False
 ) -> list[ReviewItem]:
-    """Shared tail end of the pipeline (validate → draft fields → relevance
-    check → candidate matching → save) — identical regardless of whether
-    raw_pages came from Lambda's normal-size path or
+    """Shared tail end of the pipeline (validate → classify → draft/split →
+    candidate matching → save) — identical regardless of whether raw_pages
+    came from Lambda's normal-size path or
     pdf_large_extraction.extract_full_document()'s oversized-document path.
     Keeping this as one function is what makes the handoff path "free" from
     downstream code's perspective: nothing past this point needs to know or
     care which extractor produced the pages.
 
-    Returns a LIST of ReviewItems, not one — a single PDF is not guaranteed
-    to be exactly one regulatory topic (REVISED 2026-08-24: could be several
-    combined announcements, or none at all). For structured_license content,
-    identify_license_topics() splits the document into 0..N independent
-    topics first, and each becomes its own fully-independent ReviewItem
-    (own candidate-matching, own decision) — deliberately NOT a single item
-    with nested per-topic decisions, so the existing single-topic review UI/
-    decision endpoint needs zero changes. know_how content is unaffected by
-    this split — it keeps its own bundled-topics-in-one-item model."""
+    Returns a LIST of ReviewItems, not one:
+      - structured_license content splits into 0..N independent topics
+        (identify_license_topics) — a PDF isn't guaranteed to be exactly one
+        license, could be several combined announcements or none at all.
+      - REVISED 2026-08-24: a document can also genuinely MIX both shapes
+        (live-tested and confirmed — e.g. a clean license procedure followed
+        by unrelated general business advice). classify_content_shape()'s
+        secondary_pages flags a substantial chunk of the OTHER shape when
+        present; that chunk is run through the OTHER pipeline too, producing
+        additional sibling item(s) alongside the primary one, instead of
+        silently dropping whichever shape didn't win the primary classification."""
     pages: list[PageExtractionRecord] = []
     for p in raw_pages:
         flags = validate_extraction(
@@ -93,21 +216,14 @@ def _build_and_save_review_item(
 
     page_markdowns = [p["typhoon_markdown"] for p in raw_pages]
 
-    item = ReviewItem(
-        filename=filename,
-        s3_raw_pdf_path=s3_raw_pdf_path,
-        extraction_completed_at=time.time(),
-        pages=pages,
-    )
-
-    # Both best-effort: a Sheet/embedding/LLM hiccup here must not lose the
-    # extraction work already done above — the item still saves with the
-    # relevant field left None, reviewer just won't see that particular hint
-    # for this one item (check_relevance itself already never raises; the
-    # try/except here is defense-in-depth against an unexpected bug, not the
+    # Best-effort: a Sheet/embedding/LLM hiccup here must not lose the
+    # extraction work already done above — every resulting item just gets
+    # relevance_check=None (check_relevance itself already never raises; this
+    # try/except is defense-in-depth against an unexpected bug, not the
     # primary safety net).
+    relevance_check = None
     try:
-        item.relevance_check = check_relevance(page_markdowns)
+        relevance_check = check_relevance(page_markdowns)
     except Exception as e:
         logger.error(f"[SQSConsumer] Relevance check failed for {filename}, continuing without it: {e}")
 
@@ -118,84 +234,37 @@ def _build_and_save_review_item(
     # path) — no try/except needed here, unlike the calls above/below that
     # wrap genuinely-fallible external services.
     shape_check = classify_content_shape(page_markdowns)
-    item.content_shape = shape_check
 
     if shape_check["shape"] == "know_how":
-        try:
-            topic_bounds = identify_knowhow_topics(page_markdowns)
-            item.knowhow_topics = [
-                {
-                    "document_title": t["document_title"],
-                    "source_type": t["source_type"],
-                    "main_topic": t["main_topic"],
-                    "sub_topic": t["sub_topic"],
-                    "summary": t["summary"],
-                    "category": t["category"],
-                    "page_range": f"{t['start_page']}-{t['end_page']}" if t["start_page"] != t["end_page"] else str(t["start_page"]),
-                    "full_text": "\n\n---\n\n".join(page_markdowns[t["start_page"] - 1 : t["end_page"]]),
-                }
-                for t in topic_bounds
-            ]
-            logger.info(f"[SQSConsumer] {filename}: know-how path, {len(item.knowhow_topics)} topic(s) identified")
-        except Exception as e:
-            logger.error(f"[SQSConsumer] Know-how topic-splitting failed for {filename}, item saved with no topics for manual handling: {e}")
+        primary_builder, secondary_builder = _build_knowhow_items, _build_license_items
+    else:
+        primary_builder, secondary_builder = _build_license_items, _build_knowhow_items
 
-        _queue_manager.save(item)
-        logger.info(f"[SQSConsumer] Saved review item {item.id} for {filename} ({len(pages)} pages, shape=know_how)")
-        return [item]
+    secondary_pages = shape_check.get("secondary_pages", [])
 
-    # structured_license: split into 0..N independent regulatory topics first —
-    # each becomes its own fully-independent ReviewItem below.
-    try:
-        topic_bounds = identify_license_topics(page_markdowns)
-    except Exception as e:
-        logger.error(
-            f"[SQSConsumer] License topic-splitting failed for {filename}, falling back to treating "
-            f"the whole document as one topic (old single-topic behavior): {e}"
-        )
-        topic_bounds = [{"department": "", "license_type": "", "start_page": 1, "end_page": len(pages)}]
-
-    if not topic_bounds:
-        # Genuinely 0 license topics found (not a failure) — save the whole-
-        # document item anyway with no drafted fields, so it's still visible
-        # in the queue for a human to look at/reject rather than vanishing
-        # silently. Distinguishing this from the exception fallback above
-        # matters: an LLM failure must not look identical to "confirmed
-        # nothing here".
-        logger.info(f"[SQSConsumer] {filename}: no license topics identified — saving unlabeled item for manual review")
-        _queue_manager.save(item)
-        logger.info(f"[SQSConsumer] Saved review item {item.id} for {filename} ({len(pages)} pages, shape=structured_license, 0 topics)")
-        return [item]
+    # Exclude secondary-shape pages from the PRIMARY pass — without this, a
+    # license procedure classified as "secondary" would ALSO get re-picked-up
+    # as its own topic inside the primary know_how bundle (confirmed live:
+    # this happened before this exclusion was added), redundantly describing
+    # the same content twice across 2 different tabs/sheets — a reviewer
+    # approving both would write near-duplicate data into 2 places. Each
+    # page is handled by exactly one builder.
+    excluded_page_nums = {n for start, end in secondary_pages for n in range(start, end + 1)}
+    primary_indices = [i for i, p in enumerate(pages) if p.page_num not in excluded_page_nums]
+    primary_pages = [pages[i] for i in primary_indices]
+    primary_markdowns = [page_markdowns[i] for i in primary_indices]
 
     items: list[ReviewItem] = []
-    for topic in topic_bounds:
-        topic_pages = [p for p in pages if topic["start_page"] <= p.page_num <= topic["end_page"]]
-        topic_markdowns = [p.typhoon_markdown for p in topic_pages]
+    if primary_pages:
+        items.extend(primary_builder(filename, s3_raw_pdf_path, primary_pages, primary_markdowns, relevance_check, shape_check))
+    else:
+        logger.info(f"[SQSConsumer] {filename}: entire document was flagged as secondary-shape content, nothing left for the primary pass")
 
-        topic_item = ReviewItem(
-            filename=filename,
-            s3_raw_pdf_path=s3_raw_pdf_path,
-            extraction_completed_at=time.time(),
-            pages=topic_pages,
-            relevance_check=item.relevance_check,
-            content_shape=item.content_shape,
-        )
-        topic_item.llm_drafted_fields = draft_fields_from_pages(topic_markdowns)
-        try:
-            topic_item.candidate_matches = find_candidate_matches(topic_item)
-        except Exception as e:
-            logger.error(f"[SQSConsumer] Candidate matching failed for {filename} (pages {topic['start_page']}-{topic['end_page']}), continuing without it: {e}")
-        try:
-            topic_item.category_fit_check = check_category_fit(topic_item)
-        except Exception as e:
-            logger.error(f"[SQSConsumer] Category-fit check failed for {filename} (pages {topic['start_page']}-{topic['end_page']}), continuing without it: {e}")
-
-        _queue_manager.save(topic_item)
-        logger.info(
-            f"[SQSConsumer] Saved review item {topic_item.id} for {filename} "
-            f"(pages {topic['start_page']}-{topic['end_page']}, dept={topic['department']!r}, license_type={topic['license_type']!r})"
-        )
-        items.append(topic_item)
+    for start, end in secondary_pages:
+        secondary_shape = "structured_license" if shape_check["shape"] == "know_how" else "know_how"
+        logger.info(f"[SQSConsumer] {filename}: processing secondary {secondary_shape} content at pages {start}-{end}")
+        sub_pages, sub_markdowns = pages[start - 1 : end], page_markdowns[start - 1 : end]
+        items.extend(secondary_builder(filename, s3_raw_pdf_path, sub_pages, sub_markdowns, relevance_check, shape_check))
 
     return items
 

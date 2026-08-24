@@ -36,6 +36,7 @@ from openai import OpenAI
 
 import conf
 from utils.logger import get_logger
+from utils.page_ranges import fuzzy_ratio, merge_topic_chunks
 
 logger = get_logger(__name__)
 
@@ -47,8 +48,7 @@ class KnowhowTopicBounds(TypedDict):
     sub_topic: str
     summary: str
     category: str
-    start_page: int
-    end_page: int
+    page_ranges: list[tuple[int, int]]
 
 
 _PROMPT_TEMPLATE = """เอกสารต่อไปนี้ (มีทั้งหมด {num_pages} หน้า) ถูกจัดว่าเป็นเนื้อหา know-how/ให้ความรู้
@@ -69,6 +69,10 @@ _PROMPT_TEMPLATE = """เอกสารต่อไปนี้ (มีทั�
 - "category" (ประเภท): **ไม่บังคับ** ถ้าเนื้อหาไม่ได้ระบุหมวดหมู่ชัดเจน ให้ใส่ค่าว่าง "" ห้ามเดา/แต่งขึ้นเอง
 - แต่ละหน้าต้องอยู่ในหัวข้อย่อยใดหัวข้อย่อยหนึ่งเท่านั้น ห้ามข้ามหน้าหรือซ้อนทับกัน
 - ถ้าเอกสารทั้งฉบับเป็นเรื่องเดียวต่อเนื่องกัน ให้ตอบมาแค่ 1 หัวข้อย่อยที่ครอบคลุมทุกหน้าก็ได้
+- **สำคัญ**: ถ้าหัวข้อย่อยเดียวกันปรากฏอีกครั้งหลังถูกคั่นด้วยหัวข้ออื่น ให้ตอบเป็นคนละรายการที่แยกกันได้
+  ตามปกติ (แต่ละรายการยังต้องเป็นช่วงหน้าต่อเนื่อง) แต่ต้องใช้ค่า "main_topic" และ "sub_topic" เป็น
+  **ข้อความเดียวกันเป๊ะๆ** กับรายการแรกที่พูดถึงเรื่องนี้ — **ห้ามเติมคำต่อท้ายเช่น "(ต่อ)"** เพราะระบบ
+  จะรวมรายการที่ main_topic+sub_topic ตรงกันเป๊ะให้เป็นเรื่องเดียวโดยอัตโนมัติในภายหลัง
 
 **ห้ามคัดลอกเนื้อหาเต็มมาใส่ — ระบุแค่ขอบเขตหน้าและสรุปสั้นๆ เท่านั้น** (เนื้อหาเต็มจริงจะถูกตัดมาจาก
 ต้นฉบับโดยตรงทีหลัง ไม่ต้องพิมพ์ซ้ำ)
@@ -133,7 +137,7 @@ def identify_knowhow_topics(pages_markdown: list[str]) -> list[KnowhowTopicBound
         source_type = "document"  # fail toward the more general tab, not a guess at "book"
 
     num_pages = len(pages_markdown)
-    topics: list[KnowhowTopicBounds] = []
+    chunks: list[dict] = []
     for raw_topic in parsed["topics"]:
         try:
             start_page = int(raw_topic["start_page"])
@@ -158,7 +162,7 @@ def identify_knowhow_topics(pages_markdown: list[str]) -> list[KnowhowTopicBound
             logger.warning(f"[KnowhowDrafting] Skipping topic missing required main_topic/sub_topic: {raw_topic!r}")
             continue
 
-        topics.append({
+        chunks.append({
             "document_title": document_title,
             "source_type": source_type,
             "main_topic": main_topic,
@@ -169,8 +173,9 @@ def identify_knowhow_topics(pages_markdown: list[str]) -> list[KnowhowTopicBound
             "end_page": end_page,
         })
 
+    topics: list[KnowhowTopicBounds] = merge_topic_chunks(chunks, ("main_topic", "sub_topic"), fuzzy_ratio)
     logger.info(
         f"[KnowhowDrafting] {document_title!r} (source_type={source_type}): "
-        f"identified {len(topics)} topic(s) across {num_pages} page(s)"
+        f"identified {len(topics)} topic(s) (from {len(chunks)} chunk(s)) across {num_pages} page(s)"
     )
     return topics

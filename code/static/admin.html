@@ -977,10 +977,18 @@
       structured_license: "📋 โครงสร้างใบอนุญาต/ขั้นตอนชัดเจน — ใช้ฟิลด์มาตรฐานด้านล่าง",
       know_how: "📚 เนื้อหา Know-how — แยกเก็บเป็นหัวข้อย่อยแทน (ไม่ใช้ฟิลด์มาตรฐาน)",
     };
+    // secondary_pages (2026-08-24): this same PDF upload had a substantial
+    // chunk of the OPPOSITE shape, split into a separate sibling item in the
+    // queue (same filename, different page range) — noted here so the
+    // reviewer isn't confused seeing 2 related entries for one upload.
+    const hasSecondary = cs.secondary_pages && cs.secondary_pages.length > 0;
+    const secondaryShape = cs.shape === "know_how" ? "โครงสร้างใบอนุญาต" : "know-how";
+    const secondaryPagesStr = hasSecondary ? cs.secondary_pages.map(r => r[0] === r[1] ? r[0] : `${r[0]}-${r[1]}`).join(", ") : "";
     return `
       <div class="content-shape ${escHtml(cs.shape)}">
         ${labels[cs.shape] || escHtml(cs.shape)}
         ${cs.reasoning ? `<br><span class="cs-reasoning">${escHtml(cs.reasoning)}</span>` : ""}
+        ${hasSecondary ? `<br><span class="cs-reasoning">⚡ ไฟล์นี้มีเนื้อหา${secondaryShape}แทรกอยู่ที่หน้า ${escHtml(secondaryPagesStr)} ด้วย — แยกไปเป็นรายการต่างหากในคิวแล้ว (ค้นหาไฟล์ชื่อเดียวกัน)</span>` : ""}
       </div>`;
   }
 

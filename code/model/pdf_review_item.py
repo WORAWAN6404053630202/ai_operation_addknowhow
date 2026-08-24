@@ -86,12 +86,17 @@ class ReviewItem(BaseModel):
     # "not_relevant", "reasoning": str}. See service/pdf_relevance_check.py.
     relevance_check: Optional[dict[str, str]] = None
 
-    # {"shape": "structured_license"|"know_how", "reasoning": str} — routes
-    # which drafting path ran (see service/pdf_content_shape.py). None means
-    # the classifier itself never ran (old item, or it failed before reaching
-    # this step) — treat the same as "structured_license" for display, since
-    # that's the fallback the classifier itself uses too.
-    content_shape: Optional[dict[str, str]] = None
+    # {"shape": "structured_license"|"know_how", "reasoning": str,
+    # "secondary_pages": list[[start,end]]} — routes which drafting path ran
+    # (see service/pdf_content_shape.py); secondary_pages (REVISED
+    # 2026-08-24) flags a substantial chunk of the OTHER shape mixed into the
+    # same document, which gets run through that other pipeline too,
+    # producing additional sibling ReviewItem(s) for this same upload rather
+    # than silently losing whichever shape didn't win the primary vote. None
+    # means the classifier itself never ran (old item, or it failed before
+    # reaching this step) — treat the same as "structured_license" for
+    # display, since that's the fallback the classifier itself uses too.
+    content_shape: Optional[dict[str, Any]] = None
 
     # Populated instead of llm_drafted_fields when content_shape == "know_how"
     # — one dict per identified topic: {title, summary, full_text, category,

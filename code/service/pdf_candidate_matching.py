@@ -42,10 +42,8 @@ both simpler and always current."""
 
 from __future__ import annotations
 
-import difflib
 import json
 import math
-import re
 from typing import Any, Optional
 
 from openai import OpenAI
@@ -55,6 +53,7 @@ from model.pdf_review_item import ReviewItem
 from service.pdf_field_drafting import DRAFTABLE_FIELDS
 from service.sheet_write_back import _clean_header, _get_worksheet
 from utils.logger import get_logger
+from utils.page_ranges import fuzzy_ratio
 
 logger = get_logger(__name__)
 
@@ -93,17 +92,6 @@ _EMBEDDING_MIN_GAP = 0.05  # a gap smaller than this isn't trustworthy as a cuto
 _IDENTITY_FUZZY_THRESHOLD = 0.82  # normalized SequenceMatcher ratio
 
 _LLM_SCAN_BATCH_SIZE = 18  # rows per LLM call — keeps each call's output small/fast
-
-
-def _normalize(s: str) -> str:
-    return re.sub(r"\s+", "", (s or "")).strip().lower()
-
-
-def _fuzzy_ratio(a: str, b: str) -> float:
-    a, b = _normalize(a), _normalize(b)
-    if not a or not b:
-        return 0.0
-    return difflib.SequenceMatcher(None, a, b).ratio()
 
 
 def _comparison_text(values: dict[str, str], keys: list[str]) -> str:
@@ -217,7 +205,7 @@ def _identity_fuzzy_candidates(new_values: dict[str, str], rows: list[tuple[int,
     for row_number, values in rows:
         matched_fields = 0
         for key in _IDENTITY_FIELD_KEYS:
-            if new_values.get(key, "").strip() and _fuzzy_ratio(new_values[key], values.get(key, "")) >= _IDENTITY_FUZZY_THRESHOLD:
+            if new_values.get(key, "").strip() and fuzzy_ratio(new_values[key], values.get(key, "")) >= _IDENTITY_FUZZY_THRESHOLD:
                 matched_fields += 1
         if matched_fields == len(_IDENTITY_FIELD_KEYS):
             flagged.add(row_number)
