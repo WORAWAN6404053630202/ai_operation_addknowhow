@@ -153,6 +153,11 @@ _TOPIC_SPLIT_PROMPT = """เอกสารต่อไปนี้ (มีท�
   ยังต้องเป็นช่วงหน้าต่อเนื่อง) แต่ต้องใช้ค่า "department" และ "license_type" เป็น**ข้อความเดียวกันเป๊ะๆ**
   กับรายการแรกที่พูดถึงเรื่องนี้ — **ห้ามเติมคำต่อท้ายเช่น "(ต่อ)" หรือเปลี่ยนคำแม้เล็กน้อย** เพราะระบบ
   จะรวมรายการที่ department+license_type ตรงกันเป๊ะให้เป็นเรื่องเดียวโดยอัตโนมัติในภายหลัง
+- **สำคัญมาก**: ถ้าเอกสารมีใบอนุญาต/เรื่องหลายรายการที่ชื่อคล้ายกันมากแต่จริงๆ เป็นคนละเรื่องกัน
+  (เช่น "ใบอนุญาตประกอบกิจการโรงงานจำพวกที่ 1" กับ "จำพวกที่ 2", หรือมีรหัส/หมายเลข/ประเภทย่อย
+  กำกับไว้ต่อท้ายเพื่อแยกความแตกต่าง) **ต้องคงคำหรือรหัสที่แยกความแตกต่างนั้นไว้ใน "license_type" เสมอ
+  ห้ามตัดออกแม้จะทำให้ข้อความสั้นลง** — การตัดรายละเอียดที่แยกความแตกต่างออกจะทำให้ระบบเข้าใจผิดว่า
+  เป็นเรื่องเดียวกันแล้วรวมเข้าด้วยกันโดยไม่ตั้งใจ
 
 ตอบเป็น JSON array เท่านั้น ไม่ต้องมีข้อความอื่น:
 [
@@ -204,7 +209,18 @@ def identify_license_topics(pages_markdown: list[str]) -> list[LicenseTopicBound
             "role": "user",
             "content": _TOPIC_SPLIT_PROMPT.format(num_pages=len(pages_markdown), combined_text=combined_text),
         }],
-        max_tokens=1500,
+        # 6000 (raised from 1500, then 4000, then 6000 — all 2026-08-25):
+        # live-tested a 45-topic combined bulletin and reproduced a real
+        # JSONDecodeError from output getting cut off mid-string at 1500 —
+        # the caller's except-clause fallback (treat the whole slice as one
+        # topic) meant this degraded gracefully rather than crashing, but
+        # silently produced a garbled single row blending 45 departments
+        # together, not a clean split. 4000 fixed that, but then the SAME
+        # sweep found the prompt instruction below (preserve distinguishing
+        # codes/classes so similarly-named-but-different topics don't get
+        # merge_topic_chunks'd together) makes each entry longer, which
+        # itself re-hit the ceiling at 45 topics — 6000 covers both.
+        max_tokens=6000,
     )
     raw = (resp.choices[0].message.content or "[]").strip()
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)

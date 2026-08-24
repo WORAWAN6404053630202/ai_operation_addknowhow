@@ -26,12 +26,13 @@ def fuzzy_ratio(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a2, b2).ratio()
 
 
-def format_page_ranges(page_nums: list[int]) -> str:
-    """"4" for a single page, "1-3" for one contiguous run, "1, 3-4" for
-    disjoint runs — never claims a page is included when it isn't."""
+def group_into_ranges(page_nums: list[int]) -> list[tuple[int, int]]:
+    """[1,2,3,5] -> [(1,3),(5,5)] — compresses a flat page-number list into
+    contiguous (start,end) runs. Shared by format_page_ranges below and by
+    sqs_consumer.py's uncovered-page fallback (see _build_license_items)."""
     nums = sorted(set(page_nums))
     if not nums:
-        return ""
+        return []
 
     runs: list[tuple[int, int]] = []
     run_start = run_end = nums[0]
@@ -42,8 +43,35 @@ def format_page_ranges(page_nums: list[int]) -> str:
             runs.append((run_start, run_end))
             run_start = run_end = n
     runs.append((run_start, run_end))
+    return runs
 
+
+def format_page_ranges(page_nums: list[int]) -> str:
+    """"4" for a single page, "1-3" for one contiguous run, "1, 3-4" for
+    disjoint runs — never claims a page is included when it isn't."""
+    runs = group_into_ranges(page_nums)
     return ", ".join(str(s) if s == e else f"{s}-{e}" for s, e in runs)
+
+
+def _digit_sequences(s: str) -> list[str]:
+    return re.findall(r"\d+", s or "")
+
+
+def _differs_only_by_digits(a: str, b: str) -> bool:
+    """True when two strings are identical apart from embedded digit
+    sequences that are themselves different (e.g. "...จำพวกที่ 1" vs
+    "...จำพวกที่ 2", or a "รหัส 001" vs "รหัส 021" style code) — added
+    2026-08-25 after live-testing found the plain fuzzy_ratio check below
+    cannot tell these apart: a string differing by one digit out of 40+
+    characters scores a very high similarity ratio despite the digit being
+    the ENTIRE meaningful distinction (a different regulatory class/code,
+    not incidental rewording like "(ต่อ)"). Real Thai regulatory patterns
+    like "ใบอนุญาตประกอบกิจการโรงงาน จำพวกที่ 1/2/3" make this a genuine
+    risk, not just a contrived edge case."""
+    stripped_a = re.sub(r"\d+", "", a or "")
+    stripped_b = re.sub(r"\d+", "", b or "")
+    digits_a, digits_b = _digit_sequences(a), _digit_sequences(b)
+    return stripped_a == stripped_b and digits_a != digits_b and bool(digits_a or digits_b)
 
 
 def merge_topic_chunks(
@@ -60,7 +88,11 @@ def merge_topic_chunks(
     fuzzy_match(a: str, b: str) -> float should return a 0..1 similarity —
     reuses pdf_candidate_matching.py's _fuzzy_ratio so a chunk the LLM
     labeled with a slightly different string the second time around (e.g.
-    appending "(ต่อ)") still merges instead of silently staying split.
+    appending "(ต่อ)") still merges instead of silently staying split. A
+    digits-only difference (see _differs_only_by_digits) blocks the merge
+    regardless of how high the fuzzy score is — a differing class/code
+    number is the single most likely case where 2 strings are 95%+ textually
+    identical yet describe genuinely different topics.
 
     Returns each group as {**first_chunk_without_page_fields, "page_ranges":
     [(s,e), ...]} sorted ascending, groups in first-seen order — chunks with
@@ -80,11 +112,15 @@ def merge_topic_chunks(
         match = None
         for g in groups:
             # Conservative on purpose: only merge when EVERY identity key is
-            # non-blank in both AND fuzzy-matches. A missed merge just means
-            # 2 rows instead of 1 (a human sees both, no data lost); a wrong
-            # merge could conflate genuinely distinct topics — worse.
+            # non-blank in both, fuzzy-matches, AND isn't a digits-only
+            # difference. A missed merge just means 2 rows instead of 1 (a
+            # human sees both, no data lost); a wrong merge could conflate
+            # genuinely distinct topics — worse.
             same = all(
-                identity_values[k] and g[k] and fuzzy_match(identity_values[k], g[k]) >= _FUZZY_MERGE_THRESHOLD
+                identity_values[k]
+                and g[k]
+                and not _differs_only_by_digits(identity_values[k], g[k])
+                and fuzzy_match(identity_values[k], g[k]) >= _FUZZY_MERGE_THRESHOLD
                 for k in identity_keys
             )
             if same:

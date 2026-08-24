@@ -37,7 +37,7 @@ from service.pdf_knowhow_drafting import identify_knowhow_topics
 from service.pdf_large_extraction import extract_full_document
 from service.pdf_relevance_check import check_relevance
 from utils.logger import get_logger
-from utils.page_ranges import format_page_ranges
+from utils.page_ranges import format_page_ranges, group_into_ranges
 
 logger = get_logger(__name__)
 
@@ -88,8 +88,11 @@ def _build_knowhow_items(
     try:
         topic_bounds = identify_knowhow_topics(page_markdowns)
         knowhow_topics = []
+        covered_local: set[int] = set()
         for t in topic_bounds:
             topic_pages, topic_markdowns = _slice_by_ranges(pages, page_markdowns, t["page_ranges"])
+            for s, e in t["page_ranges"]:
+                covered_local.update(range(s, e + 1))
             knowhow_topics.append({
                 "document_title": t["document_title"],
                 "source_type": t["source_type"],
@@ -100,6 +103,33 @@ def _build_knowhow_items(
                 "page_range": format_page_ranges([p.page_num for p in topic_pages]),
                 "full_text": "\n\n---\n\n".join(topic_markdowns),
             })
+
+        # Defensive: the prompt REQUIRES every page land in some topic, and
+        # live-testing confirms it reliably does — but an LLM not perfectly
+        # following an instruction is exactly the kind of thing that must not
+        # silently lose content if it ever happens (see the sibling gap this
+        # same sweep found in _build_license_items, where exclusion is
+        # actually the INTENDED behavior). No second LLM call here — just a
+        # deterministic catch-all topic over whatever local page_markdowns
+        # index wasn't claimed by anything, verbatim, so nothing vanishes.
+        uncovered_local = sorted(set(range(1, len(page_markdowns) + 1)) - covered_local)
+        if uncovered_local:
+            logger.warning(f"[SQSConsumer] {filename}: know-how splitting left {len(uncovered_local)} page(s) uncovered ({uncovered_local}), adding a catch-all topic")
+            uncovered_ranges = group_into_ranges(uncovered_local)
+            leftover_pages, leftover_markdowns = _slice_by_ranges(pages, page_markdowns, uncovered_ranges)
+            fallback_doc_title = topic_bounds[0]["document_title"] if topic_bounds else filename
+            fallback_source_type = topic_bounds[0]["source_type"] if topic_bounds else "document"
+            knowhow_topics.append({
+                "document_title": fallback_doc_title,
+                "source_type": fallback_source_type,
+                "main_topic": "เนื้อหาที่เหลือ (ไม่ถูกจัดหมวดหมู่โดยอัตโนมัติ)",
+                "sub_topic": "ตรวจสอบและจัดหมวดหมู่ด้วยตนเอง",
+                "summary": "",
+                "category": "",
+                "page_range": format_page_ranges([p.page_num for p in leftover_pages]),
+                "full_text": "\n\n---\n\n".join(leftover_markdowns),
+            })
+
         item.knowhow_topics = knowhow_topics
         logger.info(f"[SQSConsumer] {filename}: know-how path, {len(knowhow_topics)} topic(s) identified")
     except Exception as e:
@@ -146,8 +176,11 @@ def _build_license_items(
         return [item]
 
     items: list[ReviewItem] = []
+    covered_local: set[int] = set()
     for topic in topic_bounds:
         topic_pages, topic_markdowns = _slice_by_ranges(pages, page_markdowns, topic["page_ranges"])
+        for s, e in topic["page_ranges"]:
+            covered_local.update(range(s, e + 1))
 
         topic_item = ReviewItem(
             filename=filename, s3_raw_pdf_path=s3_raw_pdf_path, extraction_completed_at=time.time(),
@@ -170,6 +203,19 @@ def _build_license_items(
             f"(pages {page_str}, dept={topic['department']!r}, license_type={topic['license_type']!r})"
         )
         items.append(topic_item)
+
+    # Live-testing found a real gap here: identify_license_topics() correctly
+    # (by design) excludes pages that don't describe a license procedure —
+    # but those pages must not just vanish. Route them through the know-how
+    # pipeline instead (one hop, not recursive — _build_knowhow_items has its
+    # own deterministic no-LLM fallback for ITS uncovered pages, so this
+    # can't chain indefinitely even in a pathological case).
+    uncovered_local = sorted(set(range(1, len(page_markdowns) + 1)) - covered_local)
+    if uncovered_local:
+        logger.info(f"[SQSConsumer] {filename}: pages {uncovered_local} weren't part of any license topic, routing through know-how instead")
+        uncovered_ranges = group_into_ranges(uncovered_local)
+        leftover_pages, leftover_markdowns = _slice_by_ranges(pages, page_markdowns, uncovered_ranges)
+        items.extend(_build_knowhow_items(filename, s3_raw_pdf_path, leftover_pages, leftover_markdowns, relevance_check, content_shape))
 
     return items
 
