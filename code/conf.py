@@ -292,6 +292,12 @@ PDF_INGESTION_GOOGLE_CREDENTIALS_PATH = os.getenv("PDF_INGESTION_GOOGLE_CREDENTI
 # pdf_large_extraction.py to pick up and fully OCR here with no time limit.
 PDF_HANDOFF_S3_PREFIX = os.getenv("PDF_HANDOFF_S3_PREFIX", "restbiz/pending_large/")
 
+# HTTP Basic Auth for /admin/* (router/admin.py) — both fields must be set for
+# the dependency to accept any request; see require_admin_basic_auth's
+# fail-closed rationale in that file.
+ADMIN_BASIC_AUTH_USERNAME = os.getenv("ADMIN_BASIC_AUTH_USERNAME", "")
+ADMIN_BASIC_AUTH_PASSWORD = os.getenv("ADMIN_BASIC_AUTH_PASSWORD", "")
+
 # State manager configuration
 STATE_DIR = os.getenv("STATE_DIR") or None
 STATE_LOCK_TIMEOUT_S = _safe_float("STATE_LOCK_TIMEOUT_S", 0.5)
