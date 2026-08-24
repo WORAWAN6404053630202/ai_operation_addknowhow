@@ -20,7 +20,7 @@ OS level.
 
 Requires these Lambda environment variables (set in the console, NOT read from
 this repo's conf.py/env.properties — this function has no access to those):
-  TYPHOON_OCR_API_KEY, OPENROUTER_API_KEY
+  TYPHOON_OCR_API_KEY, OPENROUTER_API_KEY, SQS_QUEUE_URL
 Optional:
   OPENROUTER_BASE_URL     (default: https://openrouter.ai/api/v1)
   OPENROUTER_MODEL        (default: anthropic/claude-sonnet-4-5)
@@ -28,7 +28,23 @@ Optional:
   HANDOFF_S3_PREFIX       (default: restbiz/pending_large/)
   MAX_PAGES_FOR_LAMBDA    (default: 35)
 
-LARGE-DOCUMENT HANDLING (was "KNOWN LIMITATION: not solved here" before
+SQS DELIVERY (2026-08-24): originally relied on S3's own bucket notification
+configuration (prefix/suffix rule -> SQS) to tell the EC2 consumer a result
+was ready. Live-tested and reproduced twice: Lambda wrote the output to S3
+successfully both times, but the S3->SQS notification never fired — no
+message ever arrived (queue confirmed at 0 messages via GetQueueAttributes
+each time), despite the notification config and the queue's access policy
+both checking out correct via the console and API. Rather than keep
+debugging an opaque AWS-side gap, this Lambda now sends the SQS message
+itself directly (_notify_sqs below) right after each S3 write — the same
+Records[]-shaped body a real S3 event notification would have sent, so
+sqs_consumer.py's process_sqs_message() needed zero changes. This removes
+the dependency on that notification path entirely; the bucket's
+extracted/ and pending_large/ -> SQS notification rules are no longer
+needed and were removed (the restbiz/ -> Lambda trigger notification is
+unrelated and stays)."""
+
+"""LARGE-DOCUMENT HANDLING (was "KNOWN LIMITATION: not solved here" before
 2026-08-22): a real test (66-page PDF) confirmed Lambda's 15-minute hard cap
 gets hit around ~55-60 pages even with 4-way page concurrency, and that cap
 cannot be raised — it's a platform limit, not a config knob. Rather than
@@ -61,6 +77,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 s3 = boto3.client("s3")
+sqs = boto3.client("sqs")
 
 TYPHOON_OCR_API_KEY = os.environ.get("TYPHOON_OCR_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
@@ -69,6 +86,7 @@ OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet-4
 OUTPUT_S3_PREFIX = os.environ.get("OUTPUT_S3_PREFIX", "restbiz/extracted/")
 HANDOFF_S3_PREFIX = os.environ.get("HANDOFF_S3_PREFIX", "restbiz/pending_large/")
 MAX_PAGES_FOR_LAMBDA = int(os.environ.get("MAX_PAGES_FOR_LAMBDA", "35"))
+SQS_QUEUE_URL = os.environ.get("SQS_QUEUE_URL", "")
 
 _MAX_WORKERS = 4  # concurrent pages — keep modest, each page = 2 API calls already
 _SCREEN_PAGE_COUNT = 2  # pages OCR'd for the cheap pre-screen on oversized docs
@@ -99,6 +117,21 @@ _SCREEN_PROMPT_TEMPLATE = """นี่คือ 2 หน้าแรกของ
 === เนื้อหา 2 หน้าแรก ===
 {combined_text}
 """
+
+
+def _notify_sqs(bucket: str, key: str) -> None:
+    """Sends the same Records[]-shaped body a real S3 event notification would
+    have sent — sqs_consumer.py's process_sqs_message() parses this exact
+    shape and doesn't know or care whether S3 or this function sent it. Logs
+    and re-raises on failure rather than swallowing it: if this fails, the
+    S3 object this Lambda just wrote would otherwise sit there forever with
+    nothing to ever pick it up, which is worse than a visible Lambda error
+    (visible in CloudWatch, and S3 will retry the whole invocation)."""
+    if not SQS_QUEUE_URL:
+        raise RuntimeError("SQS_QUEUE_URL is not set — cannot notify the consumer that s3://{}/{} is ready".format(bucket, key))
+    message_body = json.dumps({"Records": [{"s3": {"bucket": {"name": bucket}, "object": {"key": key}}}]}, ensure_ascii=False)
+    sqs.send_message(QueueUrl=SQS_QUEUE_URL, MessageBody=message_body)
+    logger.info(f"Notified SQS for s3://{bucket}/{key}")
 
 
 def _render_page_to_png_bytes(pdf_bytes: bytes, page_num: int, dpi: int = 200) -> bytes:
@@ -224,6 +257,7 @@ def lambda_handler(event, context):
                     ContentType="application/json",
                 )
                 logger.info(f"{filename}: skipped after cheap screen ({screen['reason']}) — wrote {output_key}, saved OCR on remaining {num_pages - _SCREEN_PAGE_COUNT} page(s)")
+                _notify_sqs(bucket, output_key)
                 results.append({"input_key": key, "output_key": output_key, "page_count": num_pages, "skipped": True})
                 continue
 
@@ -241,6 +275,7 @@ def lambda_handler(event, context):
                 ContentType="application/json",
             )
             logger.info(f"{filename}: {num_pages} pages, screen passed ({screen['reason']}) — handed off to EC2 via {handoff_key}, not processed in Lambda")
+            _notify_sqs(bucket, handoff_key)
             results.append({"input_key": key, "handoff_key": handoff_key, "page_count": num_pages, "handed_off": True})
             continue
 
@@ -260,6 +295,7 @@ def lambda_handler(event, context):
             ContentType="application/json",
         )
         logger.info(f"Wrote extraction result to s3://{bucket}/{output_key}")
+        _notify_sqs(bucket, output_key)
         results.append({"input_key": key, "output_key": output_key, "page_count": num_pages})
 
     return {"statusCode": 200, "body": json.dumps(results, ensure_ascii=False)}
