@@ -29,7 +29,7 @@ import boto3
 import conf
 from model.pdf_review_item import PageExtractionRecord, ReviewItem
 from model.pdf_review_queue_manager import PdfReviewQueueManager
-from service.pdf_candidate_matching import find_candidate_matches
+from service.pdf_candidate_matching import check_category_fit, find_candidate_matches
 from service.pdf_content_shape import classify_content_shape
 from service.pdf_extraction_validation import validate_extraction
 from service.pdf_field_drafting import draft_fields_from_pages
@@ -133,6 +133,10 @@ def _build_and_save_review_item(
             item.candidate_matches = find_candidate_matches(item)
         except Exception as e:
             logger.error(f"[SQSConsumer] Candidate matching failed for {filename}, continuing without it: {e}")
+        try:
+            item.category_fit_check = check_category_fit(item)
+        except Exception as e:
+            logger.error(f"[SQSConsumer] Category-fit check failed for {filename}, continuing without it: {e}")
 
     _queue_manager.save(item)
     logger.info(f"[SQSConsumer] Saved review item {item.id} for {filename} ({len(pages)} pages, shape={shape_check['shape']})")

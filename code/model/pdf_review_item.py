@@ -65,9 +65,21 @@ class ReviewItem(BaseModel):
     # a dev to review before merging — not built yet.
     regex_draft_ref: Optional[str] = None
 
-    # Embedding-based candidate matching against the existing Sheet data (top-3
-    # similar rows, per design) — see service/pdf_candidate_matching.py.
+    # Candidate rows from the existing Sheet that might be the same regulatory
+    # topic as this new document — union of 3 independent signals (embedding
+    # similarity, department+license_type fuzzy match, LLM batch-scan), each
+    # candidate tagged with which signal(s) flagged it plus a field-by-field
+    # diff against the new document's drafted values. No fixed top-N cutoff —
+    # see service/pdf_candidate_matching.py for why.
     candidate_matches: Optional[list[dict[str, Any]]] = None
+
+    # decision_type == "new_category" support signal: {"fits_known_category":
+    # bool, "matched_topic": str|None, "reasoning": str} — LLM judgment of
+    # whether this document's topic fits any operation_topic already present
+    # in the Sheet. A suggestion surfaced in the admin UI, never auto-applied —
+    # the reviewer still has to click ④ themselves. See
+    # service/pdf_candidate_matching.py's check_category_fit().
+    category_fit_check: Optional[dict[str, Any]] = None
 
     # LLM judgment of whether this document belongs in the restaurant-business
     # regulatory knowledge base at all — {"tier": "relevant"|"uncertain"|

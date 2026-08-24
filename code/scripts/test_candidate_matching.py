@@ -42,14 +42,20 @@ def main() -> None:
     print(f"Found {len(matches)} candidate match(es)")
     print("=" * 60)
     for m in matches:
-        print(f"  row {m['row_number']}: similarity={m['similarity']:.4f}")
+        sim_str = f"{m['similarity']:.4f}" if m["similarity"] is not None else "n/a"
+        print(f"  row {m['row_number']}: similarity={sim_str} found_by={m['found_by']}")
         print(f"    department={m['department']!r} license_type={m['license_type']!r}")
         print(f"    operation_topic={m['operation_topic']!r}")
+        if m.get("llm_reasoning"):
+            print(f"    llm_reasoning={m['llm_reasoning']!r}")
+        if m.get("field_diffs"):
+            print(f"    field_diffs={m['field_diffs']}")
 
-    if matches and matches[0]["similarity"] > 0.9:
+    top_sim = matches[0]["similarity"] if matches and matches[0]["similarity"] is not None else None
+    if top_sim is not None and top_sim > 0.9:
         print("\n✅ PASS: top match has very high similarity, as expected for near-identical content")
     elif matches:
-        print(f"\n⚠️  Top match similarity only {matches[0]['similarity']:.4f} — expected >0.9 for near-identical content, investigate")
+        print(f"\n⚠️  Top match similarity={top_sim} (found_by={matches[0]['found_by']}) — expected a strong signal for near-identical content, investigate")
     else:
         print("\n❌ FAIL: no matches found at all — expected at least the near-identical row 181")
 

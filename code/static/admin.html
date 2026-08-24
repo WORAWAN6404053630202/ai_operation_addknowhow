@@ -280,16 +280,31 @@
     .candidate-matches { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; overflow: hidden; }
     .cm-title { padding: 10px 12px; background: var(--panel); font-size: 12px; font-weight: 700; color: var(--text); border-bottom: 1px solid var(--border); }
     .cm-empty { padding: 10px 12px; color: var(--muted); font-size: 12px; }
-    .cm-row { padding: 8px 12px; border-bottom: 1px solid var(--border); display: flex; gap: 10px; align-items: center; font-size: 12px; }
-    .cm-row:last-child { border-bottom: none; }
+    .cm-row-wrap:last-child .cm-row { border-bottom: none; }
+    .cm-row { padding: 8px 12px; border-bottom: 1px solid var(--border); display: flex; gap: 10px; align-items: center; font-size: 12px; cursor: pointer; }
+    .cm-row:hover { background: var(--panel); }
     .cm-score { font-weight: 700; min-width: 42px; }
     .cm-score.high { color: var(--red); }
     .cm-score.medium { color: var(--orange); }
     .cm-score.low { color: var(--muted); }
     .cm-info { color: var(--text); flex: 1; }
     .cm-info .cm-row-num { color: var(--accent); }
+    .cm-badges { display: flex; gap: 4px; flex-wrap: wrap; }
+    .cm-badge { background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); padding: 2px 7px; border-radius: 10px; font-size: 10px; white-space: nowrap; }
     .cm-use-btn { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); padding: 3px 10px; border-radius: 6px; cursor: pointer; font-size: 11px; white-space: nowrap; }
     .cm-use-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .cm-detail { display: none; padding: 0 12px 10px 12px; border-bottom: 1px solid var(--border); background: var(--bg); }
+    .cm-detail.open { display: block; }
+    .cm-llm-reasoning { font-size: 11.5px; color: var(--muted); padding: 8px 0 4px 0; }
+    .cm-diff-none { font-size: 11.5px; color: var(--muted); padding: 8px 0; }
+    .cm-diff-table { width: 100%; border-collapse: collapse; font-size: 11.5px; margin-top: 6px; }
+    .cm-diff-table th { text-align: left; color: var(--muted); font-weight: 600; padding: 4px 6px; border-bottom: 1px solid var(--border); }
+    .cm-diff-table td { padding: 4px 6px; border-bottom: 1px solid var(--border); vertical-align: top; }
+    .cm-diff-field { color: var(--muted); white-space: nowrap; }
+    .cm-diff-old { color: var(--red); }
+    .cm-diff-new { color: var(--green); }
+    .category-fit-banner { border: 1px solid var(--orange); border-radius: 8px; padding: 10px 12px; margin-bottom: 14px; font-size: 12px; color: var(--orange); }
+    .category-fit-banner .cf-reasoning { color: var(--muted); }
 
     /* ── Relevance check (in-scope-for-restaurant-business hint) ── */
     .relevance-check { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; padding: 10px 12px; font-size: 12px; display: flex; gap: 8px; align-items: baseline; }
@@ -838,33 +853,93 @@
     return edited;
   }
 
+  // found_by tags -> display label. embedding/identity_match/llm_scan are the
+  // 3 independent signals unioned server-side (see pdf_candidate_matching.py) —
+  // shown so the reviewer can see WHY a row was flagged, not just that it was.
+  const _FOUND_BY_LABELS = {
+    embedding: "ความหมายใกล้เคียง",
+    identity_match: "หน่วยงาน/ใบอนุญาตตรงกัน",
+    llm_scan: "AI อ่านแล้วน่าจะเรื่องเดียวกัน",
+  };
+
+  const _DIFF_FIELD_LABELS = {
+    registration_type: "ประเภทการจดทะเบียน",
+    terms_and_conditions: "เงื่อนไขและหลักเกณฑ์",
+    service_channel: "ช่องทางการให้บริการ",
+    operation_steps: "ขั้นตอนการดำเนินการ",
+    identification_documents: "เอกสารยืนยันตัวตน",
+    operation_duration: "ระยะเวลาการดำเนินการ",
+    fees: "ค่าธรรมเนียม",
+    legal_regulatory: "ข้อกำหนดทางกฎหมายและข้อบังคับ",
+  };
+
+  function fieldDiffTableHtml(diffs) {
+    if (!diffs || !diffs.length) {
+      return `<div class="cm-diff-none">ไม่พบความต่างในฟิลด์รายละเอียด (ขั้นตอน/ค่าธรรมเนียม/เอกสาร ฯลฯ) — น่าจะเป็นข้อมูลเดิมจริงๆ</div>`;
+    }
+    const rows = diffs.map(d => `
+      <tr>
+        <td class="cm-diff-field">${escHtml(_DIFF_FIELD_LABELS[d.field] || d.field)}</td>
+        <td class="cm-diff-old">${escHtml(d.old_value)}</td>
+        <td class="cm-diff-new">${escHtml(d.new_value)}</td>
+      </tr>`).join("");
+    return `
+      <table class="cm-diff-table">
+        <thead><tr><th>ฟิลด์</th><th>ของเดิม (แถวที่มีอยู่)</th><th>ของใหม่ (เอกสารนี้)</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
   function candidateMatchesHtml(item) {
     const matches = item.candidate_matches;
     // null = not computed for this item (e.g. saved before this feature shipped);
-    // [] = computed, genuinely nothing similar found — both worth telling the
-    // reviewer apart, so only skip the whole section for the null case.
+    // [] = computed, genuinely nothing found by any signal — both worth telling
+    // the reviewer apart, so only skip the whole section for the null case.
     if (matches === null || matches === undefined) return "";
 
     if (matches.length === 0) {
-      return `<div class="candidate-matches"><div class="cm-title">🔍 รายการที่อาจซ้ำ/เกี่ยวข้อง</div><div class="cm-empty">ไม่พบรายการที่คล้ายกันในชีท — น่าจะเป็นข้อมูลใหม่จริง</div></div>`;
+      return `<div class="candidate-matches"><div class="cm-title">🔍 รายการที่อาจซ้ำ/เกี่ยวข้อง</div><div class="cm-empty">ไม่พบรายการที่เกี่ยวข้องในชีท (เช็คแล้วทั้งความหมายใกล้เคียง, หน่วยงาน/ใบอนุญาตตรงกัน, และให้ AI อ่านเทียบทุกแถว) — น่าจะเป็นข้อมูลใหม่จริง</div></div>`;
     }
 
-    const rowsHtml = matches.map(m => {
-      const pct = Math.round(m.similarity * 100);
-      const tier = m.similarity >= 0.85 ? "high" : m.similarity >= 0.7 ? "medium" : "low";
+    const rowsHtml = matches.map((m, idx) => {
+      const hasSim = typeof m.similarity === "number";
+      const pct = hasSim ? Math.round(m.similarity * 100) : null;
+      const tier = hasSim ? (m.similarity >= 0.85 ? "high" : m.similarity >= 0.7 ? "medium" : "low") : "low";
       const parts = [m.department, m.license_type, m.operation_topic].filter(Boolean).map(escHtml).join(" — ");
+      const foundByBadges = (m.found_by || []).map(f => `<span class="cm-badge">${_FOUND_BY_LABELS[f] || f}</span>`).join("");
+      const detailId = `cm-detail-${idx}`;
       return `
-        <div class="cm-row">
-          <span class="cm-score ${tier}">${pct}%</span>
-          <span class="cm-info"><span class="cm-row-num">แถวที่ ${m.row_number}</span>${parts ? ": " + parts : ""}</span>
-          <button class="cm-use-btn" onclick="useAsOldRowRef(${m.row_number})">③ ใช้เป็นแถวเดิม</button>
+        <div class="cm-row-wrap">
+          <div class="cm-row" onclick="document.getElementById('${detailId}').classList.toggle('open')">
+            <span class="cm-score ${tier}">${hasSim ? pct + "%" : "—"}</span>
+            <span class="cm-info"><span class="cm-row-num">แถวที่ ${m.row_number}</span>${parts ? ": " + parts : ""}</span>
+            <span class="cm-badges">${foundByBadges}</span>
+            <button class="cm-use-btn" onclick="event.stopPropagation();useAsOldRowRef(${m.row_number})">③ ใช้เป็นแถวเดิม</button>
+          </div>
+          <div class="cm-detail" id="${detailId}">
+            ${m.llm_reasoning ? `<div class="cm-llm-reasoning">🤖 ${escHtml(m.llm_reasoning)}</div>` : ""}
+            ${fieldDiffTableHtml(m.field_diffs)}
+          </div>
         </div>`;
     }).join("");
 
     return `
       <div class="candidate-matches">
-        <div class="cm-title">🔍 รายการที่อาจซ้ำ/เกี่ยวข้อง (เทียบจากความคล้ายเนื้อหา — ไม่ใช่การตัดสินใจอัตโนมัติ)</div>
+        <div class="cm-title">🔍 รายการที่อาจซ้ำ/เกี่ยวข้อง (${matches.length} รายการ — คลิกแต่ละแถวเพื่อดูว่าต่างจากของเดิมตรงไหน — ไม่ใช่การตัดสินใจอัตโนมัติ)</div>
         ${rowsHtml}
+      </div>`;
+  }
+
+  function categoryFitHtml(item) {
+    const cf = item.category_fit_check;
+    if (!cf) return "";
+    if (cf.fits_known_category) return "";
+    // Only surface a banner for the "doesn't fit" case — a suggestion only,
+    // reviewer still has to click ④ themselves, this never auto-selects it.
+    return `
+      <div class="category-fit-banner">
+        ⚠️ อาจเป็นหมวดใหม่ที่ระบบยังไม่รู้จัก (พิจารณาปุ่ม "④ กฎหมายหมวดใหม่")
+        ${cf.reasoning ? `<br><span class="cf-reasoning">${escHtml(cf.reasoning)}</span>` : ""}
       </div>`;
   }
 
@@ -1011,7 +1086,7 @@
       <div style="flex:1;overflow-y:auto;padding:16px">
         ${relevanceCheckHtml(item)}
         ${contentShapeHtml(item)}
-        ${isKnowhow ? knowhowTopicsHtml(item) : candidateMatchesHtml(item)}
+        ${isKnowhow ? knowhowTopicsHtml(item) : categoryFitHtml(item) + candidateMatchesHtml(item)}
         ${item.pages.map((p, idx) => pageCard(p, idx)).join("")}
         ${!isKnowhow && item.review_status === "pending" ? fieldsEditorHtml(item) : ""}
         ${decisionHtml}

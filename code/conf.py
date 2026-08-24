@@ -46,6 +46,16 @@ OPENROUTER_SWITCH_MODEL = os.getenv("OPENROUTER_SWITCH_MODEL", "anthropic/claude
 # Separate fast model for topic_picker (non-critical, fail-fast friendly)
 OPENROUTER_MODEL_TOPIC_PICKER = os.getenv("OPENROUTER_MODEL_TOPIC_PICKER", OPENROUTER_SWITCH_MODEL)
 
+# PDF review queue (feature/pdf-ingestion): candidate-matching LLM batch-scan
+# (pdf_candidate_matching.py) + new_category fit check. Both are short JSON-only
+# classification calls run many times per upload (batched over every existing
+# Sheet row) — deliberately the cheapest usable OpenRouter model, not one of
+# the main chat models above. Picked 2026-08-24 from OpenRouter's live pricing
+# (qwen/qwen3.7-flash: $0.03/$0.13 per M tokens, supports response_format,
+# strong multilingual/Thai) — re-check pricing before assuming this is still
+# cheapest if revisiting later, OpenRouter's lineup changes often.
+OPENROUTER_MODEL_PDF_MATCHING = os.getenv("OPENROUTER_MODEL_PDF_MATCHING", "qwen/qwen3.7-flash")
+
 # FIX: wrap conversions in try/except so bad env vars give clear error instead of crashing silently
 def _safe_float(name: str, default: float) -> float:
     raw = os.getenv(name, str(default))
