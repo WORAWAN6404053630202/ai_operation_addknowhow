@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import re
+from typing import TypedDict
 
 from openai import OpenAI
 
@@ -127,3 +128,98 @@ def draft_fields_from_pages(pages_markdown: list[str]) -> dict[str, str]:
 
     logger.info(f"[pdf_field_drafting] Drafted {sum(1 for v in result.values() if v)} / {len(result)} fields")
     return result
+
+
+class LicenseTopicBounds(TypedDict):
+    department: str
+    license_type: str
+    start_page: int
+    end_page: int
+
+
+_TOPIC_SPLIT_PROMPT = """เอกสารต่อไปนี้ (มีทั้งหมด {num_pages} หน้า) ถูกจัดว่าเป็นเอกสารเกี่ยวกับใบอนุญาต/
+ขั้นตอนราชการ ซึ่งอาจพูดถึงใบอนุญาตหรือขั้นตอนมากกว่า 1 เรื่องปนกันอยู่ในไฟล์เดียวก็ได้ (เช่น เอกสารรวม
+ประกาศหลายฉบับ) หรืออาจไม่เกี่ยวกับใบอนุญาต/ขั้นตอนราชการเลยก็ได้
+
+หน้าที่ของคุณ: **ระบุว่าเอกสารนี้พูดถึงใบอนุญาต/ขั้นตอนราชการกี่เรื่อง แต่ละเรื่องอยู่หน้าไหนถึงหน้าไหน**
+(ไม่ต้องกรอกรายละเอียดฟิลด์ทั้งหมดตรงนี้ แค่ระบุหน่วยงาน+ประเภทใบอนุญาตคร่าวๆ พอให้แยกเรื่องออกจากกันได้)
+
+- ถ้าทั้งเอกสารพูดถึงเรื่องเดียวต่อเนื่องกัน ให้ตอบมาแค่ 1 รายการที่ครอบคลุมทุกหน้า
+- ถ้าเอกสารไม่เกี่ยวกับใบอนุญาต/ขั้นตอนราชการเลย ให้ตอบ list ว่างเปล่า [] ห้ามฝืนสร้างรายการที่ไม่มีจริง
+- แต่ละหน้าควรอยู่ในเรื่องใดเรื่องหนึ่งเท่านั้น ห้ามข้ามหน้าหรือซ้อนทับกันโดยไม่จำเป็น
+
+ตอบเป็น JSON array เท่านั้น ไม่ต้องมีข้อความอื่น:
+[
+  {{
+    "department": "หน่วยงานที่รับผิดชอบเรื่องนี้",
+    "license_type": "ประเภทใบอนุญาต/เรื่องนี้สั้นๆ",
+    "start_page": 1,
+    "end_page": 3
+  }}
+]
+
+=== เนื้อหาเอกสารทุกหน้า (มีเลขหน้ากำกับแต่ละส่วน) ===
+{combined_text}
+"""
+
+
+def identify_license_topics(pages_markdown: list[str]) -> list[LicenseTopicBounds]:
+    """Splits a structured_license-shaped PDF into 0..N distinct license/
+    procedure topics by page range, mirroring pdf_knowhow_drafting.py's
+    identify_knowhow_topics() — a single PDF is not guaranteed to be exactly
+    one license (could be several combined announcements, or none at all).
+    Each returned bound gets sliced and passed to draft_fields_from_pages()
+    independently by the caller (sqs_consumer.py), producing one fully-
+    independent ReviewItem per topic — reuses the existing single-topic
+    review/candidate-matching/decision UI unchanged rather than needing a
+    new nested per-topic decision flow.
+
+    Returns [] (never raises) on failure OR on a genuine "0 topics" verdict —
+    the caller must not assume [] always means an error; see sqs_consumer.py
+    for how a truly-empty result is distinguished (falls back to treating the
+    whole document as one topic only when this call raised/failed outright,
+    not when the LLM legitimately found nothing license-related)."""
+    numbered_pages = [f"[หน้า {i + 1}]\n{md}" for i, md in enumerate(pages_markdown)]
+    combined_text = "\n\n---\n\n".join(numbered_pages)
+
+    client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
+    resp = client.chat.completions.create(
+        model=conf.OPENROUTER_MODEL_PRACTICAL,
+        messages=[{
+            "role": "user",
+            "content": _TOPIC_SPLIT_PROMPT.format(num_pages=len(pages_markdown), combined_text=combined_text),
+        }],
+        max_tokens=1500,
+    )
+    raw = (resp.choices[0].message.content or "[]").strip()
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
+    parsed = json.loads(raw)
+
+    if not isinstance(parsed, list):
+        raise ValueError(f"identify_license_topics: LLM returned non-list JSON: {type(parsed)}")
+
+    num_pages = len(pages_markdown)
+    topics: list[LicenseTopicBounds] = []
+    for raw_topic in parsed:
+        try:
+            start_page = int(raw_topic["start_page"])
+            end_page = int(raw_topic["end_page"])
+        except (KeyError, TypeError, ValueError):
+            logger.warning(f"[pdf_field_drafting] Skipping license topic with invalid page bounds: {raw_topic!r}")
+            continue
+
+        start_page = max(1, start_page)
+        end_page = min(num_pages, end_page)
+        if start_page > end_page or start_page > num_pages or end_page < 1:
+            logger.warning(f"[pdf_field_drafting] Skipping license topic with out-of-range pages {raw_topic.get('start_page')}-{raw_topic.get('end_page')} (doc has {num_pages} pages)")
+            continue
+
+        topics.append({
+            "department": str(raw_topic.get("department", "")).strip(),
+            "license_type": str(raw_topic.get("license_type", "")).strip(),
+            "start_page": start_page,
+            "end_page": end_page,
+        })
+
+    logger.info(f"[pdf_field_drafting] Identified {len(topics)} license topic(s) across {num_pages} page(s)")
+    return topics

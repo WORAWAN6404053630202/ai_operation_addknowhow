@@ -219,6 +219,19 @@ class PdfReviewDecision(BaseModel):
     # never the raw LLM draft blindly — the whole point of the review step.
 
 
+def _page_range_str(item) -> str:
+    """Same "N-M" logic as sheet_write_back.py's _format_page_range — surfaced
+    in the queue list so a structured_license PDF that split into several
+    independent review items (see sqs_consumer.py, 2026-08-24) doesn't just
+    show N identical filenames with no way to tell them apart at a glance."""
+    page_nums = sorted(p.page_num for p in item.pages)
+    if not page_nums:
+        return ""
+    if page_nums[0] == page_nums[-1]:
+        return str(page_nums[0])
+    return f"{page_nums[0]}-{page_nums[-1]}"
+
+
 @router.get("/api/pdf-queue")
 async def pdf_queue_list():
     """Summary list for the left-hand panel — newest upload first."""
@@ -234,6 +247,9 @@ async def pdf_queue_list():
                 "review_status": i.review_status,
                 "decision_type": i.decision_type,
                 "page_count": len(i.pages),
+                "page_range": _page_range_str(i),
+                "department": (i.llm_drafted_fields or {}).get("หน่วยงาน", ""),
+                "license_type": (i.llm_drafted_fields or {}).get("ใบอนุญาต", ""),
                 "total_flag_count": i.total_flag_count,
                 "high_severity_flag_count": i.high_severity_flag_count,
                 "needs_review": i.needs_review,

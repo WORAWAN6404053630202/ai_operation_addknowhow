@@ -259,6 +259,8 @@
     .pq-item:hover { background: var(--panel-2); }
     .pq-item.active { background: var(--panel-2); border-left: 2px solid var(--accent); }
     .pq-filename { color: var(--text); font-size: 12px; margin-bottom: 4px; word-break: break-all; }
+    .pq-page-range { color: var(--muted); font-weight: 400; }
+    .pq-subtitle { color: var(--muted); font-size: 11px; margin-bottom: 6px; }
     .pq-meta { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 
     .status-pill { border-radius: 4px; padding: 1px 7px; font-size: 10px; font-weight: 700; border: 1px solid; }
@@ -733,9 +735,16 @@
       el.innerHTML = '<div style="padding:20px;color:var(--muted);text-align:center">ยังไม่มีไฟล์ในคิว</div>';
       return;
     }
-    el.innerHTML = allPdfQueueItems.map(i => `
+    // department/license_type/page_range let a structured_license PDF that
+    // split into several independent review items (sqs_consumer.py,
+    // 2026-08-24) be told apart at a glance instead of showing as N
+    // identical-looking "filename.pdf" rows.
+    el.innerHTML = allPdfQueueItems.map(i => {
+      const subParts = [i.department, i.license_type].filter(Boolean).join(" — ");
+      return `
       <div class="pq-item ${i.id === activePdfQueueItem ? 'active' : ''}" onclick="selectPdfQueueItem('${i.id}')">
-        <div class="pq-filename">${escHtml(i.filename)}</div>
+        <div class="pq-filename">${escHtml(i.filename)}${i.page_range ? ` <span class="pq-page-range">(หน้า ${escHtml(i.page_range)})</span>` : ""}</div>
+        ${subParts ? `<div class="pq-subtitle">${escHtml(subParts)}</div>` : ""}
         <div class="pq-meta">
           <span class="status-pill ${escHtml(i.review_status)}">${escHtml(i.review_status)}</span>
           ${flagCountPill(i.total_flag_count, i.high_severity_flag_count)}
@@ -743,7 +752,8 @@
           <span style="color:var(--muted);font-size:11px">${fmt(i.uploaded_at)}</span>
         </div>
       </div>
-    `).join("");
+    `;
+    }).join("");
   }
 
   async function selectPdfQueueItem(id) {
@@ -973,16 +983,26 @@
       </div>`;
   }
 
+  // source_type -> which of the 2 REAL know-how tabs this routes to (see
+  // knowhow_write_back.py's _TAB_BY_SOURCE_TYPE — must match exactly).
+  const _KNOWHOW_TAB_LABELS = {
+    book: 'Know How_ข้อมูลหนังสือ (เนื้อหาจากหนังสือ)',
+    document: 'Know how_ร้านอาหาร (เอกสาร/คู่มือทั่วไป)',
+  };
+
   function knowhowTopicsHtml(item) {
     const topics = item.knowhow_topics;
     if (!topics || !topics.length) return "";
+    const docTitle = topics[0].document_title || item.filename;
+    const tabLabel = _KNOWHOW_TAB_LABELS[topics[0].source_type] || _KNOWHOW_TAB_LABELS.document;
+
     const cards = topics.map((t, idx) => {
       const fullText = t.full_text || "";
       const isS3Pointer = fullText.startsWith("s3://");
       return `
         <div class="kt-card">
-          <div class="kt-card-title">${idx + 1}. ${escHtml(t.title)}</div>
-          <div class="kt-card-meta">หมวด: ${escHtml(t.category || "-")} · หน้า ${escHtml(t.page_range || "-")} · ${fullText.length.toLocaleString()} ตัวอักษร</div>
+          <div class="kt-card-title">${idx + 1}. ${escHtml(t.main_topic)} — ${escHtml(t.sub_topic)}</div>
+          <div class="kt-card-meta">${t.category ? `หมวด: ${escHtml(t.category)} · ` : ""}หน้า ${escHtml(t.page_range || "-")} · ${fullText.length.toLocaleString()} ตัวอักษร</div>
           <div class="kt-card-summary">${escHtml(t.summary)}</div>
           <details class="kt-fulltext-details">
             <summary>${isS3Pointer ? "เนื้อหายาวเกินไป จะเก็บที่ S3 แยก (ไม่แสดงตรงนี้)" : "ดูเนื้อหาเต็ม"}</summary>
@@ -993,7 +1013,7 @@
 
     return `
       <div class="knowhow-topics">
-        <div class="kt-title">📚 หัวข้อ Know-how ที่พบ (${topics.length} หัวข้อ — แต่ละหัวข้อจะเป็น 1 แถวใหม่ในแท็บ know_how)</div>
+        <div class="kt-title">📚 "${escHtml(docTitle)}" — ${topics.length} หัวข้อ (จะเขียนเข้าแท็บ ${escHtml(tabLabel)})</div>
         ${cards}
       </div>`;
   }
@@ -1045,7 +1065,7 @@
       decisionHtml = `
         <div class="decision-box">
           <div class="decision-title">การตัดสินใจ (Know-how)</div>
-          <div class="decision-subtitle">จะเขียนเข้าแท็บ know_how เป็น ${item.knowhow_topics.length} แถวใหม่ (แยกตามหัวข้อด้านบน) — เพิ่มเท่านั้น ไม่ลบ/ทับของเดิม</div>
+          <div class="decision-subtitle">จะเขียนเข้าแท็บ ${escHtml(_KNOWHOW_TAB_LABELS[item.knowhow_topics[0].source_type] || _KNOWHOW_TAB_LABELS.document)} เป็น ${item.knowhow_topics.length} แถวใหม่ (แยกตามหัวข้อด้านบน) — เพิ่มเท่านั้น ไม่ลบ/ทับของเดิม</div>
           <textarea class="decision-notes" id="decisionNotes" placeholder="หมายเหตุ (ถ้ามี)"></textarea>
           <div class="decision-actions">
             <button class="btn-approve" onclick="submitKnowhowDecision('${item.id}','approved')">✓ อนุมัติทั้งหมด</button>

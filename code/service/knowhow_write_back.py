@@ -1,17 +1,28 @@
 # code/service/knowhow_write_back.py
-"""Additive-only write-back for approved know-how topics (feature/pdf-ingestion)
-— the know-how counterpart to sheet_write_back.py, writing to a separate
-"know_how" tab (lighter schema: title/summary/full_text/category/source_file/
-page_range) instead of the main regulatory tab's fixed 13 fields.
+"""Additive-only write-back for approved know-how topics (feature/pdf-ingestion).
 
-Two-tier storage per topic, per the design agreed for this feature: `summary`
-is what a normal retrieval/search pass matches against (short, cheap to
-embed); `full_text` is what actually gets read at answer-generation time once
-a topic is selected, so nothing gets lost the way forcing long content into
-the structured Sheet's fields would. A Google Sheet cell has a hard 50,000-
-character limit — full_text that would exceed a safe margin under that
-(_FULL_TEXT_CELL_LIMIT) is uploaded to S3 instead, with the cell holding an
-`s3://bucket/key` pointer rather than truncated (i.e. silently lossy) text.
+REVISED 2026-08-24: originally wrote to a brand-new "know_how" tab invented
+for this feature (never actually used, deleted). The real Sheet already has 2
+established know-how tabs the bot's data_loader.py already reads from:
+  - "Know how_ร้านอาหาร" — general business/marketing know-how
+  - "Know How_ข้อมูลหนังสือ" — content sourced from actual published books
+Routes each topic to the right one via pdf_knowhow_drafting.py's source_type
+classification, and writes by matching each tab's REAL header text (both tabs
+share the same 6-column shape: เรื่อง/ชื่อหนังสือ, หัวข้อหลัก,
+หัวข้อการดำเนินการย่อย, ประเภท, แนวคำตอบ, อ้างอิง) rather than assuming a fixed
+column order — same defensive pattern sheet_write_back.py already uses for
+the regulatory Sheet, so a column getting reordered by hand doesn't silently
+write data into the wrong field.
+
+Two-tier storage per topic, per the design agreed for this feature: a new
+"สรุปสั้น" column (added idempotently to both tabs if missing) is what a
+retrieval/search pass matches against (short, cheap to embed); the existing
+"แนวคำตอบ" column keeps its original meaning (full answer content, unchanged
+for the 764 pre-existing rows) and is what actually gets read at answer-
+generation time. A Google Sheet cell has a hard 50,000-character limit —
+full_text that would exceed a safe margin under that (_FULL_TEXT_CELL_LIMIT)
+is uploaded to S3 instead, with the cell holding an `s3://bucket/key` pointer
+rather than truncated (i.e. silently lossy) text.
 
 Additive-only, same as sheet_write_back.py: appends new rows only, never
 edits/deletes existing ones."""
@@ -24,6 +35,7 @@ import boto3
 import gspread
 
 import conf
+from service.sheet_write_back import _RESEARCH_REFERENCE_HEADER_VARIANTS, _clean_header, _parse_sheet_url
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -32,9 +44,23 @@ logger = get_logger(__name__)
 # for the odd extra character from encoding/formatting quirks.
 _FULL_TEXT_CELL_LIMIT = 40_000
 _KNOWHOW_FULLTEXT_S3_PREFIX = "restbiz/knowhow_fulltext/"
-_KNOWHOW_TAB_TITLE = "know_how"
 
-_KNOWHOW_HEADERS = ["title", "summary", "full_text", "category", "source_file", "page_range"]
+_TAB_BOOK = "Know How_ข้อมูลหนังสือ"
+_TAB_GENERAL = "Know how_ร้านอาหาร"
+_TAB_BY_SOURCE_TYPE = {"book": _TAB_BOOK, "document": _TAB_GENERAL}
+
+_SUMMARY_HEADER = "สรุปสั้น"
+
+# Real tabs use เรื่อง (general) or ชื่อหนังสือ (book) for the same document-
+# level column — both map to the same logical field here.
+_HEADER_VARIANTS = {
+    "document_title": ["เรื่อง", "ชื่อหนังสือ"],
+    "main_topic": ["หัวข้อหลัก"],
+    "sub_topic": ["หัวข้อการดำเนินการย่อย"],
+    "category": ["ประเภท"],
+    "full_text": ["แนวคำตอบ"],
+    "summary": [_SUMMARY_HEADER],
+}
 
 
 def _get_spreadsheet():
@@ -48,33 +74,31 @@ def _get_spreadsheet():
         cred_path = str(Path(conf.BASE_DIR) / cred_path)
 
     client = gspread.service_account(filename=cred_path)
-    # Same spreadsheet FILE as the regulatory data (just a different tab within
-    # it) — reuses the one gspread sharing/auth setup already granted for this
-    # feature rather than needing a second spreadsheet shared separately.
-    from service.sheet_write_back import _parse_sheet_url
-
+    # Same spreadsheet FILE as the regulatory data (both real know-how tabs
+    # live here too) — reuses the one gspread sharing/auth setup already
+    # granted for this feature rather than needing a second spreadsheet
+    # shared separately.
     spreadsheet_id, _gid = _parse_sheet_url(conf.SHEET_URL_REGULATORY)
     return client.open_by_key(spreadsheet_id)
 
 
-def ensure_knowhow_tab_exists() -> gspread.Worksheet:
-    """Idempotent — creates the know_how tab with headers if it doesn't exist
-    yet, otherwise just returns the existing one untouched. Safe to call every
-    time (e.g. at the start of append_knowhow_topics) rather than requiring a
-    separate manual setup step someone could forget."""
-    spreadsheet = _get_spreadsheet()
-    try:
-        worksheet = spreadsheet.worksheet(_KNOWHOW_TAB_TITLE)
-        logger.info(f"[KnowhowWriteBack] Using existing '{_KNOWHOW_TAB_TITLE}' tab")
-        return worksheet
-    except gspread.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(title=_KNOWHOW_TAB_TITLE, rows=1000, cols=len(_KNOWHOW_HEADERS))
-        worksheet.append_row(_KNOWHOW_HEADERS, value_input_option="RAW")
-        logger.info(f"[KnowhowWriteBack] Created new '{_KNOWHOW_TAB_TITLE}' tab with headers")
-        return worksheet
+def _ensure_summary_column(worksheet: gspread.Worksheet) -> None:
+    """Idempotent — the 2 real know-how tabs predate this feature and don't
+    have a short-summary column; adds one (appended as the last column, never
+    inserted in the middle, so nothing already reading these tabs by position
+    gets silently shifted) if it isn't already there."""
+    header_row = worksheet.row_values(1)
+    cleaned = [_clean_header(h) for h in header_row]
+    if _SUMMARY_HEADER in cleaned:
+        return
+    next_col = len(header_row) + 1
+    if next_col > worksheet.col_count:
+        worksheet.add_cols(next_col - worksheet.col_count)
+    worksheet.update_cell(1, next_col, _SUMMARY_HEADER)
+    logger.info(f"[KnowhowWriteBack] Added {_SUMMARY_HEADER!r} column to {worksheet.title!r} at column {next_col}")
 
 
-def _store_full_text(full_text: str, source_file: str, topic_title: str) -> str:
+def _store_full_text(full_text: str, source_file: str, label: str) -> str:
     """Returns either the full_text itself (fits in a cell) or an s3://
     pointer (doesn't fit) — never truncates."""
     if len(full_text) <= _FULL_TEXT_CELL_LIMIT:
@@ -84,41 +108,73 @@ def _store_full_text(full_text: str, source_file: str, topic_title: str) -> str:
         # No bucket configured to overflow into — truncating would silently
         # lose content, so fail loudly instead of guessing.
         raise RuntimeError(
-            f"full_text for {topic_title!r} is {len(full_text)} chars (limit {_FULL_TEXT_CELL_LIMIT}) "
+            f"full_text for {label!r} is {len(full_text)} chars (limit {_FULL_TEXT_CELL_LIMIT}) "
             "but PDF_INGESTION_S3_BUCKET is unset — cannot store the overflow."
         )
 
     s3 = boto3.client("s3", region_name=conf.AWS_REGION or None)
-    safe_title = "".join(c if c.isalnum() or c in "-_" else "_" for c in topic_title)[:60]
-    key = f"{_KNOWHOW_FULLTEXT_S3_PREFIX}{source_file}/{safe_title}.txt"
+    safe_label = "".join(c if c.isalnum() or c in "-_" else "_" for c in label)[:60]
+    key = f"{_KNOWHOW_FULLTEXT_S3_PREFIX}{source_file}/{safe_label}.txt"
     s3.put_object(Bucket=conf.PDF_INGESTION_S3_BUCKET, Key=key, Body=full_text.encode("utf-8"), ContentType="text/plain; charset=utf-8")
     pointer = f"s3://{conf.PDF_INGESTION_S3_BUCKET}/{key}"
-    logger.info(f"[KnowhowWriteBack] {topic_title!r}: full_text {len(full_text)} chars exceeds cell limit, stored at {pointer}")
+    logger.info(f"[KnowhowWriteBack] {label!r}: full_text {len(full_text)} chars exceeds cell limit, stored at {pointer}")
     return pointer
 
 
+def _build_row(header_row: list[str], values: dict[str, str], reference_text: str) -> list[str]:
+    """Matches by REAL header text (like sheet_write_back.py's
+    _resolve_value_for_header), not fixed column position — a column that
+    exists in the tab but isn't one we write (or vice versa) just comes out
+    blank instead of misaligning every other column."""
+    row = []
+    for raw_header in header_row:
+        cleaned = _clean_header(raw_header)
+        if cleaned in _RESEARCH_REFERENCE_HEADER_VARIANTS:
+            row.append(reference_text)
+            continue
+        matched_key = next((key for key, variants in _HEADER_VARIANTS.items() if cleaned in variants), None)
+        row.append(values.get(matched_key, "") if matched_key else "")
+    return row
+
+
 def append_knowhow_topics(topics: list[dict], source_file: str) -> dict:
-    """Each topic dict needs: title, summary, full_text, category, page_range
-    (page_range as a display string like "3-5"). Appends ONE row per topic —
-    a single reviewed PDF can produce several know-how rows, unlike the
-    regulatory path's one-PDF-one-row model."""
+    """Each topic dict needs: document_title, source_type ("book"|"document"),
+    main_topic, sub_topic, summary, full_text, category, page_range (display
+    string like "3-5"). Appends ONE row per topic, routed to whichever of the
+    2 real know-how tabs source_type points at — a single reviewed PDF can
+    produce several rows across either or both tabs, unlike the regulatory
+    path's one-PDF-one-row model."""
     if not topics:
         raise ValueError("append_knowhow_topics called with an empty topic list — caller bug")
 
-    worksheet = ensure_knowhow_tab_exists()
-    rows_appended = 0
-    for topic in topics:
-        stored_full_text = _store_full_text(topic["full_text"], source_file, topic["title"])
-        row = [
-            topic["title"],
-            topic["summary"],
-            stored_full_text,
-            topic.get("category", ""),
-            source_file,
-            topic.get("page_range", ""),
-        ]
-        worksheet.append_row(row, value_input_option="USER_ENTERED")
-        rows_appended += 1
-        logger.info(f"[KnowhowWriteBack] Appended row for topic {topic['title']!r} from {source_file}")
+    spreadsheet = _get_spreadsheet()
+    worksheets_cache: dict[str, gspread.Worksheet] = {}
+    rows_by_tab: dict[str, int] = {}
 
-    return {"rows_appended": rows_appended}
+    for topic in topics:
+        tab_name = _TAB_BY_SOURCE_TYPE.get(topic.get("source_type"), _TAB_GENERAL)
+        if tab_name not in worksheets_cache:
+            worksheet = spreadsheet.worksheet(tab_name)
+            _ensure_summary_column(worksheet)
+            worksheets_cache[tab_name] = worksheet
+        worksheet = worksheets_cache[tab_name]
+
+        label = topic.get("sub_topic") or topic.get("main_topic") or "topic"
+        stored_full_text = _store_full_text(topic["full_text"], source_file, label)
+        page_range = topic.get("page_range", "")
+        reference_text = f"{source_file} (หน้า {page_range})" if page_range else source_file
+
+        row_values = {
+            "document_title": topic.get("document_title", ""),
+            "main_topic": topic.get("main_topic", ""),
+            "sub_topic": topic.get("sub_topic", ""),
+            "category": topic.get("category", ""),
+            "full_text": stored_full_text,
+            "summary": topic.get("summary", ""),
+        }
+        row = _build_row(worksheet.row_values(1), row_values, reference_text)
+        worksheet.append_row(row, value_input_option="USER_ENTERED")
+        rows_by_tab[tab_name] = rows_by_tab.get(tab_name, 0) + 1
+        logger.info(f"[KnowhowWriteBack] Appended row for {label!r} from {source_file} to tab {tab_name!r}")
+
+    return {"rows_appended": sum(rows_by_tab.values()), "rows_by_tab": rows_by_tab}

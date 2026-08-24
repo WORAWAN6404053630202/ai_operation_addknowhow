@@ -32,7 +32,7 @@ from model.pdf_review_queue_manager import PdfReviewQueueManager
 from service.pdf_candidate_matching import check_category_fit, find_candidate_matches
 from service.pdf_content_shape import classify_content_shape
 from service.pdf_extraction_validation import validate_extraction
-from service.pdf_field_drafting import draft_fields_from_pages
+from service.pdf_field_drafting import draft_fields_from_pages, identify_license_topics
 from service.pdf_knowhow_drafting import identify_knowhow_topics
 from service.pdf_large_extraction import extract_full_document
 from service.pdf_relevance_check import check_relevance
@@ -55,14 +55,24 @@ def _assert_dev_environment() -> None:
 
 def _build_and_save_review_item(
     filename: str, s3_raw_pdf_path: str, raw_pages: list[dict], use_llm_comparison: bool = False
-) -> ReviewItem:
+) -> list[ReviewItem]:
     """Shared tail end of the pipeline (validate → draft fields → relevance
     check → candidate matching → save) — identical regardless of whether
     raw_pages came from Lambda's normal-size path or
     pdf_large_extraction.extract_full_document()'s oversized-document path.
     Keeping this as one function is what makes the handoff path "free" from
     downstream code's perspective: nothing past this point needs to know or
-    care which extractor produced the pages."""
+    care which extractor produced the pages.
+
+    Returns a LIST of ReviewItems, not one — a single PDF is not guaranteed
+    to be exactly one regulatory topic (REVISED 2026-08-24: could be several
+    combined announcements, or none at all). For structured_license content,
+    identify_license_topics() splits the document into 0..N independent
+    topics first, and each becomes its own fully-independent ReviewItem
+    (own candidate-matching, own decision) — deliberately NOT a single item
+    with nested per-topic decisions, so the existing single-topic review UI/
+    decision endpoint needs zero changes. know_how content is unaffected by
+    this split — it keeps its own bundled-topics-in-one-item model."""
     pages: list[PageExtractionRecord] = []
     for p in raw_pages:
         flags = validate_extraction(
@@ -115,7 +125,10 @@ def _build_and_save_review_item(
             topic_bounds = identify_knowhow_topics(page_markdowns)
             item.knowhow_topics = [
                 {
-                    "title": t["title"],
+                    "document_title": t["document_title"],
+                    "source_type": t["source_type"],
+                    "main_topic": t["main_topic"],
+                    "sub_topic": t["sub_topic"],
                     "summary": t["summary"],
                     "category": t["category"],
                     "page_range": f"{t['start_page']}-{t['end_page']}" if t["start_page"] != t["end_page"] else str(t["start_page"]),
@@ -126,24 +139,68 @@ def _build_and_save_review_item(
             logger.info(f"[SQSConsumer] {filename}: know-how path, {len(item.knowhow_topics)} topic(s) identified")
         except Exception as e:
             logger.error(f"[SQSConsumer] Know-how topic-splitting failed for {filename}, item saved with no topics for manual handling: {e}")
-    else:
-        llm_drafted_fields = draft_fields_from_pages(page_markdowns)
-        item.llm_drafted_fields = llm_drafted_fields
+
+        _queue_manager.save(item)
+        logger.info(f"[SQSConsumer] Saved review item {item.id} for {filename} ({len(pages)} pages, shape=know_how)")
+        return [item]
+
+    # structured_license: split into 0..N independent regulatory topics first —
+    # each becomes its own fully-independent ReviewItem below.
+    try:
+        topic_bounds = identify_license_topics(page_markdowns)
+    except Exception as e:
+        logger.error(
+            f"[SQSConsumer] License topic-splitting failed for {filename}, falling back to treating "
+            f"the whole document as one topic (old single-topic behavior): {e}"
+        )
+        topic_bounds = [{"department": "", "license_type": "", "start_page": 1, "end_page": len(pages)}]
+
+    if not topic_bounds:
+        # Genuinely 0 license topics found (not a failure) — save the whole-
+        # document item anyway with no drafted fields, so it's still visible
+        # in the queue for a human to look at/reject rather than vanishing
+        # silently. Distinguishing this from the exception fallback above
+        # matters: an LLM failure must not look identical to "confirmed
+        # nothing here".
+        logger.info(f"[SQSConsumer] {filename}: no license topics identified — saving unlabeled item for manual review")
+        _queue_manager.save(item)
+        logger.info(f"[SQSConsumer] Saved review item {item.id} for {filename} ({len(pages)} pages, shape=structured_license, 0 topics)")
+        return [item]
+
+    items: list[ReviewItem] = []
+    for topic in topic_bounds:
+        topic_pages = [p for p in pages if topic["start_page"] <= p.page_num <= topic["end_page"]]
+        topic_markdowns = [p.typhoon_markdown for p in topic_pages]
+
+        topic_item = ReviewItem(
+            filename=filename,
+            s3_raw_pdf_path=s3_raw_pdf_path,
+            extraction_completed_at=time.time(),
+            pages=topic_pages,
+            relevance_check=item.relevance_check,
+            content_shape=item.content_shape,
+        )
+        topic_item.llm_drafted_fields = draft_fields_from_pages(topic_markdowns)
         try:
-            item.candidate_matches = find_candidate_matches(item)
+            topic_item.candidate_matches = find_candidate_matches(topic_item)
         except Exception as e:
-            logger.error(f"[SQSConsumer] Candidate matching failed for {filename}, continuing without it: {e}")
+            logger.error(f"[SQSConsumer] Candidate matching failed for {filename} (pages {topic['start_page']}-{topic['end_page']}), continuing without it: {e}")
         try:
-            item.category_fit_check = check_category_fit(item)
+            topic_item.category_fit_check = check_category_fit(topic_item)
         except Exception as e:
-            logger.error(f"[SQSConsumer] Category-fit check failed for {filename}, continuing without it: {e}")
+            logger.error(f"[SQSConsumer] Category-fit check failed for {filename} (pages {topic['start_page']}-{topic['end_page']}), continuing without it: {e}")
 
-    _queue_manager.save(item)
-    logger.info(f"[SQSConsumer] Saved review item {item.id} for {filename} ({len(pages)} pages, shape={shape_check['shape']})")
-    return item
+        _queue_manager.save(topic_item)
+        logger.info(
+            f"[SQSConsumer] Saved review item {topic_item.id} for {filename} "
+            f"(pages {topic['start_page']}-{topic['end_page']}, dept={topic['department']!r}, license_type={topic['license_type']!r})"
+        )
+        items.append(topic_item)
+
+    return items
 
 
-def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = False) -> ReviewItem:
+def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = False) -> list[ReviewItem]:
     """Downloads one Lambda-produced S3 object and routes it to the right
     handling, based on what Lambda actually did with this document (see
     lambda/pdf_extraction/handler.py's MAX_PAGES_FOR_LAMBDA branch):
@@ -200,13 +257,13 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
         )
         _queue_manager.save(item)
         logger.info(f"[SQSConsumer] Saved skip-marker review item {item.id} for {filename}")
-        return item
+        return [item]
 
     raw_pages = data["pages"]
     return _build_and_save_review_item(filename, s3_raw_pdf_path, raw_pages, use_llm_comparison)
 
 
-def process_sqs_message(message_body: str) -> Optional[ReviewItem]:
+def process_sqs_message(message_body: str) -> Optional[list[ReviewItem]]:
     """Parses one SQS message body (the raw S3 event notification JSON S3
     sends directly to SQS — same Records[].s3.bucket/object shape as the
     Lambda trigger event) and processes it. Returns None if the message

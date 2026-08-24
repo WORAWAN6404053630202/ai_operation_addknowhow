@@ -37,15 +37,17 @@ def main() -> None:
     parser.add_argument("--llm-comparison", action="store_true", help="Also run the LLM full-content comparison check")
     args = parser.parse_args()
 
-    item = process_extraction_result(args.bucket, args.key, use_llm_comparison=args.llm_comparison)
+    items = process_extraction_result(args.bucket, args.key, use_llm_comparison=args.llm_comparison)
 
-    print(f"\n✅ Review item created: {item.id}")
-    print(f"   filename: {item.filename}")
-    print(f"   pages: {len(item.pages)}")
-    print(f"   total flags: {item.total_flag_count} ({item.high_severity_flag_count} high severity)")
-    print(f"   needs_review: {item.needs_review}")
-    print(f"   drafted fields: {sum(1 for v in (item.llm_drafted_fields or {}).values() if v)} / {len(item.llm_drafted_fields or {})} populated")
-    print("\n   Check it in the admin panel: /admin/ → PDF Review Queue")
+    print(f"\n✅ {len(items)} review item(s) created (a PDF can now split into several — see sqs_consumer.py)")
+    for item in items:
+        print(f"\n   --- {item.id} ---")
+        print(f"   filename: {item.filename}")
+        print(f"   pages: {len(item.pages)}")
+        print(f"   total flags: {item.total_flag_count} ({item.high_severity_flag_count} high severity)")
+        print(f"   needs_review: {item.needs_review}")
+        print(f"   drafted fields: {sum(1 for v in (item.llm_drafted_fields or {}).values() if v)} / {len(item.llm_drafted_fields or {})} populated")
+    print("\n   Check them in the admin panel: /admin/ → PDF Review Queue")
 
 
 if __name__ == "__main__":
