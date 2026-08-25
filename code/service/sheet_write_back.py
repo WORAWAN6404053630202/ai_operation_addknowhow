@@ -51,6 +51,15 @@ def _clean_header(name: str) -> str:
 _SOURCE_REVIEW_ID_HEADER = "source_review_id"
 _SUPERSEDED_NOTE_HEADER = "superseded_note"
 
+# Google Sheets' actual hard limit — live-tested 2026-08-25: an oversized
+# single field (not full_text, which already has S3-overflow protection in
+# knowhow_write_back.py) raised a raw gspread APIError that propagated all
+# the way to the reviewer as a cryptic "[400] Your input contains more than
+# the maximum..." with no indication of WHICH field or how to fix it. The
+# write failed atomically (no half-written row), so this was never silent
+# data corruption — but it WAS a dead-end the reviewer had no path out of.
+_SHEET_CELL_CHAR_LIMIT = 50_000
+
 
 def _parse_sheet_url(sheet_url: str) -> tuple[str, str]:
     """Returns (spreadsheet_id, gid) — same parsing logic as
@@ -163,6 +172,18 @@ def append_review_item_to_sheet(item: ReviewItem) -> dict:
 
     matched_count = sum(1 for v in new_row if v)
     logger.info(f"[SheetWriteBack] Matched {matched_count}/{len(header_row)} Sheet columns to drafted fields for item {item.id}")
+
+    oversized = [
+        (_clean_header(raw_col_name), len(value))
+        for raw_col_name, value in zip(header_row, new_row)
+        if isinstance(value, str) and len(value) > _SHEET_CELL_CHAR_LIMIT
+    ]
+    if oversized:
+        details = ", ".join(f"{name!r} ({length:,} ตัวอักษร)" for name, length in oversized)
+        raise ValueError(
+            f"ฟิลด์ยาวเกินขีดจำกัดของ Google Sheets ({_SHEET_CELL_CHAR_LIMIT:,} ตัวอักษรต่อช่อง): {details} — "
+            f"กรุณาแก้ไขฟิลด์นี้ให้สั้นลงก่อนอนุมัติอีกครั้ง (item {item.id})"
+        )
 
     worksheet.append_row(new_row, value_input_option="USER_ENTERED")
     new_row_number = len(worksheet.get_all_values())  # append_row doesn't return the row number itself

@@ -174,6 +174,16 @@ def append_knowhow_topics(topics: list[dict], source_file: str) -> dict:
             "summary": topic.get("summary", ""),
         }
         row = _build_row(worksheet.row_values(1), row_values, reference_text)
+        # stored_full_text is already S3-overflowed below the Sheets limit
+        # by _store_full_text above — this guards the OTHER fields
+        # (document_title/main_topic/sub_topic/category/summary), which are
+        # short by prompt design but not literally length-capped anywhere.
+        oversized = [(i, len(v)) for i, v in enumerate(row) if isinstance(v, str) and len(v) > _FULL_TEXT_CELL_LIMIT]
+        if oversized:
+            raise ValueError(
+                f"know-how field(s) too long for a Sheet cell (>{_FULL_TEXT_CELL_LIMIT:,} chars): "
+                f"column index(es) {[i for i, _ in oversized]} — topic {label!r} from {source_file!r}"
+            )
         worksheet.append_row(row, value_input_option="USER_ENTERED")
         rows_by_tab[tab_name] = rows_by_tab.get(tab_name, 0) + 1
         logger.info(f"[KnowhowWriteBack] Appended row for {label!r} from {source_file} to tab {tab_name!r}")
