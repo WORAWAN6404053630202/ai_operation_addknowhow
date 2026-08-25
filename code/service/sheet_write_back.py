@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 import gspread
@@ -28,7 +29,8 @@ import conf
 from model.pdf_review_item import ReviewItem
 from service.pdf_field_drafting import DRAFTABLE_FIELDS
 from utils.logger import get_logger
-from utils.page_ranges import format_page_ranges
+from utils.page_ranges import format_page_ranges, fuzzy_ratio
+from utils.sheet_safety import neutralize_formula
 
 logger = get_logger(__name__)
 
@@ -157,7 +159,7 @@ def append_review_item_to_sheet(item: ReviewItem) -> dict:
         if _clean_header(raw_col_name) == _SOURCE_REVIEW_ID_HEADER:
             new_row.append(item.id)
         else:
-            new_row.append(_resolve_value_for_header(raw_col_name, fields, item))
+            new_row.append(neutralize_formula(_resolve_value_for_header(raw_col_name, fields, item)))
 
     matched_count = sum(1 for v in new_row if v)
     logger.info(f"[SheetWriteBack] Matched {matched_count}/{len(header_row)} Sheet columns to drafted fields for item {item.id}")
@@ -169,17 +171,30 @@ def append_review_item_to_sheet(item: ReviewItem) -> dict:
         f"({item.filename}, decision_type={item.decision_type})"
     )
 
+    old_row_ref_warning = None
     if item.decision_type == "update" and item.old_row_ref:
-        _note_superseded_row(worksheet, header_row, item)
+        old_row_ref_warning = _note_superseded_row(worksheet, header_row, item)
 
-    return {"row_appended": True, "row_number": new_row_number}
+    result = {"row_appended": True, "row_number": new_row_number}
+    if old_row_ref_warning:
+        result["old_row_ref_warning"] = old_row_ref_warning
+    return result
 
 
-def _note_superseded_row(worksheet, header_row: list[str], item: ReviewItem) -> None:
+def _note_superseded_row(worksheet, header_row: list[str], item: ReviewItem) -> Optional[str]:
     """Best-effort: writes a note on the OLD row pointing at the new one, if the
     Sheet has a dedicated column for it. Never deletes/overwrites the old row's
     actual content — and never raises, since a missing note column shouldn't
-    fail the whole approval (the new row is already safely written by this point)."""
+    fail the whole approval (the new row is already safely written by this point).
+
+    Returns a warning string (never blocks the write — the reviewer typed this
+    row number deliberately and might know something the system doesn't) when
+    old_row_ref's own department+license_type don't relate at all to the new
+    item's — live-testing found this catches a real risk with zero protection
+    before: a typo'd/misremembered row number silently mislabels a completely
+    unrelated real Sheet row as "superseded" with no error or signal anywhere,
+    since update_cell() only fails on an out-of-range row number, not a
+    valid-but-wrong one."""
     cleaned_headers = [_clean_header(h) for h in header_row]
     if _SUPERSEDED_NOTE_HEADER not in cleaned_headers:
         logger.warning(
@@ -187,7 +202,7 @@ def _note_superseded_row(worksheet, header_row: list[str], item: ReviewItem) -> 
             f"skipping old-row note for review item {item.id}. Add that column manually "
             f"if you want this automated; old row ref was: {item.old_row_ref!r}"
         )
-        return
+        return None
     try:
         old_row_number = int(item.old_row_ref)
     except (TypeError, ValueError):
@@ -195,12 +210,36 @@ def _note_superseded_row(worksheet, header_row: list[str], item: ReviewItem) -> 
             f"[SheetWriteBack] old_row_ref={item.old_row_ref!r} is not a row number — "
             f"skipping old-row note for review item {item.id}"
         )
-        return
+        return None
+
+    warning = None
+    try:
+        old_row_values = worksheet.row_values(old_row_number)
+        col_index_map = {_clean_header(h): idx for idx, h in enumerate(header_row)}
+        for key in ("department", "license_type"):
+            for variant in DRAFTABLE_FIELDS[key]:
+                if variant in col_index_map:
+                    idx = col_index_map[variant]
+                    old_val = old_row_values[idx] if idx < len(old_row_values) else ""
+                    new_val = (item.llm_drafted_fields or {}).get(DRAFTABLE_FIELDS[key][0], "")
+                    if old_val and new_val and fuzzy_ratio(old_val, new_val) < 0.5:
+                        warning = (
+                            f"เลขแถวเดิม ({old_row_number}) ดูเหมือนจะเป็นคนละเรื่องกับเอกสารใหม่ — "
+                            f"แถวเดิม {key}={old_val!r} แต่เอกสารใหม่ {key}={new_val!r} กรุณาตรวจสอบว่าใส่เลขแถวถูกต้อง"
+                        )
+                        break
+            if warning:
+                break
+    except Exception as e:
+        logger.warning(f"[SheetWriteBack] Could not check old_row_ref={old_row_number} relatedness for item {item.id}: {e}")
 
     col_index = cleaned_headers.index(_SUPERSEDED_NOTE_HEADER) + 1  # gspread columns are 1-indexed
     note = f"มีข้อมูลใหม่มาแทนที่ — ดูแถวใหม่ (source_review_id={item.id})"
     try:
         worksheet.update_cell(old_row_number, col_index, note)
         logger.info(f"[SheetWriteBack] Noted row {old_row_number} as superseded by review item {item.id}")
+        if warning:
+            logger.warning(f"[SheetWriteBack] {warning}")
     except Exception as e:
         logger.error(f"[SheetWriteBack] Failed to write superseded-note on row {old_row_number}: {e}")
+    return warning

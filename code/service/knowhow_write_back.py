@@ -37,6 +37,7 @@ import gspread
 import conf
 from service.sheet_write_back import _RESEARCH_REFERENCE_HEADER_VARIANTS, _clean_header, _parse_sheet_url
 from utils.logger import get_logger
+from utils.sheet_safety import neutralize_formula
 
 logger = get_logger(__name__)
 
@@ -130,10 +131,10 @@ def _build_row(header_row: list[str], values: dict[str, str], reference_text: st
     for raw_header in header_row:
         cleaned = _clean_header(raw_header)
         if cleaned in _RESEARCH_REFERENCE_HEADER_VARIANTS:
-            row.append(reference_text)
+            row.append(neutralize_formula(reference_text))
             continue
         matched_key = next((key for key, variants in _HEADER_VARIANTS.items() if cleaned in variants), None)
-        row.append(values.get(matched_key, "") if matched_key else "")
+        row.append(neutralize_formula(values.get(matched_key, "")) if matched_key else "")
     return row
 
 

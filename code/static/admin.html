@@ -1155,6 +1155,15 @@
       alert("เกิดข้อผิดพลาด: " + (err.error || r.status));
       return;
     }
+    // old_row_ref_warning (2026-08-25): the write still succeeds even when
+    // the old row doesn't relate to the new content at all (a typo'd row
+    // number is otherwise silent — see sheet_write_back.py) — surfaced here
+    // so the reviewer notices immediately instead of it staying buried in
+    // server logs only they'd never look at.
+    const resBody = await r.json().catch(() => ({}));
+    if (resBody.sheet_result && resBody.sheet_result.old_row_ref_warning) {
+      alert("⚠️ คำเตือน: " + resBody.sheet_result.old_row_ref_warning);
+    }
     await loadPdfQueue();
     selectPdfQueueItem(itemId);
   }
