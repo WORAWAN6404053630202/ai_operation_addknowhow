@@ -56,6 +56,20 @@ OPENROUTER_MODEL_TOPIC_PICKER = os.getenv("OPENROUTER_MODEL_TOPIC_PICKER", OPENR
 # cheapest if revisiting later, OpenRouter's lineup changes often.
 OPENROUTER_MODEL_PDF_MATCHING = os.getenv("OPENROUTER_MODEL_PDF_MATCHING", "qwen/qwen3.7-flash")
 
+# PDF review queue: classification/boundary-finding tasks (content-shape
+# routing, license/know-how topic-splitting) — added 2026-08-25 after
+# realizing these 3 functions had been silently reusing
+# OPENROUTER_MODEL_PRACTICAL (the main chat persona's model, claude-sonnet-
+# 4-5) purely because that constant already existed, not from any deliberate
+# quality decision for THIS task. These are read-and-classify/find-
+# boundaries tasks, the same nature of work OPENROUTER_MODEL_PDF_MATCHING
+# above already handles well on a cheap model — NOT used for
+# draft_fields_from_pages, which writes the actual regulatory content
+# (fees/steps/legal requirements) real users rely on and deliberately stays
+# on a stronger model until quality is separately verified for that
+# specifically higher-stakes task.
+OPENROUTER_MODEL_PDF_CLASSIFICATION = os.getenv("OPENROUTER_MODEL_PDF_CLASSIFICATION", "qwen/qwen3.7-flash")
+
 # FIX: wrap conversions in try/except so bad env vars give clear error instead of crashing silently
 def _safe_float(name: str, default: float) -> float:
     raw = os.getenv(name, str(default))

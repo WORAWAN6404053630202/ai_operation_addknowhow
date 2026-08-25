@@ -115,13 +115,19 @@ def identify_knowhow_topics(pages_markdown: list[str]) -> list[KnowhowTopicBound
     try:
         client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
         resp = client.chat.completions.create(
-            model=conf.OPENROUTER_MODEL_PRACTICAL,
+            model=conf.OPENROUTER_MODEL_PDF_CLASSIFICATION,
             messages=[{
                 "role": "user",
                 "content": _PROMPT_TEMPLATE.format(num_pages=len(pages_markdown), combined_text=combined_text),
             }],
             max_tokens=2500,
             response_format={"type": "json_object"},
+            # qwen3.7-flash defaults reasoning ON — without disabling it, the
+            # model's own chain-of-thought can consume the token budget
+            # before ever writing the JSON answer (message.content=None,
+            # finish_reason "length"). Found live 2026-08-25 switching this
+            # call off OPENROUTER_MODEL_PRACTICAL.
+            extra_body={"reasoning": {"enabled": False}},
         )
         raw = (resp.choices[0].message.content or "{}").strip()
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)

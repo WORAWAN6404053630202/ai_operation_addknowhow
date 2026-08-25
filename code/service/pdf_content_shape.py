@@ -110,9 +110,15 @@ def classify_content_shape(pages_markdown: list[str]) -> ShapeCheck:
     try:
         client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
         resp = client.chat.completions.create(
-            model=conf.OPENROUTER_MODEL_PRACTICAL,
+            model=conf.OPENROUTER_MODEL_PDF_CLASSIFICATION,
             messages=[{"role": "user", "content": _PROMPT_TEMPLATE.format(num_pages=num_pages, combined_text=combined_text)}],
             max_tokens=500,
+            # qwen3.7-flash defaults reasoning ON — without disabling it, the
+            # model's own chain-of-thought consumes the whole max_tokens
+            # budget before it ever writes the JSON answer, leaving
+            # message.content=None (finish_reason="length"). Found live
+            # 2026-08-25 switching this call off OPENROUTER_MODEL_PRACTICAL.
+            extra_body={"reasoning": {"enabled": False}},
         )
         raw = (resp.choices[0].message.content or "{}").strip()
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
