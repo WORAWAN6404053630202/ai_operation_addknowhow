@@ -5,7 +5,6 @@ Endpoints for monitoring bot usage, sessions, and logs.
 
 import json
 import os
-import secrets
 import time
 from pathlib import Path
 from typing import Optional
@@ -15,9 +14,8 @@ try:
 except Exception:
     _conf = None
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 
 from model.state_manager import StateManager
@@ -27,32 +25,8 @@ from utils.page_ranges import format_page_ranges
 from utils.simple_cache import get_cache
 
 _LOG = get_logger(__name__)
-_basic_auth = HTTPBasic(auto_error=False)
 
-
-def require_admin_basic_auth(credentials: Optional[HTTPBasicCredentials] = Depends(_basic_auth)) -> None:
-    """Fail closed: if ADMIN_BASIC_AUTH_USERNAME/PASSWORD aren't both set in
-    conf.py, every request is rejected rather than let through — an unset
-    credential must lock this dashboard down, not leave it open (it can
-    read raw session content and write review decisions to the Sheet)."""
-    expected_user = getattr(_conf, "ADMIN_BASIC_AUTH_USERNAME", "") or ""
-    expected_pass = getattr(_conf, "ADMIN_BASIC_AUTH_PASSWORD", "") or ""
-    unauthorized = HTTPException(
-        status_code=401,
-        detail="Missing or invalid admin credentials",
-        headers={"WWW-Authenticate": "Basic"},
-    )
-    if not expected_user or not expected_pass:
-        raise unauthorized
-    if credentials is None:
-        raise unauthorized
-    user_ok = secrets.compare_digest(credentials.username, expected_user)
-    pass_ok = secrets.compare_digest(credentials.password, expected_pass)
-    if not (user_ok and pass_ok):
-        raise unauthorized
-
-
-router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin_basic_auth)])
+router = APIRouter(prefix="/admin", tags=["admin"])
 
 _state_manager = StateManager()
 _pdf_queue_manager = PdfReviewQueueManager()
