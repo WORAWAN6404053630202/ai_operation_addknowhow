@@ -65,6 +65,7 @@ import base64
 import json
 import logging
 import os
+import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -85,6 +86,10 @@ OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet-4-5")
 OUTPUT_S3_PREFIX = os.environ.get("OUTPUT_S3_PREFIX", "restbiz/extracted/")
 HANDOFF_S3_PREFIX = os.environ.get("HANDOFF_S3_PREFIX", "restbiz/pending_large/")
+# Same default as conf.PDF_STATUS_S3_PREFIX on the EC2 side (service/
+# pdf_status_tracker.py) — both sides write the identical JSON shape to the
+# same prefix so router/admin.py needs no knowledge of which side wrote it.
+STATUS_S3_PREFIX = os.environ.get("STATUS_S3_PREFIX", "restbiz/status/")
 MAX_PAGES_FOR_LAMBDA = int(os.environ.get("MAX_PAGES_FOR_LAMBDA", "35"))
 SQS_QUEUE_URL = os.environ.get("SQS_QUEUE_URL", "")
 
@@ -117,6 +122,39 @@ _SCREEN_PROMPT_TEMPLATE = """นี่คือ 2 หน้าแรกของ
 === เนื้อหา 2 หน้าแรก ===
 {combined_text}
 """
+
+
+def _write_status(bucket, filename, *, stage, pages_done=None, pages_total=None, attempt=1, error=None) -> None:
+    """Progress/error visibility for the ≤MAX_PAGES_FOR_LAMBDA path — the
+    same in-flight-status mechanism as the EC2 large-doc path (see
+    conf.PDF_STATUS_S3_PREFIX / service/pdf_status_tracker.py on the EC2
+    side), duplicated inline here rather than imported since this Lambda is
+    a standalone zip with no access to code/ (see module docstring). Never
+    raises — a status-write failure must not break real OCR work."""
+    payload = {
+        "filename": filename, "stage": stage, "pages_done": pages_done,
+        "pages_total": pages_total, "attempt": attempt,
+        "error": error[:500] if error else None, "updated_at": time.time(),
+    }
+    try:
+        s3.put_object(
+            Bucket=bucket, Key=f"{STATUS_S3_PREFIX}{filename}.json",
+            Body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except Exception as e:
+        logger.warning(f"{filename}: failed to write status: {e}")
+
+
+def _next_attempt_number(bucket, filename) -> int:
+    """1 for a fresh document, or (prior attempt + 1) if a status object
+    from an earlier failed invocation is still there."""
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=f"{STATUS_S3_PREFIX}{filename}.json")
+        prior = json.loads(obj["Body"].read().decode("utf-8"))
+        return prior.get("attempt", 0) + 1
+    except Exception:
+        return 1
 
 
 def _notify_sqs(bucket: str, key: str) -> None:
@@ -279,23 +317,44 @@ def lambda_handler(event, context):
             results.append({"input_key": key, "handoff_key": handoff_key, "page_count": num_pages, "handed_off": True})
             continue
 
-        pages = [None] * num_pages
-        with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
-            futures = {pool.submit(_extract_one_page, pdf_bytes, p): p for p in range(1, num_pages + 1)}
-            for future in as_completed(futures):
-                page_num = futures[future]
-                pages[page_num - 1] = future.result()
+        # Progress visibility (2026-08-27): this is the common case (most
+        # uploads are well under MAX_PAGES_FOR_LAMBDA) and it shares
+        # OPENROUTER_API_KEY with _run_claude() below, so it can fail the
+        # exact same silent way an out-of-credits account broke the EC2
+        # large-doc path — previously invisible until the item either landed
+        # in the review queue or someone went digging through CloudWatch.
+        attempt = _next_attempt_number(bucket, filename)
+        _write_status(bucket, filename, stage="processing", pages_done=0, pages_total=num_pages, attempt=attempt)
+        _PROGRESS_WRITE_EVERY_N_PAGES = 5  # small enough to matter for a ≤35-page doc
 
-        output = {"filename": filename, "s3_raw_pdf_path": key, "pages": pages}
-        output_key = f"{OUTPUT_S3_PREFIX}{filename}.json"
-        s3.put_object(
-            Bucket=bucket,
-            Key=output_key,
-            Body=json.dumps(output, ensure_ascii=False).encode("utf-8"),
-            ContentType="application/json",
-        )
-        logger.info(f"Wrote extraction result to s3://{bucket}/{output_key}")
-        _notify_sqs(bucket, output_key)
+        try:
+            pages = [None] * num_pages
+            pages_done = 0
+            with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+                futures = {pool.submit(_extract_one_page, pdf_bytes, p): p for p in range(1, num_pages + 1)}
+                for future in as_completed(futures):
+                    page_num = futures[future]
+                    pages[page_num - 1] = future.result()
+                    pages_done += 1
+                    if pages_done == num_pages or pages_done % _PROGRESS_WRITE_EVERY_N_PAGES == 0:
+                        _write_status(bucket, filename, stage="processing", pages_done=pages_done, pages_total=num_pages, attempt=attempt)
+
+            output = {"filename": filename, "s3_raw_pdf_path": key, "pages": pages}
+            output_key = f"{OUTPUT_S3_PREFIX}{filename}.json"
+            s3.put_object(
+                Bucket=bucket,
+                Key=output_key,
+                Body=json.dumps(output, ensure_ascii=False).encode("utf-8"),
+                ContentType="application/json",
+            )
+            logger.info(f"Wrote extraction result to s3://{bucket}/{output_key}")
+            _notify_sqs(bucket, output_key)
+        except Exception as e:
+            # Status only — Lambda's own async-invoke retry policy is
+            # unchanged by this, this just makes a failed attempt visible
+            # instead of only existing in CloudWatch logs.
+            _write_status(bucket, filename, stage="failed", pages_total=num_pages, attempt=attempt, error=str(e))
+            raise
         results.append({"input_key": key, "output_key": output_key, "page_count": num_pages})
 
     return {"statusCode": 200, "body": json.dumps(results, ensure_ascii=False)}

@@ -267,6 +267,13 @@
     .status-pill.pending  { color: var(--orange); border-color: var(--orange); }
     .status-pill.approved { color: var(--green);  border-color: var(--green); }
     .status-pill.rejected { color: var(--red);    border-color: var(--red); }
+    .status-pill.processing { color: var(--blue); border-color: var(--blue); }
+    .status-pill.failed-retry { color: var(--red); border-color: var(--red); }
+
+    /* ── In-flight (S3 status/, no ReviewItem yet — see pdf_status_tracker.py) ── */
+    .pq-item.in-flight { cursor: default; }
+    .pq-item.in-flight:hover { background: transparent; }
+    .in-flight-error { color: var(--red); font-size: 11px; margin-top: 4px; word-break: break-all; }
 
     .flag-pill { border-radius: 4px; padding: 1px 7px; font-size: 10px; font-weight: 700; }
     .flag-pill.high   { background: var(--red);    color: #1a0000; }
@@ -705,23 +712,49 @@
 
   // ── PDF Review Queue ──────────────────────────────────────────
   let allPdfQueueItems = [];
+  let allInFlightItems = [];
   let activePdfQueueItem = null;
   let selectedDecisionType = null;
 
   async function loadPdfQueue() {
     const d = await apiGet("/admin/api/pdf-queue");
     allPdfQueueItems = d.items || [];
+    allInFlightItems = d.in_flight || [];
     document.getElementById("pdfQueueCount").textContent = allPdfQueueItems.length;
 
+    // Badge counts pending reviews + stuck-retrying in-flight docs — both
+    // are "needs a human to look" states, unlike a document quietly still
+    // OCR-ing normally.
     const pendingCount = allPdfQueueItems.filter(i => i.review_status === "pending").length;
+    const failedInFlightCount = allInFlightItems.filter(f => f.stage === "failed").length;
     const badge = document.getElementById("pdfQueueBadge");
-    if (pendingCount > 0) {
+    if (pendingCount + failedInFlightCount > 0) {
       badge.style.display = "";
-      badge.textContent = pendingCount;
+      badge.textContent = pendingCount + failedInFlightCount;
     } else {
       badge.style.display = "none";
     }
     renderPdfQueueList();
+  }
+
+  function inFlightRowHtml(f) {
+    const isFailed = f.stage === "failed";
+    const pill = isFailed
+      ? `<span class="status-pill failed-retry">🔴 พัง — กำลัง retry (ครั้งที่ ${f.attempt})</span>`
+      : `<span class="status-pill processing">🟡 กำลังประมวลผล (ครั้งที่ ${f.attempt})</span>`;
+    const pageInfo = f.pages_total
+      ? `<span style="color:var(--muted);font-size:11px">${f.pages_done ?? "?"}/${f.pages_total} หน้า</span>`
+      : "";
+    return `
+      <div class="pq-item in-flight">
+        <div class="pq-filename">${escHtml(f.filename)}</div>
+        <div class="pq-meta">
+          ${pill}
+          ${pageInfo}
+          <span style="color:var(--muted);font-size:11px">${fmt(f.updated_at)}</span>
+        </div>
+        ${isFailed && f.error ? `<div class="in-flight-error">${escHtml(f.error)}</div>` : ""}
+      </div>`;
   }
 
   function flagCountPill(totalFlags, highFlags) {
@@ -732,15 +765,24 @@
 
   function renderPdfQueueList() {
     const el = document.getElementById("pdfQueueList");
-    if (!allPdfQueueItems.length) {
+    if (!allPdfQueueItems.length && !allInFlightItems.length) {
       el.innerHTML = '<div style="padding:20px;color:var(--muted);text-align:center">ยังไม่มีไฟล์ในคิว</div>';
       return;
     }
+    // In-flight rows (still OCR-ing on EC2, or stuck retrying — no
+    // ReviewItem yet) always show above the real queue, newest-updated
+    // first, so a stuck/failing document doesn't just silently sit off
+    // the bottom of a long list.
+    const inFlightHtml = [...allInFlightItems]
+      .sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0))
+      .map(inFlightRowHtml)
+      .join("");
+
     // department/license_type/page_range let a structured_license PDF that
     // split into several independent review items (sqs_consumer.py,
     // 2026-08-24) be told apart at a glance instead of showing as N
     // identical-looking "filename.pdf" rows.
-    el.innerHTML = allPdfQueueItems.map(i => {
+    const itemsHtml = allPdfQueueItems.map(i => {
       const subParts = [i.department, i.license_type].filter(Boolean).join(" — ");
       return `
       <div class="pq-item ${i.id === activePdfQueueItem ? 'active' : ''}" onclick="selectPdfQueueItem('${i.id}')">
@@ -755,6 +797,8 @@
       </div>
     `;
     }).join("");
+
+    el.innerHTML = inFlightHtml + itemsHtml;
   }
 
   async function selectPdfQueueItem(id) {

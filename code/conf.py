@@ -315,6 +315,10 @@ PDF_INGESTION_GOOGLE_CREDENTIALS_PATH = os.getenv("PDF_INGESTION_GOOGLE_CREDENTI
 # itself) for documents over MAX_PAGES_FOR_LAMBDA, for sqs_consumer.py /
 # pdf_large_extraction.py to pick up and fully OCR here with no time limit.
 PDF_HANDOFF_S3_PREFIX = os.getenv("PDF_HANDOFF_S3_PREFIX", "restbiz/pending_large/")
+# Progress/error visibility for the EC2 large-document OCR path (see
+# service/pdf_status_tracker.py) — one small JSON object per in-flight raw
+# PDF, deleted once a real ReviewItem is saved.
+PDF_STATUS_S3_PREFIX = os.getenv("PDF_STATUS_S3_PREFIX", "restbiz/status/")
 
 # State manager configuration
 STATE_DIR = os.getenv("STATE_DIR") or None

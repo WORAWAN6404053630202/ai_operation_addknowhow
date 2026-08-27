@@ -20,6 +20,7 @@ from pydantic import BaseModel
 
 from model.state_manager import StateManager
 from model.pdf_review_queue_manager import PdfReviewQueueManager
+from service import pdf_status_tracker
 from utils.logger import get_logger
 from utils.page_ranges import format_page_ranges
 from utils.simple_cache import get_cache
@@ -207,9 +208,24 @@ def _page_range_str(item) -> str:
 
 @router.get("/api/pdf-queue")
 async def pdf_queue_list():
-    """Summary list for the left-hand panel — newest upload first."""
+    """Summary list for the left-hand panel — newest upload first.
+
+    "in_flight" (2026-08-27) surfaces documents still being worked on by the
+    EC2 large-document OCR path (or stuck retrying against a failure) that
+    have no ReviewItem yet — see service/pdf_status_tracker.py's docstring
+    for the incident that motivated this: a 634-page document silently
+    retried for 13+ hours with nothing visible here beforehand."""
     items = _pdf_queue_manager.list_all()
     items.sort(key=lambda i: i.uploaded_at, reverse=True)
+
+    in_flight = []
+    bucket = getattr(_conf, "PDF_INGESTION_S3_BUCKET", "") if _conf else ""
+    if bucket:
+        try:
+            in_flight = pdf_status_tracker.list_in_flight(bucket)
+        except Exception as e:
+            _LOG.warning(f"[pdf_queue_list] Failed to list in-flight status: {e}")
+
     return JSONResponse({
         "items": [
             {
@@ -230,6 +246,7 @@ async def pdf_queue_list():
             for i in items
         ],
         "total": len(items),
+        "in_flight": in_flight,
     })
 
 

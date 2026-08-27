@@ -26,6 +26,7 @@ import base64
 import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Callable, Optional
 
 import boto3
 import pymupdf
@@ -101,12 +102,21 @@ def _extract_one_page(pdf_bytes: bytes, page_num: int) -> dict:
     return {"page_num": page_num, "typhoon_markdown": typhoon_markdown, "claude_markdown": claude_markdown}
 
 
-def extract_full_document(bucket: str, raw_pdf_key: str) -> list[dict]:
+def extract_full_document(
+    bucket: str, raw_pdf_key: str, on_progress: Optional[Callable[[int, int], None]] = None,
+) -> list[dict]:
     """Downloads the original PDF from S3 and OCRs every page with no time
     pressure (unlike the Lambda path, this can safely take as long as it
     needs to). Returns the same page-record shape process_extraction_result()
     already expects, so downstream validation/drafting/candidate-matching
-    code needs zero changes to handle large-document results."""
+    code needs zero changes to handle large-document results.
+
+    on_progress(pages_done, pages_total), if given, is called after every
+    page completes — from this function's own thread (the as_completed loop
+    below), never from a worker thread, so the callback doesn't need to be
+    thread-safe itself. Whether/how often that actually turns into an S3
+    write is the caller's call (see sqs_consumer.py) — this function just
+    reports every single page, no throttling logic here."""
     s3 = boto3.client("s3", region_name=conf.AWS_REGION or None)
     logger.info(f"[LargeExtraction] Downloading s3://{bucket}/{raw_pdf_key}")
     obj = s3.get_object(Bucket=bucket, Key=raw_pdf_key)
@@ -118,11 +128,15 @@ def extract_full_document(bucket: str, raw_pdf_key: str) -> list[dict]:
     logger.info(f"[LargeExtraction] {raw_pdf_key}: {num_pages} page(s), starting full extraction (no time limit on EC2)")
 
     pages: list[dict | None] = [None] * num_pages
+    pages_done = 0
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
         futures = {pool.submit(_extract_one_page, pdf_bytes, p): p for p in range(1, num_pages + 1)}
         for future in as_completed(futures):
             page_num = futures[future]
             pages[page_num - 1] = future.result()
+            pages_done += 1
+            if on_progress is not None:
+                on_progress(pages_done, num_pages)
 
     logger.info(f"[LargeExtraction] {raw_pdf_key}: all {num_pages} page(s) extracted successfully")
     return pages

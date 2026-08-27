@@ -36,6 +36,7 @@ from service.pdf_field_drafting import draft_fields_from_pages, identify_license
 from service.pdf_knowhow_drafting import identify_knowhow_topics
 from service.pdf_large_extraction import extract_full_document
 from service.pdf_relevance_check import check_relevance
+from service import pdf_status_tracker
 from utils.logger import get_logger
 from utils.page_ranges import format_page_ranges, group_into_ranges
 
@@ -346,12 +347,47 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
     if key.startswith(conf.PDF_HANDOFF_S3_PREFIX):
         filename = data["filename"]
         s3_raw_pdf_path = data["s3_raw_pdf_path"]
+        page_count = data.get("page_count")
         logger.info(
-            f"[SQSConsumer] {filename}: handoff marker ({data.get('page_count')} pages, "
+            f"[SQSConsumer] {filename}: handoff marker ({page_count} pages, "
             f"screen_reason={data.get('screen_reason')!r}) — running full extraction on EC2"
         )
-        raw_pages = extract_full_document(bucket, s3_raw_pdf_path)
-        return _build_and_save_review_item(filename, s3_raw_pdf_path, raw_pages, use_llm_comparison)
+
+        # Visibility for this specific long-running path (see
+        # service/pdf_status_tracker.py's docstring for why: a page-1 restart
+        # on every retry previously left zero trace anywhere a human could
+        # see until either success or a manual journalctl dig). attempt is
+        # read from any status object a PRIOR failed attempt left behind, so
+        # the admin UI shows a real retry count instead of always "1".
+        attempt = pdf_status_tracker.next_attempt_number(bucket, filename)
+        pdf_status_tracker.write_status(
+            bucket, filename, stage="processing", pages_done=0, pages_total=page_count, attempt=attempt,
+        )
+
+        # Throttled to every 20 pages (or the final page) — this is purely
+        # about S3 request/log volume, NOT OCR spend: the real cost (Typhoon
+        # + Claude Vision per page) happens regardless of how often progress
+        # gets reported, an S3 PUT here and there is negligible either way.
+        _PROGRESS_WRITE_EVERY_N_PAGES = 20
+
+        def _on_progress(pages_done: int, pages_total: int) -> None:
+            if pages_done == pages_total or pages_done % _PROGRESS_WRITE_EVERY_N_PAGES == 0:
+                pdf_status_tracker.write_status(
+                    bucket, filename, stage="processing",
+                    pages_done=pages_done, pages_total=pages_total, attempt=attempt,
+                )
+
+        try:
+            raw_pages = extract_full_document(bucket, s3_raw_pdf_path, on_progress=_on_progress)
+        except Exception as e:
+            pdf_status_tracker.write_status(
+                bucket, filename, stage="failed", pages_total=page_count, attempt=attempt, error=str(e),
+            )
+            raise
+
+        items = _build_and_save_review_item(filename, s3_raw_pdf_path, raw_pages, use_llm_comparison)
+        pdf_status_tracker.clear(bucket, filename)
+        return items
 
     filename = data["filename"]
     s3_raw_pdf_path = data.get("s3_raw_pdf_path", "")
@@ -375,7 +411,13 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
         return [item]
 
     raw_pages = data["pages"]
-    return _build_and_save_review_item(filename, s3_raw_pdf_path, raw_pages, use_llm_comparison)
+    items = _build_and_save_review_item(filename, s3_raw_pdf_path, raw_pages, use_llm_comparison)
+    # Clears the status Lambda's normal (≤MAX_PAGES_FOR_LAMBDA) path wrote —
+    # see lambda/pdf_extraction/handler.py's _write_status. Mirrors the
+    # handoff branch above: covers the full gap (Lambda OCR + this
+    # validation/drafting step), not just the Lambda portion.
+    pdf_status_tracker.clear(bucket, filename)
+    return items
 
 
 def process_sqs_message(message_body: str) -> Optional[list[ReviewItem]]:
