@@ -44,6 +44,16 @@ logger = get_logger(__name__)
 
 _queue_manager = PdfReviewQueueManager()
 
+# Hard cap on the EC2 large-document handoff path (see process_extraction_result's
+# handoff branch below) — each attempt re-OCRs and re-runs Claude Vision over
+# EVERY page of the document from scratch (no per-page checkpoint), so an
+# uncapped retry loop here is the most expensive possible version of the
+# 2026-08-27/08-28 field-drafting incident this same sweep fixed. 3 attempts
+# gives real transient errors (a momentary 500, a network blip) room to
+# resolve on their own without letting a permanently-broken document
+# (e.g. out-of-credits, a malformed PDF) retry indefinitely.
+_MAX_HANDOFF_ATTEMPTS = 3
+
 
 def _assert_dev_environment() -> None:
     """Same training-wheel as pdf_dual_extraction.py — this module still isn't
@@ -187,7 +197,22 @@ def _build_license_items(
             filename=filename, s3_raw_pdf_path=s3_raw_pdf_path, extraction_completed_at=time.time(),
             pages=topic_pages, relevance_check=relevance_check, content_shape=content_shape,
         )
-        topic_item.llm_drafted_fields = draft_fields_from_pages(topic_markdowns)
+        # Was unwrapped until 2026-08-28 — the one call in this function
+        # without error handling, unlike every sibling call around it. When
+        # draft_fields_from_pages() escalates to Sonnet for an oversized
+        # field (max_tokens=6000, the largest in the PDF pipeline) and that
+        # call fails, the exception used to propagate all the way up through
+        # process_extraction_result(), so the SQS message was never deleted
+        # and SQS redelivered it for a full-cost retry from page 1 — 47
+        # times over ~24h on one document, ~$78-80 in OpenRouter spend
+        # before anyone noticed. Matching the candidate_matches/
+        # category_fit_check pattern below: log and leave the item
+        # (llm_drafted_fields stays None) for manual review instead of
+        # losing the whole item to one field-drafting failure.
+        try:
+            topic_item.llm_drafted_fields = draft_fields_from_pages(topic_markdowns)
+        except Exception as e:
+            logger.error(f"[SQSConsumer] Field drafting failed for {filename} ({topic['department']!r}/{topic['license_type']!r}), continuing without it: {e}")
         page_str = format_page_ranges([p.page_num for p in topic_pages])
         try:
             topic_item.candidate_matches = find_candidate_matches(topic_item)
@@ -245,12 +270,23 @@ def _build_and_save_review_item(
         silently dropping whichever shape didn't win the primary classification."""
     pages: list[PageExtractionRecord] = []
     for p in raw_pages:
-        flags = validate_extraction(
-            p["typhoon_markdown"],
-            compare_with=p["claude_markdown"],
-            compare_label="claude",
-            use_llm_comparison=use_llm_comparison,
-        )
+        # validate_extraction() only calls an LLM when use_llm_comparison=True
+        # (off by default in the normal SQS flow, so this wasn't part of the
+        # 2026-08-27/08-28 incident) — but when it IS on (manual/test runs
+        # pass it through), this was the one call in this loop without error
+        # handling. Same fix pattern as the rest of this sweep: log and keep
+        # going with no flags for this page rather than losing the whole
+        # document to one page's comparison call failing.
+        try:
+            flags = validate_extraction(
+                p["typhoon_markdown"],
+                compare_with=p["claude_markdown"],
+                compare_label="claude",
+                use_llm_comparison=use_llm_comparison,
+            )
+        except Exception as e:
+            logger.error(f"[SQSConsumer] Extraction validation failed for {filename} page {p['page_num']}, continuing without flags: {e}")
+            flags = []
         pages.append(
             PageExtractionRecord(
                 page_num=p["page_num"],
@@ -383,6 +419,33 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
             pdf_status_tracker.write_status(
                 bucket, filename, stage="failed", pages_total=page_count, attempt=attempt, error=str(e),
             )
+            # Added 2026-08-28, same incident that motivated pdf_status_tracker.py
+            # itself (see its docstring: a 634-page document retried for 13+
+            # hours with no cap). Visibility into failed attempts alone doesn't
+            # stop them from repeating — extract_full_document() has no
+            # per-page checkpoint, so every SQS redelivery here re-runs OCR +
+            # Claude Vision on ALL pages_total pages again, not just the ones
+            # that failed. For a 634-page document that's ~634 fresh Claude
+            # calls per retry, worse than the field-drafting bug this same
+            # sweep fixed. Past _MAX_HANDOFF_ATTEMPTS, stop re-raising (so SQS
+            # deletes the message instead of redelivering it forever) and save
+            # a placeholder item flagged for manual review instead.
+            if attempt >= _MAX_HANDOFF_ATTEMPTS:
+                logger.error(
+                    f"[SQSConsumer] {filename}: giving up after {attempt} failed attempts "
+                    f"(handoff extraction), saving for manual review instead of retrying again: {e}"
+                )
+                item = ReviewItem(
+                    filename=filename, s3_raw_pdf_path=s3_raw_pdf_path, extraction_completed_at=time.time(),
+                    pages=[],
+                    relevance_check={
+                        "tier": "extraction_failed",
+                        "reasoning": f"หยุดลองใหม่หลังล้มเหลว {attempt} ครั้งติดต่อกัน (เอกสาร {page_count} หน้า) — ข้อผิดพลาดล่าสุด: {e}",
+                    },
+                )
+                _queue_manager.save(item)
+                pdf_status_tracker.clear(bucket, filename)
+                return [item]
             raise
 
         items = _build_and_save_review_item(filename, s3_raw_pdf_path, raw_pages, use_llm_comparison)
