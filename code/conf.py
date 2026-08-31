@@ -61,14 +61,76 @@ OPENROUTER_MODEL_PDF_MATCHING = os.getenv("OPENROUTER_MODEL_PDF_MATCHING", "qwen
 # realizing these 3 functions had been silently reusing
 # OPENROUTER_MODEL_PRACTICAL (the main chat persona's model, claude-sonnet-
 # 4-5) purely because that constant already existed, not from any deliberate
-# quality decision for THIS task. These are read-and-classify/find-
-# boundaries tasks, the same nature of work OPENROUTER_MODEL_PDF_MATCHING
-# above already handles well on a cheap model — NOT used for
-# draft_fields_from_pages, which writes the actual regulatory content
-# (fees/steps/legal requirements) real users rely on and deliberately stays
-# on a stronger model until quality is separately verified for that
-# specifically higher-stakes task.
-OPENROUTER_MODEL_PDF_CLASSIFICATION = os.getenv("OPENROUTER_MODEL_PDF_CLASSIFICATION", "qwen/qwen3.7-flash")
+# quality decision for THIS task.
+#
+# DECISION 2026-08-25: live-tested 6 cheaper alternatives (qwen3.7-flash,
+# qwen3-30b-a3b, deepseek-v4-flash, deepseek-v4-pro, gemini-2.5-flash-lite,
+# claude-haiku-4-5) across all 3 functions, 5-15 synthetic cases x 3 runs
+# each. deepseek-v4-flash/-pro came closest but still fell short on
+# classify_content_shape's secondary_pages field (73-87% vs sonnet-4-5's
+# 100%) — this is the field that catches mixed-shape documents (e.g. a
+# license procedure buried inside an otherwise-know_how PDF), and a miss
+# there means that buried license never gets candidate-matched against the
+# regulatory Sheet at all (caught by a human reviewer eventually, but not
+# automatically). Given this function decides which drafting pipeline a
+# real document runs through, the user chose to keep it on the proven
+# claude-sonnet-4-5 rather than trade accuracy for cost here — same model
+# OPENROUTER_MODEL_PRACTICAL already uses, kept as its own constant so this
+# task's model can still be changed independently later without touching
+# the main chat persona.
+OPENROUTER_MODEL_PDF_CLASSIFICATION = os.getenv("OPENROUTER_MODEL_PDF_CLASSIFICATION", "anthropic/claude-sonnet-4-5")
+
+# PDF review queue: draft_fields_from_pages — writes the actual regulatory
+# content (department, license type, fees, steps, legal basis, etc.) that
+# real users rely on to make business decisions, the highest-stakes task in
+# this pipeline. Also was silently reusing OPENROUTER_MODEL_PRACTICAL with
+# no deliberate decision behind it, same as OPENROUTER_MODEL_PDF_CLASSIFICATION
+# above was before 2026-08-25.
+#
+# DECISION 2026-08-25: live-tested 6 models on 8 synthetic cases (2-3 runs
+# each, ~110 individual field-level checks: required-field presence, exact
+# numeric values, no hallucination on genuinely-absent fields, no dropped
+# list items, no cross-field misattribution). claude-sonnet-4-5, claude-
+# haiku-4-5, and claude-sonnet-5 all scored a perfect 110/110. The 3 cheaper
+# non-Anthropic candidates each had a real defect: qwen3.7-flash and
+# deepseek-v4-pro each returned an ENTIRELY EMPTY result (all 13 fields
+# blank) for a fully-populated source document on one of their runs — the
+# most dangerous failure mode for this task, since a reviewer scanning a
+# blank-looking item may not realize the source document actually had
+# extractable content; deepseek-v4-flash consistently missed a duration
+# figure across both its runs. Given the 3 perfect performers, chose
+# claude-haiku-4-5: identical accuracy to claude-sonnet-4-5 in every test
+# run, at roughly 1/3 the price ($1/$5 vs $3/$15 per M tokens) — a real
+# saving with no accuracy trade-off found in testing so far. Kept as its
+# own constant, independent of OPENROUTER_MODEL_PRACTICAL, so it can be
+# revisited without touching the main chat persona.
+OPENROUTER_MODEL_PDF_DRAFTING = os.getenv("OPENROUTER_MODEL_PDF_DRAFTING", "anthropic/claude-haiku-4-5")
+
+# pdf_large_extraction.py's per-page Vision OCR cross-check (second opinion
+# against Typhoon's free OCR pass, on the EC2 large-document handoff path).
+# Was hardcoded to conf.OPENROUTER_MODEL (claude-sonnet-4-5) — deliberately
+# NOT read from that constant, because OPENROUTER_MODEL doubles as the main
+# chat persona's fallback default in persona_supervisor.py/persona_practical.py
+# (getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL), 30+ call
+# sites) — changing OPENROUTER_MODEL's value to save money here would have
+# silently changed the production chat bot's model too wherever
+# OPENROUTER_SWITCH_MODEL isn't set. Own constant instead, same pattern as
+# OPENROUTER_MODEL_PDF_CLASSIFICATION/_DRAFTING above.
+#
+# DECISION 2026-08-31: this pipeline was found retrying an unbounded number
+# of times on failure (see sqs_consumer.py's 2026-08-28 fix), during which
+# investigation the per-page dual-OCR cost (Sonnet Vision on every page of
+# large documents, up to 4000 output tokens/page) turned out to be the
+# single largest cost driver in the whole PDF pipeline. Backtested
+# google/gemini-2.5-flash-lite ($0.10/$0.40 per M vs Sonnet's $3/$15 — ~30x
+# cheaper) against Sonnet on 2 real documents (9 page-comparisons, each
+# checked against Typhoon via compare_extractions' salient-token diff):
+# Gemini matched or beat Sonnet's agreement-with-Typhoon rate on every page
+# tested (Sonnet: 3 disagreements/9 pages, all the same recurring form-code
+# formatting quirk; Gemini: 0/9). Small sample — re-evaluate if the review
+# queue (the human safety net downstream of this) starts surfacing OCR
+# quality complaints on documents that went through this path.
+OPENROUTER_MODEL_PDF_VISION = os.getenv("OPENROUTER_MODEL_PDF_VISION", "google/gemini-2.5-flash-lite")
 
 # FIX: wrap conversions in try/except so bad env vars give clear error instead of crashing silently
 def _safe_float(name: str, default: float) -> float:
