@@ -6,10 +6,11 @@ pipeline calls the OpenAI SDK directly and never had its own cost data
 before this).
 """
 import logging
+import threading
 
 import pytest
 
-from utils.llm_cost_logging import PDF_PIPELINE_MODEL_PRICING, log_call_duration, log_llm_cost
+from utils.llm_cost_logging import CostAccumulator, PDF_PIPELINE_MODEL_PRICING, log_call_duration, log_llm_cost
 
 
 class _FakeUsage:
@@ -111,3 +112,76 @@ class TestLogCallDuration:
         # elapsed_seconds is always a real float from time.monotonic() differences
         # in practice, but this must not be a crash-prone code path regardless.
         log_call_duration(logging.getLogger("test"), "TestNonLlmCall", 0.0)
+
+
+@pytest.mark.unit
+class TestCostAccumulator:
+    """Backs the admin UI's per-document total_cost_usd display — see
+    model/pdf_review_item.py and sqs_consumer.py's threading of one
+    CostAccumulator instance through every stage of one document's pipeline."""
+
+    def test_starts_at_zero(self):
+        assert CostAccumulator().total_cost_usd == 0.0
+
+    def test_add_accumulates(self):
+        acc = CostAccumulator()
+        acc.add(0.001)
+        acc.add(0.002)
+        acc.add(0.0)
+        assert acc.total_cost_usd == pytest.approx(0.003)
+
+    def test_thread_safe_under_concurrent_adds(self):
+        # Mirrors real usage: multiple pages' vision-verify calls add to the
+        # same accumulator concurrently via ThreadPoolExecutor.
+        acc = CostAccumulator()
+        n_threads, adds_per_thread, amount = 20, 100, 0.0001
+
+        def worker():
+            for _ in range(adds_per_thread):
+                acc.add(amount)
+
+        threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        expected = n_threads * adds_per_thread * amount
+        assert acc.total_cost_usd == pytest.approx(expected)
+
+    def test_log_llm_cost_adds_computed_cost_to_accumulator(self):
+        acc = CostAccumulator()
+        response = _FakeResponse(_FakeUsage(prompt_tokens=1000, completion_tokens=500))
+        model = "anthropic/claude-sonnet-4-5"
+        pricing = PDF_PIPELINE_MODEL_PRICING[model]
+        expected = (1000 * pricing["input"] + 500 * pricing["output"]) / 1_000_000
+
+        cost = log_llm_cost(logging.getLogger("test"), "TestCall", model, response, accumulator=acc)
+
+        assert cost == pytest.approx(expected)
+        assert acc.total_cost_usd == pytest.approx(expected)
+
+    def test_log_llm_cost_adds_zero_on_unknown_model_without_crashing(self):
+        acc = CostAccumulator()
+        response = _FakeResponse(_FakeUsage(prompt_tokens=100, completion_tokens=50))
+        log_llm_cost(logging.getLogger("test"), "TestCall", "some/unpriced-model", response, accumulator=acc)
+        assert acc.total_cost_usd == 0.0
+
+    def test_log_llm_cost_accumulates_across_multiple_calls(self):
+        # Simulates one document's pipeline: several call sites sharing one accumulator.
+        acc = CostAccumulator()
+        model = "anthropic/claude-haiku-4-5"
+        pricing = PDF_PIPELINE_MODEL_PRICING[model]
+        for _ in range(3):
+            response = _FakeResponse(_FakeUsage(prompt_tokens=200, completion_tokens=100))
+            log_llm_cost(logging.getLogger("test"), "TestCall", model, response, accumulator=acc)
+
+        expected_per_call = (200 * pricing["input"] + 100 * pricing["output"]) / 1_000_000
+        assert acc.total_cost_usd == pytest.approx(expected_per_call * 3)
+
+    def test_log_llm_cost_without_accumulator_still_works(self):
+        # accumulator is optional — every existing call site (before this
+        # feature) omits it and must keep working unchanged.
+        response = _FakeResponse(_FakeUsage(prompt_tokens=100, completion_tokens=50))
+        cost = log_llm_cost(logging.getLogger("test"), "TestCall", "anthropic/claude-sonnet-4-5", response)
+        assert cost > 0

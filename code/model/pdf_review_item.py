@@ -48,6 +48,25 @@ class ReviewItem(BaseModel):
     uploaded_at: float = Field(default_factory=time.time)
     extraction_completed_at: Optional[float] = None
 
+    # Added 2026-09 for the admin UI's per-document cost/time display.
+    # extraction_started_at is captured where extraction actually begins
+    # (Lambda invocation start, or extract_full_document()'s start on the
+    # EC2 handoff path) — NOT when this ReviewItem object is constructed,
+    # so processing_duration_seconds below reflects real wall-clock time
+    # from "file appeared" to "review item ready", not just the cheap
+    # build phase. None on items processed before this field existed.
+    extraction_started_at: Optional[float] = None
+    # Sum of every log_llm_cost() call's returned cost across the WHOLE
+    # pipeline for this document (extraction/vision-verify + content-shape
+    # classification + topic drafting + candidate matching) — see
+    # utils/llm_cost_logging.py's CostAccumulator. If a document splits into
+    # multiple ReviewItems (mixed-shape or multi-topic), the same
+    # document-level total is attached to every resulting item — the cost
+    # isn't meaningfully separable per sub-item since e.g. the one
+    # classification call covers the whole document. None on items
+    # processed before this field existed.
+    total_cost_usd: Optional[float] = None
+
     pages: list[PageExtractionRecord] = Field(default_factory=list)
 
     # --- Human review decision (unset until a reviewer acts) ---
@@ -127,3 +146,13 @@ class ReviewItem(BaseModel):
     @property
     def high_severity_flag_count(self) -> int:
         return sum(p.high_severity_flag_count for p in self.pages)
+
+    @property
+    def processing_duration_seconds(self) -> Optional[float]:
+        """Wall-clock time from extraction_started_at to extraction_completed_at
+        — NOT the sum of every call's elapsed_seconds, since pages extract
+        concurrently (summing would overcount). None if either timestamp is
+        missing (e.g. an item processed before these fields existed)."""
+        if self.extraction_started_at is None or self.extraction_completed_at is None:
+            return None
+        return self.extraction_completed_at - self.extraction_started_at

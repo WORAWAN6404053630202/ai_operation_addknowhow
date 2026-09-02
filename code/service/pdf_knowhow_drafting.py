@@ -31,12 +31,12 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import TypedDict
+from typing import Optional, TypedDict
 
 from openai import OpenAI
 
 import conf
-from utils.llm_cost_logging import log_llm_cost
+from utils.llm_cost_logging import CostAccumulator, log_llm_cost
 from utils.logger import get_logger
 from utils.page_ranges import fuzzy_ratio, group_into_ranges, merge_topic_chunks
 from utils.prompt_safety import INJECTION_GUARD
@@ -116,7 +116,9 @@ _OVERLAP_RESOLUTION_PROMPT = """หน้าต่อไปนี้ถูกร
 """
 
 
-def _resolve_page_overlaps(topics: list[KnowhowTopicBounds], pages_markdown: list[str]) -> list[KnowhowTopicBounds]:
+def _resolve_page_overlaps(
+    topics: list[KnowhowTopicBounds], pages_markdown: list[str], cost_accumulator: Optional[CostAccumulator] = None,
+) -> list[KnowhowTopicBounds]:
     """merge_topic_chunks() above can still leave an overlap if the LLM's raw
     page_ranges answer claimed the same page for 2+ topics — a real,
     reproduced failure (2026-08/09 live example: adjacent topics claiming
@@ -180,7 +182,7 @@ def _resolve_page_overlaps(topics: list[KnowhowTopicBounds], pages_markdown: lis
                 max_tokens=50,
                 temperature=0,
             )
-            log_llm_cost(logger, "KnowhowDrafting/ResolveOverlap", conf.OPENROUTER_MODEL_PDF_CLASSIFICATION, resp, time.monotonic() - _call_start)
+            log_llm_cost(logger, "KnowhowDrafting/ResolveOverlap", conf.OPENROUTER_MODEL_PDF_CLASSIFICATION, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
             raw = (resp.choices[0].message.content or "{}").strip()
             raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
             winner = json.loads(raw).get("winner", "A")
@@ -205,7 +207,7 @@ def _resolve_page_overlaps(topics: list[KnowhowTopicBounds], pages_markdown: lis
     return resolved
 
 
-def identify_knowhow_topics(pages_markdown: list[str]) -> list[KnowhowTopicBounds]:
+def identify_knowhow_topics(pages_markdown: list[str], cost_accumulator: Optional[CostAccumulator] = None) -> list[KnowhowTopicBounds]:
     """One LLM call. Returns [] (never raises) on any failure — the caller
     treats an empty list as "could not split into topics" and should fall
     back to treating the whole document as one topic rather than losing it
@@ -239,7 +241,7 @@ def identify_knowhow_topics(pages_markdown: list[str]) -> list[KnowhowTopicBound
             # call off OPENROUTER_MODEL_PRACTICAL.
             extra_body={"reasoning": {"enabled": False}},
         )
-        log_llm_cost(logger, "KnowhowDrafting/IdentifyTopics", conf.OPENROUTER_MODEL_PDF_CLASSIFICATION, resp, time.monotonic() - _call_start)
+        log_llm_cost(logger, "KnowhowDrafting/IdentifyTopics", conf.OPENROUTER_MODEL_PDF_CLASSIFICATION, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
         raw = (resp.choices[0].message.content or "{}").strip()
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
         parsed = json.loads(raw)
@@ -294,7 +296,7 @@ def identify_knowhow_topics(pages_markdown: list[str]) -> list[KnowhowTopicBound
         })
 
     topics: list[KnowhowTopicBounds] = merge_topic_chunks(chunks, ("main_topic", "sub_topic"), fuzzy_ratio)
-    topics = _resolve_page_overlaps(topics, pages_markdown)
+    topics = _resolve_page_overlaps(topics, pages_markdown, cost_accumulator=cost_accumulator)
     logger.info(
         f"[KnowhowDrafting] {document_title!r} (source_type={source_type}): "
         f"identified {len(topics)} topic(s) (from {len(chunks)} chunk(s)) across {num_pages} page(s)"

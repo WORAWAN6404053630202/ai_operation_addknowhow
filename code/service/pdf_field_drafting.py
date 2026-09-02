@@ -31,12 +31,12 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import TypedDict
+from typing import Optional, TypedDict
 
 from openai import OpenAI
 
 import conf
-from utils.llm_cost_logging import log_llm_cost
+from utils.llm_cost_logging import CostAccumulator, log_llm_cost
 from utils.logger import get_logger
 from utils.page_ranges import fuzzy_ratio as _fuzzy_ratio
 from utils.page_ranges import group_into_ranges, merge_topic_chunks
@@ -101,7 +101,7 @@ _PROMPT_TEMPLATE = """ต่อไปนี้คือข้อความท�
 """
 
 
-def draft_fields_from_pages(pages_markdown: list[str]) -> dict[str, str]:
+def draft_fields_from_pages(pages_markdown: list[str], cost_accumulator: Optional[CostAccumulator] = None) -> dict[str, str]:
     """Runs one LLM call over all pages combined and returns a dict keyed by the
     REAL Sheet header text (via DRAFTABLE_FIELDS, 13 fields), ready to hand to
     sheet_write_back.py. Fields the LLM couldn't find are empty strings, not
@@ -116,7 +116,7 @@ def draft_fields_from_pages(pages_markdown: list[str]) -> dict[str, str]:
         messages=[{"role": "user", "content": prompt}],
         max_tokens=3000,
     )
-    log_llm_cost(logger, "FieldDrafting/DraftFields", conf.OPENROUTER_MODEL_PDF_DRAFTING, resp, time.monotonic() - _call_start)
+    log_llm_cost(logger, "FieldDrafting/DraftFields", conf.OPENROUTER_MODEL_PDF_DRAFTING, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
     raw = (resp.choices[0].message.content or "{}").strip()
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
 
@@ -183,7 +183,7 @@ _TOPIC_SPLIT_PROMPT = """เอกสารต่อไปนี้ (มีท�
 """
 
 
-def identify_license_topics(pages_markdown: list[str]) -> list[LicenseTopicBounds]:
+def identify_license_topics(pages_markdown: list[str], cost_accumulator: Optional[CostAccumulator] = None) -> list[LicenseTopicBounds]:
     """Splits a structured_license-shaped PDF into 0..N distinct license/
     procedure topics, mirroring pdf_knowhow_drafting.py's
     identify_knowhow_topics() — a single PDF is not guaranteed to be exactly
@@ -244,7 +244,7 @@ def identify_license_topics(pages_markdown: list[str]) -> list[LicenseTopicBound
         # OPENROUTER_MODEL_PRACTICAL.
         extra_body={"reasoning": {"enabled": False}},
     )
-    log_llm_cost(logger, "FieldDrafting/IdentifyLicenseTopics", conf.OPENROUTER_MODEL_PDF_CLASSIFICATION, resp, time.monotonic() - _call_start)
+    log_llm_cost(logger, "FieldDrafting/IdentifyLicenseTopics", conf.OPENROUTER_MODEL_PDF_CLASSIFICATION, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
     raw = (resp.choices[0].message.content or "[]").strip()
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
     parsed = json.loads(raw)
@@ -276,7 +276,7 @@ def identify_license_topics(pages_markdown: list[str]) -> list[LicenseTopicBound
         })
 
     topics: list[LicenseTopicBounds] = merge_topic_chunks(chunks, ("department", "license_type"), _fuzzy_ratio)
-    topics = _resolve_page_overlaps(topics, pages_markdown)
+    topics = _resolve_page_overlaps(topics, pages_markdown, cost_accumulator=cost_accumulator)
     logger.info(f"[pdf_field_drafting] Identified {len(topics)} license topic(s) (from {len(chunks)} chunk(s)) across {num_pages} page(s)")
     return topics
 
@@ -294,7 +294,9 @@ _OVERLAP_RESOLUTION_PROMPT = """หน้าต่อไปนี้ถูกร
 """
 
 
-def _resolve_page_overlaps(topics: list[LicenseTopicBounds], pages_markdown: list[str]) -> list[LicenseTopicBounds]:
+def _resolve_page_overlaps(
+    topics: list[LicenseTopicBounds], pages_markdown: list[str], cost_accumulator: Optional[CostAccumulator] = None,
+) -> list[LicenseTopicBounds]:
     """Same fix as pdf_knowhow_drafting.py's _resolve_page_overlaps (not
     imported — this checks a different topic shape: department/license_type
     instead of main_topic/sub_topic, and the two functions' prompts need
@@ -357,7 +359,7 @@ def _resolve_page_overlaps(topics: list[LicenseTopicBounds], pages_markdown: lis
                 max_tokens=50,
                 temperature=0,
             )
-            log_llm_cost(logger, "FieldDrafting/ResolveOverlap", conf.OPENROUTER_MODEL_PDF_CLASSIFICATION, resp, time.monotonic() - _call_start)
+            log_llm_cost(logger, "FieldDrafting/ResolveOverlap", conf.OPENROUTER_MODEL_PDF_CLASSIFICATION, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
             raw = (resp.choices[0].message.content or "{}").strip()
             raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
             winner = json.loads(raw).get("winner", "A")

@@ -37,7 +37,7 @@ from typhoon_ocr import ocr_document
 
 import conf
 from service.pdf_extraction_validation import _extract_salient_tokens
-from utils.llm_cost_logging import log_call_duration, log_llm_cost
+from utils.llm_cost_logging import CostAccumulator, log_call_duration, log_llm_cost
 from utils.logger import get_logger
 from utils.pdf_text_layer import extract_page_native_text
 from utils.rate_limiter import MinIntervalRateLimiter
@@ -138,7 +138,7 @@ def _run_typhoon(png_bytes: bytes, page_num: int) -> str:
         os.remove(tmp_path)
 
 
-def _run_vision_verify(png_bytes: bytes) -> str:
+def _run_vision_verify(png_bytes: bytes, cost_accumulator: Optional[CostAccumulator] = None) -> str:
     """Second-opinion OCR pass on top of Typhoon's — model is
     conf.OPENROUTER_MODEL_PDF_VISION (see conf.py for why this is its own
     constant, not conf.OPENROUTER_MODEL), not necessarily Claude despite the
@@ -159,11 +159,11 @@ def _run_vision_verify(png_bytes: bytes) -> str:
         ],
         max_tokens=4000,
     )
-    log_llm_cost(logger, "LargeExtraction/VisionVerify", conf.OPENROUTER_MODEL_PDF_VISION, resp, time.monotonic() - _call_start)
+    log_llm_cost(logger, "LargeExtraction/VisionVerify", conf.OPENROUTER_MODEL_PDF_VISION, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
     return resp.choices[0].message.content or "(no text returned)"
 
 
-def _extract_one_page(pdf_bytes: bytes, page_num: int) -> dict:
+def _extract_one_page(pdf_bytes: bytes, page_num: int, cost_accumulator: Optional[CostAccumulator] = None) -> dict:
     # Added 2026-09 (same optimization shipped to lambda/pdf_extraction/
     # handler.py's normal path first) — many digital-native pages need no
     # OCR at all. Matters even more here than on the Lambda side: this is
@@ -193,7 +193,7 @@ def _extract_one_page(pdf_bytes: bytes, page_num: int) -> dict:
         # documents accumulate to confirm this still holds.
         salient = _extract_salient_tokens(typhoon_markdown)
         if any(salient[k] for k in salient):
-            claude_markdown = _run_vision_verify(png_bytes)
+            claude_markdown = _run_vision_verify(png_bytes, cost_accumulator=cost_accumulator)
         else:
             claude_markdown = ""
             logger.info(f"[LargeExtraction] Page {page_num}: no salient tokens in Typhoon output, skipping Claude cross-check")
@@ -217,12 +217,16 @@ def _extract_one_page(pdf_bytes: bytes, page_num: int) -> dict:
 
 def extract_full_document(
     bucket: str, raw_pdf_key: str, on_progress: Optional[Callable[[int, int], None]] = None,
-) -> list[dict]:
+) -> tuple[list[dict], float, float]:
     """Downloads the original PDF from S3 and OCRs every page with no time
     pressure (unlike the Lambda path, this can safely take as long as it
-    needs to). Returns the same page-record shape process_extraction_result()
+    needs to). Returns (pages, extraction_cost_usd, extraction_started_at) —
+    the pages list is the same page-record shape process_extraction_result()
     already expects, so downstream validation/drafting/candidate-matching
-    code needs zero changes to handle large-document results.
+    code needs zero changes to handle large-document results; the cost/
+    started_at pair (added 2026-09) lets sqs_consumer.py seed its own
+    build-phase CostAccumulator and set ReviewItem.extraction_started_at for
+    a real wall-clock number in the admin UI — see model/pdf_review_item.py.
 
     on_progress(pages_done, pages_total), if given, is called after every
     page completes — from this function's own thread (the as_completed loop
@@ -230,6 +234,7 @@ def extract_full_document(
     thread-safe itself. Whether/how often that actually turns into an S3
     write is the caller's call (see sqs_consumer.py) — this function just
     reports every single page, no throttling logic here."""
+    started_at = time.time()
     s3 = boto3.client("s3", region_name=conf.AWS_REGION or None)
     logger.info(f"[LargeExtraction] Downloading s3://{bucket}/{raw_pdf_key}")
     obj = s3.get_object(Bucket=bucket, Key=raw_pdf_key)
@@ -240,10 +245,11 @@ def extract_full_document(
     doc.close()
     logger.info(f"[LargeExtraction] {raw_pdf_key}: {num_pages} page(s), starting full extraction (no time limit on EC2)")
 
+    cost_accumulator = CostAccumulator()
     pages: list[dict | None] = [None] * num_pages
     pages_done = 0
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
-        futures = {pool.submit(_extract_one_page, pdf_bytes, p): p for p in range(1, num_pages + 1)}
+        futures = {pool.submit(_extract_one_page, pdf_bytes, p, cost_accumulator): p for p in range(1, num_pages + 1)}
         for future in as_completed(futures):
             page_num = futures[future]
             pages[page_num - 1] = future.result()
@@ -252,4 +258,4 @@ def extract_full_document(
                 on_progress(pages_done, num_pages)
 
     logger.info(f"[LargeExtraction] {raw_pdf_key}: all {num_pages} page(s) extracted successfully")
-    return pages
+    return pages, cost_accumulator.total_cost_usd, started_at

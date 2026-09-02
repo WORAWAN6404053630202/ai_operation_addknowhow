@@ -36,6 +36,7 @@ from service.pdf_field_drafting import draft_fields_from_pages, identify_license
 from service.pdf_knowhow_drafting import identify_knowhow_topics
 from service.pdf_large_extraction import extract_full_document
 from service import pdf_status_tracker
+from utils.llm_cost_logging import CostAccumulator
 from utils.logger import get_logger
 from utils.page_ranges import format_page_ranges, group_into_ranges
 
@@ -83,6 +84,7 @@ def _slice_by_ranges(
 def _build_knowhow_items(
     filename: str, s3_raw_pdf_path: str, pages: list[PageExtractionRecord], page_markdowns: list[str],
     relevance_check: Optional[dict], content_shape: dict,
+    cost_accumulator: Optional[CostAccumulator] = None, extraction_started_at: Optional[float] = None,
 ) -> list[ReviewItem]:
     """Builds ONE bundled ReviewItem (multiple knowhow_topics inside) from
     this pages/page_markdowns slice. Safe to call on the full document OR a
@@ -90,13 +92,19 @@ def _build_knowhow_items(
     _build_and_save_review_item) — identify_knowhow_topics()'s returned
     page_ranges are always local to whatever page_markdowns was passed in,
     and _slice_by_ranges resolves them against the SAME pages/page_markdowns
-    given here, so nesting composes correctly regardless of depth."""
+    given here, so nesting composes correctly regardless of depth.
+
+    cost_accumulator/extraction_started_at (added 2026-09) are threaded
+    through from process_extraction_result() so the resulting ReviewItem can
+    show a document-level total cost/wall-clock time in the admin UI — see
+    model/pdf_review_item.py."""
     item = ReviewItem(
         filename=filename, s3_raw_pdf_path=s3_raw_pdf_path, extraction_completed_at=time.time(),
         pages=pages, relevance_check=relevance_check, content_shape=content_shape,
+        extraction_started_at=extraction_started_at,
     )
     try:
-        topic_bounds = identify_knowhow_topics(page_markdowns)
+        topic_bounds = identify_knowhow_topics(page_markdowns, cost_accumulator=cost_accumulator)
         knowhow_topics = []
         covered_local: set[int] = set()
         for t in topic_bounds:
@@ -145,6 +153,8 @@ def _build_knowhow_items(
     except Exception as e:
         logger.error(f"[SQSConsumer] Know-how topic-splitting failed for {filename}, item saved with no topics for manual handling: {e}")
 
+    if cost_accumulator is not None:
+        item.total_cost_usd = cost_accumulator.total_cost_usd
     _queue_manager.save(item)
     logger.info(f"[SQSConsumer] Saved review item {item.id} for {filename} ({len(pages)} pages, shape=know_how)")
     return [item]
@@ -153,15 +163,19 @@ def _build_knowhow_items(
 def _build_license_items(
     filename: str, s3_raw_pdf_path: str, pages: list[PageExtractionRecord], page_markdowns: list[str],
     relevance_check: Optional[dict], content_shape: dict,
+    cost_accumulator: Optional[CostAccumulator] = None, extraction_started_at: Optional[float] = None,
 ) -> list[ReviewItem]:
     """Builds 0..N independent ReviewItems (own candidate-matching, own
     decision each) from this pages/page_markdowns slice — a single slice is
     not guaranteed to be exactly one regulatory topic (could be several
     combined announcements, or none at all). Safe to call on the full
     document OR a secondary sub-slice of a mixed-shape document; see
-    _build_knowhow_items for why nesting composes correctly."""
+    _build_knowhow_items for why nesting composes correctly.
+
+    cost_accumulator/extraction_started_at — see _build_knowhow_items's
+    docstring, same purpose."""
     try:
-        topic_bounds = identify_license_topics(page_markdowns)
+        topic_bounds = identify_license_topics(page_markdowns, cost_accumulator=cost_accumulator)
     except Exception as e:
         logger.error(
             f"[SQSConsumer] License topic-splitting failed for {filename}, falling back to treating "
@@ -180,7 +194,10 @@ def _build_license_items(
         item = ReviewItem(
             filename=filename, s3_raw_pdf_path=s3_raw_pdf_path, extraction_completed_at=time.time(),
             pages=pages, relevance_check=relevance_check, content_shape=content_shape,
+            extraction_started_at=extraction_started_at,
         )
+        if cost_accumulator is not None:
+            item.total_cost_usd = cost_accumulator.total_cost_usd
         _queue_manager.save(item)
         logger.info(f"[SQSConsumer] Saved review item {item.id} for {filename} ({len(pages)} pages, shape=structured_license, 0 topics)")
         return [item]
@@ -195,6 +212,7 @@ def _build_license_items(
         topic_item = ReviewItem(
             filename=filename, s3_raw_pdf_path=s3_raw_pdf_path, extraction_completed_at=time.time(),
             pages=topic_pages, relevance_check=relevance_check, content_shape=content_shape,
+            extraction_started_at=extraction_started_at,
         )
         # Was unwrapped until 2026-08-28 — the one call in this function
         # without error handling, unlike every sibling call around it. When
@@ -209,16 +227,16 @@ def _build_license_items(
         # (llm_drafted_fields stays None) for manual review instead of
         # losing the whole item to one field-drafting failure.
         try:
-            topic_item.llm_drafted_fields = draft_fields_from_pages(topic_markdowns)
+            topic_item.llm_drafted_fields = draft_fields_from_pages(topic_markdowns, cost_accumulator=cost_accumulator)
         except Exception as e:
             logger.error(f"[SQSConsumer] Field drafting failed for {filename} ({topic['department']!r}/{topic['license_type']!r}), continuing without it: {e}")
         page_str = format_page_ranges([p.page_num for p in topic_pages])
         try:
-            topic_item.candidate_matches = find_candidate_matches(topic_item)
+            topic_item.candidate_matches = find_candidate_matches(topic_item, cost_accumulator=cost_accumulator)
         except Exception as e:
             logger.error(f"[SQSConsumer] Candidate matching failed for {filename} ({topic['department']!r}/{topic['license_type']!r}), continuing without it: {e}")
         try:
-            topic_item.category_fit_check = check_category_fit(topic_item)
+            topic_item.category_fit_check = check_category_fit(topic_item, cost_accumulator=cost_accumulator)
         except Exception as e:
             logger.error(f"[SQSConsumer] Category-fit check failed for {filename} ({topic['department']!r}/{topic['license_type']!r}), continuing without it: {e}")
 
@@ -240,13 +258,31 @@ def _build_license_items(
         logger.info(f"[SQSConsumer] {filename}: pages {uncovered_local} weren't part of any license topic, routing through know-how instead")
         uncovered_ranges = group_into_ranges(uncovered_local)
         leftover_pages, leftover_markdowns = _slice_by_ranges(pages, page_markdowns, uncovered_ranges)
-        items.extend(_build_knowhow_items(filename, s3_raw_pdf_path, leftover_pages, leftover_markdowns, relevance_check, content_shape))
+        items.extend(_build_knowhow_items(
+            filename, s3_raw_pdf_path, leftover_pages, leftover_markdowns, relevance_check, content_shape,
+            cost_accumulator=cost_accumulator, extraction_started_at=extraction_started_at,
+        ))
+
+    # Stamped here, once, after everything above (all topics' drafting/
+    # matching + any uncovered-pages know-how routing) has had its chance to
+    # add to cost_accumulator — stamping earlier (e.g. inside the per-topic
+    # loop) would give earlier topics a falsely-low total that doesn't
+    # include cost incurred processing LATER topics. Every item from this
+    # one document-level accumulator gets the same final total — see
+    # _build_knowhow_items's docstring for why per-item cost isn't
+    # meaningfully separable. Re-save is safe/cheap: PdfReviewQueueManager
+    # upserts by id, this isn't creating duplicates.
+    if cost_accumulator is not None:
+        for it in items:
+            it.total_cost_usd = cost_accumulator.total_cost_usd
+            _queue_manager.save(it)
 
     return items
 
 
 def _build_and_save_review_item(
-    filename: str, s3_raw_pdf_path: str, raw_pages: list[dict], use_llm_comparison: bool = False
+    filename: str, s3_raw_pdf_path: str, raw_pages: list[dict], use_llm_comparison: bool = False,
+    extraction_cost_usd: float = 0.0, extraction_started_at: Optional[float] = None,
 ) -> list[ReviewItem]:
     """Shared tail end of the pipeline (validate → classify → draft/split →
     candidate matching → save) — identical regardless of whether raw_pages
@@ -255,6 +291,14 @@ def _build_and_save_review_item(
     Keeping this as one function is what makes the handoff path "free" from
     downstream code's perspective: nothing past this point needs to know or
     care which extractor produced the pages.
+
+    extraction_cost_usd/extraction_started_at (added 2026-09) come from
+    whichever extractor ran BEFORE this function — Lambda includes them in
+    its S3 JSON output, extract_full_document() returns them directly (see
+    process_extraction_result()). Seeds this document's CostAccumulator so
+    the OCR/vision-verify spend that already happened is included in the
+    total shown in the admin UI, not just the build-phase (classify/draft/
+    match) cost this function's own calls add on top.
 
     Returns a LIST of ReviewItems, not one:
       - structured_license content splits into 0..N independent topics
@@ -267,6 +311,8 @@ def _build_and_save_review_item(
         present; that chunk is run through the OTHER pipeline too, producing
         additional sibling item(s) alongside the primary one, instead of
         silently dropping whichever shape didn't win the primary classification."""
+    cost_accumulator = CostAccumulator()
+    cost_accumulator.add(extraction_cost_usd)
     pages: list[PageExtractionRecord] = []
     for p in raw_pages:
         # validate_extraction() only calls an LLM when use_llm_comparison=True
@@ -317,7 +363,7 @@ def _build_and_save_review_item(
     # never raises (fails toward "structured_license", the longer-proven
     # path) — no try/except needed here, unlike the calls above/below that
     # wrap genuinely-fallible external services.
-    shape_check = classify_content_shape(page_markdowns)
+    shape_check = classify_content_shape(page_markdowns, cost_accumulator=cost_accumulator)
 
     if shape_check["shape"] == "know_how":
         primary_builder, secondary_builder = _build_knowhow_items, _build_license_items
@@ -340,7 +386,10 @@ def _build_and_save_review_item(
 
     items: list[ReviewItem] = []
     if primary_pages:
-        items.extend(primary_builder(filename, s3_raw_pdf_path, primary_pages, primary_markdowns, relevance_check, shape_check))
+        items.extend(primary_builder(
+            filename, s3_raw_pdf_path, primary_pages, primary_markdowns, relevance_check, shape_check,
+            cost_accumulator=cost_accumulator, extraction_started_at=extraction_started_at,
+        ))
     else:
         logger.info(f"[SQSConsumer] {filename}: entire document was flagged as secondary-shape content, nothing left for the primary pass")
 
@@ -348,7 +397,24 @@ def _build_and_save_review_item(
         secondary_shape = "structured_license" if shape_check["shape"] == "know_how" else "know_how"
         logger.info(f"[SQSConsumer] {filename}: processing secondary {secondary_shape} content at pages {start}-{end}")
         sub_pages, sub_markdowns = pages[start - 1 : end], page_markdowns[start - 1 : end]
-        items.extend(secondary_builder(filename, s3_raw_pdf_path, sub_pages, sub_markdowns, relevance_check, shape_check))
+        items.extend(secondary_builder(
+            filename, s3_raw_pdf_path, sub_pages, sub_markdowns, relevance_check, shape_check,
+            cost_accumulator=cost_accumulator, extraction_started_at=extraction_started_at,
+        ))
+
+    # Each builder call above already re-saves ITS OWN items with the
+    # accumulator's total at the time IT finished — but if both primary and
+    # secondary builders ran (mixed-shape document), the primary items were
+    # saved before the secondary pass added more cost to the same shared
+    # accumulator. One more pass here guarantees EVERY item from this one
+    # document, regardless of which builder produced it, ends up showing
+    # the true final total — cheap (in-memory field set + upsert-by-id save).
+    if items:
+        final_cost = cost_accumulator.total_cost_usd
+        for it in items:
+            if it.total_cost_usd != final_cost:
+                it.total_cost_usd = final_cost
+                _queue_manager.save(it)
 
     return items
 
@@ -420,7 +486,7 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
                 )
 
         try:
-            raw_pages = extract_full_document(bucket, s3_raw_pdf_path, on_progress=_on_progress)
+            raw_pages, extraction_cost_usd, extraction_started_at = extract_full_document(bucket, s3_raw_pdf_path, on_progress=_on_progress)
         except Exception as e:
             pdf_status_tracker.write_status(
                 bucket, filename, stage="failed", pages_total=page_count, attempt=attempt, error=str(e),
@@ -454,7 +520,10 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
                 return [item]
             raise
 
-        items = _build_and_save_review_item(filename, s3_raw_pdf_path, raw_pages, use_llm_comparison)
+        items = _build_and_save_review_item(
+            filename, s3_raw_pdf_path, raw_pages, use_llm_comparison,
+            extraction_cost_usd=extraction_cost_usd, extraction_started_at=extraction_started_at,
+        )
         pdf_status_tracker.clear(bucket, filename)
         return items
 
@@ -483,7 +552,14 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
         return [item]
 
     raw_pages = data["pages"]
-    items = _build_and_save_review_item(filename, s3_raw_pdf_path, raw_pages, use_llm_comparison)
+    # extraction_cost_usd/extraction_started_at: absent on items written by a
+    # Lambda deploy from before 2026-09 (pre-dates these fields) — .get()
+    # defaults keep this backward-compatible rather than KeyError-ing.
+    items = _build_and_save_review_item(
+        filename, s3_raw_pdf_path, raw_pages, use_llm_comparison,
+        extraction_cost_usd=data.get("extraction_cost_usd", 0.0),
+        extraction_started_at=data.get("extraction_started_at"),
+    )
     # Clears the status Lambda's normal (≤MAX_PAGES_FOR_LAMBDA) path wrote —
     # see lambda/pdf_extraction/handler.py's _write_status. Mirrors the
     # handoff branch above: covers the full gap (Lambda OCR + this

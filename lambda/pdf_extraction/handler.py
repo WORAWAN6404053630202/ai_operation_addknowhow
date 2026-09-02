@@ -170,12 +170,31 @@ _MODEL_PRICING = {
 }
 
 
-def _log_llm_cost(label: str, model: str, response, elapsed_seconds: float | None = None) -> None:
+class _CostAccumulator:
+    """Duplicated from code/utils/llm_cost_logging.py's CostAccumulator (NOT
+    imported — this Lambda has no access to code/) — thread-safe running
+    total for one document's extraction phase (all page's vision-verify
+    calls), included in the JSON this Lambda writes to S3 so sqs_consumer.py
+    on the EC2 side can add it to its own build-phase total for one
+    document-level cost shown in the admin UI. See that module for why."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.total_cost_usd = 0.0
+
+    def add(self, cost_usd: float) -> None:
+        with self._lock:
+            self.total_cost_usd += cost_usd
+
+
+def _log_llm_cost(label: str, model: str, response, elapsed_seconds: float | None = None, accumulator: "_CostAccumulator | None" = None) -> float:
     """Never raises — a logging failure must not break real OCR work.
     elapsed_seconds added 2026-09 alongside code/utils/llm_cost_logging.py's
     same addition — see that module for why (Typhoon's undocumented-until-
     checked 2 RPS / 20 RPM rate limit; a slow/retried call is the first
-    visible symptom, and this pipeline had no timing data anywhere before)."""
+    visible symptom, and this pipeline had no timing data anywhere before).
+    Returns the computed cost (0.0 on any failure/unknown-pricing path) and
+    adds it to `accumulator` if given — added alongside _CostAccumulator."""
     elapsed_str = "" if elapsed_seconds is None else f" elapsed_s={elapsed_seconds:.2f}"
     try:
         usage = getattr(response, "usage", None)
@@ -183,7 +202,9 @@ def _log_llm_cost(label: str, model: str, response, elapsed_seconds: float | Non
         completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
     except Exception as e:
         logger.warning(f"[CostLog] {label}: could not read token usage from the response, logging nothing{elapsed_str}: {e}")
-        return
+        if accumulator is not None:
+            accumulator.add(0.0)
+        return 0.0
 
     total_tokens = prompt_tokens + completion_tokens
     pricing = _MODEL_PRICING.get(model)
@@ -193,7 +214,9 @@ def _log_llm_cost(label: str, model: str, response, elapsed_seconds: float | Non
             f"completion_tokens={completion_tokens} total_tokens={total_tokens} "
             f"cost_usd=unknown (no pricing entry for this model in _MODEL_PRICING){elapsed_str}"
         )
-        return
+        if accumulator is not None:
+            accumulator.add(0.0)
+        return 0.0
 
     cost_usd = (prompt_tokens * pricing["input"] + completion_tokens * pricing["output"]) / 1_000_000
     logger.info(
@@ -201,6 +224,9 @@ def _log_llm_cost(label: str, model: str, response, elapsed_seconds: float | Non
         f"completion_tokens={completion_tokens} total_tokens={total_tokens} "
         f"cost_usd={cost_usd:.6f}{elapsed_str}"
     )
+    if accumulator is not None:
+        accumulator.add(cost_usd)
+    return cost_usd
 
 
 def _log_call_duration(label: str, elapsed_seconds: float) -> None:
@@ -309,7 +335,7 @@ def _run_typhoon(png_bytes: bytes, page_num: int) -> str:
         os.remove(tmp_path)
 
 
-def _run_vision_verify(png_bytes: bytes) -> str:
+def _run_vision_verify(png_bytes: bytes, cost_accumulator: "_CostAccumulator | None" = None) -> str:
     """Second-opinion OCR pass on top of Typhoon's — model is
     OPENROUTER_MODEL_VISION, not necessarily Claude despite the old function
     name this replaces (renamed 2026-09 to match pdf_large_extraction.py's
@@ -330,7 +356,7 @@ def _run_vision_verify(png_bytes: bytes) -> str:
         ],
         max_tokens=4000,
     )
-    _log_llm_cost("VisionVerify", OPENROUTER_MODEL_VISION, resp, time.time() - _call_start)
+    _log_llm_cost("VisionVerify", OPENROUTER_MODEL_VISION, resp, time.time() - _call_start, accumulator=cost_accumulator)
     return resp.choices[0].message.content or "(no text returned)"
 
 
@@ -426,7 +452,7 @@ def _extract_page_native_text(pdf_bytes: bytes, page_num: int) -> str | None:
     return text
 
 
-def _extract_one_page(pdf_bytes: bytes, page_num: int) -> dict:
+def _extract_one_page(pdf_bytes: bytes, page_num: int, cost_accumulator: "_CostAccumulator | None" = None) -> dict:
     native_text = _extract_page_native_text(pdf_bytes, page_num)
     if native_text is not None:
         logger.info(f"Page {page_num}: used native PDF text layer ({len(native_text)} chars) — skipped OCR entirely, $0 for this page")
@@ -449,7 +475,7 @@ def _extract_one_page(pdf_bytes: bytes, page_num: int) -> dict:
         # regardless of what the vision model would say.
         salient = _extract_salient_tokens(typhoon_markdown)
         if any(salient[k] for k in salient):
-            claude_markdown = _run_vision_verify(png_bytes)
+            claude_markdown = _run_vision_verify(png_bytes, cost_accumulator=cost_accumulator)
         else:
             claude_markdown = ""
             logger.info(f"Page {page_num}: no salient tokens in Typhoon output, skipping vision-verify")
@@ -481,6 +507,11 @@ def lambda_handler(event, context):
         filename = key.rsplit("/", 1)[-1]
 
         logger.info(f"Processing s3://{bucket}/{key}")
+        # Captured here, not at Lambda cold-start — this is "extraction
+        # actually begins" for THIS record, which is what
+        # ReviewItem.processing_duration_seconds on the EC2 side measures
+        # against extraction_completed_at for a real wall-clock number.
+        record_started_at = time.time()
         obj = s3.get_object(Bucket=bucket, Key=key)
         pdf_bytes = obj["Body"].read()
 
@@ -531,11 +562,12 @@ def lambda_handler(event, context):
         _write_status(bucket, filename, stage="processing", pages_done=0, pages_total=num_pages, attempt=attempt)
         _PROGRESS_WRITE_EVERY_N_PAGES = 5  # small enough to matter for a ≤35-page doc
 
+        extraction_cost_accumulator = _CostAccumulator()
         try:
             pages = [None] * num_pages
             pages_done = 0
             with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
-                futures = {pool.submit(_extract_one_page, pdf_bytes, p): p for p in range(1, num_pages + 1)}
+                futures = {pool.submit(_extract_one_page, pdf_bytes, p, extraction_cost_accumulator): p for p in range(1, num_pages + 1)}
                 for future in as_completed(futures):
                     page_num = futures[future]
                     pages[page_num - 1] = future.result()
@@ -543,7 +575,14 @@ def lambda_handler(event, context):
                     if pages_done == num_pages or pages_done % _PROGRESS_WRITE_EVERY_N_PAGES == 0:
                         _write_status(bucket, filename, stage="processing", pages_done=pages_done, pages_total=num_pages, attempt=attempt)
 
-            output = {"filename": filename, "s3_raw_pdf_path": key, "pages": pages}
+            # extraction_cost_usd/extraction_started_at: read by sqs_consumer.py
+            # on the EC2 side to seed its own build-phase CostAccumulator and
+            # ReviewItem.extraction_started_at — see model/pdf_review_item.py.
+            output = {
+                "filename": filename, "s3_raw_pdf_path": key, "pages": pages,
+                "extraction_cost_usd": extraction_cost_accumulator.total_cost_usd,
+                "extraction_started_at": record_started_at,
+            }
             output_key = f"{OUTPUT_S3_PREFIX}{filename}.json"
             s3.put_object(
                 Bucket=bucket,

@@ -564,6 +564,25 @@
     return new Date(ts * 1000).toLocaleString("th-TH", { dateStyle: "short", timeStyle: "short" });
   }
 
+  // Added 2026-09: total_cost_usd/extraction_started_at are None on items
+  // processed before these fields existed — "no data" for those rather than
+  // showing $0.00/0s, which would misleadingly imply a real zero-cost run
+  // instead of "we never measured this one". processing_duration_seconds is
+  // computed here (not read from the model) because it's a Python @property
+  // on ReviewItem, not a stored field, so model_dump() doesn't include it —
+  // only the two raw timestamps it's derived from. English labels
+  // deliberately kept separate from the rest of this file's Thai UI text —
+  // scoped per explicit request, not a general English-ification.
+  function costTimeHtml(item) {
+    const hasCost = typeof item.total_cost_usd === "number";
+    const hasDuration = item.extraction_started_at && item.extraction_completed_at;
+    const costStr = hasCost ? `$${item.total_cost_usd.toFixed(4)}` : "no data";
+    const durationStr = hasDuration
+      ? `${(item.extraction_completed_at - item.extraction_started_at).toFixed(1)}s`
+      : "no data";
+    return `<span title="Total across all stages: OCR/vision-verify + classify + draft + candidate matching">cost: ${costStr}</span><span title="Total wall-clock time from extraction start to queue save">time: ${durationStr}</span>`;
+  }
+
   function escHtml(t) {
     return String(t || "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
   }
@@ -1187,9 +1206,10 @@
       <div class="pq-header">
         <h2>${escHtml(item.filename)}</h2>
         <div class="pq-header-meta">
-          <span>📅 อัปโหลด: ${fmt(item.uploaded_at)}</span>
+          <span>📅 uploaded: ${fmt(item.uploaded_at)}</span>
           <span>📄 ${item.pages.length} หน้า</span>
           <span>🚩 ${totalFlags} flags (${highFlags} severity สูง)</span>
+          ${costTimeHtml(item)}
         </div>
       </div>
       <div style="flex:1;overflow-y:auto;padding:16px">

@@ -53,7 +53,7 @@ import conf
 from model.pdf_review_item import ReviewItem
 from service.pdf_field_drafting import DRAFTABLE_FIELDS
 from service.sheet_write_back import _clean_header, _get_worksheet
-from utils.llm_cost_logging import log_call_duration, log_llm_cost
+from utils.llm_cost_logging import CostAccumulator, log_call_duration, log_llm_cost
 from utils.logger import get_logger
 from utils.page_ranges import fuzzy_ratio
 from utils.prompt_safety import INJECTION_GUARD
@@ -236,7 +236,9 @@ _LLM_SCAN_PROMPT = """คุณกำลังช่วยตรวจสอบ�
 """
 
 
-def _llm_scan_batch(new_values: dict[str, str], batch: list[tuple[int, dict[str, str]]]) -> list[dict[str, Any]]:
+def _llm_scan_batch(
+    new_values: dict[str, str], batch: list[tuple[int, dict[str, str]]], cost_accumulator: Optional[CostAccumulator] = None,
+) -> list[dict[str, Any]]:
     rows_block = "\n".join(
         f"[{row_number}] หน่วยงาน: {values.get('department', '')} | "
         f"ประเภทใบอนุญาต: {values.get('license_type', '')} | "
@@ -259,7 +261,7 @@ def _llm_scan_batch(new_values: dict[str, str], batch: list[tuple[int, dict[str,
         response_format={"type": "json_object"},
         extra_body={"reasoning": {"enabled": False}},
     )
-    log_llm_cost(logger, "CandidateMatching/LLMScan", conf.OPENROUTER_MODEL_PDF_MATCHING, resp, time.monotonic() - _call_start)
+    log_llm_cost(logger, "CandidateMatching/LLMScan", conf.OPENROUTER_MODEL_PDF_MATCHING, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
     raw = (resp.choices[0].message.content or "{}").strip()
     raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     parsed = json.loads(raw)
@@ -267,7 +269,9 @@ def _llm_scan_batch(new_values: dict[str, str], batch: list[tuple[int, dict[str,
     return [m for m in matches if isinstance(m, dict) and isinstance(m.get("row_number"), int)]
 
 
-def _llm_scan_candidates(new_values: dict[str, str], rows: list[tuple[int, dict[str, str]]]) -> dict[int, str]:
+def _llm_scan_candidates(
+    new_values: dict[str, str], rows: list[tuple[int, dict[str, str]]], cost_accumulator: Optional[CostAccumulator] = None,
+) -> dict[int, str]:
     """Returns {row_number: reasoning}. Never raises — a failed batch just
     contributes nothing (the embedding + identity signals above still stand),
     logged so it's visible without blocking the whole review item."""
@@ -275,7 +279,7 @@ def _llm_scan_candidates(new_values: dict[str, str], rows: list[tuple[int, dict[
     for i in range(0, len(rows), _LLM_SCAN_BATCH_SIZE):
         batch = rows[i : i + _LLM_SCAN_BATCH_SIZE]
         try:
-            matches = _llm_scan_batch(new_values, batch)
+            matches = _llm_scan_batch(new_values, batch, cost_accumulator=cost_accumulator)
             for m in matches:
                 results[m["row_number"]] = str(m.get("reasoning", ""))
         except Exception as e:
@@ -303,7 +307,7 @@ def _field_diff(new_values: dict[str, str], existing_values: dict[str, str]) -> 
     return diffs
 
 
-def find_candidate_matches(item: ReviewItem) -> list[dict[str, Any]]:
+def find_candidate_matches(item: ReviewItem, cost_accumulator: Optional[CostAccumulator] = None) -> list[dict[str, Any]]:
     """Returns every existing Sheet row flagged by ANY of the 3 signals
     (embedding similarity / identity fuzzy match / LLM batch-scan), each with
     a found_by list and a field-by-field diff against the new item's drafted
@@ -331,7 +335,7 @@ def find_candidate_matches(item: ReviewItem) -> list[dict[str, Any]]:
         logger.error(f"[CandidateMatching] Embedding signal failed for {item.filename}, continuing with other signals: {e}")
 
     identity_hits = _identity_fuzzy_candidates(new_values, rows)
-    llm_hits = _llm_scan_candidates(new_values, rows)
+    llm_hits = _llm_scan_candidates(new_values, rows, cost_accumulator=cost_accumulator)
 
     all_row_numbers = set(embedding_scores) | identity_hits | set(llm_hits)
     if not all_row_numbers:
@@ -389,7 +393,7 @@ _CATEGORY_FIT_PROMPT = """คุณกำลังช่วยตรวจสอ
 """
 
 
-def check_category_fit(item: ReviewItem) -> Optional[dict[str, Any]]:
+def check_category_fit(item: ReviewItem, cost_accumulator: Optional[CostAccumulator] = None) -> Optional[dict[str, Any]]:
     """decision_type == 'new_category' support signal — a suggestion only,
     never auto-applied. Compares the new item's operation_topic against every
     distinct operation_topic already in the Sheet (the same live data the
@@ -430,7 +434,7 @@ def check_category_fit(item: ReviewItem) -> Optional[dict[str, Any]]:
             response_format={"type": "json_object"},
             extra_body={"reasoning": {"enabled": False}},
         )
-        log_llm_cost(logger, "CategoryFit", conf.OPENROUTER_MODEL_PDF_MATCHING, resp, time.monotonic() - _call_start)
+        log_llm_cost(logger, "CategoryFit", conf.OPENROUTER_MODEL_PDF_MATCHING, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
         raw = (resp.choices[0].message.content or "{}").strip()
         raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         parsed = json.loads(raw)

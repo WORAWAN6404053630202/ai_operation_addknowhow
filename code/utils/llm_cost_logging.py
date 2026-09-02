@@ -21,7 +21,8 @@ this table is ever copied elsewhere."""
 
 from __future__ import annotations
 
-from typing import Any
+import threading
+from typing import Any, Optional
 
 # {"input": $ per million input tokens, "output": $ per million output tokens}
 PDF_PIPELINE_MODEL_PRICING: dict[str, dict[str, float]] = {
@@ -32,11 +33,37 @@ PDF_PIPELINE_MODEL_PRICING: dict[str, dict[str, float]] = {
 }
 
 
+class CostAccumulator:
+    """Thread-safe running total for ONE document's processing — added
+    2026-09 so the admin review UI can show a per-document total instead of
+    cost only ever being visible one log line at a time. Pass the same
+    instance into every log_llm_cost() call across every stage of one
+    document's pipeline (extraction/vision-verify, content-shape
+    classification, topic drafting, candidate matching) via the optional
+    `accumulator` parameter — thread-safe because per-page extraction calls
+    happen concurrently via ThreadPoolExecutor."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.total_cost_usd = 0.0
+
+    def add(self, cost_usd: float) -> None:
+        with self._lock:
+            self.total_cost_usd += cost_usd
+
+
 def _elapsed_suffix(elapsed_seconds: float | None) -> str:
     return "" if elapsed_seconds is None else f" elapsed_s={elapsed_seconds:.2f}"
 
 
-def log_llm_cost(logger: Any, label: str, model: str, response: Any, elapsed_seconds: float | None = None) -> float:
+def log_llm_cost(
+    logger: Any,
+    label: str,
+    model: str,
+    response: Any,
+    elapsed_seconds: float | None = None,
+    accumulator: Optional[CostAccumulator] = None,
+) -> float:
     """Call once, right after receiving a chat-completion (or embedding)
     response, with a short label identifying which call site this was (e.g.
     "ClassifyContentShape", "DraftFields/topic-3") — the label is what makes
@@ -61,7 +88,10 @@ def log_llm_cost(logger: Any, label: str, model: str, response: Any, elapsed_sec
     Returns the computed cost in USD (0.0 if pricing for this model is
     unknown), so a caller that wants to accumulate a running total across
     multiple calls for one document can do so without re-deriving it from
-    the log line."""
+    the log line — or pass a CostAccumulator via `accumulator` to have this
+    function do that bookkeeping for you (added when the accumulator itself
+    was added; 0-cost outcomes are added too, harmlessly, so the accumulator
+    stays accurate without the caller needing to branch on which path ran)."""
     elapsed_str = _elapsed_suffix(elapsed_seconds)
     try:
         usage = getattr(response, "usage", None)
@@ -69,6 +99,8 @@ def log_llm_cost(logger: Any, label: str, model: str, response: Any, elapsed_sec
         completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
     except Exception as e:
         logger.warning(f"[CostLog] {label}: could not read token usage from the response, logging nothing{elapsed_str}: {e}")
+        if accumulator is not None:
+            accumulator.add(0.0)
         return 0.0
 
     total_tokens = prompt_tokens + completion_tokens
@@ -80,6 +112,8 @@ def log_llm_cost(logger: Any, label: str, model: str, response: Any, elapsed_sec
             f"completion_tokens={completion_tokens} total_tokens={total_tokens} "
             f"cost_usd=unknown (no pricing entry for this model in PDF_PIPELINE_MODEL_PRICING){elapsed_str}"
         )
+        if accumulator is not None:
+            accumulator.add(0.0)
         return 0.0
 
     cost_usd = (prompt_tokens * pricing["input"] + completion_tokens * pricing["output"]) / 1_000_000
@@ -88,6 +122,8 @@ def log_llm_cost(logger: Any, label: str, model: str, response: Any, elapsed_sec
         f"completion_tokens={completion_tokens} total_tokens={total_tokens} "
         f"cost_usd={cost_usd:.6f}{elapsed_str}"
     )
+    if accumulator is not None:
+        accumulator.add(cost_usd)
     return cost_usd
 
 

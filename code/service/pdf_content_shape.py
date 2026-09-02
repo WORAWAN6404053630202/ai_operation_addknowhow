@@ -25,12 +25,12 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import Literal, TypedDict
+from typing import Literal, Optional, TypedDict
 
 from openai import OpenAI
 
 import conf
-from utils.llm_cost_logging import log_llm_cost
+from utils.llm_cost_logging import CostAccumulator, log_llm_cost
 from utils.logger import get_logger
 from utils.prompt_safety import INJECTION_GUARD
 
@@ -114,9 +114,11 @@ structured_license ได้** (เช่น รวมประกาศใบ�
 """
 
 
-def classify_content_shape(pages_markdown: list[str]) -> ShapeCheck:
+def classify_content_shape(pages_markdown: list[str], cost_accumulator: Optional[CostAccumulator] = None) -> ShapeCheck:
     """One LLM call over all pages combined. Never raises — see
-    _FAILURE_FALLBACK for why the safe default is "structured_license"."""
+    _FAILURE_FALLBACK for why the safe default is "structured_license".
+    cost_accumulator (added 2026-09) is optional — pass one from
+    sqs_consumer.py to fold this call's cost into a document-level total."""
     numbered_pages = [f"[หน้า {i + 1}]\n{md}" for i, md in enumerate(pages_markdown)]
     combined_text = "\n\n---\n\n".join(numbered_pages)
     num_pages = len(pages_markdown)
@@ -141,7 +143,7 @@ def classify_content_shape(pages_markdown: list[str]) -> ShapeCheck:
             # 2026-08-25 switching this call off OPENROUTER_MODEL_PRACTICAL.
             extra_body={"reasoning": {"enabled": False}},
         )
-        log_llm_cost(logger, "ClassifyContentShape", conf.OPENROUTER_MODEL_PDF_CLASSIFICATION, resp, time.monotonic() - _call_start)
+        log_llm_cost(logger, "ClassifyContentShape", conf.OPENROUTER_MODEL_PDF_CLASSIFICATION, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
         raw = (resp.choices[0].message.content or "{}").strip()
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
         parsed = json.loads(raw)
