@@ -21,6 +21,7 @@ venv/
 *.key
 env.properties
 env.*.properties
+env.*.properties.*
 credentials.json
 credentials.*.json
 

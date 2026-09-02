@@ -35,7 +35,6 @@ from service.pdf_extraction_validation import validate_extraction
 from service.pdf_field_drafting import draft_fields_from_pages, identify_license_topics
 from service.pdf_knowhow_drafting import identify_knowhow_topics
 from service.pdf_large_extraction import extract_full_document
-from service.pdf_relevance_check import check_relevance
 from service import pdf_status_tracker
 from utils.logger import get_logger
 from utils.page_ranges import format_page_ranges, group_into_ranges
@@ -299,16 +298,18 @@ def _build_and_save_review_item(
 
     page_markdowns = [p["typhoon_markdown"] for p in raw_pages]
 
-    # Best-effort: a Sheet/embedding/LLM hiccup here must not lose the
-    # extraction work already done above — every resulting item just gets
-    # relevance_check=None (check_relevance itself already never raises; this
-    # try/except is defense-in-depth against an unexpected bug, not the
-    # primary safety net).
+    # Removed 2026-09: check_relevance() judged relevance against a fixed
+    # topic list that was already found too narrow (real case: a general tax
+    # guide flagged "uncertain"/"not_relevant" for not being restaurant-
+    # specific, when Restbiz's actual scope is much broader — HR, labor law,
+    # back-office, tax, not just food-specific licenses) and would keep
+    # needing manual updates for every new law/topic area. Every document
+    # entering this pipeline is already curated by whoever uploaded it —
+    # there's no real "is this in scope" decision left for the bot to make.
+    # relevance_check stays on ReviewItem (pdf_review_item.py) only so
+    # already-processed items from before this change keep displaying
+    # correctly in the admin UI; nothing sets it for new items anymore.
     relevance_check = None
-    try:
-        relevance_check = check_relevance(page_markdowns)
-    except Exception as e:
-        logger.error(f"[SQSConsumer] Relevance check failed for {filename}, continuing without it: {e}")
 
     # Routing decision: does this document fit the structured 13-field Sheet
     # schema, or is it know-how/multi-topic content that would lose most of
@@ -360,15 +361,23 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
     1. Normal completed extraction (the common case, unchanged since this
        feature's original build) — pages already OCR'd by Lambda, just run
        the validate/draft/review pipeline on them.
-    2. Skip marker ({"skipped": true, ...}) — Lambda's cheap pre-screen on an
-       oversized document judged it not worth the remaining OCR spend. Saves
-       a lightweight, zero-page ReviewItem carrying the skip reason in
-       relevance_check (reusing the same admin-UI banner candidate items
-       use) so it's still visible/overridable, not silently dropped.
-    3. Handoff marker (key under conf.PDF_HANDOFF_S3_PREFIX) — Lambda's
-       screen passed but the document is too large for Lambda's 15-minute
-       cap to process itself. Runs the full OCR here on EC2 (no such time
-       limit), then continues through the identical pipeline as case 1.
+    2. Skip marker ({"skipped": true, ...}) — LEGACY, 2026-09: Lambda used to
+       run a cheap pre-screen on oversized documents and write this marker
+       when it judged content not worth the OCR spend; that pre-screen was
+       removed (see the handoff branch below and lambda/pdf_extraction/
+       handler.py's module docstring — every document is now handed off
+       unconditionally, no screening). Lambda can no longer produce this
+       marker for a NEW document, so this branch cannot fire going forward
+       — kept only so a message somehow still carrying this old shape (e.g.
+       a stuck SQS/DLQ redelivery from before the change) degrades to a
+       clean, visible review-queue item instead of crashing on the
+       raw_pages = data["pages"] KeyError below. Old already-saved skip-
+       marker items get a "reprocess" button in the admin UI (router/
+       admin.py) for backward-compat recovery.
+    3. Handoff marker (key under conf.PDF_HANDOFF_S3_PREFIX) — the document
+       is too large for Lambda's 15-minute cap to process itself. Runs the
+       full OCR here on EC2 (no such time limit), then continues through
+       the identical pipeline as case 1.
 
     Safe to call directly (bypassing SQS) for local testing against a known
     S3 key — this is the actual processing logic; poll_and_process_forever()
@@ -384,10 +393,7 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
         filename = data["filename"]
         s3_raw_pdf_path = data["s3_raw_pdf_path"]
         page_count = data.get("page_count")
-        logger.info(
-            f"[SQSConsumer] {filename}: handoff marker ({page_count} pages, "
-            f"screen_reason={data.get('screen_reason')!r}) — running full extraction on EC2"
-        )
+        logger.info(f"[SQSConsumer] {filename}: handoff marker ({page_count} pages) — running full extraction on EC2")
 
         # Visibility for this specific long-running path (see
         # service/pdf_status_tracker.py's docstring for why: a page-1 restart
@@ -456,8 +462,11 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
     s3_raw_pdf_path = data.get("s3_raw_pdf_path", "")
 
     if data.get("skipped"):
+        # LEGACY branch — see this function's docstring (case 2). Lambda no
+        # longer produces this marker for any new document; this only
+        # handles a stale message somehow still carrying the old shape.
         reason = data.get("skip_reason", "")
-        logger.info(f"[SQSConsumer] {filename}: skip marker from Lambda's cheap screen — {reason!r}")
+        logger.warning(f"[SQSConsumer] {filename}: received a legacy skip-marker message (Lambda hasn't produced these since 2026-09) — {reason!r}")
         item = ReviewItem(
             filename=filename,
             s3_raw_pdf_path=s3_raw_pdf_path,

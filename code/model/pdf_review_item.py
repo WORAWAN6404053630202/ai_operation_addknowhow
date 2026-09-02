@@ -81,9 +81,15 @@ class ReviewItem(BaseModel):
     # service/pdf_candidate_matching.py's check_category_fit().
     category_fit_check: Optional[dict[str, Any]] = None
 
-    # LLM judgment of whether this document belongs in the restaurant-business
-    # regulatory knowledge base at all — {"tier": "relevant"|"uncertain"|
-    # "not_relevant", "reasoning": str}. See service/pdf_relevance_check.py.
+    # Legacy field — the LLM relevance-scope check that used to populate this
+    # (service/pdf_relevance_check.py, plus a Lambda pre-screen for oversized
+    # docs) was removed 2026-09: every document entering this pipeline is
+    # already curated as relevant by whoever uploaded it, and the fixed
+    # topic-scope list both checks judged against kept being wrong/too
+    # narrow (e.g. general tax/labor-law documents wrongly flagged, when
+    # Restbiz's real scope is broader than food-specific licenses). Kept on
+    # the model, defaulting to None, only so already-processed items from
+    # before this change keep displaying correctly in the admin UI.
     relevance_check: Optional[dict[str, str]] = None
 
     # {"shape": "structured_license"|"know_how", "reasoning": str,

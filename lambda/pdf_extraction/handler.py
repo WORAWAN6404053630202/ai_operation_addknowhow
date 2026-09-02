@@ -23,7 +23,7 @@ this repo's conf.py/env.properties — this function has no access to those):
   TYPHOON_OCR_API_KEY, OPENROUTER_API_KEY, SQS_QUEUE_URL
 Optional:
   OPENROUTER_BASE_URL     (default: https://openrouter.ai/api/v1)
-  OPENROUTER_MODEL        (default: anthropic/claude-sonnet-4-5)
+  OPENROUTER_MODEL_VISION (default: google/gemini-2.5-flash-lite) — per-page image OCR
   OUTPUT_S3_PREFIX        (default: restbiz/extracted/)
   HANDOFF_S3_PREFIX       (default: restbiz/pending_large/)
   MAX_PAGES_FOR_LAMBDA    (default: 35)
@@ -65,13 +65,17 @@ import base64
 import json
 import logging
 import os
+import random
+import re
+import threading
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
 
 import boto3
 import pymupdf
-from openai import OpenAI
+from openai import APIConnectionError, APITimeoutError, InternalServerError, OpenAI, RateLimitError
 from typhoon_ocr import ocr_document
 
 logger = logging.getLogger()
@@ -83,7 +87,12 @@ sqs = boto3.client("sqs")
 TYPHOON_OCR_API_KEY = os.environ.get("TYPHOON_OCR_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet-4-5")
+# Model for the per-page vision OCR call (_run_vision_verify below).
+# DECISION 2026-08/09: backtested against pdf_large_extraction.py's same
+# check on the EC2 side — Gemini 2.5 Flash Lite ($0.10/$0.40 per M vs
+# Sonnet's $3/$15, ~30x cheaper) matched or beat Sonnet's agreement rate
+# with Typhoon on every page tested.
+OPENROUTER_MODEL_VISION = os.environ.get("OPENROUTER_MODEL_VISION", "google/gemini-2.5-flash-lite")
 OUTPUT_S3_PREFIX = os.environ.get("OUTPUT_S3_PREFIX", "restbiz/extracted/")
 HANDOFF_S3_PREFIX = os.environ.get("HANDOFF_S3_PREFIX", "restbiz/pending_large/")
 # Same default as conf.PDF_STATUS_S3_PREFIX on the EC2 side (service/
@@ -94,7 +103,50 @@ MAX_PAGES_FOR_LAMBDA = int(os.environ.get("MAX_PAGES_FOR_LAMBDA", "35"))
 SQS_QUEUE_URL = os.environ.get("SQS_QUEUE_URL", "")
 
 _MAX_WORKERS = 4  # concurrent pages — keep modest, each page = 2 API calls already
-_SCREEN_PAGE_COUNT = 2  # pages OCR'd for the cheap pre-screen on oversized docs
+
+# Duplicated from code/utils/rate_limiter.py (NOT imported — this Lambda has
+# no access to code/, see module docstring) — see that module for the full
+# reasoning: Typhoon's own docs (checked 2026-09) say typhoon-ocr is
+# rate-limited to 2 requests/sec, 20 requests/min, and _MAX_WORKERS=4
+# page-level concurrency above can otherwise burst past that on a single
+# document alone. Per-invocation only — does NOT protect against multiple
+# concurrent Lambda invocations processing different documents at once.
+class _MinIntervalRateLimiter:
+    def __init__(self, min_interval_seconds: float):
+        self._min_interval = min_interval_seconds
+        self._lock = threading.Lock()
+        self._last_call_at: float | None = None
+
+    def wait(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            if self._last_call_at is not None:
+                remaining = self._min_interval - (now - self._last_call_at)
+                if remaining > 0:
+                    time.sleep(remaining)
+                    now = time.monotonic()
+            self._last_call_at = now
+
+
+# 1.8 (not 2.0) leaves a small margin for clock/network jitter — same value
+# as pdf_large_extraction.py's EC2-side copy.
+_typhoon_rate_limiter = _MinIntervalRateLimiter(min_interval_seconds=1 / 1.8)
+
+_TYPHOON_RETRYABLE_ERRORS = (RateLimitError, APIConnectionError, APITimeoutError, InternalServerError)
+_TYPHOON_MAX_RETRIES = 4  # bounded, never infinite — same lesson as the SQS retry-loop incident this pipeline already had once
+
+
+def _retry_after_seconds(exc: Exception) -> Optional[float]:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    header = getattr(response, "headers", {}).get("Retry-After")
+    if header is None:
+        return None
+    try:
+        return float(header)
+    except (TypeError, ValueError):
+        return None
 
 _CLAUDE_PROMPT = (
     "ถอดข้อความภาษาไทย (และอังกฤษถ้ามี) ทั้งหมดในภาพเอกสารนี้ให้ครบถ้วนและถูกต้องที่สุด "
@@ -104,24 +156,58 @@ _CLAUDE_PROMPT = (
     "แทนที่จะเดาคำที่ดูสมเหตุสมผล"
 )
 
-# Deliberately a plain yes/no triage prompt, NOT the full 3-tier relevant/
-# uncertain/not_relevant judgment code/service/pdf_relevance_check.py already
-# does properly on the complete document later in the EC2 pipeline — this one
-# only exists to answer "worth spending ~30 more pages of OCR on?", so it's
-# biased to say yes when unsure (a wrongly-skipped real document is a much
-# worse outcome than a few extra dollars of OCR on a false positive).
-_SCREEN_PROMPT_TEMPLATE = """นี่คือ 2 หน้าแรกของเอกสารขนาดใหญ่ (หลายสิบหน้า) ที่อัปโหลดเข้าระบบฐานความรู้
-ของ Restbiz ซึ่งเป็นระบบ AI ให้คำปรึกษาด้านกฎหมาย/ใบอนุญาต/ข้อบังคับสำหรับธุรกิจร้านอาหารในไทย
+# Duplicated from code/utils/llm_cost_logging.py (NOT imported — this Lambda
+# has no access to code/, see module docstring). Kept intentionally minimal
+# (this Lambda has exactly one LLM call site, _run_vision_verify below) —
+# see the EC2-side module for the full pricing-source explanation and the
+# claude-haiku-4-5 stale-value note. Re-verify against openrouter.ai before
+# trusting this table if it's ever copied elsewhere.
+_MODEL_PRICING = {
+    "anthropic/claude-sonnet-4-5": {"input": 3.00, "output": 15.00},
+    "anthropic/claude-haiku-4-5": {"input": 1.00, "output": 5.00},
+    "qwen/qwen3.7-flash": {"input": 0.03, "output": 0.13},
+    "google/gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40},
+}
 
-จากแค่ 2 หน้านี้ ประเมินคร่าวๆ ว่าเอกสารทั้งฉบับ**น่าจะ**เกี่ยวข้องกับธุรกิจร้านอาหาร/อาหารในไทยหรือไม่
-(ใบอนุญาต, กฎหมาย, know-how ที่เกี่ยวข้อง) — ถ้าไม่แน่ใจ ให้ตอบว่าเกี่ยวข้องไว้ก่อนเสมอ (ป้องกันการข้าม
-เอกสารที่จริงๆ มีประโยชน์ไปอย่างผิดพลาด)
 
-ตอบเป็น JSON เท่านั้น: {{"worth_processing": true หรือ false, "reason": "เหตุผลสั้นๆ 1 ประโยค"}}
+def _log_llm_cost(label: str, model: str, response, elapsed_seconds: float | None = None) -> None:
+    """Never raises — a logging failure must not break real OCR work.
+    elapsed_seconds added 2026-09 alongside code/utils/llm_cost_logging.py's
+    same addition — see that module for why (Typhoon's undocumented-until-
+    checked 2 RPS / 20 RPM rate limit; a slow/retried call is the first
+    visible symptom, and this pipeline had no timing data anywhere before)."""
+    elapsed_str = "" if elapsed_seconds is None else f" elapsed_s={elapsed_seconds:.2f}"
+    try:
+        usage = getattr(response, "usage", None)
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+    except Exception as e:
+        logger.warning(f"[CostLog] {label}: could not read token usage from the response, logging nothing{elapsed_str}: {e}")
+        return
 
-=== เนื้อหา 2 หน้าแรก ===
-{combined_text}
-"""
+    total_tokens = prompt_tokens + completion_tokens
+    pricing = _MODEL_PRICING.get(model)
+    if pricing is None:
+        logger.warning(
+            f"[CostLog] {label} | model={model} prompt_tokens={prompt_tokens} "
+            f"completion_tokens={completion_tokens} total_tokens={total_tokens} "
+            f"cost_usd=unknown (no pricing entry for this model in _MODEL_PRICING){elapsed_str}"
+        )
+        return
+
+    cost_usd = (prompt_tokens * pricing["input"] + completion_tokens * pricing["output"]) / 1_000_000
+    logger.info(
+        f"[CostLog] {label} | model={model} prompt_tokens={prompt_tokens} "
+        f"completion_tokens={completion_tokens} total_tokens={total_tokens} "
+        f"cost_usd={cost_usd:.6f}{elapsed_str}"
+    )
+
+
+def _log_call_duration(label: str, elapsed_seconds: float) -> None:
+    """For external calls with no token/cost data (Typhoon's ocr_document()
+    returns a plain string, not a response object with .usage) — mirrors
+    code/utils/llm_cost_logging.py's log_call_duration."""
+    logger.info(f"[CostLog] {label} | elapsed_s={elapsed_seconds:.2f} (no token/cost data for this call)")
 
 
 def _write_status(bucket, filename, *, stage, pages_done=None, pages_total=None, attempt=1, error=None) -> None:
@@ -184,27 +270,55 @@ def _render_page_to_png_bytes(pdf_bytes: bytes, page_num: int, dpi: int = 200) -
 
 
 def _run_typhoon(png_bytes: bytes, page_num: int) -> str:
+    """Throttled (_typhoon_rate_limiter) + retried with backoff on transient
+    failures — mirrors pdf_large_extraction.py's EC2-side copy, added
+    2026-09. Never retries forever: gives up after _TYPHOON_MAX_RETRIES and
+    re-raises, so Lambda's own async-invoke retry policy still applies as
+    the final safety net."""
     # ocr_document takes a file path, not bytes — /tmp is Lambda's writable scratch space.
     tmp_path = f"/tmp/page_{page_num}.png"
     with open(tmp_path, "wb") as f:
         f.write(png_bytes)
     try:
-        return ocr_document(
-            tmp_path,
-            model="typhoon-ocr",
-            figure_language="Thai",
-            task_type="v1.5",
-            api_key=TYPHOON_OCR_API_KEY,
-        )
+        attempt = 0
+        while True:
+            attempt += 1
+            _typhoon_rate_limiter.wait()
+            _call_start = time.time()
+            try:
+                result = ocr_document(
+                    tmp_path,
+                    model="typhoon-ocr",
+                    figure_language="Thai",
+                    task_type="v1.5",
+                    api_key=TYPHOON_OCR_API_KEY,
+                )
+                _log_call_duration(f"LambdaExtraction/Typhoon[page {page_num}]", time.time() - _call_start)
+                return result
+            except _TYPHOON_RETRYABLE_ERRORS as e:
+                _log_call_duration(f"LambdaExtraction/Typhoon[page {page_num}] attempt {attempt} FAILED", time.time() - _call_start)
+                if attempt > _TYPHOON_MAX_RETRIES:
+                    logger.error(f"Page {page_num}: Typhoon OCR failed after {attempt} attempts, giving up: {e}")
+                    raise
+                delay = _retry_after_seconds(e)
+                if delay is None:
+                    delay = min(2 ** (attempt - 1), 30) + random.uniform(0, 1)
+                logger.warning(f"Page {page_num}: Typhoon OCR attempt {attempt} failed ({type(e).__name__}), retrying in {delay:.1f}s: {e}")
+                time.sleep(delay)
     finally:
         os.remove(tmp_path)
 
 
-def _run_claude(png_bytes: bytes) -> str:
+def _run_vision_verify(png_bytes: bytes) -> str:
+    """Second-opinion OCR pass on top of Typhoon's — model is
+    OPENROUTER_MODEL_VISION, not necessarily Claude despite the old function
+    name this replaces (renamed 2026-09 to match pdf_large_extraction.py's
+    same rename on the EC2 side)."""
     client = OpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL)
     b64 = base64.b64encode(png_bytes).decode("utf-8")
+    _call_start = time.time()
     resp = client.chat.completions.create(
-        model=OPENROUTER_MODEL,
+        model=OPENROUTER_MODEL_VISION,
         messages=[
             {
                 "role": "user",
@@ -216,41 +330,144 @@ def _run_claude(png_bytes: bytes) -> str:
         ],
         max_tokens=4000,
     )
+    _log_llm_cost("VisionVerify", OPENROUTER_MODEL_VISION, resp, time.time() - _call_start)
     return resp.choices[0].message.content or "(no text returned)"
 
 
+# Duplicated from service/pdf_extraction_validation.py's _extract_salient_tokens
+# (NOT imported — this Lambda has no access to code/, see module docstring)
+# — kept byte-for-byte identical on purpose, since the H2 backtest result
+# (100% recall skipping vision-verify on pages with none of these 4 token
+# types, only 32.7% of pages needed it) that justified this optimization on
+# the EC2 side was measured against exactly this logic; drifting the two
+# copies apart would invalidate that result for this side.
+_FORM_CODE_RE = re.compile(r"[ก-ฮ]{1,3}\.?\s?\d{2}-\d{2}")
+_BAHT_AMOUNT_RE = re.compile(r"[\d,]+(?:\.\d{1,2})?\s*บาท")
+_DATE_RE = re.compile(r"\b\d{1,2}/\d{1,2}/\d{4}\b")
+_LICENSE_NUMBER_RE = re.compile(r"\b\d{2,4}-?[A-Zก-ฮ]?-?\d{6,8}\b")
+
+
+def _clean_number(raw: str) -> float:
+    return float(raw.replace(",", "").replace("บาท", "").strip())
+
+
+def _normalize_date(raw: str) -> str:
+    day, month, year = raw.split("/")
+    return f"{int(day):02d}/{int(month):02d}/{year}"
+
+
+def _extract_salient_tokens(markdown: str) -> dict[str, set]:
+    return {
+        "baht_amounts": {_BAHT_AMOUNT_RE.sub(lambda m: str(_clean_number(m.group())), a) for a in _BAHT_AMOUNT_RE.findall(markdown)},
+        "dates": {_normalize_date(d) for d in _DATE_RE.findall(markdown)},
+        "form_codes": {m.group().replace(" ", "") for m in _FORM_CODE_RE.finditer(markdown)},
+        "license_numbers": set(_LICENSE_NUMBER_RE.findall(markdown)),
+    }
+
+
+_MIN_PAGE_TEXT_LAYER_CHARS = 40  # below this, treat as scanned/image-only — not enough embedded text to trust
+
+# Character-validity check for a PDF's embedded text layer — the established
+# root cause of a corrupted text layer (per PyMuPDF/Docling issue trackers
+# and mojibake-detection literature, e.g. the `ftfy` library's heuristic
+# docs) is a CID-keyed font with no ToUnicode map, or a straight wrong-
+# encoding decode. Both failure modes overwhelmingly produce characters
+# OUTSIDE what a legitimate Thai document should contain: Unicode Private
+# Use Area (U+E000–U+F8FF, the single most-cited signature of the missing-
+# ToUnicode-map case) or the U+FFFD replacement character (the signature of
+# a wrong-encoding decode). Scoped to Thai + ASCII rather than reusing
+# `ftfy`-style pattern lists on purpose — those are tuned for Western
+# encoding confusion (UTF-8 decoded as Windows-1252 etc.), not the CID-font
+# failure mode that's the more common cause for Thai-language PDFs
+# specifically, and this needs no new dependency for what's meant to stay a
+# minimal, zip-deployable Lambda.
+_EXPECTED_TEXT_RANGES = (
+    (0x0009, 0x000A),  # tab, newline
+    (0x0020, 0x007E),  # ASCII printable: Latin letters, digits, punctuation
+    (0x0E00, 0x0E7F),  # Thai
+    (0x2018, 0x201F),  # curly quotes
+    (0x2013, 0x2014),  # en/em dash
+)
+_MAX_BAD_CHAR_RATIO = 0.05  # >5% characters outside the expected ranges = likely corrupted
+
+
+def _text_looks_valid(text: str) -> bool:
+    """See _EXPECTED_TEXT_RANGES above for the reasoning. Ignores whitespace
+    (not a signal either way) and never raises."""
+    stripped = "".join(text.split())
+    if not stripped:
+        return False
+    bad = sum(1 for ch in stripped if not any(lo <= ord(ch) <= hi for lo, hi in _EXPECTED_TEXT_RANGES))
+    return (bad / len(stripped)) <= _MAX_BAD_CHAR_RATIO
+
+
+def _extract_page_native_text(pdf_bytes: bytes, page_num: int) -> str | None:
+    """Zero-cost alternative to OCR: many digital-native (non-scanned) PDFs
+    already carry an extractable text layer via pymupdf's page.get_text() —
+    added 2026-09, this codebase had never used it anywhere in the actual
+    extraction path before. Returns None (caller falls back to OCR) for a
+    scanned/image-only page with no meaningful embedded text, a text layer
+    that fails the character-validity check above (likely a corrupted/
+    mismapped font), or if extraction itself errors — never raises."""
+    try:
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            text = doc[page_num - 1].get_text()
+        finally:
+            doc.close()
+    except Exception as e:
+        logger.warning(f"Page {page_num}: native text-layer extraction failed, falling back to OCR: {e}")
+        return None
+    if len(text.strip()) < _MIN_PAGE_TEXT_LAYER_CHARS:
+        return None
+    if not _text_looks_valid(text):
+        logger.info(f"Page {page_num}: native text layer present but failed the character-validity check (likely a corrupted/mismapped font) — falling back to OCR")
+        return None
+    return text
+
+
 def _extract_one_page(pdf_bytes: bytes, page_num: int) -> dict:
-    png_bytes = _render_page_to_png_bytes(pdf_bytes, page_num)
-    typhoon_markdown = _run_typhoon(png_bytes, page_num)
-    claude_markdown = _run_claude(png_bytes)
-    logger.info(f"Page {page_num}: extracted (Typhoon {len(typhoon_markdown)} chars, Claude {len(claude_markdown)} chars)")
-    return {"page_num": page_num, "typhoon_markdown": typhoon_markdown, "claude_markdown": claude_markdown}
+    native_text = _extract_page_native_text(pdf_bytes, page_num)
+    if native_text is not None:
+        logger.info(f"Page {page_num}: used native PDF text layer ({len(native_text)} chars) — skipped OCR entirely, $0 for this page")
+        # Same value in both fields: this IS the source text, not a second
+        # extractor's independent read of it — validate_extraction()'s
+        # compare_extractions() finding "no disagreement" here is correct
+        # (nothing to disagree about), not a fake cross-check.
+        return {"page_num": page_num, "typhoon_markdown": native_text, "claude_markdown": native_text}
 
+    try:
+        png_bytes = _render_page_to_png_bytes(pdf_bytes, page_num)
+        typhoon_markdown = _run_typhoon(png_bytes, page_num)
 
-def _screen_worth_processing(pdf_bytes: bytes, num_pages: int) -> dict:
-    """OCRs just the first _SCREEN_PAGE_COUNT pages and asks a cheap yes/no
-    triage question — the whole point is spending a little to potentially
-    avoid spending a lot (OCR on the remaining 30+ pages of something
-    out-of-scope). Never raises: any failure here defaults to "process it
-    anyway" (see caller), since a broken screen must not silently drop a real
-    document."""
-    screen_pages = min(_SCREEN_PAGE_COUNT, num_pages)
-    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
-        futures = {pool.submit(_extract_one_page, pdf_bytes, p): p for p in range(1, screen_pages + 1)}
-        results = {futures[f]: f.result() for f in as_completed(futures)}
-    ordered = [results[p] for p in sorted(results)]
+        # Same H2 optimization as pdf_large_extraction.py on the EC2 side
+        # (2026-08/09 backtest, 49 pages / 13 documents: 100% recall skipping
+        # vision-verify on pages with none of these 4 salient-token types,
+        # while only calling it on 32.7% of pages) — compare_extractions() in
+        # pdf_extraction_validation.py can only ever flag a disagreement in one
+        # of these categories, so a page with none of them can't produce a flag
+        # regardless of what the vision model would say.
+        salient = _extract_salient_tokens(typhoon_markdown)
+        if any(salient[k] for k in salient):
+            claude_markdown = _run_vision_verify(png_bytes)
+        else:
+            claude_markdown = ""
+            logger.info(f"Page {page_num}: no salient tokens in Typhoon output, skipping vision-verify")
 
-    combined_text = "\n\n---\n\n".join(p["typhoon_markdown"] for p in ordered)
-    client = OpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL)
-    resp = client.chat.completions.create(
-        model=OPENROUTER_MODEL,
-        messages=[{"role": "user", "content": _SCREEN_PROMPT_TEMPLATE.format(combined_text=combined_text)}],
-        max_tokens=300,
-    )
-    raw = (resp.choices[0].message.content or "{}").strip()
-    raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    parsed = json.loads(raw)
-    return {"worth_processing": bool(parsed.get("worth_processing", True)), "reason": str(parsed.get("reason", ""))}
+        logger.info(f"Page {page_num}: extracted via OCR (Typhoon {len(typhoon_markdown)} chars, Claude {len(claude_markdown)} chars)")
+        return {"page_num": page_num, "typhoon_markdown": typhoon_markdown, "claude_markdown": claude_markdown}
+    except Exception as e:
+        # Added 2026-09 (mirrors pdf_large_extraction.py's EC2-side copy):
+        # without this, one page's unrecoverable failure propagates out of
+        # the ThreadPoolExecutor future in lambda_handler() and kills the
+        # ENTIRE document — discarding every other page already successfully
+        # (and expensively) extracted in the same invocation. A placeholder
+        # record for just this one page costs nothing and keeps the rest of
+        # the document's work intact; a reviewer sees the error text in the
+        # review queue and knows exactly which page to re-check manually.
+        logger.error(f"Page {page_num}: extraction failed, saving placeholder instead of losing the whole document: {e}")
+        error_markdown = f"[สกัดข้อมูลหน้านี้ไม่สำเร็จ — เกิดข้อผิดพลาดระหว่างประมวลผล: {e}]"
+        return {"page_num": page_num, "typhoon_markdown": error_markdown, "claude_markdown": ""}
 
 
 def lambda_handler(event, context):
@@ -273,38 +490,25 @@ def lambda_handler(event, context):
         logger.info(f"{filename}: {num_pages} page(s)")
 
         if num_pages > MAX_PAGES_FOR_LAMBDA:
-            logger.info(f"{filename}: {num_pages} pages exceeds MAX_PAGES_FOR_LAMBDA={MAX_PAGES_FOR_LAMBDA}, screening first")
-            try:
-                screen = _screen_worth_processing(pdf_bytes, num_pages)
-            except Exception as e:
-                logger.error(f"Screening failed, defaulting to worth_processing=True (fail open, not closed): {e}")
-                screen = {"worth_processing": True, "reason": f"screen error, defaulted to processing: {e}"}
-
-            if not screen["worth_processing"]:
-                skip_output = {
-                    "filename": filename,
-                    "s3_raw_pdf_path": key,
-                    "skipped": True,
-                    "skip_reason": screen["reason"],
-                    "page_count": num_pages,
-                }
-                output_key = f"{OUTPUT_S3_PREFIX}{filename}.json"
-                s3.put_object(
-                    Bucket=bucket, Key=output_key,
-                    Body=json.dumps(skip_output, ensure_ascii=False).encode("utf-8"),
-                    ContentType="application/json",
-                )
-                logger.info(f"{filename}: skipped after cheap screen ({screen['reason']}) — wrote {output_key}, saved OCR on remaining {num_pages - _SCREEN_PAGE_COUNT} page(s)")
-                _notify_sqs(bucket, output_key)
-                results.append({"input_key": key, "output_key": output_key, "page_count": num_pages, "skipped": True})
-                continue
-
+            # Removed 2026-09: used to run a cheap relevance pre-screen here
+            # (OCR a few sample pages, ask an LLM "worth processing?") before
+            # committing to full OCR on EC2 — dropped along with
+            # check_relevance() elsewhere in this pipeline (see
+            # sqs_consumer.py) for the same reason: every document entering
+            # this pipeline is already curated by whoever uploaded it, so
+            # there's no real "is this in scope" decision left to make, and
+            # the screen's only real failure mode (wrongly skipping a
+            # genuinely relevant large document, losing it entirely with no
+            # OCR ever run) was strictly worse than the cost it was trying
+            # to save — cost exposure it was guarding against is now mostly
+            # covered anyway by _extract_page_native_text()'s free text-layer
+            # skip and _extract_one_page()'s salient-token check on the EC2
+            # side, both of which apply regardless of topic relevance.
             handoff = {
                 "filename": filename,
                 "s3_raw_pdf_path": key,
                 "bucket": bucket,
                 "page_count": num_pages,
-                "screen_reason": screen["reason"],
             }
             handoff_key = f"{HANDOFF_S3_PREFIX}{filename}.json"
             s3.put_object(
@@ -312,14 +516,14 @@ def lambda_handler(event, context):
                 Body=json.dumps(handoff, ensure_ascii=False).encode("utf-8"),
                 ContentType="application/json",
             )
-            logger.info(f"{filename}: {num_pages} pages, screen passed ({screen['reason']}) — handed off to EC2 via {handoff_key}, not processed in Lambda")
+            logger.info(f"{filename}: {num_pages} pages exceeds MAX_PAGES_FOR_LAMBDA={MAX_PAGES_FOR_LAMBDA} — handed off to EC2 via {handoff_key}, not processed in Lambda")
             _notify_sqs(bucket, handoff_key)
             results.append({"input_key": key, "handoff_key": handoff_key, "page_count": num_pages, "handed_off": True})
             continue
 
         # Progress visibility (2026-08-27): this is the common case (most
         # uploads are well under MAX_PAGES_FOR_LAMBDA) and it shares
-        # OPENROUTER_API_KEY with _run_claude() below, so it can fail the
+        # OPENROUTER_API_KEY with _run_vision_verify() below, so it can fail the
         # exact same silent way an out-of-credits account broke the EC2
         # large-doc path — previously invisible until the item either landed
         # in the review queue or someone went digging through CloudWatch.

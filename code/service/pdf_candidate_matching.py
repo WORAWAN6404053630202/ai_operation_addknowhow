@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from typing import Any, Optional
 
 from openai import OpenAI
@@ -52,6 +53,7 @@ import conf
 from model.pdf_review_item import ReviewItem
 from service.pdf_field_drafting import DRAFTABLE_FIELDS
 from service.sheet_write_back import _clean_header, _get_worksheet
+from utils.llm_cost_logging import log_call_duration, log_llm_cost
 from utils.logger import get_logger
 from utils.page_ranges import fuzzy_ratio
 from utils.prompt_safety import INJECTION_GUARD
@@ -144,7 +146,9 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
     embeddings: list[list[float]] = []
     for i in range(0, len(texts), _EMBEDDING_BATCH_SIZE):
         batch = texts[i : i + _EMBEDDING_BATCH_SIZE]
+        _call_start = time.monotonic()
         resp = client.embeddings.create(model=conf.EMBEDDING_MODEL, input=batch)
+        log_call_duration(logger, f"CandidateMatching/Embed[{len(batch)} texts]", time.monotonic() - _call_start)
         embeddings.extend([d.embedding for d in resp.data])
     return embeddings
 
@@ -247,6 +251,7 @@ def _llm_scan_batch(new_values: dict[str, str], batch: list[tuple[int, dict[str,
         rows_block=rows_block,
     )
     client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
+    _call_start = time.monotonic()
     resp = client.chat.completions.create(
         model=conf.OPENROUTER_MODEL_PDF_MATCHING,
         messages=[{"role": "user", "content": prompt}],
@@ -254,6 +259,7 @@ def _llm_scan_batch(new_values: dict[str, str], batch: list[tuple[int, dict[str,
         response_format={"type": "json_object"},
         extra_body={"reasoning": {"enabled": False}},
     )
+    log_llm_cost(logger, "CandidateMatching/LLMScan", conf.OPENROUTER_MODEL_PDF_MATCHING, resp, time.monotonic() - _call_start)
     raw = (resp.choices[0].message.content or "{}").strip()
     raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     parsed = json.loads(raw)
@@ -416,6 +422,7 @@ def check_category_fit(item: ReviewItem) -> Optional[dict[str, Any]]:
     )
     try:
         client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
+        _call_start = time.monotonic()
         resp = client.chat.completions.create(
             model=conf.OPENROUTER_MODEL_PDF_MATCHING,
             messages=[{"role": "user", "content": prompt}],
@@ -423,6 +430,7 @@ def check_category_fit(item: ReviewItem) -> Optional[dict[str, Any]]:
             response_format={"type": "json_object"},
             extra_body={"reasoning": {"enabled": False}},
         )
+        log_llm_cost(logger, "CategoryFit", conf.OPENROUTER_MODEL_PDF_MATCHING, resp, time.monotonic() - _call_start)
         raw = (resp.choices[0].message.content or "{}").strip()
         raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         parsed = json.loads(raw)

@@ -6,9 +6,10 @@ license X" procedures) or is better handled as one-or-more free-form
 know-how entries (advisory content, multi-topic documents, anything that
 would lose most of its substance getting forced into 13 spreadsheet cells).
 
-This is a ROUTING decision, not a relevance judgment (see pdf_relevance_check.py,
-which already runs separately) — a document can be perfectly relevant to
-restaurant business and still not have a single-license shape.
+This is a ROUTING decision, not a relevance judgment (the separate relevance
+check this used to be contrasted against, pdf_relevance_check.py, was
+removed 2026-09 — see sqs_consumer.py) — a document can be perfectly
+relevant to restaurant business and still not have a single-license shape.
 
 Advisory-only in spirit but structurally load-bearing: sqs_consumer.py uses
 this to decide which drafting path to run (pdf_field_drafting.py vs
@@ -23,11 +24,13 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Literal, TypedDict
 
 from openai import OpenAI
 
 import conf
+from utils.llm_cost_logging import log_llm_cost
 from utils.logger import get_logger
 from utils.prompt_safety import INJECTION_GUARD
 
@@ -74,13 +77,18 @@ _PROMPT_TEMPLATE = """เอกสารต่อไปนี้ (มีทั�
 
 **ส่วนที่ 1 — จำแนกรูปแบบหลักของเอกสาร:**
 
-**"structured_license"** — เอกสารอธิบาย**ใบอนุญาต/การจดทะเบียนเรื่องเดียวที่ชัดเจน** มีโครงสร้างครบ
+**"structured_license"** — เอกสารอธิบาย**ขั้นตอนขอใบอนุญาต/การจดทะเบียนที่มีโครงสร้างครบ**
 (หน่วยงานที่ออก, ขั้นตอน, เอกสารที่ต้องใช้, ค่าธรรมเนียม, ระยะเวลา) — เหมาะจะสรุปลงตารางฟิลด์ตายตัวได้
-โดยไม่เสียเนื้อหาสำคัญไป
+โดยไม่เสียเนื้อหาสำคัญไป **เอกสารอาจมีใบอนุญาต/การจดทะเบียนแบบนี้มากกว่า 1 เรื่องปนกันก็ยังนับเป็น
+structured_license ได้** (เช่น รวมประกาศใบอนุญาต 3 เรื่องจากคนละหน่วยงานไว้ในไฟล์เดียว) — ระบบจะแยก
+แต่ละเรื่องออกเป็นรายการอิสระเองในขั้นตอนถัดไป ไม่ต้องกังวลเรื่องจำนวนเรื่อง **สิ่งที่ต้องดูคือรูปแบบของ
+แต่ละเรื่อง**: ถ้าทุกเรื่องในเอกสารเป็นขั้นตอนขอใบอนุญาตที่มีโครงสร้างครบแบบนี้ ให้ตอบ structured_license
+แม้จะมีหลายเรื่องก็ตาม
 
-**"know_how"** — เอกสารเป็นเนื้อหาให้ความรู้/คำแนะนำทั่วไป (ไม่ใช่ขั้นตอนขอใบอนุญาตเรื่องเดียว),
-หรือมี**หลายหัวข้อ/หลายประเด็นปนกันในไฟล์เดียว**, หรือเนื้อหายาว/ซับซ้อนเกินกว่าจะสรุปลงฟิลด์ตายตัว
-โดยไม่เสียเนื้อหาไปมาก — เหมาะเก็บเป็นรายการความรู้แยกเรื่อง
+**"know_how"** — เอกสารเป็นเนื้อหาให้ความรู้/คำแนะนำทั่วไปที่**ไม่ใช่ขั้นตอนขอใบอนุญาต**(กลยุทธ์ธุรกิจ,
+การตลาด, การบริหารจัดการ ฯลฯ), หรือเนื้อหายาว/ซับซ้อนเกินกว่าจะสรุปลงฟิลด์ตายตัวโดยไม่เสียเนื้อหาไปมาก —
+เหมาะเก็บเป็นรายการความรู้แยกเรื่อง **การมีหลายเรื่องในไฟล์เดียวไม่ได้แปลว่าเป็น know_how โดยอัตโนมัติ** —
+ต้องดูที่**รูปแบบเนื้อหา**แต่ละเรื่องเป็นหลัก ไม่ใช่จำนวนเรื่อง
 
 **ส่วนที่ 2 — เนื้อหาส่วนน้อย (secondary) ของรูปแบบตรงข้าม (ถ้ามีจริง):**
 ถ้าเอกสารมีเนื้อหา**ก้อนใหญ่ชัดเจน**ของรูปแบบตรงข้ามกับที่เลือกในส่วนที่ 1 ปนอยู่ด้วย (เช่น
@@ -88,6 +96,11 @@ _PROMPT_TEMPLATE = """เอกสารต่อไปนี้ (มีทั�
 ให้ระบุช่วงหน้าของส่วนนั้นไว้ใน "secondary_pages" — **ใช้เฉพาะเมื่อเนื้อหานั้นสมบูรณ์พอจะแยกออกมาใช้ได้จริง
 เท่านั้น** ถ้าเป็นแค่การพูดถึงผ่านๆ ประโยคเดียวหรือสองประโยค **อย่า**ใส่ใน secondary_pages (จะกลายเป็น
 เสียงรบกวน ไม่มีเนื้อหาพอจะแยกออกมาจริง) ถ้าเอกสารเป็นรูปแบบเดียวล้วนๆ ให้ตอบ secondary_pages เป็น [] เสมอ
+
+**ตรวจสอบความสอดคล้องก่อนตอบ**: ถ้าข้อความใน "reasoning" ของคุณเองอธิบายว่ามีหน้าไหนที่เข้าข่ายรูปแบบ
+ตรงข้ามอย่างสมบูรณ์ (เช่น พูดถึงขั้นตอน/หน่วยงาน/ค่าธรรมเนียมของใบอนุญาตหนึ่งครบถ้วนในหน้านั้น) แต่
+"secondary_pages" ที่จะตอบกลับว่างเปล่า [] — นั่นคือคำตอบไม่สอดคล้องกัน ให้แก้ไข secondary_pages ให้ตรงกับ
+สิ่งที่ reasoning อธิบายจริงก่อนส่งคำตอบ
 
 ตอบเป็น JSON เท่านั้น:
 {{
@@ -109,10 +122,18 @@ def classify_content_shape(pages_markdown: list[str]) -> ShapeCheck:
     num_pages = len(pages_markdown)
     try:
         client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
+        _call_start = time.monotonic()
         resp = client.chat.completions.create(
             model=conf.OPENROUTER_MODEL_PDF_CLASSIFICATION,
             messages=[{"role": "user", "content": _PROMPT_TEMPLATE.format(num_pages=num_pages, combined_text=combined_text)}],
             max_tokens=500,
+            # Live-tested 2026-08-25: on borderline mixed-shape documents,
+            # default sampling temperature made secondary_pages detection
+            # flip run-to-run (2/4 correct across identical repeated calls).
+            # temperature=0 made the same case 4/4 consistent — this is a
+            # classification task where determinism matters more than
+            # variety, so pin it.
+            temperature=0,
             # qwen3.7-flash defaults reasoning ON — without disabling it, the
             # model's own chain-of-thought consumes the whole max_tokens
             # budget before it ever writes the JSON answer, leaving
@@ -120,6 +141,7 @@ def classify_content_shape(pages_markdown: list[str]) -> ShapeCheck:
             # 2026-08-25 switching this call off OPENROUTER_MODEL_PRACTICAL.
             extra_body={"reasoning": {"enabled": False}},
         )
+        log_llm_cost(logger, "ClassifyContentShape", conf.OPENROUTER_MODEL_PDF_CLASSIFICATION, resp, time.monotonic() - _call_start)
         raw = (resp.choices[0].message.content or "{}").strip()
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
         parsed = json.loads(raw)
@@ -139,7 +161,15 @@ def classify_content_shape(pages_markdown: list[str]) -> ShapeCheck:
     secondary_pages: list[tuple[int, int]] = []
     for raw_range in parsed.get("secondary_pages", []) or []:
         try:
-            s, e = int(raw_range[0]), int(raw_range[1])
+            if isinstance(raw_range, (int, float, str)):
+                # Live-tested 2026-08-25: qwen3.7-flash sometimes returns a
+                # bare page number (e.g. 1) instead of the requested [1, 1]
+                # pair for a single-page secondary chunk — a real single-
+                # page intent expressed in the wrong shape, not garbage;
+                # worth interpreting rather than discarding.
+                s = e = int(raw_range)
+            else:
+                s, e = int(raw_range[0]), int(raw_range[1])
         except (TypeError, ValueError, IndexError):
             logger.warning(f"[ContentShape] Skipping malformed secondary_pages entry: {raw_range!r}")
             continue

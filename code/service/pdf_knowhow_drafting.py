@@ -30,13 +30,15 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import TypedDict
 
 from openai import OpenAI
 
 import conf
+from utils.llm_cost_logging import log_llm_cost
 from utils.logger import get_logger
-from utils.page_ranges import fuzzy_ratio, merge_topic_chunks
+from utils.page_ranges import fuzzy_ratio, group_into_ranges, merge_topic_chunks
 from utils.prompt_safety import INJECTION_GUARD
 
 logger = get_logger(__name__)
@@ -101,6 +103,108 @@ _PROMPT_TEMPLATE = """เอกสารต่อไปนี้ (มีทั�
 """
 
 
+_OVERLAP_RESOLUTION_PROMPT = """หน้าต่อไปนี้ถูกระบบแบ่งหัวข้อจัดให้อยู่ใน 2 หัวข้อพร้อมกันโดยผิดพลาด (ห้ามเกิดขึ้น
+แต่เกิดขึ้นจริง) ต้องเลือกว่าเนื้อหาหน้านี้ควรอยู่หัวข้อไหนมากกว่ากัน — เลือกแค่ 1 หัวข้อ
+
+หัวข้อ A: "{topic_a}" — {sub_a}
+หัวข้อ B: "{topic_b}" — {sub_b}
+
+=== เนื้อหาหน้าที่มีปัญหา (หน้า {page_nums}) ===
+{combined_text}
+
+ตอบเป็น JSON เท่านั้น: {{"winner": "A" หรือ "B"}}
+"""
+
+
+def _resolve_page_overlaps(topics: list[KnowhowTopicBounds], pages_markdown: list[str]) -> list[KnowhowTopicBounds]:
+    """merge_topic_chunks() above can still leave an overlap if the LLM's raw
+    page_ranges answer claimed the same page for 2+ topics — a real,
+    reproduced failure (2026-08/09 live example: adjacent topics claiming
+    pages 6-7 in common) despite the main prompt already saying "ห้ามข้ามหน้า
+    หรือซ้อนทับกัน". There's a deterministic check for the OPPOSITE failure
+    (pages nobody claimed) in sqs_consumer.py's catch-all fallback, but
+    nothing caught this direction until now.
+
+    For each contiguous run of pages overlapping between exactly 2 topics,
+    asks one small targeted follow-up (just those pages' text + the 2
+    competing topic descriptions) rather than guessing with a heuristic —
+    cheap (a couple pages of context, ~50 output tokens) and actually
+    grounded in the disputed content, unlike a blind "first topic wins"
+    rule which has no way to know which topic is really right. Falls back
+    to first-topic-wins only if that follow-up call itself fails, so this
+    can never hang or retry indefinitely — same bounded-fallback pattern as
+    the rest of this pipeline's error handling."""
+    def _page_set(t: KnowhowTopicBounds) -> set[int]:
+        s: set[int] = set()
+        for a, b in t["page_ranges"]:
+            s.update(range(a, b + 1))
+        return s
+
+    page_owners: dict[int, list[int]] = {}
+    for idx, t in enumerate(topics):
+        for p in _page_set(t):
+            page_owners.setdefault(p, []).append(idx)
+
+    overlapping = sorted(p for p, owners in page_owners.items() if len(owners) > 1)
+    if not overlapping:
+        return topics
+
+    # Group contiguous pages that share the exact same pair of competing
+    # topics into one dispute (one follow-up call per dispute, not per page).
+    runs: list[tuple[list[int], tuple[int, int]]] = []
+    for p in overlapping:
+        owners = tuple(sorted(page_owners[p])[:2])  # 3+-way overlap: just take the first 2, rare enough not to warrant a bespoke multi-way prompt
+        if runs and runs[-1][1] == owners and runs[-1][0][-1] == p - 1:
+            runs[-1][0].append(p)
+        else:
+            runs.append(([p], owners))
+
+    losers: dict[int, set[int]] = {}
+    client: OpenAI | None = None
+    for pages, (idx_a, idx_b) in runs:
+        winner_idx, loser_idx = idx_a, idx_b  # safe default if the resolution call below fails
+        try:
+            if client is None:
+                client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
+            combined = "\n\n---\n\n".join(f"[หน้า {p}]\n{pages_markdown[p - 1]}" for p in pages)
+            prompt = _OVERLAP_RESOLUTION_PROMPT.format(
+                topic_a=topics[idx_a]["main_topic"], sub_a=topics[idx_a]["sub_topic"],
+                topic_b=topics[idx_b]["main_topic"], sub_b=topics[idx_b]["sub_topic"],
+                page_nums=", ".join(str(p) for p in pages),
+                combined_text=combined,
+            )
+            _call_start = time.monotonic()
+            resp = client.chat.completions.create(
+                model=conf.OPENROUTER_MODEL_PDF_CLASSIFICATION,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=50,
+                temperature=0,
+            )
+            log_llm_cost(logger, "KnowhowDrafting/ResolveOverlap", conf.OPENROUTER_MODEL_PDF_CLASSIFICATION, resp, time.monotonic() - _call_start)
+            raw = (resp.choices[0].message.content or "{}").strip()
+            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
+            winner = json.loads(raw).get("winner", "A")
+            winner_idx, loser_idx = (idx_a, idx_b) if winner == "A" else (idx_b, idx_a)
+        except Exception as e:
+            logger.warning(f"[KnowhowDrafting] Overlap resolution call failed for pages {pages}, defaulting to first-topic-wins: {e}")
+
+        losers.setdefault(loser_idx, set()).update(pages)
+
+    resolved: list[KnowhowTopicBounds] = []
+    for idx, t in enumerate(topics):
+        if idx not in losers:
+            resolved.append(t)
+            continue
+        remaining_pages = sorted(_page_set(t) - losers[idx])
+        if not remaining_pages:
+            logger.info(f"[KnowhowDrafting] Topic {t['main_topic']!r}/{t['sub_topic']!r} lost all its pages to overlap resolution, dropping it")
+            continue
+        resolved.append({**t, "page_ranges": group_into_ranges(remaining_pages)})
+
+    logger.info(f"[KnowhowDrafting] Resolved {len(overlapping)} overlapping page(s) across {len(runs)} dispute(s)")
+    return resolved
+
+
 def identify_knowhow_topics(pages_markdown: list[str]) -> list[KnowhowTopicBounds]:
     """One LLM call. Returns [] (never raises) on any failure — the caller
     treats an empty list as "could not split into topics" and should fall
@@ -114,6 +218,7 @@ def identify_knowhow_topics(pages_markdown: list[str]) -> list[KnowhowTopicBound
 
     try:
         client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
+        _call_start = time.monotonic()
         resp = client.chat.completions.create(
             model=conf.OPENROUTER_MODEL_PDF_CLASSIFICATION,
             messages=[{
@@ -122,6 +227,11 @@ def identify_knowhow_topics(pages_markdown: list[str]) -> list[KnowhowTopicBound
             }],
             max_tokens=2500,
             response_format={"type": "json_object"},
+            # Live-tested 2026-08-25 (same finding as pdf_content_shape.py /
+            # pdf_field_drafting.py): default sampling temperature made a
+            # borderline classification call flip run-to-run; temperature=0
+            # made repeated identical calls consistent.
+            temperature=0,
             # qwen3.7-flash defaults reasoning ON — without disabling it, the
             # model's own chain-of-thought can consume the token budget
             # before ever writing the JSON answer (message.content=None,
@@ -129,6 +239,7 @@ def identify_knowhow_topics(pages_markdown: list[str]) -> list[KnowhowTopicBound
             # call off OPENROUTER_MODEL_PRACTICAL.
             extra_body={"reasoning": {"enabled": False}},
         )
+        log_llm_cost(logger, "KnowhowDrafting/IdentifyTopics", conf.OPENROUTER_MODEL_PDF_CLASSIFICATION, resp, time.monotonic() - _call_start)
         raw = (resp.choices[0].message.content or "{}").strip()
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
         parsed = json.loads(raw)
@@ -183,6 +294,7 @@ def identify_knowhow_topics(pages_markdown: list[str]) -> list[KnowhowTopicBound
         })
 
     topics: list[KnowhowTopicBounds] = merge_topic_chunks(chunks, ("main_topic", "sub_topic"), fuzzy_ratio)
+    topics = _resolve_page_overlaps(topics, pages_markdown)
     logger.info(
         f"[KnowhowDrafting] {document_title!r} (source_type={source_type}): "
         f"identified {len(topics)} topic(s) (from {len(chunks)} chunk(s)) across {num_pages} page(s)"

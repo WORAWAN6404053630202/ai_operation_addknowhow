@@ -39,11 +39,13 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import Any
 
 import conf
+from utils.llm_cost_logging import log_llm_cost
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -261,11 +263,13 @@ def compare_extractions_llm(
     prompt = _LLM_COMPARISON_PROMPT.format(markdown_a=markdown_a, markdown_b=markdown_b)
 
     try:
+        _call_start = time.monotonic()
         resp = client.chat.completions.create(
             model=conf.OPENROUTER_MODEL_PRACTICAL,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=1500,
         )
+        log_llm_cost(logger, "ExtractionValidation/LLMComparison", conf.OPENROUTER_MODEL_PRACTICAL, resp, time.monotonic() - _call_start)
         raw = (resp.choices[0].message.content or "[]").strip()
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
         disagreements = json.loads(raw)

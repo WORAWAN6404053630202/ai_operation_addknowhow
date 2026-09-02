@@ -12,9 +12,25 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 from pathlib import Path
+
+# handler.py's module-level logger only sets its own level (logger.setLevel),
+# it never attaches a handler (real Lambda runtime provides one automatically
+# — a plain local script does not). Without this, logger.info(...) calls —
+# including the [CostLog] lines this script exists to verify — are silently
+# dropped: confirmed locally that only WARNING+ reaches the console via
+# Python's "handler of last resort" when no handler is configured.
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+# handler.py constructs boto3.client("s3")/("sqs") at import time with no
+# explicit region — fine inside a real Lambda runtime (region is always
+# ambient there) but breaks import in a plain local shell with no AWS config
+# active. Same NoRegionError, same fix already applied in
+# tests/test_pdf_path_parity.py's lazy-import helper.
+os.environ.setdefault("AWS_DEFAULT_REGION", "ap-southeast-2")
 
 project_root = Path(__file__).parent.parent.parent
 lambda_dir = project_root / "lambda" / "pdf_extraction"

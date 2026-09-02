@@ -30,14 +30,16 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import TypedDict
 
 from openai import OpenAI
 
 import conf
+from utils.llm_cost_logging import log_llm_cost
 from utils.logger import get_logger
 from utils.page_ranges import fuzzy_ratio as _fuzzy_ratio
-from utils.page_ranges import merge_topic_chunks
+from utils.page_ranges import group_into_ranges, merge_topic_chunks
 from utils.prompt_safety import INJECTION_GUARD
 
 logger = get_logger(__name__)
@@ -108,11 +110,13 @@ def draft_fields_from_pages(pages_markdown: list[str]) -> dict[str, str]:
     client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
 
     prompt = _PROMPT_TEMPLATE.format(combined_text=combined_text)
+    _call_start = time.monotonic()
     resp = client.chat.completions.create(
-        model=conf.OPENROUTER_MODEL_PRACTICAL,
+        model=conf.OPENROUTER_MODEL_PDF_DRAFTING,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=3000,
     )
+    log_llm_cost(logger, "FieldDrafting/DraftFields", conf.OPENROUTER_MODEL_PDF_DRAFTING, resp, time.monotonic() - _call_start)
     raw = (resp.choices[0].message.content or "{}").strip()
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
 
@@ -208,6 +212,7 @@ def identify_license_topics(pages_markdown: list[str]) -> list[LicenseTopicBound
     combined_text = "\n\n---\n\n".join(numbered_pages)
 
     client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
+    _call_start = time.monotonic()
     resp = client.chat.completions.create(
         model=conf.OPENROUTER_MODEL_PDF_CLASSIFICATION,
         messages=[{
@@ -226,6 +231,12 @@ def identify_license_topics(pages_markdown: list[str]) -> list[LicenseTopicBound
         # merge_topic_chunks'd together) makes each entry longer, which
         # itself re-hit the ceiling at 45 topics — 6000 covers both.
         max_tokens=6000,
+        # Live-tested 2026-08-25 (same finding as pdf_content_shape.py):
+        # default sampling temperature made a borderline topic-boundary call
+        # flip run-to-run; temperature=0 made repeated identical calls
+        # consistent. Topic splitting is a classification task, not a
+        # creative one — determinism matters more than variety here.
+        temperature=0,
         # qwen3.7-flash defaults reasoning ON — without disabling it, the
         # model's own chain-of-thought can consume the token budget before
         # ever writing the JSON answer (message.content=None, finish_reason
@@ -233,6 +244,7 @@ def identify_license_topics(pages_markdown: list[str]) -> list[LicenseTopicBound
         # OPENROUTER_MODEL_PRACTICAL.
         extra_body={"reasoning": {"enabled": False}},
     )
+    log_llm_cost(logger, "FieldDrafting/IdentifyLicenseTopics", conf.OPENROUTER_MODEL_PDF_CLASSIFICATION, resp, time.monotonic() - _call_start)
     raw = (resp.choices[0].message.content or "[]").strip()
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
     parsed = json.loads(raw)
@@ -264,5 +276,107 @@ def identify_license_topics(pages_markdown: list[str]) -> list[LicenseTopicBound
         })
 
     topics: list[LicenseTopicBounds] = merge_topic_chunks(chunks, ("department", "license_type"), _fuzzy_ratio)
+    topics = _resolve_page_overlaps(topics, pages_markdown)
     logger.info(f"[pdf_field_drafting] Identified {len(topics)} license topic(s) (from {len(chunks)} chunk(s)) across {num_pages} page(s)")
     return topics
+
+
+_OVERLAP_RESOLUTION_PROMPT = """หน้าต่อไปนี้ถูกระบบแบ่งหัวข้อจัดให้อยู่ใน 2 เรื่องพร้อมกันโดยผิดพลาด (ห้ามเกิดขึ้น
+แต่เกิดขึ้นจริง) ต้องเลือกว่าเนื้อหาหน้านี้ควรอยู่เรื่องไหนมากกว่ากัน — เลือกแค่ 1 เรื่อง
+
+เรื่อง A: หน่วยงาน "{department_a}" — ประเภทใบอนุญาต "{license_type_a}"
+เรื่อง B: หน่วยงาน "{department_b}" — ประเภทใบอนุญาต "{license_type_b}"
+
+=== เนื้อหาหน้าที่มีปัญหา (หน้า {page_nums}) ===
+{combined_text}
+
+ตอบเป็น JSON เท่านั้น: {{"winner": "A" หรือ "B"}}
+"""
+
+
+def _resolve_page_overlaps(topics: list[LicenseTopicBounds], pages_markdown: list[str]) -> list[LicenseTopicBounds]:
+    """Same fix as pdf_knowhow_drafting.py's _resolve_page_overlaps (not
+    imported — this checks a different topic shape: department/license_type
+    instead of main_topic/sub_topic, and the two functions' prompts need
+    different label text, not worth a shared abstraction over 2 small call
+    sites). See that function's docstring for the full reasoning: merge_topic_
+    chunks() above can still leave an overlap if the LLM's raw page_ranges
+    answer claimed the same page for 2+ topics, despite the main prompt
+    already saying "ห้ามข้ามหน้าหรือซ้อนทับกัน" — this was a real, reproduced
+    failure mode for identify_knowhow_topics() (adjacent topics claiming
+    pages 6-7 in common, 2026-08/09) and there's no reason identify_license_
+    topics() is structurally immune to the identical LLM behavior, even
+    though it hasn't been separately reproduced here yet.
+
+    Resolves each contiguous run of pages overlapping between exactly 2
+    topics with one small targeted follow-up call (just those pages' text +
+    the 2 competing topic descriptions), falling back to first-topic-wins
+    only if that follow-up call itself fails — bounded, can never hang or
+    retry indefinitely."""
+    def _page_set(t: LicenseTopicBounds) -> set[int]:
+        s: set[int] = set()
+        for a, b in t["page_ranges"]:
+            s.update(range(a, b + 1))
+        return s
+
+    page_owners: dict[int, list[int]] = {}
+    for idx, t in enumerate(topics):
+        for p in _page_set(t):
+            page_owners.setdefault(p, []).append(idx)
+
+    overlapping = sorted(p for p, owners in page_owners.items() if len(owners) > 1)
+    if not overlapping:
+        return topics
+
+    runs: list[tuple[list[int], tuple[int, int]]] = []
+    for p in overlapping:
+        owners = tuple(sorted(page_owners[p])[:2])
+        if runs and runs[-1][1] == owners and runs[-1][0][-1] == p - 1:
+            runs[-1][0].append(p)
+        else:
+            runs.append(([p], owners))
+
+    losers: dict[int, set[int]] = {}
+    client: OpenAI | None = None
+    for pages, (idx_a, idx_b) in runs:
+        winner_idx, loser_idx = idx_a, idx_b  # safe default if the resolution call below fails
+        try:
+            if client is None:
+                client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
+            combined = "\n\n---\n\n".join(f"[หน้า {p}]\n{pages_markdown[p - 1]}" for p in pages)
+            prompt = _OVERLAP_RESOLUTION_PROMPT.format(
+                department_a=topics[idx_a]["department"], license_type_a=topics[idx_a]["license_type"],
+                department_b=topics[idx_b]["department"], license_type_b=topics[idx_b]["license_type"],
+                page_nums=", ".join(str(p) for p in pages),
+                combined_text=combined,
+            )
+            _call_start = time.monotonic()
+            resp = client.chat.completions.create(
+                model=conf.OPENROUTER_MODEL_PDF_CLASSIFICATION,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=50,
+                temperature=0,
+            )
+            log_llm_cost(logger, "FieldDrafting/ResolveOverlap", conf.OPENROUTER_MODEL_PDF_CLASSIFICATION, resp, time.monotonic() - _call_start)
+            raw = (resp.choices[0].message.content or "{}").strip()
+            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
+            winner = json.loads(raw).get("winner", "A")
+            winner_idx, loser_idx = (idx_a, idx_b) if winner == "A" else (idx_b, idx_a)
+        except Exception as e:
+            logger.warning(f"[pdf_field_drafting] Overlap resolution call failed for pages {pages}, defaulting to first-topic-wins: {e}")
+
+        losers.setdefault(loser_idx, set()).update(pages)
+
+    resolved: list[LicenseTopicBounds] = []
+    for idx, t in enumerate(topics):
+        if idx not in losers:
+            resolved.append(t)
+            continue
+        remaining_pages = sorted(_page_set(t) - losers[idx])
+        if not remaining_pages:
+            logger.info(f"[pdf_field_drafting] Topic {t['department']!r}/{t['license_type']!r} lost all its pages to overlap resolution, dropping it")
+            continue
+        resolved.append({**t, "page_ranges": group_into_ranges(remaining_pages)})
+
+    logger.info(f"[pdf_field_drafting] Resolved {len(overlapping)} overlapping page(s) across {len(runs)} dispute(s)")
+    return resolved

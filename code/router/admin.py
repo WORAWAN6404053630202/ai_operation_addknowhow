@@ -337,3 +337,73 @@ async def pdf_queue_decide(item_id: str, decision: PdfReviewDecision):
         )
 
     return JSONResponse({"ok": True, "item": item.model_dump(), "sheet_result": sheet_result})
+
+
+@router.post("/api/pdf-queue/{item_id}/reprocess")
+async def pdf_queue_reprocess(item_id: str):
+    """Manual safety net for a document Lambda's cheap oversized-document
+    pre-screen (lambda/pdf_extraction/handler.py's _screen_worth_processing,
+    REMOVED 2026-09 — see that file and sqs_consumer.py for why) decided to
+    skip back when that screen still existed — it only sampled a handful of
+    pages, so it could misjudge a large document whose relevant content
+    happened to be outside its sample (real case, 2026-08/09: a 258-page tax
+    guide was skipped because its first 2 pages read as generic
+    front-matter — this endpoint is how that specific item was recovered).
+    Kept even though nothing can produce a new skip-marker item anymore, so
+    any already-skipped item from before the removal stays recoverable:
+    writes a fresh handoff marker pointing at the SAME original PDF and
+    re-notifies SQS, so it goes through full extraction on EC2 this
+    time — bypassing the screen entirely, same as if it had passed the first
+    time. Does not delete the old skip-marker item; marks it rejected/
+    superseded so the queue doesn't show it as still-pending once the
+    reprocessed version lands as a new item."""
+    item = _pdf_queue_manager.load(item_id)
+    if item is None:
+        return JSONResponse({"error": "Item not found"}, status_code=404)
+    if not item.s3_raw_pdf_path:
+        return JSONResponse({"error": "This item has no s3_raw_pdf_path — nothing to reprocess"}, status_code=400)
+
+    bucket = getattr(_conf, "PDF_INGESTION_S3_BUCKET", "") if _conf else ""
+    queue_url = getattr(_conf, "PDF_SQS_QUEUE_URL", "") if _conf else ""
+    handoff_prefix = getattr(_conf, "PDF_HANDOFF_S3_PREFIX", "restbiz/pending_large/") if _conf else "restbiz/pending_large/"
+    if not bucket or not queue_url:
+        return JSONResponse({"error": "PDF_INGESTION_S3_BUCKET / PDF_SQS_QUEUE_URL not configured"}, status_code=500)
+
+    try:
+        import boto3
+
+        s3 = boto3.client("s3", region_name=getattr(_conf, "AWS_REGION", "") or None)
+        sqs = boto3.client("sqs", region_name=getattr(_conf, "AWS_REGION", "") or None)
+
+        handoff = {
+            "filename": item.filename,
+            "s3_raw_pdf_path": item.s3_raw_pdf_path,
+            "bucket": bucket,
+            "page_count": None,  # unknown here; sqs_consumer.py treats it as optional (progress display only)
+            "screen_reason": "manual reprocess triggered by reviewer from the admin UI",
+        }
+        handoff_key = f"{handoff_prefix}{item.filename}.json"
+        s3.put_object(
+            Bucket=bucket, Key=handoff_key,
+            Body=json.dumps(handoff, ensure_ascii=False).encode("utf-8"),
+            ContentType="application/json",
+        )
+        # Same Records[]-shaped body a real S3 event notification would send —
+        # sqs_consumer.py's process_sqs_message() parses this exact shape
+        # regardless of whether S3 or this endpoint sent it.
+        message_body = json.dumps(
+            {"Records": [{"s3": {"bucket": {"name": bucket}, "object": {"key": handoff_key}}}]},
+            ensure_ascii=False,
+        )
+        sqs.send_message(QueueUrl=queue_url, MessageBody=message_body)
+    except Exception as e:
+        _LOG.error(f"[pdf_queue_reprocess] Failed to re-queue {item.filename} ({item_id}): {e}")
+        return JSONResponse({"error": f"Failed to re-queue for reprocessing: {e}"}, status_code=502)
+
+    item.review_status = "rejected"
+    item.reviewer_notes = ((item.reviewer_notes or "") + " [ส่งประมวลผลใหม่ทั้งไฟล์แล้ว — รายการนี้ถูกแทนที่ รอรายการใหม่ในคิว]").strip()
+    item.reviewed_at = time.time()
+    _pdf_queue_manager.save(item)
+
+    _LOG.info(f"[pdf_queue_reprocess] Re-queued {item.filename} ({item_id}) for full extraction, handoff_key={handoff_key}")
+    return JSONResponse({"ok": True, "handoff_key": handoff_key})

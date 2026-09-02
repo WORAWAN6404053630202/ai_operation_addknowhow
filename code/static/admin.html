@@ -434,6 +434,18 @@
     .btn-approve { background: rgba(74,222,128,0.12); border-color: var(--green); color: var(--green); }
     .btn-reject  { background: rgba(248,113,113,0.12); border-color: var(--red); color: var(--red); }
     .btn-approve:disabled, .btn-reject:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-reprocess {
+      margin-left: 10px;
+      padding: 4px 12px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 11px;
+      font-weight: 700;
+      font-family: inherit;
+      border: 1px solid var(--amber, #fbbf24);
+      background: rgba(251,191,36,0.12);
+      color: var(--amber, #fbbf24);
+    }
 
     .already-decided {
       padding: 12px 16px;
@@ -1007,11 +1019,35 @@
       not_relevant: "🚫 ดูเหมือนไม่เกี่ยวข้องกับธุรกิจร้านอาหารเลย",
     };
     const label = labels[rc.tier] || rc.tier;
+    // A genuine skip-marker (Lambda's cheap oversized-document pre-screen,
+    // only samples a handful of pages — see lambda/pdf_extraction/handler.py)
+    // has tier="not_relevant" AND zero pages, since nothing was ever OCR'd.
+    // A "uncertain"/"not_relevant" verdict from the FULL check_relevance()
+    // call after normal processing still has real pages — don't offer to
+    // reprocess something that was already fully processed, that button is
+    // only for the "content never even got looked at" case.
+    const isSkipMarker = rc.tier === "not_relevant" && (!item.pages || item.pages.length === 0);
+    const reprocessBtn = isSkipMarker
+      ? `<button class="btn-reprocess" onclick="reprocessItem('${item.id}')">🔁 ประมวลผลใหม่ทั้งไฟล์ (ข้ามการคัดกรองครั้งนี้)</button>`
+      : "";
     return `
       <div class="relevance-check ${escHtml(rc.tier)}">
         <span class="rc-tag">${label}</span>
         ${rc.reasoning ? `<span class="rc-reasoning">— ${escHtml(rc.reasoning)}</span>` : ""}
+        ${reprocessBtn}
       </div>`;
+  }
+
+  async function reprocessItem(itemId) {
+    if (!confirm("ยืนยันส่งไฟล์นี้ประมวลผลใหม่ทั้งไฟล์ (ข้ามการคัดกรองแบบเดิม)?")) return;
+    const r = await fetch(`/admin/api/pdf-queue/${itemId}/reprocess`, { method: "POST" });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      alert("เกิดข้อผิดพลาด: " + (err.error || r.status));
+      return;
+    }
+    alert("ส่งประมวลผลใหม่แล้ว — รายการใหม่จะปรากฏในคิวเมื่อประมวลผลเสร็จ");
+    await loadPdfQueue();
   }
 
   function contentShapeHtml(item) {

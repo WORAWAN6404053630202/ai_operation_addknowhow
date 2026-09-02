@@ -381,6 +381,11 @@ PDF_HANDOFF_S3_PREFIX = os.getenv("PDF_HANDOFF_S3_PREFIX", "restbiz/pending_larg
 # service/pdf_status_tracker.py) — one small JSON object per in-flight raw
 # PDF, deleted once a real ReviewItem is saved.
 PDF_STATUS_S3_PREFIX = os.getenv("PDF_STATUS_S3_PREFIX", "restbiz/status/")
+# Was only ever hardcoded as a CLI argument in restbiz-pdf-consumer.service's
+# ExecStart (systemd unit on EC2), nowhere reusable from code — added as a
+# real constant 2026-09 so router/admin.py's manual-reprocess endpoint can
+# notify the same queue without duplicating that URL a second place.
+PDF_SQS_QUEUE_URL = os.getenv("PDF_SQS_QUEUE_URL", "https://sqs.ap-southeast-2.amazonaws.com/390844753868/restbiz-pdf-extraction-results")
 
 # State manager configuration
 STATE_DIR = os.getenv("STATE_DIR") or None
