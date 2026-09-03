@@ -110,6 +110,7 @@ from utils.text_patterns import (
     ENTITY_HINT_RE as _SHARED_ENTITY_HINT_RE,
     GENERIC_FOLLOWUP_KEYWORDS_RE as _SHARED_GENERIC_FOLLOWUP_KEYWORDS_RE,
     SPECIFIC_TOPIC_RE as _SHARED_SPECIFIC_TOPIC_RE,
+    topic_label_matches_query,
 )
 from utils.prompts_supervisor import (
     build_topic_picker_prompt,
@@ -2756,10 +2757,21 @@ class PersonaSupervisor:
         # entity_false_positive_regex_tightening.md Part 2.
         new_entity: Optional[str] = None
         new_entity_source: Optional[str] = None
-        if self._ENTITY_NATURAL_RE.search(q_orig):
+        _entity_natural_hit = bool(self._ENTITY_NATURAL_RE.search(q_orig))
+        _entity_niti_hit = bool(self._ENTITY_NITI_RE.search(q_orig))
+        if _entity_natural_hit and _entity_niti_hit:
+            # Genuine multi-entity comparison (e.g. "บุคคลธรรมดากับนิติบุคคล ต่างกันไหม")
+            # — both named in the same message. Pick นิติบุคคล as the nominal
+            # "established" slot value (arbitrary; either side works since both are
+            # surfaced via _multi_entity_mentioned below for the guaranteed-fetch
+            # and prompt-exception paths), but do NOT let this silently overwrite a
+            # single-entity intent — see _multi_entity_mentioned block below.
+            new_entity = "นิติบุคคล"
+            new_entity_source = "explicit"
+        elif _entity_natural_hit:
             new_entity = "บุคคลธรรมดา"
             new_entity_source = "explicit"
-        elif self._ENTITY_NITI_RE.search(q_orig):
+        elif _entity_niti_hit:
             new_entity = "นิติบุคคล"
             new_entity_source = "explicit"
         else:
@@ -2789,6 +2801,18 @@ class PersonaSupervisor:
                         _q_thai, new_entity, _best,
                     )
                     break
+
+        # Surface both explicitly-named entity types (when the query genuinely
+        # compares/names both, e.g. "หจก. กับบุคคลธรรมดา ต่างกันไหม") to
+        # persona_practical.py, mirroring _multi_dept_mentioned above — so its
+        # guaranteed-fetch can pull docs for BOTH entity_type_normalized values
+        # this turn, not just the one that stays "established" in collected_slots
+        # (see prompts_practical.py's new multi-entity comparison exception).
+        if state.context is not None:
+            if _entity_natural_hit and _entity_niti_hit:
+                state.context["_multi_entity_mentioned"] = ["บุคคลธรรมดา", "นิติบุคคล"]
+            else:
+                state.context.pop("_multi_entity_mentioned", None)
 
         # ── Detect location switch (กรุงเทพฯ ↔ ต่างจังหวัด) — regex only here; ──
         # LLM fallback (if needed) runs concurrently with entity/area below.
@@ -4128,12 +4152,28 @@ class PersonaSupervisor:
         # Cap at _MAIN_TOPIC_MAX_DOCS as a safety ceiling only — not a quality gate.
         # Set high enough to never truncate real chapters (largest known: 37 docs).
         # Prevents runaway token usage if a future chapter grows very large (>60 docs).
+        # Also check the original user message — the LLM rewriter often drops key words
+        # (e.g. "การตลาดแบบ B2B" → "การตลาด B2B สำหรับร้านอาหาร", losing "แบบ"). Computed once
+        # here and shared with the sub_topic block below via topic_label_matches_query
+        # (utils/text_patterns.py) — was previously duplicated inline with main_topic's
+        # copy missing the raw-message/ASCII-id fallbacks sub_topic's copy had, an
+        # asymmetry that made main_topic chapter-fetch miss more often than sub_topic for
+        # the exact same class of paraphrased query. state.messages[-1] (role=user) holds
+        # the raw pre-rewrite text.
+        _q_lower_sv = q.lower()
+        _last_raw_human = next(
+            (m.get("content", "") for m in reversed(state.messages or []) if m.get("role") == "user"),
+            "",
+        ).lower()
+
         _MAIN_TOPIC_MAX_DOCS = 60
         _mt_filter_used = False
         _main_topic_candidates = self._get_all_main_topics_from_store()
         if _main_topic_candidates:
-            _q_lower_sv = q.lower()
-            _matched_mts = [mt for mt in _main_topic_candidates if mt.lower() in _q_lower_sv and len(mt) >= 5]
+            _matched_mts = [
+                mt for mt in _main_topic_candidates
+                if len(mt) >= 5 and topic_label_matches_query(mt, _q_lower_sv, _last_raw_human)
+            ]
             # When multiple main_topics match, pick the longest one (most specific).
             # E.g. query "การบริหารจัดการพนักงานภายในร้านอาหาร" matches both
             # "การฝึกอบรมพนักงาน" and "การบริหารจัดการพนักงานภายในร้านอาหาร" —
@@ -4186,34 +4226,10 @@ class PersonaSupervisor:
         _st_filter_used = False
         _sub_topic_candidates = self._get_all_sub_topics_from_store()
         if _sub_topic_candidates:
-            # Also check the original user message — the LLM rewriter often drops key words
-            # (e.g. "การตลาดแบบ B2B" → "การตลาด B2B สำหรับร้านอาหาร", losing "แบบ").
-            # state.messages[-1] (role=user) holds the raw pre-rewrite text.
-            _last_raw_human = next(
-                (m.get("content", "") for m in reversed(state.messages or []) if m.get("role") == "user"),
-                "",
-            ).lower()
-            # ASCII identifier matching: catch cases where LLM drops Thai particles but keeps
-            # the key ASCII token (e.g. user: "การตลาด B2B", sub_topic: "การตลาดแบบ B2B").
-            # Extract significant ASCII tokens (3+ chars with at least one letter) from sub_topic
-            # and check if they all appear in the combined query text.
-            import re as _re_st
-            _ASCII_ID_RE_ST = _re_st.compile(r'[A-Za-z][A-Za-z0-9\-]{2,}|[0-9][A-Za-z][A-Za-z0-9\-]{1,}')
-            _combined_q = _q_lower_sv + " " + _last_raw_human
-
-            def _ascii_id_match(sub_t: str) -> bool:
-                tokens = _ASCII_ID_RE_ST.findall(sub_t)
-                if not tokens:
-                    return False
-                return all(t.lower() in _combined_q for t in tokens)
-
+            # _q_lower_sv / _last_raw_human computed once above (shared with main_topic).
             _matched_sts = [
                 st for st in _sub_topic_candidates
-                if len(st) >= 8 and (
-                    st.lower() in _q_lower_sv
-                    or st.lower() in _last_raw_human
-                    or _ascii_id_match(st)
-                )
+                if len(st) >= 8 and topic_label_matches_query(st, _q_lower_sv, _last_raw_human)
             ]
             # Also check operation_topic values — rows like the exemption row have
             # operation_topic='การจดทะเบียนพาณิชย์ที่ได้รับการยกเว้น' but sub_topic=None,
@@ -4221,11 +4237,7 @@ class PersonaSupervisor:
             _op_topic_candidates = self._get_all_operation_topics_from_store()
             _matched_ots = [
                 ot for ot in _op_topic_candidates
-                if len(ot) >= 8 and (
-                    ot.lower() in _q_lower_sv
-                    or ot.lower() in _last_raw_human
-                    or _ascii_id_match(ot)
-                )
+                if len(ot) >= 8 and topic_label_matches_query(ot, _q_lower_sv, _last_raw_human)
             ]
             _target_st_sv = ""
             _use_op_topic_filter = False

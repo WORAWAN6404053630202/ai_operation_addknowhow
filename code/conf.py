@@ -153,6 +153,16 @@ TEMPERATURE_PRACTICAL = _safe_float("TEMPERATURE_PRACTICAL", 0.0)
 MAX_TOKENS_ACADEMIC = _safe_int("MAX_TOKENS_ACADEMIC", 8000)
 MAX_TOKENS_ACADEMIC_SLOTS = _safe_int("MAX_TOKENS_ACADEMIC_SLOTS", 3000)
 MAX_TOKENS_PRACTICAL = _safe_int("MAX_TOKENS_PRACTICAL", 4500)
+# Added 2026-09: escalation ceiling used ONLY when persona_practical.py's
+# _call_llm_json detects the normal MAX_TOKENS_PRACTICAL budget likely
+# truncated the answer mid-list (LengthFinishReasonError, or a JSON parse
+# failure that had to fall back to the regex "rescue" partial-answer path)
+# — a real QA-review finding: multi-item answers (long document-requirement
+# lists, many-subtopic know-how chapters) were silently cut short and shown
+# to the user as if complete. Deliberately NOT just raising
+# MAX_TOKENS_PRACTICAL itself, since that would pay the higher ceiling's
+# cost/latency on every single call instead of only the rare truncated one.
+MAX_TOKENS_PRACTICAL_RETRY = _safe_int("MAX_TOKENS_PRACTICAL_RETRY", 8000)
 
 EMBEDDING_MODEL = os.getenv(
     "EMBEDDING_MODEL",
@@ -484,6 +494,11 @@ def validate_config() -> None:
         errors.append(f"MAX_TOKENS_ACADEMIC={MAX_TOKENS_ACADEMIC} is too low (min 100)")
     if MAX_TOKENS_PRACTICAL < 50:
         errors.append(f"MAX_TOKENS_PRACTICAL={MAX_TOKENS_PRACTICAL} is too low (min 50)")
+    if MAX_TOKENS_PRACTICAL_RETRY < MAX_TOKENS_PRACTICAL:
+        errors.append(
+            f"MAX_TOKENS_PRACTICAL_RETRY={MAX_TOKENS_PRACTICAL_RETRY} must be >= "
+            f"MAX_TOKENS_PRACTICAL={MAX_TOKENS_PRACTICAL} (it exists to give MORE room, not less)"
+        )
     if RETRIEVAL_TOP_K < 1:
         errors.append(f"RETRIEVAL_TOP_K={RETRIEVAL_TOP_K} must be >= 1")
     if LLM_REQUEST_TIMEOUT < 5:

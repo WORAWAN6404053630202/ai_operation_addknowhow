@@ -2106,12 +2106,21 @@ class PracticalPersonaService:
         return self._reply_greeting_with_choices(state, kind="thanks")
 
     # LLM + retrieval
-    def _call_llm_json(self, prompt: str, max_retries: int = 2, state: Optional[ConversationState] = None) -> dict:
+    def _call_llm_json(
+        self, prompt: str, max_retries: int = 2, state: Optional[ConversationState] = None,
+        llm_override: Optional[Any] = None,
+    ) -> dict:
+        """llm_override (added 2026-09): lets a caller substitute a
+        differently-configured LLM runnable (e.g. one bound to a higher
+        max_tokens) for this call, without touching self.llm — used by
+        _call_llm_json_with_truncation_retry below for its one-shot
+        expanded-budget retry."""
+        _llm = llm_override if llm_override is not None else self.llm
         last_err = None
         for _ in range(max_retries):
             try:
                 _sys_msg = build_cached_system_message(SYSTEM_PROMPT_PRACTICAL, getattr(self.llm, "model", ""))
-                resp = llm_invoke(self.llm, [_sys_msg, HumanMessage(content=prompt)], logger=_LOG, label="Practical/json", state=state)
+                resp = llm_invoke(_llm, [_sys_msg, HumanMessage(content=prompt)], logger=_LOG, label="Practical/json", state=state)
                 text = extract_llm_text(resp).strip()
 
                 if "```json" in text:
@@ -2215,6 +2224,57 @@ class PracticalPersonaService:
             "action": "answer",
             "execution": {"answer": "ขออภัยครับ ระบบประมวลผลคำถามไม่สำเร็จ กรุณาลองถามใหม่อีกครั้งครับ", "context_update": {}},
         }
+
+    # Marks the 2 ways _call_llm_json's own retry loop gives up and falls back
+    # to a SHORTER-than-intended answer — "json_repair" (JSON parse failed,
+    # a regex "rescue" pulled out however much of the "answer" string had
+    # been generated before the cutoff) and "Parse error" (LengthFinishReasonError,
+    # or every retry attempt failed outright). Both are consistent with the
+    # underlying response having been truncated by MAX_TOKENS_PRACTICAL before
+    # the model finished writing a long, multi-item answer.
+    _TRUNCATION_LIKELY_ANALYSIS_MARKERS = ("json_repair", "Parse error")
+
+    def _call_llm_json_with_truncation_retry(self, prompt: str, state: Optional[ConversationState] = None) -> dict:
+        """Added 2026-09 after a QA review found several real cases where a
+        long multi-item answer (an 8-item document checklist; a 23-subtopic
+        know-how chapter; a 4-category pricing framework) got silently cut
+        short — _call_llm_json's own regex "rescue" path (or its final
+        generic-error fallback) returned a truncated/empty answer to the
+        user with NO indication anything was cut off, since MAX_TOKENS_PRACTICAL
+        (4500) is a budget for the whole JSON response, not just the answer text.
+
+        This wraps _call_llm_json with exactly ONE extra attempt, using a
+        higher max_tokens ceiling (MAX_TOKENS_PRACTICAL_RETRY), ONLY when the
+        first attempt shows one of the truncation markers above — normal,
+        complete answers never pay for the extra call. If the retry ALSO
+        gets cut short (rare — would mean the content is genuinely huge),
+        falls back to whatever the first attempt produced, unchanged from
+        today's behavior."""
+        result = self._call_llm_json(prompt, state=state)
+        if result.get("analysis") not in self._TRUNCATION_LIKELY_ANALYSIS_MARKERS:
+            return result
+
+        _retry_max_tokens = int(getattr(conf, "MAX_TOKENS_PRACTICAL_RETRY", 8000))
+        _LOG.warning(
+            "[Practical/json] First attempt looked truncated (analysis=%r) — "
+            "retrying once with max_tokens=%d instead of the usual %s",
+            result.get("analysis"), _retry_max_tokens, getattr(conf, "MAX_TOKENS_PRACTICAL", 4500),
+        )
+        try:
+            _expanded_llm = self.llm.bind(max_tokens=_retry_max_tokens)
+        except Exception as e:
+            _LOG.warning("[Practical/json] Could not build expanded-budget LLM for truncation retry, keeping original result: %s", e)
+            return result
+
+        retried = self._call_llm_json(prompt, state=state, llm_override=_expanded_llm)
+        if retried.get("analysis") in self._TRUNCATION_LIKELY_ANALYSIS_MARKERS:
+            _LOG.warning(
+                "[Practical/json] Expanded-budget retry (max_tokens=%d) STILL looked truncated "
+                "(analysis=%r) — falling back to the first attempt's result",
+                _retry_max_tokens, retried.get("analysis"),
+            )
+            return result
+        return retried
 
     def _lqs_license_type_fallback(self, query: str, lt_candidates: List[str], state,
                                     min_confidence: float = 0.70) -> Optional[str]:
@@ -2550,12 +2610,27 @@ class PracticalPersonaService:
         #   operation_topic / sub_topic  — exact sub-operation label  (Sheet A & B)
         #   main_topic                   — topic cluster               (Sheet B)
         #   license_type                 — license name                (Sheet A)
+        #   department                   — issuing org/provider name   (added 2026-09)
+        #
+        # "department" added 2026-09 after a QA review found rows for NON-bank
+        # departments (e.g. "NTT DATA", the EDC card-machine provider) getting
+        # outranked/missed even on direct follow-up questions, while bank rows
+        # get an indirect assist elsewhere (query text containing a bank name
+        # tends to overlap that bank's own operation_topic/license_type labels
+        # too). This only helps when the department name is actually mentioned
+        # in the query — for the specific case that surfaced this ("ธนาคารไหน"
+        # phrasing, not naming NTT DATA, since the user doesn't know that yet)
+        # this boost alone won't fix it; that needs separate investigation into
+        # why the row's raw embedding similarity/candidate-pool inclusion is low,
+        # which needs a populated vector store to diagnose and wasn't verifiable
+        # in this environment. Still a strict, low-risk improvement for every
+        # OTHER case where a department name IS in the query.
         #
         # blend_score = chroma_sim + BOOST_WEIGHT × metadata_hit
         # BOOST_WEIGHT = 0.25  (strong enough to re-order near-ties; won't override a
         #                        genuinely better semantic match from a different topic)
         _BOOST_WEIGHT = 0.25
-        _BOOST_FIELDS = ("operation_topic", "sub_topic", "main_topic", "license_type", "book_name", "source_book")
+        _BOOST_FIELDS = ("operation_topic", "sub_topic", "main_topic", "license_type", "book_name", "source_book", "department")
         _q_lower_boost = expanded_query.lower()
         _boosted: list = []
         for _d in docs:
@@ -4382,6 +4457,63 @@ class PracticalPersonaService:
         except Exception as _e_guarantee:
             _LOG.warning("[Practical] established-topic guarantee failed: %s", _e_guarantee)
 
+        # ── Multi-entity_type established-topic guarantee (mirrors the department ──
+        # block directly above, for genuine both/and entity comparisons like "หจก.
+        # กับบุคคลธรรมดา เอกสารต่างกันไหม" — see persona_supervisor.py's
+        # _multi_entity_mentioned guard next to entity_type detection, and
+        # prompts_practical.py's matching multi-entity comparison exception).
+        # Anchor field is "license_type" (not "operation_by_department") because
+        # entity_type_normalized-differentiated docs are keyed by license_type —
+        # see the entity-switch registration_type lookup a few hundred lines up
+        # in persona_supervisor.py, which uses the same license_type/last_topic
+        # pairing to identify "the same procedure, entity-specific variant."
+        try:
+            _cs_established_entity = str(
+                state.get_collected_slot("entity_type") if hasattr(state, "get_collected_slot") else ""
+            ).strip()
+            _established_license = str((state.context or {}).get("last_topic") or "").strip()
+            _multi_entities_mentioned = list((state.context or {}).get("_multi_entity_mentioned") or [])
+            _target_entities = list(dict.fromkeys(
+                ([_cs_established_entity] if _cs_established_entity else []) + _multi_entities_mentioned
+            ))
+            if _target_entities and _established_license:
+                _entities_present = {
+                    str((d.get("metadata") or {}).get("entity_type_normalized") or "").strip()
+                    for d in _docs_to_process
+                }
+                _vs_guarantee_ent = getattr(self.retriever, "vectorstore", None)
+                _coll_guarantee_ent = getattr(_vs_guarantee_ent, "_collection", None) if _vs_guarantee_ent else None
+                if _coll_guarantee_ent is not None:
+                    _guar_max_chars_ent = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700))
+                    for _target_entity in _target_entities:
+                        if not _target_entity or _target_entity in _entities_present:
+                            continue
+                        _guar_res_ent = _coll_guarantee_ent.get(
+                            where={"$and": [
+                                {"license_type": _established_license},
+                                {"entity_type_normalized": _target_entity},
+                            ]},
+                            include=["documents", "metadatas"],
+                        )
+                        _guar_docs_ent = [
+                            {"content": (c or "")[:_guar_max_chars_ent], "metadata": m or {}}
+                            for c, m in zip(
+                                _guar_res_ent.get("documents") or [],
+                                _guar_res_ent.get("metadatas") or [],
+                            )
+                        ]
+                        if _guar_docs_ent:
+                            _docs_to_process = _guar_docs_ent + _docs_to_process
+                            state.current_docs = _docs_to_process
+                            _entities_present.add(_target_entity)
+                            _LOG.info(
+                                "[Practical] established-topic guarantee (entity): entity=%r license=%r → "
+                                "+%d doc(s) (none of that entity_type were in the retrieved set)",
+                                _target_entity, _established_license, len(_guar_docs_ent),
+                            )
+        except Exception as _e_guarantee_ent:
+            _LOG.warning("[Practical] established-topic guarantee (entity) failed: %s", _e_guarantee_ent)
+
         # Pass 1: classify research_reference + restaurant_ai_document links → SERVICE / FORM / GUIDE / REF
         # Same _classify_link logic as Academic — hybrid desc+URL classification, no URL pattern rules in prompt
         _link_service: list = []  # (desc, url) registration/portal links
@@ -5342,7 +5474,7 @@ Your JSON response:
             decision = {"action": "ask", "execution": {"question": "", "slot_options": [], "answer": "", "query": "", "context_update": {}}}
         else:
             emit_progress("กำลังเรียบเรียงคำตอบ...")
-            decision = self._call_llm_json(prompt, state=state)
+            decision = self._call_llm_json_with_truncation_retry(prompt, state=state)
             emit_progress("กำลังตรวจสอบความครบถ้วนของคำตอบ...")
         action = (decision.get("action") or "ask").strip()
         _exec_raw = decision.get("execution", {})
