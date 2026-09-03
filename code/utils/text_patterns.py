@@ -308,6 +308,56 @@ SPECIFIC_TOPIC_RE = re.compile(
 )
 
 
+# ── Chapter-fetch label matching (2026-09) ───────────────────────────────────
+# Used by persona_supervisor.py's main_topic/sub_topic/operation_topic
+# "chapter retrieval" — when a query names a chapter label exactly, ALL its
+# docs are fetched via a Chroma metadata filter instead of relying on
+# semantic top-K search (which can silently drop docs ranked below the
+# cutoff). Before 2026-09 this matcher was duplicated inline: sub_topic's
+# copy checked both the LLM-rewritten query AND the raw pre-rewrite user
+# message (the rewriter often drops key words) plus an ASCII-identifier
+# fallback (e.g. "B2B"), but main_topic's copy only had the plain-substring
+# check against the rewritten query — an asymmetry that made main_topic
+# chapter-fetch miss more often than sub_topic for the exact same class of
+# paraphrased query, contributing to reported cross-sheet/within-chapter
+# incompleteness. Extracted here as one shared function so both call sites
+# (and any future one) can't diverge again — same rationale as every other
+# consolidation in this module (see module docstring).
+_ASCII_ID_RE = re.compile(r'[A-Za-z][A-Za-z0-9\-]{2,}|[0-9][A-Za-z][A-Za-z0-9\-]{1,}')
+
+
+def topic_label_matches_query(label: str, query_lower: str, raw_human_lower: str = "") -> bool:
+    """True if `label` (a main_topic/sub_topic/operation_topic value) should be
+    treated as explicitly named by the user's current turn.
+
+    Checks, in order: (1) `label` as a literal substring of `query_lower`
+    (the query used for retrieval — possibly LLM-rewritten), (2) the same
+    against `raw_human_lower` (the raw pre-rewrite user message, when
+    provided), (3) an ASCII-identifier match — every ASCII token (3+ chars,
+    e.g. "B2B") in `label` must appear somewhere in either text, catching
+    cases where the LLM rewriter drops surrounding Thai particles but keeps
+    the distinctive ASCII term. Callers should additionally gate on a
+    minimum `len(label)` themselves (5 for main_topic, 8 for sub_topic in
+    the current call sites) to avoid short/generic labels matching too
+    broadly — that threshold is corpus-specific, not part of this function's
+    contract.
+
+    Callers must lowercase `query_lower`/`raw_human_lower` themselves (and
+    should reuse the same lowercased strings across all label checks in a
+    loop, rather than re-lowercasing per call).
+    """
+    label_lower = label.lower()
+    if label_lower in query_lower:
+        return True
+    if raw_human_lower and label_lower in raw_human_lower:
+        return True
+    tokens = _ASCII_ID_RE.findall(label)
+    if not tokens:
+        return False
+    combined = query_lower + " " + raw_human_lower
+    return all(t.lower() in combined for t in tokens)
+
+
 def is_bare_generic_followup(text: str, max_len: int = 60) -> bool:
     """
     True when `text` is a short, generic-dimension follow-up question (e.g.
