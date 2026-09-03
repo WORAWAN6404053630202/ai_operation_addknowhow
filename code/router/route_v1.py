@@ -11,7 +11,7 @@ import queue
 import uuid
 from typing import AsyncGenerator, Optional
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -84,9 +84,29 @@ try:
     # normal single-process boot since _get_reranker double-checks its cache, but wasteful
     # and confusing to have two independent trigger points for the same one-time load).
 
+except Exception:
+    logger.error("Failed to initialize services", exc_info=True)
+    supervisor = None
+    state_manager = None
+    raise
+
+
+def start_prewarm_threads() -> None:
+    """Starts the background cache-warming threads (topic pool, BM25 index, op-group
+    classifier). Must be called from app.py's lifespan startup hook — NOT run at
+    module import time like the rest of this file's init. uvicorn's --reload does an
+    throwaway import of the app module to validate it before forking the real worker
+    process, so anything with paid side effects at module level (op-group pre-warm
+    fires real Haiku LLM calls, one per license_type/entity combo) ran twice per dev
+    server start — once in that validation import, once for real in the worker
+    (confirmed live: 16 distinct op_group_classify calls each appearing exactly twice,
+    ~$0.035 wasted per restart). Matches the pattern already used for the reranker
+    preload in app.py's lifespan, which does not have this problem.
+    """
+    import threading as _th
+
     # Pre-warm topic pool in background — populates global cross-session cache so the
     # first user greeting doesn't pay the 5-retrieval build cost (~1-2s).
-    import threading as _th
     def _prewarm_topic_pool():
         try:
             _dummy = ConversationState(session_id="__prewarm__", persona_id="practical", context={})
@@ -138,12 +158,6 @@ try:
             logger.warning("Op-group pre-warm failed (non-blocking): %s", _og_e)
     _th.Thread(target=_prewarm_op_groups, daemon=True, name="op_group_prewarm").start()
 
-except Exception:
-    logger.error("Failed to initialize services", exc_info=True)
-    supervisor = None
-    state_manager = None
-    raise
-
 
 _CLEANUP_INTERVAL_S = 3600  # run at most once per hour
 _last_cleanup_ts: float = 0.0
@@ -152,6 +166,21 @@ _last_cleanup_ts: float = 0.0
 # stream endpoint runs supervisor.handle() in a thread pool executor.
 from typing import Dict
 _session_locks: Dict[str, asyncio.Lock] = {}
+
+
+def _client_identifier(http_request: Request) -> str:
+    """Identifier for rate limiting — must NOT be something the caller can
+    cheaply rotate (session_id is client-supplied and was previously used
+    here, which let a caller bypass the limit by minting a new session_id
+    per request). X-Forwarded-For's first hop is trusted only because this
+    service sits behind a reverse proxy/load balancer that sets it; if
+    deployed with the app port directly internet-facing, that header is
+    itself attacker-controlled and this would need a trusted-proxy check.
+    """
+    xff = http_request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return http_request.client.host if http_request.client else "unknown"
 
 
 def _get_session_lock(session_id: str) -> asyncio.Lock:
@@ -446,7 +475,7 @@ async def health_check():
 
 
 @api_v1.post("/chat")
-async def chat(request: ChatRequest):
+async def chat(request: ChatRequest, http_request: Request):
     if supervisor is None or state_manager is None:
         logger.error("Services not initialized")
         raise HTTPException(
@@ -463,10 +492,12 @@ async def chat(request: ChatRequest):
     await _cleanup_old_sessions_async()
 
     session_id = request.session_id or f"s_{uuid.uuid4().hex[:8]}"
+    client_id = _client_identifier(http_request)
 
-    # Rate limiting check
+    # Rate limiting check — keyed by client IP, not session_id (session_id is
+    # client-supplied and freely rotatable, see _client_identifier).
     rate_limiter = get_rate_limiter()
-    allowed, rate_info = rate_limiter.is_allowed(session_id)
+    allowed, rate_info = rate_limiter.is_allowed(client_id)
 
     if not allowed:
         logger.warning(f"[{session_id}] Rate limit exceeded - blocking request")
@@ -507,7 +538,7 @@ async def chat(request: ChatRequest):
         # Per-window token rate check (burst protection).
         _window_token_limit = int(getattr(conf, "TOKEN_RATE_LIMIT_PER_WINDOW", 0) or 0)
         if _window_token_limit > 0:
-            _token_rate_ok, _window_tokens_used = rate_limiter.is_token_rate_allowed(session_id, _window_token_limit)
+            _token_rate_ok, _window_tokens_used = rate_limiter.is_token_rate_allowed(client_id, _window_token_limit)
             if not _token_rate_ok:
                 logger.warning(
                     "[%s] Token rate limit exceeded: window_tokens=%d limit=%d",
@@ -562,7 +593,7 @@ async def chat(request: ChatRequest):
         _post_tokens = (getattr(state, "total_prompt_tokens", 0) or 0) + (getattr(state, "total_completion_tokens", 0) or 0)
         _delta_tokens = max(0, _post_tokens - _pre_tokens)
         if _delta_tokens > 0:
-            rate_limiter.record_token_usage(session_id, _delta_tokens)
+            rate_limiter.record_token_usage(client_id, _delta_tokens)
 
         # Real cost delta, not reconstructed from token counts: a turn often mixes
         # one main-persona call (Sonnet/GPT-5.1) with several cheap Haiku classifier
@@ -644,7 +675,7 @@ def _run_supervisor_with_progress(state, message, progress_cb):
 
 
 async def _stream_reply(
-    session_id: str, message: str, branch_id: str = "", branch_name: str = ""
+    session_id: str, message: str, branch_id: str = "", branch_name: str = "", client_id: str = ""
 ) -> AsyncGenerator[str, None]:
     """
     Generator ที่ส่งคำตอบทีละ chunk แบบ SSE (Server-Sent Events)
@@ -658,6 +689,10 @@ async def _stream_reply(
     if supervisor is None or state_manager is None:
         yield f"data: {json.dumps({'type': 'error', 'message': 'Services not initialized'})}\n\n"
         return
+
+    # Falls back to session_id only if a caller forgets to pass client_id —
+    # the real chat_stream() route above always passes the request's IP.
+    client_id = client_id or session_id
 
     # Compute phase: load → handle → save, serialized per session to prevent
     # concurrent requests from overwriting each other's state.
@@ -694,7 +729,7 @@ async def _stream_reply(
         _window_token_limit_st = int(getattr(conf, "TOKEN_RATE_LIMIT_PER_WINDOW", 0) or 0)
         if _window_token_limit_st > 0:
             _rl_st = get_rate_limiter()
-            _token_ok_st, _window_used_st = _rl_st.is_token_rate_allowed(session_id, _window_token_limit_st)
+            _token_ok_st, _window_used_st = _rl_st.is_token_rate_allowed(client_id, _window_token_limit_st)
             if not _token_ok_st:
                 logger.warning(
                     "[%s] Token rate limit exceeded (stream): window_tokens=%d limit=%d",
@@ -758,7 +793,7 @@ async def _stream_reply(
                 _post_tokens_st = (getattr(state, "total_prompt_tokens", 0) or 0) + (getattr(state, "total_completion_tokens", 0) or 0)
                 _delta_tokens_st = max(0, _post_tokens_st - _pre_tokens_st)
                 if _delta_tokens_st > 0:
-                    get_rate_limiter().record_token_usage(session_id, _delta_tokens_st)
+                    get_rate_limiter().record_token_usage(client_id, _delta_tokens_st)
 
                 # Real cost delta — see matching comment in the non-streaming /chat
                 # handler above (a turn often mixes one main-persona call with several
@@ -822,7 +857,7 @@ async def _stream_reply(
 
 
 @api_v1.post("/chat/stream")
-async def chat_stream(request: ChatRequest):
+async def chat_stream(request: ChatRequest, http_request: Request):
     """
     Streaming version ของ /chat
     ส่งคำตอบทีละ chunk แบบ SSE ทำให้ user เห็นข้อความทยอยขึ้น
@@ -837,10 +872,11 @@ async def chat_stream(request: ChatRequest):
     await _cleanup_old_sessions_async()
 
     session_id = request.session_id or f"s_{uuid.uuid4().hex[:8]}"
+    client_id = _client_identifier(http_request)
 
-    # Rate limiting
+    # Rate limiting — keyed by client IP, see _client_identifier.
     rate_limiter = get_rate_limiter()
-    allowed, rate_info = rate_limiter.is_allowed(session_id)
+    allowed, rate_info = rate_limiter.is_allowed(client_id)
     if not allowed:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -848,7 +884,7 @@ async def chat_stream(request: ChatRequest):
         )
 
     return StreamingResponse(
-        _stream_reply(session_id, request.message.strip(), request.branch_id, request.branch_name),
+        _stream_reply(session_id, request.message.strip(), request.branch_id, request.branch_name, client_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

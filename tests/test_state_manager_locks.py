@@ -21,8 +21,9 @@ class TestOrphanLockCleanup:
         lock_file = tmp_path / "stale_session.lock"
         lock_file.write_text(json.dumps({"pid": 99999, "ts": time.time()}))
 
-        # Backdate modification time well past the default stale threshold (15 s)
-        old_mtime = time.time() - 60
+        # Backdate modification time well past the default stale threshold
+        # (conf.STATE_LOCK_STALE_S, currently 90s — see conf.py)
+        old_mtime = time.time() - 120
         os.utime(str(lock_file), (old_mtime, old_mtime))
 
         removed = sm.cleanup_orphan_locks()
@@ -49,7 +50,7 @@ class TestOrphanLockCleanup:
 
     def test_cleanup_handles_multiple_stale_locks(self, tmp_path):
         sm = StateManager(persist_dir=str(tmp_path))
-        old_mtime = time.time() - 60
+        old_mtime = time.time() - 120
 
         for i in range(3):
             lf = tmp_path / f"session_{i}.lock"
@@ -66,7 +67,7 @@ class TestOrphanLockCleanup:
 
         stale = tmp_path / "stale.lock"
         stale.write_text(json.dumps({"pid": 99999, "ts": 0}))
-        os.utime(str(stale), (time.time() - 60, time.time() - 60))
+        os.utime(str(stale), (time.time() - 120, time.time() - 120))
 
         fresh = tmp_path / "fresh.lock"
         fresh.write_text(json.dumps({"pid": os.getpid(), "ts": time.time()}))

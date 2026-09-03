@@ -21,10 +21,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
+import conf
+
 from router.route_v1 import api_v1
 from router.monitoring import router as monitoring_router
 from router.admin import router as admin_router
-from utils.middleware import MonitoringMiddleware, HealthCheckMiddleware
+from utils.middleware import MonitoringMiddleware, HealthCheckMiddleware, BodySizeLimitMiddleware
 from utils.logger import setup_logging, get_logger
 
 # Setup logging based on environment
@@ -40,6 +42,12 @@ logger.info(f"Starting application with LOG_LEVEL={LOG_LEVEL}, LOG_FORMAT={LOG_F
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # route_v1's cache-warming threads (topic pool / BM25 / op-group classifier) must
+    # start here, not at route_v1 module import time — see start_prewarm_threads'
+    # docstring for why (duplicated paid LLM calls under uvicorn --reload otherwise).
+    from router.route_v1 import start_prewarm_threads
+    start_prewarm_threads()
+
     import conf as _conf
     if getattr(_conf, "RERANKER_ENABLED", False):
         model_name = getattr(_conf, "RERANKER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
@@ -83,10 +91,21 @@ app.add_middleware(MonitoringMiddleware, enable_debug=(LOG_LEVEL == "DEBUG"))
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    # No cookies/browser-ambient auth anywhere in this app (session_id travels
+    # in the JSON body, not a cookie) — allow_credentials=True combined with a
+    # wildcard origin is spec-invalid anyway (browsers reject it) and was
+    # never actually exercised. Dropping it makes this a valid, intentional
+    # open API instead of a misconfigured one.
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Added LAST so it's the OUTERMOST middleware (Starlette runs add_middleware
+# calls most-recently-added-first) — must wrap CORS/Monitoring/HealthCheck so
+# none of them (MonitoringMiddleware peeks the body for logging) ever sees a
+# request body larger than conf.MAX_REQUEST_BODY_BYTES.
+app.add_middleware(BodySizeLimitMiddleware, max_bytes=getattr(conf, "MAX_REQUEST_BODY_BYTES", 1_000_000))
 
 # Include routers
 app.include_router(api_v1, prefix="/api/v1")

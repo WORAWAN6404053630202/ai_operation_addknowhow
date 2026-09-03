@@ -587,9 +587,40 @@
     return String(t || "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
   }
 
+  function getAdminKey() {
+    let key = localStorage.getItem("admin_key");
+    if (!key) {
+      key = window.prompt("กรอก Admin API Key (X-Admin-Key):") || "";
+      if (key) localStorage.setItem("admin_key", key);
+    }
+    return key;
+  }
+
   async function apiGet(url) {
-    const r = await fetch(url);
+    const key = getAdminKey();
+    if (!key) return {};
+    const r = await fetch(url, { headers: { "X-Admin-Key": key } });
+    if (r.status === 401) {
+      localStorage.removeItem("admin_key");
+      alert("Admin key ไม่ถูกต้อง กรุณาโหลดหน้านี้ใหม่แล้วกรอกใหม่อีกครั้ง");
+      return {};
+    }
     return r.json();
+  }
+
+  async function apiPost(url, body) {
+    const key = getAdminKey();
+    if (!key) return { ok: false, status: 401, json: async () => ({}) };
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Admin-Key": key },
+      body: JSON.stringify(body || {}),
+    });
+    if (r.status === 401) {
+      localStorage.removeItem("admin_key");
+      alert("Admin key ไม่ถูกต้อง กรุณาโหลดหน้านี้ใหม่แล้วกรอกใหม่อีกครั้ง");
+    }
+    return r;
   }
 
   // ── Stats ──────────────────────────────────────────────────────
@@ -1059,7 +1090,7 @@
 
   async function reprocessItem(itemId) {
     if (!confirm("ยืนยันส่งไฟล์นี้ประมวลผลใหม่ทั้งไฟล์ (ข้ามการคัดกรองแบบเดิม)?")) return;
-    const r = await fetch(`/admin/api/pdf-queue/${itemId}/reprocess`, { method: "POST" });
+    const r = await apiPost(`/admin/api/pdf-queue/${itemId}/reprocess`);
     if (!r.ok) {
       const err = await r.json().catch(() => ({}));
       alert("เกิดข้อผิดพลาด: " + (err.error || r.status));
@@ -1137,11 +1168,7 @@
       decision_type: reviewStatus === "approved" ? "new" : null,
       reviewer_notes: notesEl ? notesEl.value : "",
     };
-    const r = await fetch(`/admin/api/pdf-queue/${itemId}/decision`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    const r = await apiPost(`/admin/api/pdf-queue/${itemId}/decision`, body);
     if (!r.ok) {
       const err = await r.json().catch(() => ({}));
       alert("เกิดข้อผิดพลาด: " + (err.error || r.status));
@@ -1245,11 +1272,7 @@
       edited_fields: reviewStatus === "approved" ? collectEditedFields() : null,
       old_row_ref: oldRowRef,
     };
-    const r = await fetch(`/admin/api/pdf-queue/${itemId}/decision`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    const r = await apiPost(`/admin/api/pdf-queue/${itemId}/decision`, body);
     if (!r.ok) {
       const err = await r.json().catch(() => ({}));
       alert("เกิดข้อผิดพลาด: " + (err.error || r.status));

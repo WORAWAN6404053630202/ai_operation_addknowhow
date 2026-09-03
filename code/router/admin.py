@@ -14,13 +14,14 @@ try:
 except Exception:
     _conf = None
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from model.state_manager import StateManager
 from model.pdf_review_queue_manager import PdfReviewQueueManager
 from service import pdf_status_tracker
+from utils.admin_auth import require_admin_key
 from utils.logger import get_logger
 from utils.page_ranges import format_page_ranges
 from utils.simple_cache import get_cache
@@ -28,6 +29,10 @@ from utils.simple_cache import get_cache
 _LOG = get_logger(__name__)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+# API routes need the admin key; the dashboard shell below stays open since it
+# renders no data itself (a bare page load can't attach a custom header) —
+# static/admin.html's apiGet() attaches the key to every /admin/api/* call.
+_auth = Depends(require_admin_key)
 
 _state_manager = StateManager()
 _pdf_queue_manager = PdfReviewQueueManager()
@@ -59,7 +64,7 @@ async def admin_dashboard():
     return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
 
-@router.get("/api/sessions")
+@router.get("/api/sessions", dependencies=[_auth])
 async def admin_sessions(limit: int = Query(default=50, le=200)):
     """List all sessions with message count and preview."""
     sessions = _state_manager.list_sessions(limit=limit)
@@ -100,7 +105,7 @@ async def admin_sessions(limit: int = Query(default=50, le=200)):
     return JSONResponse({"sessions": result, "total": len(result)})
 
 
-@router.get("/api/session/{session_id}")
+@router.get("/api/session/{session_id}", dependencies=[_auth])
 async def admin_session_detail(session_id: str):
     """Full message history for a session."""
     state = _state_manager.load(session_id)
@@ -133,7 +138,7 @@ async def admin_session_detail(session_id: str):
     })
 
 
-@router.get("/api/stats")
+@router.get("/api/stats", dependencies=[_auth])
 async def admin_stats():
     """Overall stats: session count, cache, log summary."""
     all_sessions = _state_manager.list_sessions(limit=500)
@@ -158,7 +163,7 @@ async def admin_stats():
     })
 
 
-@router.get("/api/logs")
+@router.get("/api/logs", dependencies=[_auth])
 async def admin_logs(lines: int = Query(default=100, le=500)):
     """Return last N lines from the server log file."""
     if not _LOG_FILE.exists():
@@ -181,8 +186,11 @@ async def admin_logs(lines: int = Query(default=100, le=500)):
 
 
 # ── PDF review queue (feature/pdf-ingestion) ─────────────────────────────
-# Protected by require_admin_basic_auth on the router above, same as every
-# other endpoint here.
+# Each endpoint below carries its own dependencies=[_auth] (X-Admin-Key),
+# same as the /api/* endpoints above — there is no router-level auth
+# dependency to inherit from (the old router-level require_admin_basic_auth
+# was removed in favor of this per-route mechanism; merging that removal
+# with main's new per-route auth left these endpoints open until fixed).
 
 class PdfReviewDecision(BaseModel):
     review_status: str  # "approved" | "rejected"
@@ -206,7 +214,7 @@ def _page_range_str(item) -> str:
     return format_page_ranges([p.page_num for p in item.pages])
 
 
-@router.get("/api/pdf-queue")
+@router.get("/api/pdf-queue", dependencies=[_auth])
 async def pdf_queue_list():
     """Summary list for the left-hand panel — newest upload first.
 
@@ -250,7 +258,7 @@ async def pdf_queue_list():
     })
 
 
-@router.get("/api/pdf-queue/{item_id}")
+@router.get("/api/pdf-queue/{item_id}", dependencies=[_auth])
 async def pdf_queue_detail(item_id: str):
     """Full record — every page's Typhoon/Claude text and flags, for the review UI."""
     item = _pdf_queue_manager.load(item_id)
@@ -259,7 +267,7 @@ async def pdf_queue_detail(item_id: str):
     return JSONResponse(item.model_dump())
 
 
-@router.post("/api/pdf-queue/{item_id}/decision")
+@router.post("/api/pdf-queue/{item_id}/decision", dependencies=[_auth])
 async def pdf_queue_decide(item_id: str, decision: PdfReviewDecision):
     """Records a human review decision. For review_status="approved" with
     decision_type in (new, update, new_category), this WRITES a new row to the
@@ -339,7 +347,7 @@ async def pdf_queue_decide(item_id: str, decision: PdfReviewDecision):
     return JSONResponse({"ok": True, "item": item.model_dump(), "sheet_result": sheet_result})
 
 
-@router.post("/api/pdf-queue/{item_id}/reprocess")
+@router.post("/api/pdf-queue/{item_id}/reprocess", dependencies=[_auth])
 async def pdf_queue_reprocess(item_id: str):
     """Manual safety net for a document Lambda's cheap oversized-document
     pre-screen (lambda/pdf_extraction/handler.py's _screen_worth_processing,

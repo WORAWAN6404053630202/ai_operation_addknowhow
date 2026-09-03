@@ -380,11 +380,11 @@ PRICING_USD_PER_MILLION_TOKENS = {
     "anthropic/claude-sonnet-4": {"input": 3.00, "output": 15.00},
     "anthropic/claude-4-5-sonnet-20241022": {"input": 3.00, "output": 15.00},
     # Claude Haiku family
-    "anthropic/claude-haiku-4-5": {"input": 0.80, "output": 4.00},
+    "anthropic/claude-haiku-4-5": {"input": 1.00, "output": 5.00},
     "anthropic/claude-haiku-4": {"input": 0.25, "output": 1.25},
     "anthropic/claude-3.5-haiku-20241022": {"input": 0.25, "output": 1.25},
     # GPT-5.x family (verify pricing at openrouter.ai/models)
-    "openai/gpt-5.1": {"input": 2.00, "output": 8.00},
+    "openai/gpt-5.1": {"input": 1.25, "output": 10.00},
     # GPT-4o family
     "openai/gpt-4o": {"input": 5.00, "output": 15.00},
     "openai/chatgpt-4o-latest": {"input": 5.00, "output": 15.00},

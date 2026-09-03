@@ -14,11 +14,15 @@ services:
       - "3000:3000"
     volumes:
       # Production: ไม่ mount code (เพื่อความปลอดภัย)
-      # Mount เฉพาะ env file
-      - ./env.properties:/app/env.properties
+      # Mount เฉพาะ env file — ABSOLUTE path, not relative to this compose file's own
+      # directory. The real deploy history (`docker run ... --env-file ~/env.properties`)
+      # confirmed these two files live directly in the ec2-user home dir, not next to
+      # this compose file — a `./`-relative path here silently pointed at a stale,
+      # long-unused copy instead (found 2026-08-19; see incident notes).
+      - /home/ec2-user/env.properties:/app/env.properties
       # Google service-account key for Sheets feedback logging — never baked into the
       # image (see .gitignore), must exist on the host at this path before `up`
-      - ./credentials.json:/app/credentials.json
+      - /home/ec2-user/credentials.json:/app/credentials.json
       # Persist HuggingFace model cache across container restarts/redeploys
       - /opt/huggingface-cache:/root/.cache/huggingface
       # Persist session state (data/states/*.json) across redeploys — without this,
@@ -31,7 +35,7 @@ services:
     environment:
       - PYTHONPATH=/app/code
     env_file:
-      - ./env.properties
+      - /home/ec2-user/env.properties
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
       interval: 30s      # ตรวจทุก 30 วิ
