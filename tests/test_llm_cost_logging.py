@@ -51,9 +51,17 @@ class TestLogLlmCost:
         assert cost == 0.0
 
     def test_every_pdf_pipeline_model_priced_has_positive_rates(self):
+        # baai/bge-m3 (added 2026-09, see utils/model_pricing.py) is an embedding
+        # model — it genuinely never produces completion tokens, so 0.0 output
+        # price is correct for it specifically, not a sign of a missing rate.
+        # Every chat-completion model must still have a positive output price.
+        _embedding_models = {"baai/bge-m3"}
         for model, pricing in PDF_PIPELINE_MODEL_PRICING.items():
             assert pricing["input"] > 0, f"{model} input price should be positive"
-            assert pricing["output"] > 0, f"{model} output price should be positive"
+            if model in _embedding_models:
+                assert pricing["output"] == 0.0, f"{model} is an embedding model, expected output price 0.0"
+            else:
+                assert pricing["output"] > 0, f"{model} output price should be positive"
 
     def test_elapsed_seconds_appears_in_log_line_when_given(self, caplog):
         response = _FakeResponse(_FakeUsage(prompt_tokens=100, completion_tokens=50))

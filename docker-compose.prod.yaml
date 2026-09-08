@@ -44,6 +44,38 @@ services:
       start_period: 40s  # รอ 40 วิก่อน check ครั้งแรก (โหลด e5-large ~20 วิ)
     restart: unless-stopped
 
+  # PDF ingestion review dashboard — split into its own service (2026-09) so a
+  # PDF-only dependency crash (see the boto3 incident, 2026-09-06/07) can never
+  # take the `serve` container above down again. No local_chroma_v3/
+  # huggingface-cache volumes needed — this service never touches RAG/embeddings.
+  pdf-serve:
+    container_name: ai-operation-pdf-prod
+    image: ai-operation-pdf:prod
+    platform: linux/amd64
+    build:
+      context: .
+      target: prod-pdf
+      dockerfile: ./Dockerfile
+    ports:
+      - "3001:3001"
+    volumes:
+      # Same env file and Sheets credential as `serve` for now — not forked
+      # into PDF-specific secrets in this pass (see the migration plan; that's
+      # an optional follow-up if secret isolation is wanted later).
+      - /home/ec2-user/env.properties:/app/env.properties
+      - /home/ec2-user/credentials.json:/app/credentials.json
+    environment:
+      - PYTHONPATH=/app/code
+    env_file:
+      - /home/ec2-user/env.properties
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s  # no embedding model to load — ready almost immediately
+    restart: unless-stopped
+
 networks:
   default:
     name: ai-operation-network

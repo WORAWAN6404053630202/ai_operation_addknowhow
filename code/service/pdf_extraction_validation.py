@@ -42,10 +42,10 @@ import re
 import time
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
-from typing import Any
+from typing import Any, Optional
 
 import conf
-from utils.llm_cost_logging import log_llm_cost
+from utils.llm_cost_logging import CostAccumulator, log_llm_cost
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -250,13 +250,22 @@ _LLM_COMPARISON_PROMPT = """ต่อไปนี้คือผลลัพธ�
 
 
 def compare_extractions_llm(
-    markdown_a: str, markdown_b: str, label_a: str = "model_a", label_b: str = "model_b"
+    markdown_a: str, markdown_b: str, label_a: str = "model_a", label_b: str = "model_b",
+    cost_accumulator: Optional[CostAccumulator] = None,
 ) -> list[ValidationFlag]:
     """General-purpose catch-all: asks an LLM to read both full extractions and
     report any factual disagreement in its own words — no pre-defined pattern to
     match against, unlike check_table_arithmetic/compare_extractions above. Exists
     specifically to catch error shapes we haven't seen yet in a new document type.
-    Costs a real API call — see validate_extraction(use_llm_comparison=...)."""
+    Costs a real API call — see validate_extraction(use_llm_comparison=...).
+
+    cost_accumulator is optional (None in the dev-only extract_page_dual path,
+    which has no per-document accumulator to feed) — when provided (the real
+    SQS pipeline, via validate_extraction), this call's cost is folded into the
+    same document-level total as every other stage instead of only reaching the
+    log line. Found missing 2026-09 during a cost-tracking accuracy sweep — this
+    was the one log_llm_cost() call site in the whole PDF pipeline that never
+    passed accumulator=, so its cost silently never reached ReviewItem.total_cost."""
     from openai import OpenAI
 
     client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
@@ -269,7 +278,10 @@ def compare_extractions_llm(
             messages=[{"role": "user", "content": prompt}],
             max_tokens=1500,
         )
-        log_llm_cost(logger, "ExtractionValidation/LLMComparison", conf.OPENROUTER_MODEL_PRACTICAL, resp, time.monotonic() - _call_start)
+        log_llm_cost(
+            logger, "ExtractionValidation/LLMComparison", conf.OPENROUTER_MODEL_PRACTICAL, resp,
+            time.monotonic() - _call_start, accumulator=cost_accumulator,
+        )
         raw = (resp.choices[0].message.content or "[]").strip()
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
         disagreements = json.loads(raw)
@@ -304,14 +316,19 @@ def validate_extraction(
     compare_with: str | None = None,
     compare_label: str = "second_model",
     use_llm_comparison: bool = False,
+    cost_accumulator: Optional[CostAccumulator] = None,
 ) -> list[ValidationFlag]:
     """Entry point: runs every automatic check available. `compare_with` is an
     optional second extractor's output over the SAME page for the dual-model
     checks. `use_llm_comparison` additionally runs the general-purpose LLM catch-all
-    (costs a real API call — off by default)."""
+    (costs a real API call — off by default). `cost_accumulator` is forwarded to
+    that call so its cost is folded into the caller's per-document total — see
+    compare_extractions_llm's docstring."""
     flags = check_table_arithmetic(markdown)
     if compare_with is not None:
         flags += compare_extractions(markdown, compare_with, "primary", compare_label)
         if use_llm_comparison:
-            flags += compare_extractions_llm(markdown, compare_with, "primary", compare_label)
+            flags += compare_extractions_llm(
+                markdown, compare_with, "primary", compare_label, cost_accumulator=cost_accumulator,
+            )
     return flags

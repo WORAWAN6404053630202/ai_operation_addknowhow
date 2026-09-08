@@ -82,15 +82,17 @@ class ConversationState(BaseModel):
     total_completion_tokens: int = Field(default=0, description="Cumulative completion tokens used in this session")
     total_cache_read_tokens: int = Field(default=0, description="Cumulative cache-read tokens (subset of total_prompt_tokens) — used to compute cache-aware cost, not billed on top of prompt tokens")
     total_cache_write_tokens: int = Field(default=0, description="Cumulative cache-write tokens (subset of total_prompt_tokens) — same note as above")
-    total_cost_usd: float = Field(
+    total_cost: float = Field(
         default=0.0,
         description=(
-            "Cumulative real cost (USD) across all LLM calls in this session. Accumulated "
-            "per-call at the call site (llm_call.py), where the correct model/pricing for "
-            "THAT specific call is known — a turn often mixes one main-persona call (Sonnet/"
-            "GPT-5.1) with several cheap Haiku classifier calls, so this must NOT be "
-            "reconstructed later from a single blended token delta priced at one model, "
-            "which would misprice every Haiku token at the main model's (higher) rate."
+            "Cumulative real cost (USD) across all LLM calls in this session. Renamed from "
+            "total_cost_usd (2026-09) to match the PDF review pipeline's ReviewItem.total_cost "
+            "field so the admin dashboard and the PDF review UI expose the same field name for "
+            "the same concept. Accumulated per-call at the call site (llm_call.py), where the "
+            "correct model/pricing for THAT specific call is known — a turn often mixes one "
+            "main-persona call (Sonnet/GPT-5.1) with several cheap Haiku classifier calls, so "
+            "this must NOT be reconstructed later from a single blended token delta priced at "
+            "one model, which would misprice every Haiku token at the main model's (higher) rate."
         ),
     )
 
@@ -232,8 +234,8 @@ class ConversationState(BaseModel):
         this session. cost_usd must be the caller's already-computed, correctly-priced
         cost for THIS specific call (its own model's rate) — accumulating it here at
         the source, rather than reconstructing later from blended multi-model token
-        deltas, is what keeps total_cost_usd accurate when a turn mixes models."""
-        self.total_cost_usd += max(0.0, float(cost_usd or 0))
+        deltas, is what keeps total_cost accurate when a turn mixes models."""
+        self.total_cost += max(0.0, float(cost_usd or 0))
         self.total_prompt_tokens += max(0, int(prompt_tokens or 0))
         self.total_completion_tokens += max(0, int(completion_tokens or 0))
         self.total_cache_read_tokens += max(0, int(cache_read_tokens or 0))

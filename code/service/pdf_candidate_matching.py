@@ -53,7 +53,7 @@ import conf
 from model.pdf_review_item import ReviewItem
 from service.pdf_field_drafting import DRAFTABLE_FIELDS
 from service.sheet_write_back import _clean_header, _get_worksheet
-from utils.llm_cost_logging import CostAccumulator, log_call_duration, log_llm_cost
+from utils.llm_cost_logging import CostAccumulator, log_llm_cost
 from utils.logger import get_logger
 from utils.page_ranges import fuzzy_ratio
 from utils.prompt_safety import INJECTION_GUARD
@@ -137,18 +137,28 @@ def _fetch_existing_rows() -> tuple[dict[str, int], list[tuple[int, dict[str, st
     return col_index, rows
 
 
-def _embed_texts(texts: list[str]) -> list[list[float]]:
+def _embed_texts(texts: list[str], cost_accumulator: Optional[CostAccumulator] = None) -> list[list[float]]:
     """Same OpenRouter embedding endpoint local_vector_store.py uses (conf.EMBEDDING_MODEL),
     but via the plain openai SDK instead of langchain_openai — it sends `input` as
     plain strings with no client-side tiktoken pre-encoding, so it doesn't need that
-    module's check_embedding_ctx_length=False workaround for the same 422 bug."""
+    module's check_embedding_ctx_length=False workaround for the same 422 bug.
+
+    Uses log_llm_cost (not log_call_duration) — found 2026-09 during a cost-tracking
+    accuracy sweep that this call was logging elapsed time only, silently dropping
+    its real cost (bge-m3 responses carry response.usage same as any chat completion)
+    from every document's ReviewItem.total_cost. bge-m3 has no completion_tokens
+    (it's an embedding model), so the cost this produces is prompt-tokens-only,
+    exactly as it should be."""
     client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
     embeddings: list[list[float]] = []
     for i in range(0, len(texts), _EMBEDDING_BATCH_SIZE):
         batch = texts[i : i + _EMBEDDING_BATCH_SIZE]
         _call_start = time.monotonic()
         resp = client.embeddings.create(model=conf.EMBEDDING_MODEL, input=batch)
-        log_call_duration(logger, f"CandidateMatching/Embed[{len(batch)} texts]", time.monotonic() - _call_start)
+        log_llm_cost(
+            logger, f"CandidateMatching/Embed[{len(batch)} texts]", conf.EMBEDDING_MODEL, resp,
+            time.monotonic() - _call_start, accumulator=cost_accumulator,
+        )
         embeddings.extend([d.embedding for d in resp.data])
     return embeddings
 
@@ -177,7 +187,10 @@ def _dynamic_cutoff_count(sorted_scores: list[float]) -> int:
     return min(len(above_floor), _EMBEDDING_MAX_CANDIDATES)
 
 
-def _embedding_candidates(new_values: dict[str, str], rows: list[tuple[int, dict[str, str]]]) -> dict[int, float]:
+def _embedding_candidates(
+    new_values: dict[str, str], rows: list[tuple[int, dict[str, str]]],
+    cost_accumulator: Optional[CostAccumulator] = None,
+) -> dict[int, float]:
     """Returns {row_number: similarity} for rows the embedding signal flags."""
     new_text = _comparison_text(new_values, _COMPARISON_FIELD_KEYS)
     if not new_text.strip() or not rows:
@@ -189,7 +202,7 @@ def _embedding_candidates(new_values: dict[str, str], rows: list[tuple[int, dict
     if not texts_with_rownum:
         return {}
 
-    embeddings = _embed_texts([new_text] + [t for _, t in texts_with_rownum])
+    embeddings = _embed_texts([new_text] + [t for _, t in texts_with_rownum], cost_accumulator=cost_accumulator)
     new_embedding, row_embeddings = embeddings[0], embeddings[1:]
 
     scored = [
@@ -330,7 +343,7 @@ def find_candidate_matches(item: ReviewItem, cost_accumulator: Optional[CostAccu
 
     embedding_scores: dict[int, float] = {}
     try:
-        embedding_scores = _embedding_candidates(new_values, rows)
+        embedding_scores = _embedding_candidates(new_values, rows, cost_accumulator=cost_accumulator)
     except Exception as e:
         logger.error(f"[CandidateMatching] Embedding signal failed for {item.filename}, continuing with other signals: {e}")
 

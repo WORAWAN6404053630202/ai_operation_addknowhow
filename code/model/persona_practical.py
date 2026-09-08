@@ -552,7 +552,7 @@ class PracticalPersonaService:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(kind: str, menu: List[str], greet_streak: int) -> dict:
+        def _call(kind: str, menu: List[str], greet_streak: int, state=None) -> dict:
             menu_preview = ", ".join([str(x) for x in (menu or [])[:6]])
             prompt = (
                 "หน้าที่: สร้างประโยคทักทาย/ตอบรับแบบมนุษย์ สำหรับบอทกฎหมายร้านอาหารไทย (โหมด practical)\n"
@@ -570,7 +570,7 @@ class PracticalPersonaService:
             try:
                 # วัดเวลาการเรียก LLM
                 with TimingContext(logger, "llm_greet_call"):
-                    text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/greet")).strip()
+                    text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/greet", state=state)).strip()
                     
                 # Log สำเร็จ
                 logger.log_with_data("info", "สร้างคำทักทายสำเร็จ", {
@@ -618,10 +618,10 @@ class PracticalPersonaService:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, candidates: List[str], last_topic: str = "") -> dict:
+        def _call(user_text: str, candidates: List[str], last_topic: str = "", state=None) -> dict:
             prompt = build_lqs_license_detect_prompt(user_text, candidates, last_topic=last_topic)
             try:
-                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/lqs_lt")).strip()
+                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/lqs_lt", state=state)).strip()
                 if "```json" in text:
                     text = text.split("```json")[1].split("```")[0].strip()
                 elif "```" in text:
@@ -648,11 +648,11 @@ class PracticalPersonaService:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_satisfaction_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/satisfaction")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/satisfaction", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Practical/satisfaction] LLM call failed: %s", _e)
@@ -685,11 +685,11 @@ class PracticalPersonaService:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_dont_know_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/dont_know")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/dont_know", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Practical/dont_know] LLM call failed: %s", _e)
@@ -722,11 +722,11 @@ class PracticalPersonaService:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_short_followup_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/short_followup")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/short_followup", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Practical/short_followup] LLM call failed: %s", _e)
@@ -759,11 +759,11 @@ class PracticalPersonaService:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_legal_q_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/legal_q")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/legal_q", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Practical/legal_q] LLM call failed: %s", _e)
@@ -796,11 +796,11 @@ class PracticalPersonaService:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_greeting_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/greeting")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/greeting", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Practical/greeting] LLM call failed: %s", _e)
@@ -818,10 +818,10 @@ class PracticalPersonaService:
 
         return _call
 
-    def _pick_greet_prefix(self, kind: str, menu: List[str], greet_streak: int) -> str:
+    def _pick_greet_prefix(self, kind: str, menu: List[str], greet_streak: int, state=None) -> str:
         kind2 = kind if kind in {"greet", "thanks", "smalltalk", "blank"} else "greet"
         try:
-            res = self.llm_greet_call(kind2, menu, int(greet_streak or 0))
+            res = self.llm_greet_call(kind2, menu, int(greet_streak or 0), state=state)
         except Exception as _e:
             _LOG.debug("[Practical/greet] LLM greet call failed: %s", _e)
             res = {}
@@ -1549,7 +1549,7 @@ class PracticalPersonaService:
         t = re.sub(r"(.)\1{2,}", r"\1\1", t)
         return t
 
-    def _looks_like_greeting(self, s: str) -> bool:
+    def _looks_like_greeting(self, s: str, state=None) -> bool:
         raw = (s or "").strip()
         if not raw:
             return True
@@ -1566,7 +1566,7 @@ class PracticalPersonaService:
         if self._LEGAL_SIGNAL_RE.search(t):
             return False
         # LLM fallback: catches casual greetings regex misses (e.g. "หวัดดีจ้า", "ดีๆ ค่ะ")
-        return self._greeting_llm_check(raw)
+        return self._greeting_llm_check(raw, state=state)
 
     def _looks_like_legal_question(self, s: str, state=None) -> bool:
         t = self._normalize_for_intent(s)
@@ -1595,7 +1595,7 @@ class PracticalPersonaService:
         if cache_key in cache:
             return cache[cache_key]
         try:
-            res = self._satisfaction_llm_call(q) or {}
+            res = self._satisfaction_llm_call(q, state=state) or {}
             conf_val = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_satisfied")) and conf_val >= 0.80
         except Exception as _e:
@@ -1625,7 +1625,7 @@ class PracticalPersonaService:
             return cache[cache_key]
         conf_val = 0.0
         try:
-            res = self._dont_know_llm_call(q) or {}
+            res = self._dont_know_llm_call(q, state=state) or {}
             conf_val = float(res.get("confidence") or 0.0)
             result = (bool(res.get("is_dont_know")) or bool(res.get("is_asking_types"))) and conf_val >= 0.75
         except Exception as _e:
@@ -1657,7 +1657,7 @@ class PracticalPersonaService:
             return cache[cache_key]
         conf_val = 0.0
         try:
-            res = self._short_followup_llm_call(q) or {}
+            res = self._short_followup_llm_call(q, state=state) or {}
             conf_val = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_followup")) and conf_val >= 0.80
         except Exception as _e:
@@ -1691,7 +1691,7 @@ class PracticalPersonaService:
                 return False
         conf_val = 0.0
         try:
-            res = self._practical_legal_q_llm_call(q) or {}
+            res = self._practical_legal_q_llm_call(q, state=state) or {}
             conf_val = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_legal")) and conf_val >= 0.75
         except Exception as _e:
@@ -1702,12 +1702,14 @@ class PracticalPersonaService:
         cache[cache_key] = result
         return result
 
-    def _greeting_llm_check(self, user_text: str) -> bool:
+    def _greeting_llm_check(self, user_text: str, state=None) -> bool:
         """
         LLM fallback: is this a greeting/smalltalk with no legal intent?
         Called when _EN_GREET_RE / _TH_WATDEE_RE / _TH_SAWASDEE_RE / _TH_DEE_RE all miss.
         Low threshold (0.70) — false positive = skip retrieval for a real question.
-        Uses instance-level cache (no state needed — greeting classification is stateless).
+        Uses instance-level cache for the RESULT (no state needed for that — greeting
+        classification is stateless). `state` is only used (optionally) to attribute this
+        call's real cost to the session total.
         """
         q = (user_text or "").strip()
         if not q or len(q) > 80:
@@ -1718,7 +1720,7 @@ class PracticalPersonaService:
             return cache[cache_key]
         conf_val = 0.0
         try:
-            res = self._greeting_llm_call(q) or {}
+            res = self._greeting_llm_call(q, state=state) or {}
             conf_val = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_greeting")) and conf_val >= 0.70
         except Exception as _e:
@@ -2037,7 +2039,7 @@ class PracticalPersonaService:
         "เอกสาร ค่าธรรมเนียม ขั้นตอน",
     ]
 
-    def _build_topic_menu_from_corpus(self) -> List[str]:
+    def _build_topic_menu_from_corpus(self, state=None) -> List[str]:
         freq: Dict[str, int] = {}
 
         def _add(v: Any) -> None:
@@ -2049,7 +2051,7 @@ class PracticalPersonaService:
         seen_doc_ids: set = set()
         for q in self._TOPIC_POOL_QUERIES:
             try:
-                docs = self._retrieve_docs(q)
+                docs = self._retrieve_docs(q, state=state)
             except Exception:
                 continue
             for d in docs:
@@ -2075,7 +2077,7 @@ class PracticalPersonaService:
             self._topic_menu_cache = cached
             return cached
 
-        menu = self._build_topic_menu_from_corpus()
+        menu = self._build_topic_menu_from_corpus(state=state)
         if not menu:
             menu = ["ใบอนุญาต/การเปิดร้าน", "ภาษี/VAT", "จดทะเบียนพาณิชย์", "สุขาภิบาลอาหาร"]
 
@@ -2127,7 +2129,7 @@ class PracticalPersonaService:
         menu = self._get_topic_menu(state)
         streak = int(state.context.get("greet_streak", 0) or 0) + 1
         state.context["greet_streak"] = streak
-        prefix = self._pick_greet_prefix(kind=kind, menu=menu, greet_streak=streak).strip()
+        prefix = self._pick_greet_prefix(kind=kind, menu=menu, greet_streak=streak, state=state).strip()
 
         if self._supervisor_owns_menu(state):
             return self._apply_practical_lint(prefix, kind="greet")
@@ -2337,7 +2339,7 @@ class PracticalPersonaService:
         valid_lt_set = set(lt_candidates)
         conf_val = 0.0
         try:
-            result = self._lqs_license_llm_call(query, lt_candidates, last_topic=_last_topic)
+            result = self._lqs_license_llm_call(query, lt_candidates, last_topic=_last_topic, state=state)
             lt_name = (result.get("license_type") or "").strip()
             conf_val = float(result.get("confidence") or 0)
             matched = lt_name if (lt_name and lt_name in valid_lt_set and conf_val >= min_confidence) else None
@@ -2352,7 +2354,10 @@ class PracticalPersonaService:
             _LOG.info("[Practical] LQS LLM fallback: %r → %r (conf=%.2f, min=%.2f)", query[:50], matched, conf_val, min_confidence)
         return matched
 
-    def _retrieve_docs(self, query: str, metadata_filter: Optional[Dict[str, Any]] = None, max_docs: Optional[int] = None, slot_context: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    def _retrieve_docs(
+        self, query: str, metadata_filter: Optional[Dict[str, Any]] = None, max_docs: Optional[int] = None,
+        slot_context: Optional[Dict[str, Any]] = None, state=None,
+    ) -> List[Dict[str, Any]]:
         import time
         start = time.time()
 
@@ -2363,7 +2368,7 @@ class PracticalPersonaService:
         # before synonym expansion. Appends formal terms without replacing original keywords,
         # so BM25 and synonym patterns still fire on the original text.
         if _qr_needs_rewrite(query):
-            query = enrich_query_for_retrieval(query)
+            query = enrich_query_for_retrieval(query, state=state)
 
         # Query expansion: Thai/English synonym bridging — patterns defined in utils/query_synonyms.py
         _expansions: list = []
@@ -2814,8 +2819,8 @@ class PracticalPersonaService:
         return results
 
     # Topic Registry (auto-discovery from Chroma, no hardcoding)
-    def _retrieve_multi_topic(self, question: str, slot_context: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        return self._retrieve_docs(question, slot_context=slot_context)
+    def _retrieve_multi_topic(self, question: str, slot_context: Optional[Dict[str, Any]] = None, state=None) -> List[Dict[str, Any]]:
+        return self._retrieve_docs(question, slot_context=slot_context, state=state)
 
     def _debug_log(self, stage: str, query: str, docs_json: List[Dict[str, Any]]):
         if not _LOG.isEnabledFor(logging.DEBUG):
@@ -2884,7 +2889,7 @@ class PracticalPersonaService:
                             _sel_slot_ctx = state.get_collected_slots() or None
                         except Exception:
                             pass
-                        state.current_docs = self._retrieve_docs(selected_lt, slot_context=_sel_slot_ctx)
+                        state.current_docs = self._retrieve_docs(selected_lt, slot_context=_sel_slot_ctx, state=state)
                         state.last_retrieval_query = selected_lt
                         return self.handle(state, "__auto_post_retrieve__", _internal=True)
                     return self.handle(state, user_input, _internal=False)
@@ -2929,7 +2934,7 @@ class PracticalPersonaService:
                 state.round = int(getattr(state, "round", 0) or 0) + 1
                 return state, msg
 
-            if (not _internal) and self._looks_like_greeting(user_text) and not filled_topic_value and not bypassed_menu:
+            if (not _internal) and self._looks_like_greeting(user_text, state=state) and not filled_topic_value and not bypassed_menu:
                 self._append_user_once(state, user_input)
                 msg = self._reply_greeting_with_choices(state, kind="greet")
                 self._append_assistant(state, msg)
@@ -2965,7 +2970,7 @@ class PracticalPersonaService:
                 _topic_slot_ctx = state.get_collected_slots() or None
             except Exception:
                 pass
-            state.current_docs = self._retrieve_docs(q, slot_context=_topic_slot_ctx)
+            state.current_docs = self._retrieve_docs(q, slot_context=_topic_slot_ctx, state=state)
             state.last_retrieval_query = q
             tmp = [
                 {"content": d.get("content", "")[:120], "metadata": d.get("metadata", {})}
@@ -2989,7 +2994,7 @@ class PracticalPersonaService:
                     _mt_slot_ctx = state.get_collected_slots() or None
                 except Exception:
                     pass
-                state.current_docs = self._retrieve_multi_topic(user_text, slot_context=_mt_slot_ctx)
+                state.current_docs = self._retrieve_multi_topic(user_text, slot_context=_mt_slot_ctx, state=state)
                 state.last_retrieval_query = user_text
                 tmp = [
                     {"content": d.get("content", "")[:120], "metadata": d.get("metadata", {})}
@@ -3074,6 +3079,7 @@ class PracticalPersonaService:
                         _base_q_pre,
                         metadata_filter={"entity_type_normalized": _cs_entity_pre},
                         slot_context={"entity_type": _cs_entity_pre},
+                        state=state,
                     )
                     if _pre_docs:
                         _all_docs = _pre_docs
@@ -3152,6 +3158,7 @@ class PracticalPersonaService:
                         _switch_base_q,
                         metadata_filter=_switch_filter,
                         slot_context={"entity_type": _query_et_override},
+                        state=state,
                     )
                     if _switch_docs:
                         _LOG.info(
@@ -3274,6 +3281,7 @@ class PracticalPersonaService:
                         _loc_base_q,
                         metadata_filter=_loc_meta_filter,
                         slot_context={"location": _query_loc_override},
+                        state=state,
                     )
                     if _loc_docs:
                         _LOG.info(
@@ -3579,6 +3587,7 @@ class PracticalPersonaService:
                                                     {"license_type": _dominant_lt},
                                                     {"operation_topic": _best_ot_ff},
                                                 ]},
+                                                state=state,
                                             )
                                             if _ot_fresh:
                                                 _LOG.info(
@@ -3622,6 +3631,7 @@ class PracticalPersonaService:
                             _tc_query_for_retrieve,
                             metadata_filter={"license_type": _dominant_for_tc},
                             max_docs=8,
+                            state=state,
                         )
                         if _tc_fresh:
                             # Sort: docs with actual cut-off time data (HH:MM น.) come first so
@@ -3841,6 +3851,7 @@ class PracticalPersonaService:
                     _co_mt,
                     metadata_filter={"main_topic": _co_mt},
                     max_docs=15,
+                    state=state,
                 )
                 _seen_co = {hash((d.get("content") or "")[:200]) for d in _all_docs}
                 _added_co = [d for d in _suppl if hash((d.get("content") or "")[:200]) not in _seen_co]
@@ -3859,7 +3870,7 @@ class PracticalPersonaService:
             _lrq_co = (getattr(state, "last_retrieval_query", None) or "").strip()
             if _lrq_co and _lrq_co.lower() != _co_mt.lower():
                 try:
-                    _suppl_q = self._retrieve_docs(_lrq_co, max_docs=3)
+                    _suppl_q = self._retrieve_docs(_lrq_co, max_docs=3, state=state)
                     _seen_co2 = {hash((d.get("content") or "")[:200]) for d in _all_docs}
                     _added_q = [d for d in _suppl_q if hash((d.get("content") or "")[:200]) not in _seen_co2]
                     if _added_q:
@@ -4394,6 +4405,7 @@ class PracticalPersonaService:
                 _refetch_query,
                 metadata_filter=_refetch_filter,
                 slot_context={"entity_type": _refetch_et},
+                state=state,
             )
             if _refetch_docs:
                 # Apply same op-intent filter to re-fetched docs
@@ -5629,11 +5641,11 @@ Your JSON response:
                         pass
                 if _known_ent:
                     _retrieved_all = self._retrieve_docs(
-                        q, metadata_filter={"entity_type_normalized": _known_ent}
+                        q, metadata_filter={"entity_type_normalized": _known_ent}, state=state
                     )
                     # Fallback: if filtered returns nothing, try unfiltered + post-filter
                     if not _retrieved_all:
-                        _retrieved_all = self._retrieve_docs(q)
+                        _retrieved_all = self._retrieve_docs(q, state=state)
                         _filtered = [
                             d for d in _retrieved_all
                             if not ((d.get("metadata") or {}).get("entity_type_normalized") or "").strip()
@@ -5643,7 +5655,7 @@ Your JSON response:
                     else:
                         state.current_docs = _retrieved_all
                 else:
-                    state.current_docs = self._retrieve_docs(q)
+                    state.current_docs = self._retrieve_docs(q, state=state)
                 state.last_retrieval_query = q
                 tmp = [
                     {"content": d.get("content", "")[:120], "metadata": d.get("metadata", {})}

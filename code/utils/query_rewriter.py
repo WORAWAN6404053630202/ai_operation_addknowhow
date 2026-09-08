@@ -92,7 +92,7 @@ def _needs_rewrite(query: str) -> bool:
     return True
 
 
-def enrich_query_for_retrieval(query: str, session_cache: Optional[dict] = None) -> str:
+def enrich_query_for_retrieval(query: str, session_cache: Optional[dict] = None, state=None) -> str:
     """
     Return an enriched query string for Chroma embedding.
 
@@ -104,6 +104,10 @@ def enrich_query_for_retrieval(query: str, session_cache: Optional[dict] = None)
     session_cache: optional per-session dict (pass state.context.setdefault("_qr_cache", {}))
                    to avoid repeat LLM calls within the same conversation turn.
                    Falls back to module-level cache if None.
+    state: optional ConversationState, forwarded to llm_invoke so this call's real
+           cost is attributed to the session total — found missing 2026-09 during
+           a cost-tracking accuracy sweep (this was the one retrieval-path LLM call
+           outside the 3 persona files that had never been wired up).
     """
     q = (query or "").strip()
     if not q or not _needs_rewrite(q):
@@ -124,7 +128,7 @@ def enrich_query_for_retrieval(query: str, session_cache: Optional[dict] = None)
         from langchain_core.messages import HumanMessage
         from utils.llm_call import llm_invoke, extract_llm_text
         raw = extract_llm_text(
-            llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="QueryRewriter")
+            llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="QueryRewriter", state=state)
         ).strip()
 
         # Sanity: reject if LLM returned an explanation instead of a query

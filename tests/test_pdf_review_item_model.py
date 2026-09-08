@@ -1,8 +1,10 @@
 """
 Tests for model/pdf_review_item.py's cost/timing fields (added 2026-09 for
 the admin UI's per-document cost/wall-clock-time display) — extraction_
-started_at, total_cost_usd, and the processing_duration_seconds property
-derived from extraction_started_at/extraction_completed_at.
+started_at, total_cost (renamed from total_cost_usd 2026-09 to match
+ConversationState.total_cost on the chat-bot side), and the
+processing_duration_seconds property derived from extraction_started_at/
+extraction_completed_at.
 """
 import pytest
 
@@ -14,7 +16,7 @@ class TestReviewItemCostTimingFields:
     def test_defaults_are_none(self):
         item = ReviewItem(filename="test.pdf")
         assert item.extraction_started_at is None
-        assert item.total_cost_usd is None
+        assert item.total_cost is None
         assert item.processing_duration_seconds is None
 
     def test_processing_duration_computed_from_timestamps(self):
@@ -34,8 +36,8 @@ class TestReviewItemCostTimingFields:
         item = ReviewItem(filename="test.pdf", extraction_started_at=1000.0)
         assert item.processing_duration_seconds is None
 
-    def test_total_cost_usd_settable_and_round_trips_via_model_dump(self):
-        item = ReviewItem(filename="test.pdf", total_cost_usd=0.003241, extraction_started_at=1000.0)
+    def test_total_cost_settable_and_round_trips_via_model_dump(self):
+        item = ReviewItem(filename="test.pdf", total_cost=0.003241, extraction_started_at=1000.0)
         dumped = item.model_dump()
-        assert dumped["total_cost_usd"] == pytest.approx(0.003241)
+        assert dumped["total_cost"] == pytest.approx(0.003241)
         assert dumped["extraction_started_at"] == 1000.0

@@ -1,9 +1,10 @@
 """
-Tests for utils/rate_limiter.py (MinIntervalRateLimiter) and the Typhoon
-OCR retry/throttle logic built on top of it in service/pdf_large_extraction.py
-— added 2026-09 after confirming Typhoon's typhoon-ocr endpoint is
-rate-limited to 2 requests/sec with zero retry protection anywhere in this
-pipeline before this.
+Tests for utils/pdf_rate_limiter.py (MinIntervalRateLimiter, moved out of
+utils/rate_limiter.py 2026-09 during the bot/PDF service split) and the
+Typhoon OCR retry/throttle logic built on top of it in
+service/pdf_large_extraction.py — added 2026-09 after confirming Typhoon's
+typhoon-ocr endpoint is rate-limited to 2 requests/sec with zero retry
+protection anywhere in this pipeline before this.
 """
 from __future__ import annotations
 
@@ -15,7 +16,7 @@ import httpx
 import openai
 import pytest
 
-from utils.rate_limiter import MinIntervalRateLimiter
+from utils.pdf_rate_limiter import MinIntervalRateLimiter
 
 
 def _fake_rate_limit_error(retry_after: str | None = None) -> openai.RateLimitError:

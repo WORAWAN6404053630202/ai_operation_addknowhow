@@ -117,3 +117,44 @@ EXPOSE 3000
 
 # Production: Multi-worker setup with optimization
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "3000", "--workers", "1", "--loop", "uvloop", "--http", "httptools"]
+
+# STAGE: PROD-PDF (PDF ingestion review dashboard — separate service, 2026-09)
+# Split off from the `prod` stage above so a PDF-only dependency crash (see the
+# boto3 incident, 2026-09-06/07) can never take the chat bot's container down
+# again. Deliberately does NOT install torch/chromadb/sentence-transformers/
+# langchain — this service only serves router/admin_pdf.py's endpoints, never
+# touches RAG/embeddings, and does not need local_chroma_v3/ at all.
+FROM python:3.11-slim AS prod-pdf
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -u 1000 appuser
+
+WORKDIR /app
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+COPY requirements-pdf.txt /app/
+RUN uv pip install --system --no-cache -r requirements-pdf.txt
+
+# Only the PDF-relevant subtree + shared utils — see requirements-pdf.in's
+# header comment for exactly which service/model/utils files this service
+# actually imports.
+COPY code/ /app/code/
+COPY pyproject.toml /app/
+
+RUN chown -R appuser:appuser /app
+
+USER appuser
+
+ENV PYTHONPATH=/app/code
+ENV PYTHONUNBUFFERED=1
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:3001/health || exit 1
+
+EXPOSE 3001
+
+CMD ["uvicorn", "app_pdf:app", "--host", "0.0.0.0", "--port", "3001", "--workers", "1", "--loop", "uvloop", "--http", "httptools"]

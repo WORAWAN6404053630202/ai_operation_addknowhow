@@ -225,7 +225,7 @@ class TestTyphoonThrottleRetryParity:
     """Typhoon's own rate-limit docs (2 req/sec, 20 req/min, checked 2026-09)
     justified adding a per-process throttle + bounded retry-with-backoff
     around BOTH paths' _run_typhoon — service/pdf_large_extraction.py imports
-    the shared utils/rate_limiter.py, while lambda/pdf_extraction/handler.py
+    the shared utils/pdf_rate_limiter.py, while lambda/pdf_extraction/handler.py
     hand-copies the same MinIntervalRateLimiter class (no access to code/,
     see that file's module docstring). Same drift risk as every other
     duplicated piece in this file: if the two throttle/retry configs ever

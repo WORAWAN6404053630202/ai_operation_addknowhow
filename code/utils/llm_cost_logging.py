@@ -11,26 +11,21 @@ minimal fix: one function, called once after each LLM response is received,
 that reads the token counts already present on the response object and logs
 them alongside a computed cost.
 
-Model pricing below was verified directly against openrouter.ai's model
-pages (2026-08/09, during the same investigation that added this module) —
-deliberately NOT copied from utils/llm_call.py's or router/admin.py's
-pricing tables, both of which were found to have a stale entry for
-claude-haiku-4-5 ($0.80/$4.00 there vs the actual $1.00/$5.00) during that
-same check. Re-verify against openrouter.ai before trusting old values if
-this table is ever copied elsewhere."""
+Model pricing now lives in utils/model_pricing.py — a single table shared
+with utils/llm_call.py (the main chat bot) and router/admin.py (the admin
+dashboard), consolidated 2026-09-05 after discovering all 3 had drifted out
+of sync (see model_pricing.py's module docstring for exact discrepancies
+found, including a stale claude-haiku-4-5 entry in router/admin.py). This
+module's own table used to be a separate copy verified directly against
+openrouter.ai in 2026-08/09 — re-verify against openrouter.ai before
+trusting a value if this table is ever copied out again."""
 
 from __future__ import annotations
 
 import threading
 from typing import Any, Optional
 
-# {"input": $ per million input tokens, "output": $ per million output tokens}
-PDF_PIPELINE_MODEL_PRICING: dict[str, dict[str, float]] = {
-    "anthropic/claude-sonnet-4-5": {"input": 3.00, "output": 15.00},
-    "anthropic/claude-haiku-4-5": {"input": 1.00, "output": 5.00},
-    "qwen/qwen3.7-flash": {"input": 0.03, "output": 0.13},
-    "google/gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40},
-}
+from utils.model_pricing import MODEL_PRICING as PDF_PIPELINE_MODEL_PRICING
 
 
 class CostAccumulator:

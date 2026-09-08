@@ -285,6 +285,7 @@ class AcademicPersonaService:
                 [HumanMessage(content=prompt_text)],
                 logger=_LOG,
                 label="Academic/meta_request",
+                state=state,
             )
             data = json.loads(extract_llm_text(raw))
             confidence = float(data.get("confidence") or 0.0)
@@ -416,10 +417,12 @@ class AcademicPersonaService:
             state.context["auto_return_topic_context"] = topic_ctx
 
     # Greeting/noise (backup safety)
-    def _greeting_llm_check(self, user_text: str) -> bool:
+    def _greeting_llm_check(self, user_text: str, state: Optional[ConversationState] = None) -> bool:
         """
         LLM fallback for greeting/noise detection when regex misses (e.g. "หวัดดีจ้า", "ดีๆ ค่ะ").
-        Uses instance-level cache — no state needed.
+        Uses instance-level cache for the RESULT — no state needed for that. `state` is only
+        used (optionally) to attribute this call's real cost to the session total; added
+        2026-09, see llm_invoke's `state=` param.
         """
         q = (user_text or "").strip()
         if not q or len(q) > 80:
@@ -432,7 +435,7 @@ class AcademicPersonaService:
         try:
             prompt = build_greeting_detect_prompt(q)
             text = extract_llm_text(
-                llm_invoke(self.llm_classifier, [HumanMessage(content=prompt)], logger=_LOG, label="Academic/greeting")
+                llm_invoke(self.llm_classifier, [HumanMessage(content=prompt)], logger=_LOG, label="Academic/greeting", state=state)
             ).strip()
             if "```json" in text:
                 text = text.split("```json")[1].split("```")[0].strip()
@@ -449,7 +452,7 @@ class AcademicPersonaService:
         cache[cache_key] = result
         return result
 
-    def _looks_like_greeting_or_noise(self, user_text: str) -> bool:
+    def _looks_like_greeting_or_noise(self, user_text: str, state: Optional[ConversationState] = None) -> bool:
         raw = (user_text or "").strip()
         if not raw:
             return True
@@ -490,18 +493,21 @@ class AcademicPersonaService:
             return False
 
         # LLM fallback: catches casual greetings regex misses (e.g. "หวัดดีจ้า", "ดีๆ ค่ะ")
-        return self._greeting_llm_check(raw)
+        return self._greeting_llm_check(raw, state=state)
 
     _KNOWN_TOPIC_GROUPS: List[str] = [
         "ทะเบียนธุรกิจ", "อาหารและสุขาภิบาล", "ภาษี", "บุคลากร",
         "ชำระเงิน", "บัญชีและการเงิน",
     ]
 
-    def _topic_group_llm_check(self, query: str, known_groups: List[str]) -> Optional[str]:
+    def _topic_group_llm_check(
+        self, query: str, known_groups: List[str], state: Optional[ConversationState] = None
+    ) -> Optional[str]:
         """
         LLM fallback for _detect_topic_group when retrieval scoring is inconclusive (< 30%).
         Returns the best-match group name, or None if confidence < 0.60 or LLM fails.
-        Uses instance-level cache — group detection is stateless.
+        Uses instance-level cache for the RESULT — group detection is stateless. `state` is
+        only used (optionally) to attribute this call's real cost to the session total.
         """
         q = (query or "").strip()
         if not q:
@@ -515,7 +521,7 @@ class AcademicPersonaService:
         try:
             prompt = build_topic_group_detect_prompt(q, known_groups)
             text = extract_llm_text(
-                llm_invoke(self.llm_classifier, [HumanMessage(content=prompt)], logger=_LOG, label="Academic/topic_group")
+                llm_invoke(self.llm_classifier, [HumanMessage(content=prompt)], logger=_LOG, label="Academic/topic_group", state=state)
             ).strip()
             if "```json" in text:
                 text = text.split("```json")[1].split("```")[0].strip()
@@ -534,7 +540,9 @@ class AcademicPersonaService:
         return result
 
     # ── 2-pass topic_group detection (safety net C) ───────────────────────────
-    def _detect_topic_group(self, query: str, k: int = 10) -> Optional[List[str]]:
+    def _detect_topic_group(
+        self, query: str, k: int = 10, state: Optional[ConversationState] = None
+    ) -> Optional[List[str]]:
         """
         Pass-1: broad unfiltered retrieve of top-k docs, then score topic_group by count.
         Returns a list of relevant groups (never empty — returns None when inconclusive):
@@ -548,7 +556,7 @@ class AcademicPersonaService:
         if not query:
             return None
         # LLM query rewriting + synonym expansion — same logic as _retrieve_docs
-        _q = enrich_query_for_retrieval(query) if _qr_needs_rewrite(query) else query
+        _q = enrich_query_for_retrieval(query, state=state) if _qr_needs_rewrite(query) else query
         for _pat, _exp in SYNONYM_PATTERNS:
             if re.search(_pat, _q, re.IGNORECASE) and _exp not in _q:
                 _q += " " + _exp
@@ -606,13 +614,15 @@ class AcademicPersonaService:
             best_conf * 100, group_counts,
         )
         known = list(group_counts.keys()) or self._KNOWN_TOPIC_GROUPS
-        llm_group = self._topic_group_llm_check(query, known)
+        llm_group = self._topic_group_llm_check(query, known, state=state)
         if llm_group:
             return [llm_group]
         return None
 
     # Retrieval (only once per intake)
-    def _retrieve_docs(self, query: str, metadata_filter: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    def _retrieve_docs(
+        self, query: str, metadata_filter: Optional[Dict[str, Any]] = None, state=None
+    ) -> List[Dict[str, Any]]:
         max_docs = int(getattr(conf, "LLM_DOCS_MAX_ACADEMIC", 12) or 12)
         max_chars = int(getattr(conf, "LLM_DOC_CHARS_ACADEMIC", 700) or 700)
 
@@ -703,7 +713,7 @@ class AcademicPersonaService:
 
         # LLM query rewriting: convert informal Thai to formal regulatory terminology
         if _qr_needs_rewrite(query):
-            query = enrich_query_for_retrieval(query)
+            query = enrich_query_for_retrieval(query, state=state)
 
         # Query expansion: Thai/English synonym bridging — patterns defined in utils/query_synonyms.py
         _expansions_ac: list = []
@@ -1252,7 +1262,7 @@ class AcademicPersonaService:
                 # bias broad retrieval toward entity-specific docs and cause misclassification.
                 # e.g. "การปิดงบการเงิน บริษัทจำกัด" → 67% ทะเบียนธุรกิจ (wrong)
                 #      "การปิดงบการเงิน" alone → สำนักงานบัญชี (correct)
-                _detected_groups = self._detect_topic_group(_q_before_enrichment)
+                _detected_groups = self._detect_topic_group(_q_before_enrichment, state=state)
                 if _detected_groups:
                     # Add topic_group filter alongside entity filter ($and combines both).
                     # Single group → equality filter; multiple groups → $in so cross-domain
@@ -1305,7 +1315,7 @@ class AcademicPersonaService:
                 seen_hashes: set = set()
                 per_topic: list = []  # list of lists
                 for sq in matched_sub_queries:
-                    sub_docs = self._retrieve_docs(sq, metadata_filter=metadata_filter)
+                    sub_docs = self._retrieve_docs(sq, metadata_filter=metadata_filter, state=state)
                     per_topic.append(sub_docs)
                 # Interleave: take 1 from each topic in round-robin, then de-dup
                 merged: list = []
@@ -1319,7 +1329,7 @@ class AcademicPersonaService:
                                 seen_hashes.add(h)
                                 merged.append(doc)
                 # Also add broad-query docs that weren't captured by sub-queries
-                broad_docs = self._retrieve_docs(q, metadata_filter=metadata_filter)
+                broad_docs = self._retrieve_docs(q, metadata_filter=metadata_filter, state=state)
                 for doc in broad_docs:
                     h = hash(doc.get("content", "")[:100])
                     if h not in seen_hashes:
@@ -1328,7 +1338,7 @@ class AcademicPersonaService:
                 state.current_docs = merged
                 _LOG.info("[Academic] Multi-topic interleaved merge → %d total docs", len(merged))
             else:
-                state.current_docs = self._retrieve_docs(q, metadata_filter=metadata_filter)
+                state.current_docs = self._retrieve_docs(q, metadata_filter=metadata_filter, state=state)
                 # Safety net C fallback: if topic_group filter was applied but top reranker score
                 # is extremely low (< 0.05), the topic_group was misdetected — retry with entity-only filter.
                 # e.g. "การปิดงบการเงิน" + entity=นิติบุคคล + topic_group=ทะเบียนธุรกิจ (wrong) → score 0.002
@@ -1350,7 +1360,7 @@ class AcademicPersonaService:
                             "topic_group filter likely wrong, retrying with entity-only filter",
                             float(_top_rr),
                         )
-                        state.current_docs = self._retrieve_docs(q, metadata_filter=_entity_filter)
+                        state.current_docs = self._retrieve_docs(q, metadata_filter=_entity_filter, state=state)
 
         if hasattr(state, "set_last_retrieval_query"):
             state.set_last_retrieval_query(q, cache_to_context=True)
@@ -1462,7 +1472,7 @@ class AcademicPersonaService:
             return {"bound": False}
 
         opt_list = [str(v) for v in opts.values()]
-        matched_n = self._match_section_by_text_llm(user_text, opt_list, list(opts.keys()))
+        matched_n = self._match_section_by_text_llm(user_text, opt_list, list(opts.keys()), state=state)
         if matched_n is not None and matched_n in pending:
             # Check if matched to "ทั้งหมด"
             if str(pending.get(matched_n, "")).strip() == "ทั้งหมด":
@@ -1482,7 +1492,10 @@ class AcademicPersonaService:
 
         return {"bound": False}
 
-    def _match_section_by_text_llm(self, user_text: str, option_labels: List[str], option_keys: List) -> Optional[int]:
+    def _match_section_by_text_llm(
+        self, user_text: str, option_labels: List[str], option_keys: List,
+        state: Optional[ConversationState] = None,
+    ) -> Optional[int]:
         """
         Use LLM (llm_slots) to match free-text section request to a numbered option.
         Returns the matched option number (int key from pending_options) or None.
@@ -1499,7 +1512,7 @@ class AcademicPersonaService:
             'ตอบ JSON เท่านั้น: {"choice": 1} หรือ {"choice": null}'
         )
         try:
-            resp = llm_invoke(self.llm_classifier, [HumanMessage(content=prompt)], logger=_LOG, label="Academic/section_bind")
+            resp = llm_invoke(self.llm_classifier, [HumanMessage(content=prompt)], logger=_LOG, label="Academic/section_bind", state=state)
             text = extract_llm_text(resp).strip()
             if "```" in text:
                 text = text.split("```")[1].split("```")[0].strip() if text.count("```") >= 2 else text
@@ -1512,7 +1525,9 @@ class AcademicPersonaService:
             pass
         return None
 
-    def _match_slot_choice_by_text_llm(self, user_text: str, choices: List[str]) -> Optional[str]:
+    def _match_slot_choice_by_text_llm(
+        self, user_text: str, choices: List[str], state: Optional[ConversationState] = None
+    ) -> Optional[str]:
         """
         Last-resort matcher for slot answers when a field has more real choices than the 4
         shown on screen (issue #4) and deterministic substring/token matching in
@@ -1537,7 +1552,7 @@ class AcademicPersonaService:
             'ตอบ JSON เท่านั้น: {"choice": 1} หรือ {"choice": null}'
         )
         try:
-            resp = llm_invoke(self.llm_classifier, [HumanMessage(content=prompt)], logger=_LOG, label="Academic/slot_overflow_bind")
+            resp = llm_invoke(self.llm_classifier, [HumanMessage(content=prompt)], logger=_LOG, label="Academic/slot_overflow_bind", state=state)
             text = extract_llm_text(resp).strip()
             # Despite response_format=json_object, the model sometimes still wraps the JSON in
             # a ```json ... ``` fence (occasionally with trailing reasoning text after it, e.g.
@@ -1949,7 +1964,7 @@ class AcademicPersonaService:
         # back from unfiltered vector search and then falling into the "re-filter gave 1 < 2" path.
         # For non-regulatory topics (sub_topic key), license_type won't match → try sub_topic get().
         _lt_filter: Optional[Dict[str, Any]] = {"license_type": selected_key}
-        fresh_docs = self._retrieve_docs(target_q, metadata_filter=_lt_filter)
+        fresh_docs = self._retrieve_docs(target_q, metadata_filter=_lt_filter, state=state)
         if isinstance(state.context, dict):
             state.context.pop("_academic_supplement_failed", None)
 
@@ -2024,7 +2039,7 @@ class AcademicPersonaService:
             for d in fresh_docs
         ):
             try:
-                _mt_fresh = self._retrieve_docs(target_q, metadata_filter={"main_topic": selected_key})
+                _mt_fresh = self._retrieve_docs(target_q, metadata_filter={"main_topic": selected_key}, state=state)
                 if any(
                     str((d.get("metadata") or {}).get("main_topic") or "").strip() == selected_key
                     for d in _mt_fresh
@@ -2065,7 +2080,7 @@ class AcademicPersonaService:
                 )
             else:
                 try:
-                    _hint_docs = self._retrieve_docs(target_q, metadata_filter={"license_type": _sv_lt_hint})
+                    _hint_docs = self._retrieve_docs(target_q, metadata_filter={"license_type": _sv_lt_hint}, state=state)
                     if _hint_docs and any(
                         str((d.get("metadata") or {}).get("license_type") or "").strip() == _sv_lt_hint
                         for d in _hint_docs
@@ -2114,7 +2129,7 @@ class AcademicPersonaService:
         if not fresh_docs:
             # Final fallback: unfiltered semantic search
             _LOG.info("[Academic] Targeted re-retrieval: both filters returned 0, retrying unfiltered")
-            fresh_docs = self._retrieve_docs(target_q)
+            fresh_docs = self._retrieve_docs(target_q, state=state)
         if fresh_docs:
             # After topic-specific retrieval, Chroma may still return docs from other topics
             # (e.g. querying "ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร" also ranks
@@ -2264,9 +2279,9 @@ class AcademicPersonaService:
         for key in selected_keys:
             target_q = f"{key} {base_q}".strip() if key not in base_q else base_q
             # Try license_type-filtered retrieval first
-            fresh = self._retrieve_docs(target_q, metadata_filter={"license_type": key})
+            fresh = self._retrieve_docs(target_q, metadata_filter={"license_type": key}, state=state)
             if not fresh:
-                fresh = self._retrieve_docs(target_q)
+                fresh = self._retrieve_docs(target_q, state=state)
             for d in (fresh or []):
                 fp = hash((d.get("content") or "")[:200])
                 if fp not in seen_fps:
@@ -3561,7 +3576,7 @@ class AcademicPersonaService:
                     # "แก้ไข ตราประทับ 1 ดวง" vs "...มากกว่า 1 ดวง") where a wrong guess is
                     # worse than asking again.
                     if len(_fb_vals) >= 2:
-                        _llm_match = self._match_slot_choice_by_text_llm(raw, _fb_vals)
+                        _llm_match = self._match_slot_choice_by_text_llm(raw, _fb_vals, state=state)
                         if _llm_match:
                             slots[_fb_key] = _llm_match
                             try:
@@ -3700,7 +3715,7 @@ class AcademicPersonaService:
                 # then do a fresh re-retrieve — the comment "will naturally be included" was wrong:
                 # _finalize_answer uses academic_question as-is without re-retrieving.
                 state.context["academic_question"] = query
-                new_docs_qe = self._retrieve_docs(query)
+                new_docs_qe = self._retrieve_docs(query, state=state)
                 if new_docs_qe:
                     state.current_docs = new_docs_qe
                     if hasattr(state, "last_retrieval_query"):
@@ -3797,7 +3812,7 @@ class AcademicPersonaService:
             return
 
         # Re-retrieve using _retrieve_docs (handles fallback + logging)
-        new_docs = self._retrieve_docs(query, metadata_filter=chroma_filter)
+        new_docs = self._retrieve_docs(query, metadata_filter=chroma_filter, state=state)
         if new_docs:
             state.current_docs = new_docs
             # Update stored query so staleness check reflects the new enriched query
@@ -3816,7 +3831,7 @@ class AcademicPersonaService:
                 chroma_filter,
             )
             if _selected_topic:
-                fallback_docs = self._retrieve_docs(query)
+                fallback_docs = self._retrieve_docs(query, state=state)
                 if fallback_docs:
                     state.current_docs = fallback_docs
                     if hasattr(state, "last_retrieval_query"):
@@ -4832,7 +4847,7 @@ Return JSON:
         # Start intake (NO implicit idle stage)
         if not stage:
             # If force-routed here but got greeting/noise/blank -> ask for question (no flow created)
-            if force_intake and self._looks_like_greeting_or_noise(user_text):
+            if force_intake and self._looks_like_greeting_or_noise(user_text, state=state):
                 msg = "อยากให้ช่วยเรื่องไหนเกี่ยวกับกฎหมาย/ขั้นตอนของร้านอาหารครับ"
                 self._append_assistant(state, msg)
                 return state, msg
@@ -5009,7 +5024,7 @@ Return JSON:
         # Stage: awaiting_topic → user picks which license/topic to deep-dive into
         if stage == "awaiting_topic":
             # Noise/greeting/empty → re-ask topic menu
-            if not user_text or self._looks_like_greeting_or_noise(user_text):
+            if not user_text or self._looks_like_greeting_or_noise(user_text, state=state):
                 msg = (state.context or {}).get("pending_question") or ""
                 if msg:
                     self._append_assistant(state, msg)
@@ -5104,7 +5119,7 @@ Return JSON:
         # Stage: awaiting_slots
         if stage == "awaiting_slots":
             # Noise/greeting/empty input while waiting for slots — re-ask (or proceed if all slots known)
-            if not user_text or self._looks_like_greeting_or_noise(user_text):
+            if not user_text or self._looks_like_greeting_or_noise(user_text, state=state):
                 q = self._ask_required_slots(state)
                 if q.strip():
                     self._append_assistant(state, q)
@@ -5250,7 +5265,7 @@ Return JSON:
             bind = self._bind_choice_if_any(state, user_text)
 
             # If user sends noise here, re-ask section menu (keep stage)
-            if not user_text or (not bind.get("bound") and self._looks_like_greeting_or_noise(user_text)):
+            if not user_text or (not bind.get("bound") and self._looks_like_greeting_or_noise(user_text, state=state)):
                 msg = (state.context or {}).get("pending_question") or "พิมพ์เลขข้อที่ต้องการ (เช่น 1, 2) หรือพิมพ์เลขข้อสุดท้ายเพื่อดูทั้งหมดครับ"
                 msg = msg.strip() or "พิมพ์เลขข้อที่ต้องการ (เช่น 1, 2) หรือพิมพ์เลขข้อสุดท้ายเพื่อดูทั้งหมดครับ"
                 self._append_assistant(state, msg)

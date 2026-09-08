@@ -373,38 +373,14 @@ def _check_token_budget(total: int, model: str) -> None:
         )
 
 
-# Cost Estimation (ราคาโดยประมาณ - ตรวจสอบราคาจริงจาก OpenRouter)
-PRICING_USD_PER_MILLION_TOKENS = {
-    # Claude Sonnet family
-    "anthropic/claude-sonnet-4-5": {"input": 3.00, "output": 15.00},
-    "anthropic/claude-sonnet-4": {"input": 3.00, "output": 15.00},
-    "anthropic/claude-4-5-sonnet-20241022": {"input": 3.00, "output": 15.00},
-    # Claude Haiku family
-    "anthropic/claude-haiku-4-5": {"input": 1.00, "output": 5.00},
-    "anthropic/claude-haiku-4": {"input": 0.25, "output": 1.25},
-    "anthropic/claude-3.5-haiku-20241022": {"input": 0.25, "output": 1.25},
-    # GPT-5.x family (verify pricing at openrouter.ai/models)
-    "openai/gpt-5.1": {"input": 1.25, "output": 10.00},
-    # GPT-4o family
-    "openai/gpt-4o": {"input": 5.00, "output": 15.00},
-    "openai/chatgpt-4o-latest": {"input": 5.00, "output": 15.00},
-}
+# Cost Estimation — pricing/cache-multiplier tables live in utils/model_pricing.py,
+# shared with utils/llm_cost_logging.py (PDF pipeline) and router/admin.py (dashboard)
+# so all 3 can't silently drift out of sync with each other again (they had, before
+# this consolidation — see model_pricing.py's module docstring for specifics).
+from utils.model_pricing import MODEL_PRICING as PRICING_USD_PER_MILLION_TOKENS
+from utils.model_pricing import cache_multipliers as _cache_multipliers
 
 _COST_LOG = logging.getLogger(__name__)
-
-
-def _cache_multipliers(model_name: str) -> tuple[float, float]:
-    """Returns (cache_read_multiplier, cache_write_multiplier), relative to a model's
-    normal input price. Approximate, provider-level figures (not billing-grade — the
-    pricing table above is itself already an estimate per its own comment):
-      - Anthropic: cache reads ~0.1x (90% off), cache writes ~1.25x (25% premium).
-      - Everyone else (e.g. OpenAI/GPT-5.1, which gets automatic caching with no
-        request change needed): reads ~0.5x, no write premium — matches OpenAI's
-        published "50% off cached input" behavior, distinct from Anthropic's scheme.
-    """
-    if "anthropic/" in (model_name or ""):
-        return 0.1, 1.25
-    return 0.5, 1.0
 
 
 def estimate_cost(
@@ -422,7 +398,7 @@ def estimate_cost(
     """
     pricing = PRICING_USD_PER_MILLION_TOKENS.get(model)
     if pricing is None:
-        _COST_LOG.warning("[Cost] Model %r not in pricing table — cost logged as $0. Add it to PRICING_USD_PER_MILLION_TOKENS.", model)
+        _COST_LOG.warning("[Cost] Model %r not in pricing table — cost logged as $0. Add it to utils/model_pricing.py's MODEL_PRICING.", model)
         return 0.0
     _read_mult, _write_mult = _cache_multipliers(model)
     _regular_tokens = max(0, prompt_tokens - cache_read_tokens - cache_write_tokens)

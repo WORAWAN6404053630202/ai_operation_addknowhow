@@ -1,0 +1,38 @@
+#/Users/w.worawan/Downloads/ai-operation-microservice3_v2ori/requirements-pdf.in
+#
+# Source file for the version ranges the PDF admin review service (app_pdf.py)
+# accepts — split off from requirements.in (2026-09) when the PDF review
+# dashboard became its own deployable service, separate from the bot's
+# requirements.txt. Deliberately lean: this service serves only
+# router/admin_pdf.py's endpoints (pdf-queue list/detail/decision/reprocess),
+# NOT the actual PDF extraction/OCR pipeline (service/pdf_large_extraction.py,
+# service/pdf_dual_extraction.py) — that runs in service/sqs_consumer.py as
+# its own separate, already-independent process (confirmed out of scope for
+# this split) and needs its own heavier deps (pdf2image, pymupdf,
+# typhoon_ocr) that this service never imports.
+#
+# Docker installs from the generated, exact-pinned + hash-locked
+# requirements-pdf.txt, same pattern as requirements.in/.txt. Edit ranges
+# here, then regenerate:
+#
+#   uv pip compile requirements-pdf.in --generate-hashes --python-version 3.11 \
+#     --python-platform x86_64-unknown-linux-gnu -o requirements-pdf.txt
+
+# --- Core ---
+python-dotenv>=1.0.1
+pydantic>=2.6,<3.0
+
+# --- FastAPI ---
+fastapi>=0.115.2,<1
+uvicorn>=0.27,<1
+uvloop>=0.19.0
+httptools>=0.6.0
+
+# --- LLM (candidate matching / field drafting call OpenAI directly, no LangChain) ---
+openai>=1.40.0
+
+# --- Sheet write-back (approve/reject decisions) ---
+gspread>=6.0.0
+
+# --- PDF ingestion status (S3 in-flight tracking + SQS reprocess handoff) ---
+boto3>=1.34.0

@@ -455,7 +455,15 @@ class PersonaSupervisor:
         r"|ใบอนุญาตจัดตั้ง|ใบอนุญาตจำหน่ายสุรา|ใบอนุญาตจำหน่าย"
         r"|ใบรับรองมาตรฐานร้านอาหาร|ใบวุฒิบัตรผู้สัมผัสอาหาร"
         r"|ใบรับรองแพทย์|แบบแสดงรายการภาษีป้าย"
-        r"|ประกันสังคม|กองทุนประกันสังคม",
+        r"|ประกันสังคม|กองทุนประกันสังคม"
+        # 2026-09: added after live QA rerun found the LLM broad_q classifier
+        # (_broad_question_llm_check) firing 0.95-confidence "broad" on
+        # single-device questions naming EDC or QR Payment specifically (e.g.
+        # "ขั้นตอนการสมัครเครื่อง EDC...เรียงลำดับ") — these terms weren't in
+        # this list at all, so the specificity override never had a chance to
+        # apply. license_type values confirmed in Chroma: "เครื่องรูดบัตร EDC",
+        # "ระบบชำระเงินออนไลน์" (QR Payment's actual license_type).
+        r"|EDC|เครื่องรูดบัตร|รูดบัตร|\bQR\b|QR\s*Payment|คิวอาร์|ระบบชำระเงินออนไลน์|ระบบชำระเงิน",
         re.IGNORECASE,
     )
     # Broad/overview question: triggers two-pass retrieval (pass1=user intent, pass2=regulatory).
@@ -943,7 +951,7 @@ class PersonaSupervisor:
             )
             _reply = extract_llm_text(
                 llm_invoke(_llm, [SystemMessage(content=_system), HumanMessage(content=raw_input)],
-                           logger=_LOG, label="Supervisor/deflect")
+                           logger=_LOG, label="Supervisor/deflect", state=state)
             ).strip()
             # Hard-enforce single line — collapse any newlines the LLM sneaks in
             _reply = " ".join(_reply.splitlines()).strip()
@@ -1029,7 +1037,7 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(last_hint: str, candidates: List[str], k: int, banned: List[str]) -> dict:
+        def _call(last_hint: str, candidates: List[str], k: int, banned: List[str], state=None) -> dict:
             cand = [str(x).strip() for x in (candidates or []) if str(x).strip()]
             cand = cand[:40]
             banned2 = [str(x).strip() for x in (banned or []) if str(x).strip()]
@@ -1038,7 +1046,7 @@ class PersonaSupervisor:
             prompt = build_topic_picker_prompt(last_hint, k, banned2, cand)
 
             try:
-                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/topic_picker")).strip()
+                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/topic_picker", state=state)).strip()
             except Exception as e:
                 # LengthFinishReasonError: retry ไม่ช่วย — skip แล้วใช้ fallback
                 if "LengthFinishReasonError" in type(e).__name__ or "LengthFinishReason" in str(e)[:80]:
@@ -1068,10 +1076,10 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_confirm_prompt(user_text)
             try:
-                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/llm")).strip()
+                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/llm", state=state)).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/confirm] LLM call failed: %s", _e)
                 return {}
@@ -1099,10 +1107,10 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, last_query: str = "") -> dict:
+        def _call(user_text: str, last_query: str = "", state=None) -> dict:
             prompt = build_style_detect_prompt(user_text, last_query)
             try:
-                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/llm")).strip()
+                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/llm", state=state)).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/style] LLM call failed: %s", _e)
                 return {}
@@ -1137,11 +1145,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(kind: str, persona_id: str, last_topic_hint: str, include_intro: bool) -> dict:
+        def _call(kind: str, persona_id: str, last_topic_hint: str, include_intro: bool, state=None) -> dict:
             kind_instructions = build_greet_kind_instructions(kind, last_topic_hint)
             prompt = build_greet_prefix_prompt(kind, persona_id, last_topic_hint, include_intro, kind_instructions)
             try:
-                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/greet")).strip()
+                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/greet", state=state)).strip()
             except Exception as _e:
                 _LOG.debug("[Supervisor/greet] LLM call failed: %s", _e)
                 return {}
@@ -1192,13 +1200,13 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(license_type: str, raw_ops: List[str]) -> dict:
+        def _call(license_type: str, raw_ops: List[str], state=None) -> dict:
             if not raw_ops:
                 return {"groups": []}
             prompt = build_op_group_classifier_prompt(license_type, raw_ops)
             try:
                 text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)],
-                                  logger=_LOG, label="Supervisor/op_group_classify")).strip()
+                                  logger=_LOG, label="Supervisor/op_group_classify", state=state)).strip()
                 text = self._strip_code_fences(text)
                 obj = json.loads(text)
                 return obj if isinstance(obj, dict) else {"groups": []}
@@ -1229,13 +1237,13 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(options: List[str]) -> dict:
+        def _call(options: List[str], state=None) -> dict:
             if len(options) <= 1:
                 return {"unique_options": options, "reasoning": "Only one option"}
             prompt = build_deduplicate_options_prompt(options)
-            
+
             try:
-                resp = llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/deduplicate")
+                resp = llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/deduplicate", state=state)
                 txt = extract_llm_text(resp).strip()
                 if txt.startswith("```json"):
                     txt = txt.replace("```json", "").replace("```", "").strip()
@@ -1285,10 +1293,10 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(slot_key: str, user_text: str, options: List[str]) -> dict:
+        def _call(slot_key: str, user_text: str, options: List[str], state=None) -> dict:
             prompt = build_slot_mapper_prompt(slot_key, user_text, options)
             try:
-                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/slot_mapper")).strip()
+                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/slot_mapper", state=state)).strip()
             except Exception as _e:
                 _LOG.debug("[Supervisor/slot_mapper] LLM call failed: %s", _e)
                 return {}
@@ -1302,7 +1310,7 @@ class PersonaSupervisor:
 
         return _call
 
-    def _check_select_all_intent_llm(self, key: str, user_text: str, options: List[str]) -> bool:
+    def _check_select_all_intent_llm(self, key: str, user_text: str, options: List[str], state=None) -> bool:
         """LLM fallback: detect 'select all options' intent for allow_multi slots.
         Called only when all regex/exact/fuzzy paths failed to identify the intent.
         Returns True when user clearly wants ALL options (confidence ≥ 0.70)."""
@@ -1310,7 +1318,7 @@ class PersonaSupervisor:
         try:
             prompt = build_select_all_intent_prompt(key, user_text, options)
             text = extract_llm_text(
-                llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/select_all")
+                llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/select_all", state=state)
             ).strip()
             text = self._strip_code_fences(text)
             obj = json.loads(text)
@@ -1353,10 +1361,10 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, last_query: str, persona: str) -> dict:
+        def _call(user_text: str, last_query: str, persona: str, state=None) -> dict:
             prompt = build_fallback_intent_prompt(user_text, last_query, persona)
             try:
-                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/fallback_intent")).strip()
+                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/fallback_intent", state=state)).strip()
             except Exception as _e:
                 _LOG.debug("[Supervisor/fallback_intent] LLM call failed: %s", _e)
                 return {}
@@ -1548,11 +1556,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, last_query: str) -> dict:
+        def _call(user_text: str, last_query: str, state=None) -> dict:
             prompt = build_entity_type_detect_prompt(user_text, last_query)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/entity_type")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/entity_type", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/entity_type] LLM call failed: %s", _e)
@@ -1582,11 +1590,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, last_query: str) -> dict:
+        def _call(user_text: str, last_query: str, state=None) -> dict:
             prompt = build_location_detect_prompt(user_text, last_query)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/location")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/location", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/location] LLM call failed: %s", _e)
@@ -1616,11 +1624,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, last_query: str) -> dict:
+        def _call(user_text: str, last_query: str, state=None) -> dict:
             prompt = build_operation_type_detect_prompt(user_text, last_query)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/operation_type")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/operation_type", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/operation_type] LLM call failed: %s", _e)
@@ -1650,11 +1658,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_area_size_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/area_size")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/area_size", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/area_size] LLM call failed: %s", _e)
@@ -1684,11 +1692,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, options: List[str]) -> dict:
+        def _call(user_text: str, options: List[str], state=None) -> dict:
             prompt = build_registration_type_detect_prompt(user_text, options)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/registration_type")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/registration_type", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/registration_type] LLM call failed: %s", _e)
@@ -1718,11 +1726,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, candidates: List[str]) -> dict:
+        def _call(user_text: str, candidates: List[str], state=None) -> dict:
             prompt = build_license_type_detect_prompt(user_text, candidates)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/license_type")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/license_type", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/license_type] LLM call failed: %s", _e)
@@ -1751,11 +1759,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, last_academic_query: str, section_count: int) -> dict:
+        def _call(user_text: str, last_academic_query: str, section_count: int, state=None) -> dict:
             prompt = build_academic_resume_detect_prompt(user_text, last_academic_query, section_count)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/academic_resume")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/academic_resume", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/academic_resume] LLM call failed: %s", _e)
@@ -1784,11 +1792,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, last_topic: str) -> dict:
+        def _call(user_text: str, last_topic: str, state=None) -> dict:
             prompt = build_elaborate_detect_prompt(user_text, last_topic)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/elaborate")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/elaborate", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/elaborate] LLM call failed: %s", _e)
@@ -1817,11 +1825,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_broad_question_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/broad_q")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/broad_q", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/broad_q] LLM call failed: %s", _e)
@@ -1850,11 +1858,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_slot_skip_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/slot_skip")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/slot_skip", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/slot_skip] LLM call failed: %s", _e)
@@ -1883,11 +1891,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, last_topic: str) -> dict:
+        def _call(user_text: str, last_topic: str, state=None) -> dict:
             prompt = build_followup_contextual_detect_prompt(user_text, last_topic)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/followup_ctx")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/followup_ctx", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/followup_ctx] LLM call failed: %s", _e)
@@ -1916,11 +1924,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_thanks_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/thanks")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/thanks", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/thanks] LLM call failed: %s", _e)
@@ -1949,11 +1957,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_academic_stop_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/academic_stop")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/academic_stop", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/academic_stop] LLM call failed: %s", _e)
@@ -1982,11 +1990,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, last_topic: str) -> dict:
+        def _call(user_text: str, last_topic: str, state=None) -> dict:
             prompt = build_new_topic_detect_prompt(user_text, last_topic)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/new_topic")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/new_topic", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/new_topic] LLM call failed: %s", _e)
@@ -2015,11 +2023,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_smalltalk_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/smalltalk")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/smalltalk", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/smalltalk] LLM call failed: %s", _e)
@@ -2048,11 +2056,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_switch_without_target_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/switch_no_target")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/switch_no_target", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/switch_no_target] LLM call failed: %s", _e)
@@ -2081,11 +2089,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_link_request_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/link_request")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/link_request", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/link_request] LLM call failed: %s", _e)
@@ -2114,11 +2122,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_mode_status_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/mode_status")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/mode_status", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/mode_status] LLM call failed: %s", _e)
@@ -2147,11 +2155,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_greeting_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/greeting")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/greeting", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/greeting] LLM call failed: %s", _e)
@@ -2187,10 +2195,10 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, last_topic: str) -> dict:
+        def _call(user_text: str, last_topic: str, state=None) -> dict:
             prompt = build_typo_check_prompt(user_text, last_topic)
             try:
-                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/typo_check")).strip()
+                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/typo_check", state=state)).strip()
             except Exception:
                 return {}
             text = self._strip_code_fences(text)
@@ -2217,11 +2225,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_info_action_q_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/info_action_q")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/info_action_q", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/info_action_q] LLM call failed: %s", _e)
@@ -2250,11 +2258,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_legal_q_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/legal_q")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/legal_q", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/legal_q] LLM call failed: %s", _e)
@@ -2345,7 +2353,7 @@ class PersonaSupervisor:
 
         return {"wants_short": wants_short, "wants_long": wants_long}
 
-    def _infer_user_style_request_hybrid(self, s: str, last_query: str = "") -> Dict[str, Any]:
+    def _infer_user_style_request_hybrid(self, s: str, last_query: str = "", state=None) -> Dict[str, Any]:
         text = s or ""
 
         # 1. Fast-path: deterministic keyword check (no LLM cost)
@@ -2384,9 +2392,9 @@ class PersonaSupervisor:
         res: Dict[str, Any] = {}
         try:
             if self._llm_style_call_arity >= 2:
-                res = self.llm_style_call(text, last_query) or {}
+                res = self.llm_style_call(text, last_query, state=state) or {}
             else:
-                res = self.llm_style_call(text) or {}
+                res = self.llm_style_call(text, state=state) or {}
         except Exception:
             res = {}
 
@@ -4187,7 +4195,7 @@ class PersonaSupervisor:
         # before embedding. Use a SEPARATE variable so q stays clean for last_retrieval_query
         # (mutating q would cause Jaccard cache poisoning — see comment at last_retrieval_query
         # assignment below).
-        _q_embed = enrich_query_for_retrieval(q) if _qr_needs_rewrite(q) else q
+        _q_embed = enrich_query_for_retrieval(q, state=state) if _qr_needs_rewrite(q) else q
 
         # Query expansion: use shared SYNONYM_PATTERNS (utils/query_synonyms.py) — covers all 3 sheets
         _sv_expansions: list = []
@@ -5318,7 +5326,7 @@ class PersonaSupervisor:
             )
             if _lt_infoq:
                 try:
-                    _og_res_iq = self._get_operation_groups_for_entity(_lt_infoq, "")
+                    _og_res_iq = self._get_operation_groups_for_entity(_lt_infoq, "", state=state)
                     _og_labels_iq, _og_raw_iq = (
                         _og_res_iq if isinstance(_og_res_iq, tuple) else (_og_res_iq, {})
                     )
@@ -6263,7 +6271,7 @@ class PersonaSupervisor:
         # NOTE: intentionally outside the `if "location"` block — operation_group applies to
         # ALL licenses regardless of whether location is known (e.g. ทะเบียนพาณิชย์, VAT,
         # ประกันสังคม have no location slot but do have multiple operation groups).
-        _op_res_lq = self._get_operation_groups_for_entity(license_type, _known_entity_lq)
+        _op_res_lq = self._get_operation_groups_for_entity(license_type, _known_entity_lq, state=state)
         _op_grps_lq, _raw_op_map_lq = (
             _op_res_lq if isinstance(_op_res_lq, tuple) else (_op_res_lq, {})
         )
@@ -6541,7 +6549,7 @@ class PersonaSupervisor:
             return None
         return best_opt
 
-    def _map_pending_slot_reply(self, pending: Dict[str, Any], user_input: str) -> Tuple[Optional[str], Optional[str]]:
+    def _map_pending_slot_reply(self, pending: Dict[str, Any], user_input: str, state=None) -> Tuple[Optional[str], Optional[str]]:
         options = pending.get("options") or []
         allow_multi = bool(pending.get("allow_multi", False))
         key = str(pending.get("key") or "").strip()
@@ -6722,7 +6730,7 @@ class PersonaSupervisor:
         # mapped to ONE option by the single-choice LLM below.
         # Guaranteed to fire here when all regex/exact/fuzzy paths above failed.
         if allow_multi and options and len(options) >= 2:
-            if self._check_select_all_intent_llm(key, raw.strip(), [str(x).strip() for x in options]):
+            if self._check_select_all_intent_llm(key, raw.strip(), [str(x).strip() for x in options], state=state):
                 return ", ".join([str(x).strip() for x in options if str(x).strip()]), None
 
         # Audit finding, 2026-08-05: free-text matching below (LLM + fuzzy) uses the FULL
@@ -6737,7 +6745,7 @@ class PersonaSupervisor:
         # Example: location slot with options ["กรุงเทพฯ", "ต่างจังหวัด"] and user says "กทม"
         if isinstance(_match_pool, list) and len(_match_pool) >= 2 and self.llm_slot_mapper_call:
             try:
-                res = self.llm_slot_mapper_call(key, raw.strip(), [str(x).strip() for x in _match_pool]) or {}
+                res = self.llm_slot_mapper_call(key, raw.strip(), [str(x).strip() for x in _match_pool], state=state) or {}
             except Exception:
                 res = {}
             try:
@@ -7820,7 +7828,7 @@ class PersonaSupervisor:
         # — deliberately NOT a new mechanism, this one was already proven in production.
         if not matched and values_full and len(values_full) >= 2 and self.llm_slot_mapper_call:
             try:
-                _dc_res = self.llm_slot_mapper_call(field, user_input.strip(), [str(v).strip() for v in values_full]) or {}
+                _dc_res = self.llm_slot_mapper_call(field, user_input.strip(), [str(v).strip() for v in values_full], state=state) or {}
                 _dc_confv = float(_dc_res.get("confidence", 0.0) or 0.0)
             except Exception:
                 _dc_res, _dc_confv = {}, 0.0
@@ -8154,7 +8162,7 @@ class PersonaSupervisor:
         # contaminates entity_type detection when the user switches license topics.
         _lq = last_query or ""
         try:
-            res = self._llm_entity_type_call(q, _lq) or {}
+            res = self._llm_entity_type_call(q, _lq, state=state) or {}
         except Exception as _e:
             _LOG.warning("[Supervisor/entity_type] fallback failed: %s", _e)
             cache[q] = None
@@ -8194,7 +8202,7 @@ class PersonaSupervisor:
         # contaminate location detection when user switches to a new topic.
         _lq = ""
         try:
-            res = self._llm_location_call(q, _lq) or {}
+            res = self._llm_location_call(q, _lq, state=state) or {}
         except Exception as _e:
             _LOG.warning("[Supervisor/location] fallback failed: %s", _e)
             cache[q] = None
@@ -8224,7 +8232,7 @@ class PersonaSupervisor:
         # contaminate operation_type detection when user switches to a new topic.
         _lq = ""
         try:
-            res = self._llm_operation_type_call(q, _lq) or {}
+            res = self._llm_operation_type_call(q, _lq, state=state) or {}
         except Exception as _e:
             _LOG.warning("[Supervisor/operation_type] fallback failed: %s", _e)
             cache[q] = None
@@ -8251,7 +8259,7 @@ class PersonaSupervisor:
         if q in cache:
             return cache[q]
         try:
-            res = self._llm_area_size_call(q) or {}
+            res = self._llm_area_size_call(q, state=state) or {}
         except Exception as _e:
             _LOG.warning("[Supervisor/area_size] fallback failed: %s", _e)
             cache[q] = None
@@ -8281,7 +8289,7 @@ class PersonaSupervisor:
         if _cache_key in cache:
             return cache[_cache_key]
         try:
-            res = self._llm_registration_type_call(q, options) or {}
+            res = self._llm_registration_type_call(q, options, state=state) or {}
         except Exception as _e:
             _LOG.warning("[Supervisor/registration_type] fallback failed: %s", _e)
             cache[_cache_key] = None
@@ -8335,7 +8343,7 @@ class PersonaSupervisor:
 
         candidates = [lt for _, lt in self._MULTI_TOPIC_LICENSE_KEYWORDS]
         try:
-            res = self._llm_license_type_call(q, candidates) or {}
+            res = self._llm_license_type_call(q, candidates, state=state) or {}
         except Exception as _e:
             _LOG.warning("[Supervisor/license_type] fallback failed: %s", _e)
             cache[q] = []
@@ -8359,7 +8367,7 @@ class PersonaSupervisor:
         cache[q] = []
         return []
 
-    def _classify_yes_no_hybrid(self, user_text: str) -> Dict[str, Any]:
+    def _classify_yes_no_hybrid(self, user_text: str, state=None) -> Dict[str, Any]:
         """
         Hybrid yes/no classifier: deterministic fast-path → LLM fallback when unclear.
         Returns same shape as _classify_yes_no_det: {yes, no, confidence, method}.
@@ -8376,7 +8384,7 @@ class PersonaSupervisor:
 
         # LLM fallback (uses the existing confirm LLM call — already set up in __init__)
         try:
-            res = self.llm_confirm_call(stripped) or {}
+            res = self.llm_confirm_call(stripped, state=state) or {}
         except Exception as _e:
             _LOG.warning("[Supervisor/yes_no_hybrid] LLM call failed: %s", _e)
             return det
@@ -8414,7 +8422,7 @@ class PersonaSupervisor:
         section_count = len(section_catalog) if isinstance(section_catalog, dict) else 0
 
         try:
-            res = self._llm_academic_resume_call(q, last_academic_q or "", section_count) or {}
+            res = self._llm_academic_resume_call(q, last_academic_q or "", section_count, state=state) or {}
         except Exception as _e:
             _LOG.warning("[Supervisor/academic_resume] LLM check failed: %s", _e)
             cache[q] = False
@@ -8450,7 +8458,7 @@ class PersonaSupervisor:
         if cache_key in cache:
             return cache[cache_key]
         try:
-            res = self._llm_elaborate_call(q, last_topic) or {}
+            res = self._llm_elaborate_call(q, last_topic, state=state) or {}
             conf = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_elaborate")) and conf >= 0.75
         except Exception as _e:
@@ -8475,7 +8483,7 @@ class PersonaSupervisor:
         if cache_key in cache:
             return cache[cache_key]
         try:
-            res = self._llm_broad_q_call(q) or {}
+            res = self._llm_broad_q_call(q, state=state) or {}
             conf_val = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_broad")) and conf_val >= 0.75
         except Exception as _e:
@@ -8502,7 +8510,7 @@ class PersonaSupervisor:
         if cache_key in cache:
             return cache[cache_key]
         try:
-            res = self._llm_slot_skip_call(q) or {}
+            res = self._llm_slot_skip_call(q, state=state) or {}
             conf = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_skip")) and conf >= 0.75
         except Exception as _e:
@@ -8532,7 +8540,7 @@ class PersonaSupervisor:
         if cache_key in cache:
             return cache[cache_key]
         try:
-            res = self._llm_followup_contextual_call(q, last_topic) or {}
+            res = self._llm_followup_contextual_call(q, last_topic, state=state) or {}
             conf = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_followup")) and conf >= 0.75
         except Exception as _e:
@@ -8559,7 +8567,7 @@ class PersonaSupervisor:
         if cache_key in cache:
             return cache[cache_key]
         try:
-            res = self._llm_thanks_call(q) or {}
+            res = self._llm_thanks_call(q, state=state) or {}
             conf = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_thanks")) and conf >= 0.75
         except Exception as _e:
@@ -8590,7 +8598,7 @@ class PersonaSupervisor:
             cache[cache_key] = False
             return False
         try:
-            res = self._llm_academic_stop_call(q) or {}
+            res = self._llm_academic_stop_call(q, state=state) or {}
             conf = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_stop")) and conf >= 0.80
         except Exception as _e:
@@ -8621,7 +8629,7 @@ class PersonaSupervisor:
         last_topic = ((state.context or {}).get("last_user_legal_query") or "").strip()
         conf_val = 0.0
         try:
-            res = self._llm_new_topic_call(q, last_topic) or {}
+            res = self._llm_new_topic_call(q, last_topic, state=state) or {}
             conf_val = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_new_topic")) and conf_val >= 0.75
         except Exception as _e:
@@ -8650,7 +8658,7 @@ class PersonaSupervisor:
         if cache_key in cache:
             return cache[cache_key]
         try:
-            res = self._llm_smalltalk_call(q) or {}
+            res = self._llm_smalltalk_call(q, state=state) or {}
             conf = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_smalltalk")) and conf >= 0.75
         except Exception as _e:
@@ -8676,7 +8684,7 @@ class PersonaSupervisor:
         if cache_key in cache:
             return cache[cache_key]
         try:
-            res = self._llm_switch_without_target_call(q) or {}
+            res = self._llm_switch_without_target_call(q, state=state) or {}
             conf = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_switch")) and conf >= 0.80
         except Exception as _e:
@@ -8706,7 +8714,7 @@ class PersonaSupervisor:
             cache[cache_key] = False
             return False
         try:
-            res = self._llm_link_request_call(q) or {}
+            res = self._llm_link_request_call(q, state=state) or {}
             conf = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_link_request")) and conf >= 0.75
         except Exception as _e:
@@ -8732,7 +8740,7 @@ class PersonaSupervisor:
         if cache_key in cache:
             return cache[cache_key]
         try:
-            res = self._llm_mode_status_call(q) or {}
+            res = self._llm_mode_status_call(q, state=state) or {}
             conf_val = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_mode_status")) and conf_val >= 0.75
         except Exception as _e:
@@ -8759,7 +8767,7 @@ class PersonaSupervisor:
         if cache_key in cache:
             return cache[cache_key]
         try:
-            res = self._llm_greeting_call(q) or {}
+            res = self._llm_greeting_call(q, state=state) or {}
             conf_val = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_greeting")) and conf_val >= 0.80
         except Exception as _e:
@@ -8797,7 +8805,7 @@ class PersonaSupervisor:
             return (cached.get("is_info", False), cached.get("is_action", False))
         conf_val = 0.0
         try:
-            res = self._llm_info_action_q_call(q) or {}
+            res = self._llm_info_action_q_call(q, state=state) or {}
             conf_val = float(res.get("confidence") or 0.0)
             if conf_val >= 0.75:
                 is_action = bool(res.get("is_action"))
@@ -8832,7 +8840,7 @@ class PersonaSupervisor:
             return cache[cache_key]
         conf_val = 0.0
         try:
-            res = self._llm_legal_q_call(q) or {}
+            res = self._llm_legal_q_call(q, state=state) or {}
             conf_val = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_legal")) and conf_val >= 0.60
         except Exception as _e:
@@ -8852,7 +8860,7 @@ class PersonaSupervisor:
         saving 1-3s for ambiguous-style inputs that would otherwise trigger serial LLM.
         """
         try:
-            result = self._infer_user_style_request_hybrid(text, last_q)
+            result = self._infer_user_style_request_hybrid(text, last_q, state=state)
             if state is not None and state.context is not None:
                 state.context.setdefault("_style_pw_cache", {})[(text[:80], (last_q or "")[:80])] = result
         except Exception as _e:
@@ -9047,20 +9055,27 @@ class PersonaSupervisor:
         Broad questions need more docs (across license types) to answer all dimensions.
         LLM fallback fires when regex misses and query is substantive (≥8 chars).
         """
-        if self._BROAD_Q_RE.search(query or ""):
-            # Specificity override: if a specific license name or form code appears in the query,
-            # it is a targeted single-license question — not a broad overview — even if the phrasing
-            # contains "เอกสารอะไรบ้าง" or similar. Without this override, group D of _BROAD_Q_RE
-            # misclassifies "ขอใบภาษีมูลค่าเพิ่ม ภพ.20 ต้องใช้เอกสารอะไรบ้าง" as broad, causing
-            # sibling-completion to pull docs from unrelated licenses and bloating the prompt to 47K tokens.
-            if not self._SPECIFIC_LICENSE_INDICATOR_RE.search(query or ""):
-                return True
-            # Specific license named → let LLM decide (it will correctly say not-broad)
-        if state is not None and len((query or "").strip()) >= 8:
+        q = query or ""
+        # Specificity override: if a specific license/device name or form code is named,
+        # this is a targeted single-item question — never a broad multi-category overview,
+        # by definition. This is now a HARD short-circuit rather than "let the LLM decide" —
+        # a 2026-09 live QA rerun found _broad_question_llm_check itself over-fires on exactly
+        # these cases (0.95-confidence "broad" for both "จดทะเบียนพาณิชย์แบบบุคคลธรรมดา
+        # ต้องเตรียมเอกสารอะไรบ้าง" and "ขั้นตอนการสมัครเครื่อง EDC...เรียงลำดับ", despite each
+        # naming one specific item), which then triggers 2-pass wide retrieval that dilutes the
+        # actually-relevant docs with unrelated business_guide chapters and derails the final
+        # answer — so the LLM's judgment on this narrow question class can't be trusted.
+        if self._SPECIFIC_LICENSE_INDICATOR_RE.search(q):
+            return False
+        if self._BROAD_Q_RE.search(q):
+            return True
+        if state is not None and len(q.strip()) >= 8:
             return self._broad_question_llm_check(query, state)
         return False
 
-    def _get_operation_groups_for_entity(self, license_type: str, entity_type_normalized: str) -> Tuple[List[str], Dict]:
+    def _get_operation_groups_for_entity(
+        self, license_type: str, entity_type_normalized: str, state=None
+    ) -> Tuple[List[str], Dict]:
         """
         ดึง operation_by_department จาก Chroma แล้วจัดกลุ่มเป็นหมวดหลัก
         คืน (slot_options, raw_op_map) เสมอ:
@@ -9068,6 +9083,17 @@ class PersonaSupervisor:
           raw_op_map    = {display_label: [raw operation_by_department values]}
                          ใช้สร้าง enriched query ตอน retrieval
         ไม่มี hardcode — ทุกอย่างมาจากข้อมูลจริงใน Chroma
+
+        `state` is optional (2026-09, cost-tracking accuracy sweep) — this whole
+        result is cached at the instance level (self._op_groups_cache), so the
+        underlying LLM call (Supervisor/op_group_classify) fires at most once per
+        unique (license_type, ops) across the ENTIRE process lifetime, not once
+        per turn. Passing state here only attributes that one rare cache-miss
+        call to whichever session happened to trigger it first — low-value, so
+        only the call sites where state was already trivially in scope were
+        updated to pass it; the _discover_slots_for_license() call path (which
+        has no state of its own) was deliberately left unattributed rather than
+        threading state through that separate, more widely-called helper too.
         """
         try:
             vectorstore = getattr(self._practical.retriever, "vectorstore", None)
@@ -9135,7 +9161,7 @@ class PersonaSupervisor:
             # ── Try LLM classifier first (zero hardcode, handles future license types) ──
             def _build_from_llm(op_set: set) -> Optional[Tuple[List[str], Dict]]:
                 try:
-                    res = self._llm_op_group_classifier(license_type, sorted(op_set)) or {}
+                    res = self._llm_op_group_classifier(license_type, sorted(op_set), state=state) or {}
                     groups_raw = res.get("groups") or []
                     if not groups_raw:
                         return None
@@ -9219,7 +9245,7 @@ class PersonaSupervisor:
             _LOG.warning("[Supervisor] _get_operation_groups_for_entity failed: %s", e)
             return [], {}
 
-    def _group_sub_operations(self, sub_ops: List[str], license_type: str) -> Tuple[List[str], Dict]:
+    def _group_sub_operations(self, sub_ops: List[str], license_type: str, state=None) -> Tuple[List[str], Dict]:
         """
         Groups a long list of raw sub-operation strings into ≤5 user-friendly category labels.
         Used when operation_sub_type would have >5 options (e.g. 26 แก้ไข sub-ops for
@@ -9251,7 +9277,7 @@ class PersonaSupervisor:
             _prompt = build_sub_op_group_classifier_prompt(license_type, sub_ops)
             _text = extract_llm_text(
                 llm_invoke(_sub_llm, [HumanMessage(content=_prompt)],
-                           logger=_LOG, label="Supervisor/sub_op_group")
+                           logger=_LOG, label="Supervisor/sub_op_group", state=state)
             ).strip()
             _text = self._strip_code_fences(_text)
             _obj = json.loads(_text)
@@ -9369,7 +9395,7 @@ class PersonaSupervisor:
             state.context.pop("topic_slot_queue", None)
             return self._handle_inner(state, user_input)
 
-        mapped, err = self._map_pending_slot_reply(pending, user_input)
+        mapped, err = self._map_pending_slot_reply(pending, user_input, state=state)
 
         if err:
             # The generic "answer with a number" catch-all fires when the user's text matched
@@ -10114,7 +10140,7 @@ class PersonaSupervisor:
 
                         # Append operation_group slot (skip if already collected for THIS topic)
                         _op_res_nt = self._get_operation_groups_for_entity(
-                            _license_type_for_slots, _known_entity_for_new_topic
+                            _license_type_for_slots, _known_entity_for_new_topic, state=state
                         )
                         _op_grps_nt, _raw_op_map_nt = (
                             _op_res_nt if isinstance(_op_res_nt, tuple) else (_op_res_nt, {})
@@ -10263,7 +10289,7 @@ class PersonaSupervisor:
                         if _license_type_for_slots:
                             try:
                                 _og_res_3b = self._get_operation_groups_for_entity(
-                                    _license_type_for_slots, ""
+                                    _license_type_for_slots, "", state=state
                                 )
                                 _og_labels_3b, _og_raw_3b = (
                                     _og_res_3b if isinstance(_og_res_3b, tuple) else (_og_res_3b, {})
@@ -10451,7 +10477,7 @@ class PersonaSupervisor:
                     # so the user sees "ชื่อ / กรรมการ / ที่ตั้ง / ..." instead of 26 items.
                     if len(_sub_ops) > 5:
                         _grp_opts, _grp_raw = self._group_sub_operations(
-                            _sub_ops, _saved_license or ""
+                            _sub_ops, _saved_license or "", state=state
                         )
                         if len(_grp_opts) >= 2:
                             state.context["topic_slot_queue"] = [{
@@ -11492,7 +11518,7 @@ class PersonaSupervisor:
                         # so it is asked in practical BEFORE switching to academic
                         _license_type_for_og = _license_type_for_area
                         if _license_type_for_og and _entity_val:
-                            _op_result = self._get_operation_groups_for_entity(_license_type_for_og, _entity_val)
+                            _op_result = self._get_operation_groups_for_entity(_license_type_for_og, _entity_val, state=state)
                             _op_groups, _raw_op_map = _op_result if isinstance(_op_result, tuple) else (_op_result, {})
                             # Only add to queue when ≥2 distinct options — single option means nothing to choose
                             if len(_op_groups) >= 2:
@@ -12095,7 +12121,7 @@ class PersonaSupervisor:
 
         res: Dict[str, Any] = {}
         try:
-            res = self.llm_topic_picker_call(last_hint or "", cand, int(k), banned) or {}
+            res = self.llm_topic_picker_call(last_hint or "", cand, int(k), banned, state=state) or {}
         except Exception:
             res = {}
 
@@ -12261,7 +12287,7 @@ class PersonaSupervisor:
 
         res: Dict[str, Any] = {}
         try:
-            res = self.llm_greet_prefix_call(kind, pid, last_hint, bool(include_intro)) or {}
+            res = self.llm_greet_prefix_call(kind, pid, last_hint, bool(include_intro), state=state) or {}
         except Exception:
             res = {}
 
@@ -12924,7 +12950,7 @@ class PersonaSupervisor:
                         if not _is_resume:
                             try:
                                 _last_q = state.get_last_retrieval_query() or (state.context or {}).get("last_topic", "")
-                                _fi = self.llm_fallback_intent_call(raw_stripped, _last_q or "", "academic") or {}
+                                _fi = self.llm_fallback_intent_call(raw_stripped, _last_q or "", "academic", state=state) or {}
                                 _cached_fallback_intent = _fi
                                 _intent = str(_fi.get("intent") or "").strip().lower()
                                 # Only "elaborate" (wants more detail on SAME topic) triggers resume.
@@ -13092,7 +13118,7 @@ class PersonaSupervisor:
         # _last_q_for_style pre-computed above before pre-warm block.
         _style_pw_key = (raw_stripped[:80], (_last_q_for_style or "")[:80])
         _style_pw_hit = (state.context or {}).get("_style_pw_cache", {}).get(_style_pw_key)
-        style = _style_pw_hit if _style_pw_hit is not None else self._infer_user_style_request_hybrid(raw_stripped, _last_q_for_style)
+        style = _style_pw_hit if _style_pw_hit is not None else self._infer_user_style_request_hybrid(raw_stripped, _last_q_for_style, state=state)
         # _is_short_depth_followup: allows academic switch even when input has legal keywords.
         # Two paths:
         # A) Regex path: explicit depth keyword (e.g. เจาะลึก, ละเอียด) — always accepted.
@@ -13200,7 +13226,7 @@ class PersonaSupervisor:
                 # Ambiguous short input — ask LLM
                 try:
                     _last_topic = (state.context or {}).get("last_user_legal_query", "") or (state.context or {}).get("last_topic", "")
-                    _typo_res = self.llm_typo_check_call(raw_stripped, _last_topic) or {}
+                    _typo_res = self.llm_typo_check_call(raw_stripped, _last_topic, state=state) or {}
                     if _typo_res.get("is_typo") and float(_typo_res.get("confidence") or 0.0) >= 0.75:
                         _is_typo = True
                         _typo_suggested = str(_typo_res.get("suggested") or "").strip()
@@ -13229,7 +13255,7 @@ class PersonaSupervisor:
             _yn_ctx = (state.context or {}).get("last_user_legal_query", "").strip()
             if _yn_ctx and raw_stripped and len(raw_stripped) <= 10 and not self._THANKS_RE.search(raw_stripped):
                 try:
-                    _yn = self._classify_yes_no_hybrid(raw_stripped)
+                    _yn = self._classify_yes_no_hybrid(raw_stripped, state=state)
                     _yn_conf = float(_yn.get("confidence") or 0.0)
                     if _yn.get("yes") and _yn_conf >= 0.78:
                         # Guard: if there's still a pending slot, "yes" confirms something related
@@ -13556,7 +13582,7 @@ class PersonaSupervisor:
             try:
                 last_q_fb = (state.context or {}).get("last_user_legal_query", "")
                 persona_fb = normalize_persona_id(getattr(state, "persona_id", "practical"))
-                intent_res = self.llm_fallback_intent_call(raw_stripped, last_q_fb, persona_fb) or {}
+                intent_res = self.llm_fallback_intent_call(raw_stripped, last_q_fb, persona_fb, state=state) or {}
             except Exception as _e:
                 _LOG.warning("[Supervisor] fallback_intent_llm error: %s", _e)
                 intent_res = {}

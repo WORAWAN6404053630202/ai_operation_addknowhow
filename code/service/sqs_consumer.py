@@ -154,7 +154,7 @@ def _build_knowhow_items(
         logger.error(f"[SQSConsumer] Know-how topic-splitting failed for {filename}, item saved with no topics for manual handling: {e}")
 
     if cost_accumulator is not None:
-        item.total_cost_usd = cost_accumulator.total_cost_usd
+        item.total_cost = cost_accumulator.total_cost_usd
     _queue_manager.save(item)
     logger.info(f"[SQSConsumer] Saved review item {item.id} for {filename} ({len(pages)} pages, shape=know_how)")
     return [item]
@@ -197,7 +197,7 @@ def _build_license_items(
             extraction_started_at=extraction_started_at,
         )
         if cost_accumulator is not None:
-            item.total_cost_usd = cost_accumulator.total_cost_usd
+            item.total_cost = cost_accumulator.total_cost_usd
         _queue_manager.save(item)
         logger.info(f"[SQSConsumer] Saved review item {item.id} for {filename} ({len(pages)} pages, shape=structured_license, 0 topics)")
         return [item]
@@ -274,7 +274,7 @@ def _build_license_items(
     # upserts by id, this isn't creating duplicates.
     if cost_accumulator is not None:
         for it in items:
-            it.total_cost_usd = cost_accumulator.total_cost_usd
+            it.total_cost = cost_accumulator.total_cost_usd
             _queue_manager.save(it)
 
     return items
@@ -328,6 +328,7 @@ def _build_and_save_review_item(
                 compare_with=p["claude_markdown"],
                 compare_label="claude",
                 use_llm_comparison=use_llm_comparison,
+                cost_accumulator=cost_accumulator,
             )
         except Exception as e:
             logger.error(f"[SQSConsumer] Extraction validation failed for {filename} page {p['page_num']}, continuing without flags: {e}")
@@ -412,8 +413,8 @@ def _build_and_save_review_item(
     if items:
         final_cost = cost_accumulator.total_cost_usd
         for it in items:
-            if it.total_cost_usd != final_cost:
-                it.total_cost_usd = final_cost
+            if it.total_cost != final_cost:
+                it.total_cost = final_cost
                 _queue_manager.save(it)
 
     return items

@@ -40,7 +40,7 @@ from service.pdf_extraction_validation import _extract_salient_tokens
 from utils.llm_cost_logging import CostAccumulator, log_call_duration, log_llm_cost
 from utils.logger import get_logger
 from utils.pdf_text_layer import extract_page_native_text
-from utils.rate_limiter import MinIntervalRateLimiter
+from utils.pdf_rate_limiter import MinIntervalRateLimiter
 
 logger = get_logger(__name__)
 

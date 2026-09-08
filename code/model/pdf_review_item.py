@@ -65,7 +65,10 @@ class ReviewItem(BaseModel):
     # isn't meaningfully separable per sub-item since e.g. the one
     # classification call covers the whole document. None on items
     # processed before this field existed.
-    total_cost_usd: Optional[float] = None
+    # Renamed from total_cost_usd (2026-09) to match ConversationState.total_cost
+    # on the chat-bot side, so both halves of the admin dashboard expose the
+    # same field name for the same concept.
+    total_cost: Optional[float] = None
 
     pages: list[PageExtractionRecord] = Field(default_factory=list)
 

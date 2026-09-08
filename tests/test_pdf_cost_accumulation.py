@@ -1,16 +1,23 @@
 """
 Integration-style test for the cost-accumulation ordering fix in
 service/sqs_consumer.py's _build_license_items() — added 2026-09 alongside
-the admin UI's per-document total_cost_usd display.
+the admin UI's per-document total_cost display (ReviewItem field renamed
+from total_cost_usd to total_cost later in 2026-09, to match
+ConversationState.total_cost on the chat-bot side — see
+test_pdf_review_item_model.py).
 
-Background: the first draft of this stamped each topic_item.total_cost_usd
+Background: the first draft of this stamped each topic_item.total_cost
 INSIDE the per-topic loop, right after that topic's own drafting/matching
 calls. That's a real bug — the shared CostAccumulator keeps growing as LATER
 topics get processed, so an EARLIER topic's stamped total would be missing
 cost incurred processing topics after it. Fixed by stamping (and re-saving)
-every item's total_cost_usd ONCE, after the whole loop (and any uncovered-
+every item's total_cost ONCE, after the whole loop (and any uncovered-
 page know-how routing) finishes. This test proves multiple topics from one
 document all end up showing the SAME final total, not staggered partial ones.
+
+Note: CostAccumulator itself (utils/llm_cost_logging.py) keeps its own
+attribute name total_cost_usd — only ReviewItem's field was renamed, so
+`acc.total_cost_usd` below is intentional and distinct from `item.total_cost`.
 """
 from __future__ import annotations
 
@@ -84,8 +91,8 @@ class TestLicenseItemsCostAccumulation:
 
         assert len(items) == 2
         for item in items:
-            assert item.total_cost_usd == pytest.approx(expected_total), (
-                f"item for {item.filename} showed {item.total_cost_usd}, expected the FINAL "
+            assert item.total_cost == pytest.approx(expected_total), (
+                f"item for {item.filename} showed {item.total_cost}, expected the FINAL "
                 f"total {expected_total} — an earlier item showing a smaller value would mean "
                 f"the staggered-stamping bug regressed."
             )
@@ -98,4 +105,4 @@ class TestLicenseItemsCostAccumulation:
         for item in items:
             reloaded = test_queue_manager.load(item.id)
             assert reloaded is not None
-            assert reloaded.total_cost_usd == pytest.approx(expected_total)
+            assert reloaded.total_cost == pytest.approx(expected_total)

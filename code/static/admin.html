@@ -555,6 +555,21 @@
 </div>
 
 <script>
+  // PDF review queue endpoints are served by a separate service/port from the
+  // bot (split 2026-09 so a PDF-only dependency crash can never take the bot
+  // down again — see the boto3 incident, 2026-09-06/07). The actual service
+  // in real use today is scripts/run_admin_server.py, a systemd-managed
+  // standalone process on port 8001 (restbiz-pdf-admin.service) — it also
+  // serves THIS SAME admin.html file directly (see that script's own
+  // admin_dashboard() route), so most of the time this page is already
+  // same-origin with the PDF API and no cross-origin fetch is needed at all.
+  // Origin-aware: only switch to an explicit :8001 base when the page is
+  // loaded from somewhere else (e.g. the bot's own admin dashboard on port
+  // 3000, once that becomes a real second way to reach this same UI).
+  const PDF_API_BASE = (window.location.port === "8001")
+    ? ""
+    : `${window.location.protocol}//${window.location.hostname}:8001`;
+
   let allSessions = [];
   let allLogLines = [];
   let activeSession = null;
@@ -564,7 +579,7 @@
     return new Date(ts * 1000).toLocaleString("th-TH", { dateStyle: "short", timeStyle: "short" });
   }
 
-  // Added 2026-09: total_cost_usd/extraction_started_at are None on items
+  // Added 2026-09: total_cost/extraction_started_at are None on items
   // processed before these fields existed — "no data" for those rather than
   // showing $0.00/0s, which would misleadingly imply a real zero-cost run
   // instead of "we never measured this one". processing_duration_seconds is
@@ -573,10 +588,12 @@
   // only the two raw timestamps it's derived from. English labels
   // deliberately kept separate from the rest of this file's Thai UI text —
   // scoped per explicit request, not a general English-ification.
+  // total_cost renamed from total_cost_usd (2026-09) to match ConversationState's
+  // same-purpose field on the chat-bot side of the admin dashboard.
   function costTimeHtml(item) {
-    const hasCost = typeof item.total_cost_usd === "number";
+    const hasCost = typeof item.total_cost === "number";
     const hasDuration = item.extraction_started_at && item.extraction_completed_at;
-    const costStr = hasCost ? `$${item.total_cost_usd.toFixed(4)}` : "no data";
+    const costStr = hasCost ? `$${item.total_cost.toFixed(4)}` : "no data";
     const durationStr = hasDuration
       ? `${(item.extraction_completed_at - item.extraction_started_at).toFixed(1)}s`
       : "no data";
@@ -635,7 +652,7 @@
 
   function updateTokenStats(sessions) {
     const totalTokens = sessions.reduce((s, x) => s + (x.total_tokens || 0), 0);
-    const totalCost   = sessions.reduce((s, x) => s + (x.cost_usd || 0), 0);
+    const totalCost   = sessions.reduce((s, x) => s + (x.total_cost || 0), 0);
     document.getElementById("statTokens").textContent =
       totalTokens > 0 ? totalTokens.toLocaleString() : "0";
     document.getElementById("statCost").textContent =
@@ -666,7 +683,7 @@
           <span class="badge ${escHtml(s.persona_id)}">${escHtml(s.persona_id)}</span>
           <span>💬 ${s.user_messages}/${s.total_messages}</span>
           <span>🔢 ${(s.total_tokens || 0).toLocaleString()} tokens</span>
-          <span>💵 $${(s.cost_usd || 0).toFixed(4)}</span>
+          <span>💵 $${(s.total_cost || 0).toFixed(4)}</span>
           <span>${fmt(s.updated_at)}</span>
         </div>
       </div>
@@ -707,7 +724,7 @@
       ["prompt_tokens",      (d.prompt_tokens || 0).toLocaleString()],
       ["completion_tokens",  (d.completion_tokens || 0).toLocaleString()],
       ["total_tokens",       (d.total_tokens || 0).toLocaleString()],
-      ["cost_usd",           "$" + (d.cost_usd || 0).toFixed(6)],
+      ["total_cost",         "$" + (d.total_cost || 0).toFixed(6)],
       ...Object.entries(slots).map(([k, v]) => [`slot: ${k}`, v]),
     ];
 
@@ -779,7 +796,7 @@
   let selectedDecisionType = null;
 
   async function loadPdfQueue() {
-    const d = await apiGet("/admin/api/pdf-queue");
+    const d = await apiGet(`${PDF_API_BASE}/admin/api/pdf-queue`);
     allPdfQueueItems = d.items || [];
     allInFlightItems = d.in_flight || [];
     document.getElementById("pdfQueueCount").textContent = allPdfQueueItems.length;
@@ -868,7 +885,7 @@
     selectedDecisionType = null;
     renderPdfQueueList();
 
-    const item = await apiGet(`/admin/api/pdf-queue/${id}`);
+    const item = await apiGet(`${PDF_API_BASE}/admin/api/pdf-queue/${id}`);
     renderPdfQueueDetail(item);
   }
 
@@ -1090,7 +1107,7 @@
 
   async function reprocessItem(itemId) {
     if (!confirm("ยืนยันส่งไฟล์นี้ประมวลผลใหม่ทั้งไฟล์ (ข้ามการคัดกรองแบบเดิม)?")) return;
-    const r = await apiPost(`/admin/api/pdf-queue/${itemId}/reprocess`);
+    const r = await apiPost(`${PDF_API_BASE}/admin/api/pdf-queue/${itemId}/reprocess`);
     if (!r.ok) {
       const err = await r.json().catch(() => ({}));
       alert("เกิดข้อผิดพลาด: " + (err.error || r.status));
@@ -1168,7 +1185,7 @@
       decision_type: reviewStatus === "approved" ? "new" : null,
       reviewer_notes: notesEl ? notesEl.value : "",
     };
-    const r = await apiPost(`/admin/api/pdf-queue/${itemId}/decision`, body);
+    const r = await apiPost(`${PDF_API_BASE}/admin/api/pdf-queue/${itemId}/decision`, body);
     if (!r.ok) {
       const err = await r.json().catch(() => ({}));
       alert("เกิดข้อผิดพลาด: " + (err.error || r.status));
@@ -1272,7 +1289,7 @@
       edited_fields: reviewStatus === "approved" ? collectEditedFields() : null,
       old_row_ref: oldRowRef,
     };
-    const r = await apiPost(`/admin/api/pdf-queue/${itemId}/decision`, body);
+    const r = await apiPost(`${PDF_API_BASE}/admin/api/pdf-queue/${itemId}/decision`, body);
     if (!r.ok) {
       const err = await r.json().catch(() => ({}));
       alert("เกิดข้อผิดพลาด: " + (err.error || r.status));
