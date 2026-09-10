@@ -4753,6 +4753,21 @@ class PracticalPersonaService:
                 }
             )
 
+        # Diagnostic-only (2026-09, added while investigating a real but
+        # non-reproducible info-gap: on ~1 real query the LLM answered
+        # "ยังไม่พบข้อมูลในเอกสารครับ" despite the correct doc having ranked
+        # #1 in retrieval (0.777 similarity) — 4/4 isolated retries answered
+        # correctly, so the doc/retrieval path itself is not at fault. This
+        # never fired again to pin down further. Pure logging, no behavior
+        # change — if it recurs, this line shows exactly what docs_json
+        # actually contained for the failing call, so the paired log line
+        # after the LLM call (below) can be compared against it.
+        _LOG.info(
+            "[Practical] docs_json finalized: %d doc(s) → %s",
+            len(docs_json),
+            [((dj.get("metadata") or {}).get("license_type") or (dj.get("metadata") or {}).get("operation_topic") or "?")[:40] for dj in docs_json],
+        )
+
         # Build labeled link sections — LLM copies these directly, no URL pattern matching needed
         # When docs come from multiple licenses, tag each link with [license_type] so LLM
         # only includes links relevant to the license it is currently answering about.
@@ -5383,6 +5398,25 @@ Your JSON response:
             except Exception:
                 _exec_raw = {}
         exec_ = _exec_raw if isinstance(_exec_raw, dict) else {}
+
+        # Diagnostic-only (2026-09, paired with the docs_json log above) —
+        # catches the exact failing moment if this info-gap pattern recurs:
+        # logs docs actually sent to the LLM alongside its "not found" answer,
+        # so a future occurrence in production leaves enough evidence to
+        # actually root-cause it (unlike this session's attempt, which could
+        # not reproduce it in 4/4 isolated retries with identical query+data).
+        # No behavior change — decision/action/exec_ are used exactly as before.
+        if action == "answer":
+            _diag_answer = str(exec_.get("answer") or "")
+            if re.search(r"ไม่พบข้อมูล|ยังไม่พบ", _diag_answer):
+                _LOG.warning(
+                    "[Practical] INFO-GAP ANSWER despite %d doc(s) in prompt (query=%r): "
+                    "docs sent=%s | answer_snippet=%r",
+                    len(docs_json),
+                    user_input[:120],
+                    [((dj.get("metadata") or {}).get("license_type") or (dj.get("metadata") or {}).get("operation_topic") or "?")[:40] for dj in docs_json],
+                    _diag_answer[:200],
+                )
 
         if action == "retrieve":
             # Guard: block LLM re-retrieval when docs are already loaded.
