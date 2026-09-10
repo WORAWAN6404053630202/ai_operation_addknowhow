@@ -2760,6 +2760,33 @@ class PracticalPersonaService:
         elif user_text == "__auto_post_retrieve__":
             state.context[auto_internal_guard_key] = int(state.context.get(auto_internal_guard_key, 0) or 0) + 1
 
+        # Hard cap on internal retrieve→re-retrieve recursion (2026-09 incident fix).
+        # This counter was being incremented right above on every "__auto_post_retrieve__"
+        # recursive call but was NEVER READ anywhere in this file — a dead tripwire. Found
+        # live: when retrieval genuinely returns 0 docs every time (e.g. a broken/empty
+        # vectorstore connection), the action=="retrieve" guard further down only blocks
+        # re-retrieval when `state.current_docs` is truthy (see "if state.current_docs and
+        # (...)" below) — with docs empty, that guard is skipped entirely, so the LLM keeps
+        # returning action="retrieve" with a freshly-reworded query forever and handle()
+        # keeps recursing with no limit. Reproduced: one single question recursed for 2h22m,
+        # accumulated 5.4M+ tokens, before being killed manually — this closes that gap.
+        # MAX_ROUNDS (conf) is a DIFFERENT, higher-level per-session turn limit enforced in
+        # persona_supervisor.py — it never sees this loop since handle() never returns control
+        # back up while recursing, so it can't help here; this cap is deliberately separate.
+        _apg_count = int(state.context.get(auto_internal_guard_key, 0) or 0)
+        _max_auto_retrieve_loops = int(getattr(conf, "MAX_AUTO_RETRIEVE_LOOPS", 5) or 5)
+        if _apg_count > _max_auto_retrieve_loops:
+            _LOG.error(
+                "[Practical] auto-retrieve loop exceeded cap (%d > %d) — aborting with fallback "
+                "instead of recursing further (query=%r)",
+                _apg_count, _max_auto_retrieve_loops, user_text[:80],
+            )
+            state.context[auto_internal_guard_key] = 0
+            state.context["_info_gap_detected"] = True
+            _fb = "ขอโทษครับ ไม่พบข้อมูลที่ตรงกับคำถามนี้ในฐานข้อมูลของเรา กรุณาลองถามใหม่หรือระบุรายละเอียดเพิ่มเติมครับ"
+            state.add_assistant_message(_fb)
+            return state, _fb
+
         # recovery only in non-internal, owner-gated (already inside the function)
         if not _internal:
             self._maybe_recover_pending_slot_from_last_bot(state, user_text)
