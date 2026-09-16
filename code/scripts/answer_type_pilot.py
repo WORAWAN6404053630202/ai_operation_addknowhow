@@ -85,6 +85,46 @@ FORBIDDEN_PHRASES = [
     "ผมเพิ่งอธิบายไปแล้ว", "ตอบไปแล้ว", "ดูจากข้อความก่อนหน้า", "ดังที่กล่าวไว้",
 ]
 
+# Kept as a literal copy of utils.text_patterns.INFO_GAP_DISPLAY_TEXT rather than an
+# import — this script is a standalone HTTP client (fires requests at a running server,
+# no app sys.path setup) and shouldn't gain a hard dependency on the app's internals
+# for one string. 2026-09: found live that "ข้อมูลในเอกสาร" in FORBIDDEN_PHRASES above
+# is a literal substring of this exact display text, which the INFO_GAP_TAG mechanism
+# (see utils/text_patterns.py) legitimately writes whenever a distinct topic within a
+# multi-topic answer genuinely has no matching DOCUMENTS — a real, correct info-gap
+# report, not a violation. Any answer covering ≥2 topics where one is a genuine gap
+# would always false-positive on this check before this fix. Must stay in sync with
+# INFO_GAP_DISPLAY_TEXT if that constant ever changes.
+_INFO_GAP_DISPLAY_TEXT = "ยังไม่พบข้อมูลในเอกสาร"
+
+# 2026-09: live-reproduced (Case 6 NTT DATA/EDC regression test) that "จากเอกสาร" in
+# FORBIDDEN_PHRASES above is a literal substring of "...เอกสารเพิ่มเติมจากเอกสารหลัก"
+# ("additional documents beyond/from the MAIN documents") — a legitimate, correct way
+# to describe a document-relationship (extra requirements on top of the base list),
+# not a meta-reference to "the document" as an evidence source (the actual thing
+# FORBIDDEN_PHRASES's "จากเอกสาร" entry exists to catch, e.g. "จากเอกสารที่มี"). Any
+# answer describing tiered/supplementary document requirements this way would always
+# false-positive on this check before this fix.
+#
+# 2026-09: same pattern found for "ตามเอกสาร" (matches FORBIDDEN_PHRASES's own "ตามเอกสาร"
+# entry) inside "...เลขที่บัญชีตามเอกสารจดทะเบียน" ("account number per the REGISTRATION
+# CERTIFICATE") — a normal reference to one specific, named source document, not a vague
+# "according to what I have" evidence-source hedge (the actual thing that entry exists to
+# catch, e.g. "ตามเอกสารที่มี"). Live-reproduced via the ≥4-topic VAT+ประกันสังคม eval case.
+_LEGITIMATE_DOC_PHRASES = ["จากเอกสารหลัก", "ตามเอกสารจดทะเบียน"]
+
+
+def find_forbidden_violations(answer: str) -> List[str]:
+    """FORBIDDEN_PHRASES check, blind to legitimate INFO_GAP_TAG output and other known
+    legitimate document-relationship phrasing (see comments above) — strip those
+    occurrences out first so a correct "this one topic has no data" report or a
+    correct "extra docs beyond the main list" description never counts as a
+    violation, while still catching every other real occurrence."""
+    _stripped = answer.replace(_INFO_GAP_DISPLAY_TEXT, "")
+    for _legit in _LEGITIMATE_DOC_PHRASES:
+        _stripped = _stripped.replace(_legit, "")
+    return [p for p in FORBIDDEN_PHRASES if p in _stripped]
+
 
 def run_one(base_url: str, at: AnswerType) -> dict:
     session_id = f"pilot_{at.id}_{uuid.uuid4().hex[:8]}"
@@ -101,7 +141,7 @@ def run_one(base_url: str, at: AnswerType) -> dict:
     except Exception as e:
         return {"ok": False, "error": str(e), "elapsed": time.perf_counter() - t0}
 
-    violations = [p for p in FORBIDDEN_PHRASES if p in answer]
+    violations = find_forbidden_violations(answer)
     return {
         "ok": True,
         "elapsed": elapsed,

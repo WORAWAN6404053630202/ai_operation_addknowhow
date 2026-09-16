@@ -12,6 +12,7 @@ Thai tokenization requires: pythainlp, rank_bm25
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import logging
 import threading
 import time
@@ -166,20 +167,57 @@ def _matches_metadata_filter(doc_metadata: dict, flt: dict) -> bool:
 # ── RRF fusion ────────────────────────────────────────────────────────────────
 
 def _doc_id(doc: Document) -> str:
+    """Identify "the same document" across the separately-returned Dense and
+    BM25 result lists so _rrf_fuse can combine their scores correctly.
+
+    2026-09 bug fix: the fallback used to be page_content[:80] — collides
+    whenever multiple distinct documents share a long common prefix, which
+    became common (and reproducibly hit in production) once PDF book content
+    started prepending a repeated context header ("หนังสือ: X\\nหมวด: Y\\n
+    หัวข้อย่อย: Z...") to every chunk. Confirmed live: 3 different case-study
+    chapters sharing one main_topic (Y) produced an IDENTICAL 80-char prefix
+    (the differentiating sub_topic, Z, never appeared before the cutoff) —
+    _rrf_fuse silently summed their 3 separate RRF contributions into ONE
+    entry and kept only the last-seen Document, inflating an unrelated case
+    study's score high enough to outrank the genuinely relevant chapter for
+    a real user query. The same collision also hits multi-chunk splits of
+    one long topic (utils.pdf_text_chunking), since chunk_index isn't part
+    of the old key at all.
+
+    Fix: hash the FULL page_content instead of a fixed-length prefix — removes
+    any length-dependent collision risk regardless of how future ingestion
+    paths shape their content, without requiring every future document
+    builder to remember to set an explicit id. Still prefers metadata['id']/
+    ['doc_id'] when a caller sets one explicitly (unchanged)."""
     md = doc.metadata or {}
-    return (
-        md.get("id")
-        or md.get("doc_id")
-        or f"{md.get('license_type', '')}|{md.get('data_type', '')}|{doc.page_content[:80]}"
-    )
+    explicit_id = md.get("id") or md.get("doc_id")
+    if explicit_id:
+        return str(explicit_id)
+    content_hash = hashlib.sha256((doc.page_content or "").encode("utf-8")).hexdigest()[:16]
+    return f"{md.get('license_type', '')}|{md.get('data_type', '')}|{content_hash}"
 
 
 def _rrf_fuse(
     dense_pairs: List[Tuple[Document, float]],
     bm25_pairs: List[Tuple[Document, float]],
     rrf_k: int = 60,
+    bm25_bypass_min_ratio: float = 0.35,
 ) -> List[Tuple[Document, float]]:
-    """score(d) = Σ_i  1 / (rrf_k + rank_i(d))"""
+    """score(d) = Σ_i  1 / (rrf_k + rank_i(d))
+
+    bm25_bypass_min_ratio (2026-09, see conf.BM25_BYPASS_MIN_RATIO for the full
+    measurement): a BM25-only doc (missing from Dense entirely) only gets the
+    "_bm25_hit" similarity-floor bypass when its BM25 score is at least this
+    fraction of `bm25_pairs`' own top score for this query — a RELATIVE
+    threshold, since raw BM25Okapi scores have no shared absolute scale across
+    different queries. Docs below the ratio still participate in RRF ranking
+    (rrf_scores/merged order unaffected) but are judged by the normal
+    similarity floor like any other doc — closes a real asymmetry where a
+    doc appearing in BM25's oversampled candidate pool for ANY reason,
+    however weak, previously got an unconditional pass while a genuinely
+    top-ranked Dense candidate could still be dropped for narrowly missing an
+    absolute floor.
+    """
     rrf_scores: Dict[str, float] = {}
     dense_scores: Dict[str, float] = {}  # keep original Dense sim for _sim metadata
     doc_map: Dict[str, Document] = {}
@@ -190,13 +228,18 @@ def _rrf_fuse(
         dense_scores[did] = sim
         doc_map[did] = doc
 
-    for rank, (doc, _score) in enumerate(bm25_pairs):
+    _top_bm25_score = bm25_pairs[0][1] if bm25_pairs else 0.0
+    for rank, (doc, score) in enumerate(bm25_pairs):
         did = _doc_id(doc)
         rrf_scores[did] = rrf_scores.get(did, 0.0) + 1.0 / (rrf_k + rank + 1)
         if did not in doc_map:
-            # BM25-only doc — flag it so downstream filters don't drop it for low Dense score.
-            # Copy to avoid mutating the shared doc object cached in _BM25Index._docs.
-            doc_map[did] = Document(page_content=doc.page_content, metadata={**doc.metadata, "_bm25_hit": True})
+            # BM25-only doc. Copy to avoid mutating the shared doc object cached
+            # in _BM25Index._docs. Only flag as a bypass-eligible hit when its
+            # score is competitive with this query's own top BM25 result —
+            # see bm25_bypass_min_ratio docstring above.
+            _is_confident_bm25 = _top_bm25_score > 0 and (score / _top_bm25_score) >= bm25_bypass_min_ratio
+            _md = {**doc.metadata, "_bm25_hit": True} if _is_confident_bm25 else dict(doc.metadata)
+            doc_map[did] = Document(page_content=doc.page_content, metadata=_md)
 
     merged = sorted(rrf_scores.items(), key=lambda x: -x[1])
     # BM25-only docs get 0.0 dense score (not None) — callers do arithmetic/comparison on score
@@ -238,6 +281,7 @@ def hybrid_scored_search(
     k: int = 20,
     metadata_filter: Optional[Dict[str, Any]] = None,
     rrf_k: int = 60,
+    bm25_bypass_min_ratio: float = 0.35,
 ) -> List[Tuple[Document, float]]:
     """
     Dense + BM25 fused with RRF.
@@ -247,6 +291,9 @@ def hybrid_scored_search(
     metadata_filter is applied to Dense search (Chroma supports it).
     BM25 searches full corpus then post-filters to keep metadata semantics correct.
     Falls back to Dense-only if BM25 index is unavailable.
+
+    bm25_bypass_min_ratio: forwarded to _rrf_fuse — see conf.BM25_BYPASS_MIN_RATIO
+    and that function's docstring.
     """
     # Normalize filter once: Chroma Dense rejects flat multi-field dicts and None values
     _eff_filter = _normalize_chroma_filter(metadata_filter)
@@ -300,7 +347,7 @@ def hybrid_scored_search(
     if bm25_pairs is None:
         return dense_pairs
 
-    fused = _rrf_fuse(dense_pairs, bm25_pairs, rrf_k=rrf_k)
+    fused = _rrf_fuse(dense_pairs, bm25_pairs, rrf_k=rrf_k, bm25_bypass_min_ratio=bm25_bypass_min_ratio)
     _LOG.info(
         "[Hybrid] dense=%d bm25=%d → fused=%d (rrf_k=%d filter=%s)",
         len(dense_pairs), len(bm25_pairs), len(fused), rrf_k,

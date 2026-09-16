@@ -19,7 +19,11 @@ forward.
 """
 from __future__ import annotations
 
+import logging
 import re
+from typing import List
+
+_LOG = logging.getLogger(__name__)
 
 # ── Info-gap tag (LLM-emitted marker that triggers the feedback menu) ───────
 # Shared by persona_academic.py, persona_practical.py, and persona_supervisor.py
@@ -387,3 +391,206 @@ def is_bare_generic_followup(text: str, max_len: int = 60) -> bool:
     if not t or len(t) > max_len:
         return False
     return bool(GENERIC_FOLLOWUP_KEYWORDS_RE.search(t) and not SPECIFIC_TOPIC_RE.search(t))
+
+
+# ── Canonical registration/application action-intent detector ──────────────
+# Promoted from PersonaSupervisor._ACTION_Q_RE (2026-09) as part of the
+# PDF-book truncation/retrieval fix chain — see
+# pdf_chunking_truncation_and_retrieval_fixes project memory. This is the
+# comprehensive list of phrasings meaning "the user wants to actually
+# register/apply/modify/cancel/renew something", not just ask about it.
+#
+# Why promoted: while extracting persona_practical.py's separate
+# fee/duration-query gate (below), its own hand-rolled negative-intent regex
+# turned out to be an independently-drifted, much narrower copy of this exact
+# concept — missing "อยากขอ", "ต้องการยื่น", "จะขอใบ", "วิธีลงทะเบียน", the bare
+# "ขอใบ.../ยื่นขอใบ..." pattern, and the modify/cancel/renew verbs entirely.
+# That gap meant a query like "อยากขอใบอนุญาตขายสุรา ค่าธรรมเนียมเท่าไหร่" (user
+# has real action intent) was wrongly treated as purely informational, forcing
+# a direct fee answer instead of letting the normal slot-filling flow ask for
+# the details the fee actually depends on. Same class of duplicated-logic
+# drift as everything else in this module's docstring — now there is exactly
+# one action-intent pattern for every caller to share.
+ACTION_INTENT_RE = re.compile(
+    r"(อยากจด|อยากสมัคร|อยากขอ|อยากยื่น|อยากลงทะเบียน|"
+    r"ต้องการจด|ต้องการสมัคร|ต้องการขอ|ต้องการยื่น|ต้องการลงทะเบียน|"
+    r"จะจด|จะสมัคร|จะขอใบ|จะยื่น|จะลงทะเบียน|"
+    r"วิธีจด|วิธีสมัคร|วิธีลงทะเบียน|วิธีการลงทะเบียน|"
+    r"ขั้นตอนการจด|ขั้นตอนการสมัคร|ขั้นตอนการขอ|ขั้นตอนการลงทะเบียน|"
+    r"ต้องการแก้ไข|ต้องการเปลี่ยนแปลง|ต้องการยกเลิก|ต้องการต่ออายุ|"
+    r"อยากแก้ไข|อยากเปลี่ยนแปลง|อยากยกเลิก|อยากต่ออายุ|"
+    r"จะแก้ไข|จะเปลี่ยนแปลง|จะยกเลิก|จะต่ออายุ|"
+    r"วิธีแก้ไข|วิธีเปลี่ยนแปลง|วิธียกเลิก|วิธีต่ออายุ|"
+    r"ขั้นตอนการแก้ไข|ขั้นตอนการเปลี่ยนแปลง|ขั้นตอนการยกเลิก|ขั้นตอนการต่ออายุ|"
+    r"จะเปิด|จะทำร้าน|จะทำธุรกิจ|อยากเปิด|อยากทำร้าน|อยากทำธุรกิจ|"
+    # Bare "ขอใบ(อนุญาต)" / "ยื่นขอใบ" without modal prefix — implies action, not info.
+    # Negative lookahead: exclude renewal context (ต่ออายุ/หมดอายุ within 20 chars).
+    r"(?:ขอ|ยื่น(?:\s*ขอ)?)\s*ใบ(?:อนุญาต)?(?!.{0,20}(?:ต่ออายุ|ต่อ\s*อายุ|หมดอายุ|สิ้นอายุ)))",
+    re.IGNORECASE,
+)
+
+
+# ── Fee/duration informational-query detector ───────────────────────────────
+# Extracted from persona_practical.py (2026-09) as part of the same fix chain.
+# Was previously an inline pair of regexes computed only in
+# persona_practical.py; pulled out here so it can be unit-tested directly
+# against a validation query set before any future tightening, following the
+# same module docstring rationale (one place to live, nothing left to diverge).
+FEE_DURATION_TRIGGER_RE = re.compile(
+    r"ค่าธรรมเนียม|เท่าไหร่|กี่บาท|กี่วัน|กี่เดือน|กี่ปี|ค่าใช้จ่าย|ระยะเวลา",
+    re.IGNORECASE,
+)
+
+
+def is_fee_or_duration_info_query(intent_text: str) -> bool:
+    """True when `intent_text` asks about fees/cost/duration (ค่าธรรมเนียม/
+    เท่าไหร่/กี่วัน/ระยะเวลา ฯลฯ) without also expressing intent to actually
+    register/apply/modify/cancel/renew something (see `ACTION_INTENT_RE`).
+
+    Used to force action="answer" with all fee tiers combined for purely
+    informational fee/duration questions, instead of triggering
+    entity_type/operation_group slot-asking that only makes sense when the
+    user is about to act.
+    """
+    text = intent_text or ""
+    return bool(FEE_DURATION_TRIGGER_RE.search(text)) and not bool(
+        ACTION_INTENT_RE.search(text)
+    )
+
+
+# ── Specific-topic-conflict guard for exact-match chapter-fetch sites ───────
+# Shared by persona_supervisor.py (Step 0/0b, main_topic/sub_topic chapter
+# retrieval, and the duplicated fallback copies inside
+# _route_pending_slot_to_persona) and persona_academic.py's _retrieve_docs.
+#
+# Specificity override: when these license names/codes appear in the query,
+# it names a specific, more-authoritative topic that any exact-matched
+# candidate must be corroborated by. e.g. "ขอใบภาษีมูลค่าเพิ่ม ภพ.20
+# ต้องใช้เอกสารอะไรบ้าง" is targeted, not broad.
+SPECIFIC_LICENSE_INDICATOR_RE = re.compile(
+    # Specific form/tax codes
+    r"ภพ\.\s*\d|ภส\.\s*\d|ภป\.\s*\d|สณ\.\s*\d|บอจ\.\s*\d|VAT|ภ\.อ\."
+    # Named license types
+    r"|ใบภาษีมูลค่าเพิ่ม|ใบทะเบียนพาณิชย์|ทะเบียนพาณิชย์"
+    r"|ใบอนุญาตจัดตั้ง|ใบอนุญาตจำหน่ายสุรา|ใบอนุญาตจำหน่าย"
+    r"|ใบรับรองมาตรฐานร้านอาหาร|ใบวุฒิบัตรผู้สัมผัสอาหาร"
+    r"|ใบรับรองแพทย์|แบบแสดงรายการภาษีป้าย"
+    r"|ประกันสังคม|กองทุนประกันสังคม"
+    # 2026-09: added after live QA rerun found the LLM broad_q classifier
+    # (_broad_question_llm_check) firing 0.95-confidence "broad" on
+    # single-device questions naming EDC or QR Payment specifically (e.g.
+    # "ขั้นตอนการสมัครเครื่อง EDC...เรียงลำดับ") — these terms weren't in
+    # this list at all, so the specificity override never had a chance to
+    # apply. license_type values confirmed in Chroma: "เครื่องรูดบัตร EDC",
+    # "ระบบชำระเงินออนไลน์" (QR Payment's actual license_type).
+    r"|EDC|เครื่องรูดบัตร|รูดบัตร|\bQR\b|QR\s*Payment|คิวอาร์|ระบบชำระเงินออนไลน์|ระบบชำระเงิน",
+    re.IGNORECASE,
+)
+
+
+def filter_by_specific_topic_conflict(
+    q: str, candidates: List[str], label: str = "candidate", log_prefix: str = "",
+) -> List[str]:
+    """Shared guard for every exact-match chapter-fetch site (OBD, operation_topic,
+    main_topic, sub_topic label matching, across both persona_supervisor.py and
+    persona_academic.py) — narrows or rejects a set of exact-matched candidates
+    when the query ALSO names a specific, more-authoritative topic
+    (`SPECIFIC_LICENSE_INDICATOR_RE`) that none of the candidates corroborate.
+
+    2026-09: originally written inline only for the operation_by_department ("OBD")
+    exact-match site in persona_supervisor.py after a live-reproduced bug — a
+    short, generic OBD label ("บัญชีธนาคาร") exact-matched the query while the
+    query ALSO explicitly named an unrelated, more specific topic ("QR Payment")
+    that should have taken priority; the OBD match short-circuited straight to 4
+    wrong docs even though plain semantic retrieval already ranked the correct QR
+    Payment docs correctly on its own with no shortcut involved. A systematic
+    audit then found the SAME exact-match-short-circuit shape duplicated across
+    several other sites (operation_topic in Step 0, main_topic/sub_topic chapter
+    retrieval, a fully separate copy-pasted duplicate of Step 0/0b inside the
+    topic-slot-fill fallback, and persona_academic.py's own independent copy of
+    the main_topic/sub_topic pattern) — none of which had this guard, which is
+    exactly the kind of "same bug recurs via duplicated logic" risk this project
+    has hit before (see classifier_consolidation_text_patterns.md-style history).
+    Extracted here as ONE shared implementation, in the module already dedicated
+    to preventing this exact class of cross-persona drift, so every exact-match
+    site can call it instead of re-deriving (and inevitably drifting from) its
+    own copy.
+
+    Returns:
+      - `candidates` unchanged if the query doesn't match any specific-indicator
+        term (nothing to conflict with — the overwhelmingly common case, zero
+        behavior change).
+      - Only the candidates CORROBORATED by a specific-indicator term, if at
+        least one exists (prefer the confirmed one(s) over a blind max(key=len),
+        which live-reproduced picking the wrong candidate purely because it
+        happened to be one Thai character longer).
+      - [] if none of the candidates relate to the named specific topic at all —
+        genuinely conflicting; the caller should treat this as "no confident
+        match" and fall through to normal semantic retrieval instead.
+    """
+    if not candidates or not SPECIFIC_LICENSE_INDICATOR_RE.search(q):
+        return candidates
+    _si_matches = SPECIFIC_LICENSE_INDICATOR_RE.findall(q)
+    _confirmed = [
+        c for c in candidates
+        if any(_si.lower() in c.lower() for _si in _si_matches)
+    ]
+    if _confirmed:
+        if len(_confirmed) < len(candidates):
+            _LOG.info(
+                "%s%s matches %r narrowed to %r (corroborated by specific topic %r)",
+                log_prefix, label, candidates, _confirmed, _si_matches,
+            )
+        return _confirmed
+    _LOG.info(
+        "%s%s match %r conflicts with specific topic %r in query — rejecting",
+        log_prefix, label, candidates, _si_matches,
+    )
+    return []
+
+
+# ── Thai-aware keyword extraction for topic/relevance scoring ───────────────
+# 2026-09 bug fix, root-cause layer of the pdf_chunking_truncation_and_retrieval_fixes
+# chain: persona_academic.py's _detect_distinct_topics extracted query "keywords"
+# via `re.sub(r'[^฀-๿a-zA-Z0-9]', ' ', query).split()` — plain
+# whitespace splitting, which does nothing useful for Thai text (no spaces
+# between words in normal writing). Live-reproduced: the query "ในงบกำไรขาดทุน
+# Top Line กับ Bottom Line ต่างกันยังไง" collapsed into
+# ['ในงบกำไรขาดทุน', 'top', 'line', 'กับ', 'bottom', 'ต่างกันยังไง'] — the
+# meaningful word "กำไร" (profit) was trapped inside one giant unsplittable
+# blob and could never match the correct topic's title
+# ("การวิเคราะห์รายได้และกำไร"), while the bare conjunction "กับ" ("and/with",
+# meaningless on its own) survived as its own 3-character "word" and happened
+# to coincidentally appear in a completely unrelated topic's content, handing
+# that wrong topic the only nonzero relevance score in the whole candidate set.
+#
+# Fix: reuse real Thai word segmentation (pythainlp, same `word_tokenize`
+# engine="newmm" already used by utils.hybrid_retriever's BM25 index, kept
+# consistent on purpose rather than picking a different engine here) plus
+# pythainlp's maintained Thai stopword corpus, so common function words like
+# "กับ"/"ใน"/"ที่" can never masquerade as meaningful query keywords again —
+# tokenizing alone would have rescued "กำไร" but NOT suppressed "กับ", both
+# halves are needed to actually close this bug, not just make one query pass.
+def extract_thai_keywords(text: str, min_len: int = 2) -> List[str]:
+    """Extract meaningful, lowercased keywords from `text` for substring-based
+    title/content relevance scoring (e.g. persona_academic.py's topic-menu
+    keyword matching).
+
+    Falls back to the old whitespace-split behavior if pythainlp is
+    unavailable for any reason — same resilience pattern as
+    utils.hybrid_retriever._tokenize, never a hard dependency at call time.
+    """
+    t = str(text or "")
+    try:
+        from pythainlp.corpus import thai_stopwords
+        from pythainlp.tokenize import word_tokenize
+        tokens = word_tokenize(t.lower(), engine="newmm", keep_whitespace=False)
+        stopwords = thai_stopwords()
+        return [
+            tok for tok in tokens
+            if tok and tok.strip() and len(tok) >= min_len and tok not in stopwords
+        ]
+    except Exception as _e:
+        _LOG.debug("[extract_thai_keywords] PyThaiNLP unavailable (%s) — using whitespace split", type(_e).__name__)
+        _clean = re.sub(r'[^฀-๿a-zA-Z0-9]', ' ', t.lower())
+        return [w for w in _clean.split() if len(w) >= max(min_len, 3)]

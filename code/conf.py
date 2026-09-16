@@ -95,6 +95,25 @@ RETRIEVAL_MIN_SIMILARITY = _safe_float("RETRIEVAL_MIN_SIMILARITY", 0.6)
 HYBRID_SEARCH_ENABLED = os.getenv("HYBRID_SEARCH_ENABLED", "false").lower() == "true"
 HYBRID_RRF_K = _safe_int("HYBRID_RRF_K", 60)
 
+# BM25-only bypass ratio (2026-09, evidence-based). A doc found ONLY by BM25
+# (missing from Dense results entirely) used to get an UNCONDITIONAL pass
+# through every similarity floor — its actual BM25 relevance score was computed
+# then discarded (utils/hybrid_retriever.py's _rrf_fuse). That let a purely
+# coincidental keyword match (e.g. a bare conjunction appearing in an unrelated
+# document by chance) outrank a genuinely-relevant top candidate that merely
+# scored a hair under the Dense floor.
+#
+# An ABSOLUTE BM25 score threshold doesn't work — raw BM25Okapi scores vary
+# wildly by query (measured top-scores of 12.7, 19.2, 22.8, 27.4, 103.3 across
+# different real queries, no shared scale). A RELATIVE threshold does:
+# measured across 7 real query/doc pairs, every CONFIRMED-relevant BM25 match
+# scored at least 0.556 of its own query's top BM25 score (several genuinely
+# on-topic secondary rows scored 0.556-0.933, not just the literal #1 result —
+# multiple valid docs for one topic naturally differ in length/wording). The
+# one confirmed coincidental false-positive scored only 0.227 of its query's
+# top score. 0.35 sits in that gap with margin on both sides.
+BM25_BYPASS_MIN_RATIO = _safe_float("BM25_BYPASS_MIN_RATIO", 0.35)
+
 # Cross-encoder reranker (Level 3 RAG quality improvement)
 # Set RERANKER_ENABLED=true in env.properties to activate.
 # Model: multilingual cross-encoder (mmarco-mMiniLMv2). NOTE (2026-07 research): its

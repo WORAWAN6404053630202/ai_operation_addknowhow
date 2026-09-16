@@ -210,7 +210,21 @@ class GeneralDataLoader:
 
     def _process_dataframe(self, df: pd.DataFrame, colmap: dict, source: str) -> int:
         added = 0
+        # 2026-09: same fix as data_loader.py's DataLoader._process_dataframe —
+        # sheet_write_back.py's decision_type="update" flow marks the OLD row
+        # superseded via a note in this column, but nothing on the read side
+        # ever respected it until now (Sheet itself stays additive-only/never-
+        # edited on purpose — see sheet_write_back.py — so the fix belongs at
+        # ingest time, not by mutating the Sheet). Must match
+        # sheet_write_back.py's _SUPERSEDED_NOTE_HEADER exactly.
+        _has_superseded_col = "superseded_note" in df.columns
+
         for idx, row in df.iterrows():
+            if _has_superseded_col:
+                _superseded_note = self._to_val(row.get("superseded_note"))
+                if _superseded_note and str(_superseded_note).strip() not in ("", "nan", "None"):
+                    print(f"[GeneralDataLoader] Skipping superseded row {idx}: {_superseded_note!r}")
+                    continue
             source_book = self._get(row, colmap, "source_book")
             main_topic = self._get(row, colmap, "main_topic")
             sub_topic = self._get(row, colmap, "sub_topic")

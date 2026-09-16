@@ -544,8 +544,24 @@ class DataLoader:
         docs_before = len(self.documents)
 
         colmap = self._build_column_map(df)
+        # 2026-09: sheet_write_back.py's decision_type="update" flow writes a
+        # note into this column on the OLD row it's superseding — but until now
+        # nothing on the READ side ever checked it, so the old (stale/wrong) row
+        # kept getting ingested into Chroma right alongside the new one every
+        # single rebuild. The Sheet itself stays additive-only/never-edited (an
+        # intentional safety property — see sheet_write_back.py's docstring),
+        # so the fix belongs here: skip a row at ingest time if a later row has
+        # marked it superseded, rather than mutating/deleting anything in the
+        # Sheet. See sheet_write_back.py's _SUPERSEDED_NOTE_HEADER — must match
+        # exactly.
+        _has_superseded_col = "superseded_note" in df.columns
 
         for idx, row in df.iterrows():
+            if _has_superseded_col:
+                _superseded_note = self._get_row_value(row, "superseded_note")
+                if _superseded_note and str(_superseded_note).strip() not in ("", "nan", "None"):
+                    print(f"[DataLoader] Skipping superseded row {idx}: {_superseded_note!r}")
+                    continue
             dept = self._get_row_value(row, colmap.get("department"))
             if dept:
                 self.departments_found.add(dept)

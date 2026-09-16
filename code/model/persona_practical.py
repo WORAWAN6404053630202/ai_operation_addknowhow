@@ -28,6 +28,8 @@ from utils.text_patterns import (
     ENTITY_NATURAL_RE as _SHARED_ENTITY_NATURAL_RE,
     is_bare_generic_followup as _shared_is_bare_generic_followup,
     extract_info_gap_tag as _shared_extract_info_gap_tag,
+    topic_label_matches_query as _shared_topic_label_matches_query,
+    is_fee_or_duration_info_query as _shared_is_fee_or_duration_info_query,
 )
 
 # Import professional logging
@@ -552,7 +554,7 @@ class PracticalPersonaService:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(kind: str, menu: List[str], greet_streak: int) -> dict:
+        def _call(kind: str, menu: List[str], greet_streak: int, state=None) -> dict:
             menu_preview = ", ".join([str(x) for x in (menu or [])[:6]])
             prompt = (
                 "หน้าที่: สร้างประโยคทักทาย/ตอบรับแบบมนุษย์ สำหรับบอทกฎหมายร้านอาหารไทย (โหมด practical)\n"
@@ -570,7 +572,7 @@ class PracticalPersonaService:
             try:
                 # วัดเวลาการเรียก LLM
                 with TimingContext(logger, "llm_greet_call"):
-                    text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/greet")).strip()
+                    text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/greet", state=state)).strip()
                     
                 # Log สำเร็จ
                 logger.log_with_data("info", "สร้างคำทักทายสำเร็จ", {
@@ -618,10 +620,10 @@ class PracticalPersonaService:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, candidates: List[str], last_topic: str = "") -> dict:
+        def _call(user_text: str, candidates: List[str], last_topic: str = "", state=None) -> dict:
             prompt = build_lqs_license_detect_prompt(user_text, candidates, last_topic=last_topic)
             try:
-                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/lqs_lt")).strip()
+                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/lqs_lt", state=state)).strip()
                 if "```json" in text:
                     text = text.split("```json")[1].split("```")[0].strip()
                 elif "```" in text:
@@ -648,11 +650,11 @@ class PracticalPersonaService:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_satisfaction_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/satisfaction")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/satisfaction", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Practical/satisfaction] LLM call failed: %s", _e)
@@ -685,11 +687,11 @@ class PracticalPersonaService:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_dont_know_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/dont_know")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/dont_know", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Practical/dont_know] LLM call failed: %s", _e)
@@ -722,11 +724,11 @@ class PracticalPersonaService:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_short_followup_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/short_followup")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/short_followup", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Practical/short_followup] LLM call failed: %s", _e)
@@ -759,11 +761,11 @@ class PracticalPersonaService:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_legal_q_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/legal_q")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/legal_q", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Practical/legal_q] LLM call failed: %s", _e)
@@ -796,11 +798,11 @@ class PracticalPersonaService:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_greeting_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/greeting")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/greeting", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Practical/greeting] LLM call failed: %s", _e)
@@ -818,10 +820,10 @@ class PracticalPersonaService:
 
         return _call
 
-    def _pick_greet_prefix(self, kind: str, menu: List[str], greet_streak: int) -> str:
+    def _pick_greet_prefix(self, kind: str, menu: List[str], greet_streak: int, state=None) -> str:
         kind2 = kind if kind in {"greet", "thanks", "smalltalk", "blank"} else "greet"
         try:
-            res = self.llm_greet_call(kind2, menu, int(greet_streak or 0))
+            res = self.llm_greet_call(kind2, menu, int(greet_streak or 0), state=state)
         except Exception as _e:
             _LOG.debug("[Practical/greet] LLM greet call failed: %s", _e)
             res = {}
@@ -1489,6 +1491,20 @@ class PracticalPersonaService:
         re.IGNORECASE,
     )
     _LQS_SIGN_TAX_RE = re.compile(r"ภาษีป้าย|ป้ายร้านอาหาร", re.IGNORECASE)
+    # ใบอนุญาตอาหาร (casual phrasing) → "ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร". 2026-09: this
+    # license_type had NO dedicated keyword rule here (unlike VAT/liquor/SAN/etc. above), so a
+    # casual "ขอใบอนุญาตอาหาร" query — which shares no 8-char contiguous substring with the
+    # official name (the real name has "จัดตั้งสถานที่จำหน่าย" between "ใบอนุญาต" and "อาหาร",
+    # a casual query has neither) — scored 0 on both the food-permit AND every other license,
+    # falling through to the LLM fallback classifier, which was live-reproduced picking the
+    # wrong license ("ใบทะเบียนพาณิชย์") for a query that also mentioned entity-type comparison
+    # terms ("ห้างหุ้นส่วนจำกัด", "บุคคลธรรมดา") strongly associated with DBD/commerce
+    # registration content elsewhere in the corpus, discarding all the actual food-permit docs
+    # via FOCUS FILTER before the answer was ever generated.
+    _LQS_FOOD_PERMIT_RE = re.compile(
+        r"ใบอนุญาต.*อาหาร|อาหาร.*ใบอนุญาต|จัดตั้ง.*(?:ร้านอาหาร|จำหน่ายอาหาร)|สถานที่จำหน่ายอาหาร|bma\s*oss",
+        re.IGNORECASE,
+    )
     _LQS_QR_PAYMENT_RE = re.compile(
         r"qr|คิวอาร์|คิวอาเพ|คิวอาเอพีไอ|payment|biller.?id|merchant.?id|"
         r"สมัคร.*ชำระ|ชำระ.*ออนไลน์|ลงทะเบียน.*ชำระ",
@@ -1549,7 +1565,7 @@ class PracticalPersonaService:
         t = re.sub(r"(.)\1{2,}", r"\1\1", t)
         return t
 
-    def _looks_like_greeting(self, s: str) -> bool:
+    def _looks_like_greeting(self, s: str, state=None) -> bool:
         raw = (s or "").strip()
         if not raw:
             return True
@@ -1566,7 +1582,7 @@ class PracticalPersonaService:
         if self._LEGAL_SIGNAL_RE.search(t):
             return False
         # LLM fallback: catches casual greetings regex misses (e.g. "หวัดดีจ้า", "ดีๆ ค่ะ")
-        return self._greeting_llm_check(raw)
+        return self._greeting_llm_check(raw, state=state)
 
     def _looks_like_legal_question(self, s: str, state=None) -> bool:
         t = self._normalize_for_intent(s)
@@ -1595,7 +1611,7 @@ class PracticalPersonaService:
         if cache_key in cache:
             return cache[cache_key]
         try:
-            res = self._satisfaction_llm_call(q) or {}
+            res = self._satisfaction_llm_call(q, state=state) or {}
             conf_val = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_satisfied")) and conf_val >= 0.80
         except Exception as _e:
@@ -1625,7 +1641,7 @@ class PracticalPersonaService:
             return cache[cache_key]
         conf_val = 0.0
         try:
-            res = self._dont_know_llm_call(q) or {}
+            res = self._dont_know_llm_call(q, state=state) or {}
             conf_val = float(res.get("confidence") or 0.0)
             result = (bool(res.get("is_dont_know")) or bool(res.get("is_asking_types"))) and conf_val >= 0.75
         except Exception as _e:
@@ -1657,7 +1673,7 @@ class PracticalPersonaService:
             return cache[cache_key]
         conf_val = 0.0
         try:
-            res = self._short_followup_llm_call(q) or {}
+            res = self._short_followup_llm_call(q, state=state) or {}
             conf_val = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_followup")) and conf_val >= 0.80
         except Exception as _e:
@@ -1691,7 +1707,7 @@ class PracticalPersonaService:
                 return False
         conf_val = 0.0
         try:
-            res = self._practical_legal_q_llm_call(q) or {}
+            res = self._practical_legal_q_llm_call(q, state=state) or {}
             conf_val = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_legal")) and conf_val >= 0.75
         except Exception as _e:
@@ -1702,12 +1718,14 @@ class PracticalPersonaService:
         cache[cache_key] = result
         return result
 
-    def _greeting_llm_check(self, user_text: str) -> bool:
+    def _greeting_llm_check(self, user_text: str, state=None) -> bool:
         """
         LLM fallback: is this a greeting/smalltalk with no legal intent?
         Called when _EN_GREET_RE / _TH_WATDEE_RE / _TH_SAWASDEE_RE / _TH_DEE_RE all miss.
         Low threshold (0.70) — false positive = skip retrieval for a real question.
-        Uses instance-level cache (no state needed — greeting classification is stateless).
+        Uses instance-level cache for the RESULT (no state needed for that — greeting
+        classification is stateless). `state` is only used (optionally) to attribute this
+        call's real cost to the session total.
         """
         q = (user_text or "").strip()
         if not q or len(q) > 80:
@@ -1718,7 +1736,7 @@ class PracticalPersonaService:
             return cache[cache_key]
         conf_val = 0.0
         try:
-            res = self._greeting_llm_call(q) or {}
+            res = self._greeting_llm_call(q, state=state) or {}
             conf_val = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_greeting")) and conf_val >= 0.70
         except Exception as _e:
@@ -2037,7 +2055,7 @@ class PracticalPersonaService:
         "เอกสาร ค่าธรรมเนียม ขั้นตอน",
     ]
 
-    def _build_topic_menu_from_corpus(self) -> List[str]:
+    def _build_topic_menu_from_corpus(self, state=None) -> List[str]:
         freq: Dict[str, int] = {}
 
         def _add(v: Any) -> None:
@@ -2049,7 +2067,7 @@ class PracticalPersonaService:
         seen_doc_ids: set = set()
         for q in self._TOPIC_POOL_QUERIES:
             try:
-                docs = self._retrieve_docs(q)
+                docs = self._retrieve_docs(q, state=state)
             except Exception:
                 continue
             for d in docs:
@@ -2075,7 +2093,7 @@ class PracticalPersonaService:
             self._topic_menu_cache = cached
             return cached
 
-        menu = self._build_topic_menu_from_corpus()
+        menu = self._build_topic_menu_from_corpus(state=state)
         if not menu:
             menu = ["ใบอนุญาต/การเปิดร้าน", "ภาษี/VAT", "จดทะเบียนพาณิชย์", "สุขาภิบาลอาหาร"]
 
@@ -2127,7 +2145,7 @@ class PracticalPersonaService:
         menu = self._get_topic_menu(state)
         streak = int(state.context.get("greet_streak", 0) or 0) + 1
         state.context["greet_streak"] = streak
-        prefix = self._pick_greet_prefix(kind=kind, menu=menu, greet_streak=streak).strip()
+        prefix = self._pick_greet_prefix(kind=kind, menu=menu, greet_streak=streak, state=state).strip()
 
         if self._supervisor_owns_menu(state):
             return self._apply_practical_lint(prefix, kind="greet")
@@ -2337,7 +2355,7 @@ class PracticalPersonaService:
         valid_lt_set = set(lt_candidates)
         conf_val = 0.0
         try:
-            result = self._lqs_license_llm_call(query, lt_candidates, last_topic=_last_topic)
+            result = self._lqs_license_llm_call(query, lt_candidates, last_topic=_last_topic, state=state)
             lt_name = (result.get("license_type") or "").strip()
             conf_val = float(result.get("confidence") or 0)
             matched = lt_name if (lt_name and lt_name in valid_lt_set and conf_val >= min_confidence) else None
@@ -2352,7 +2370,10 @@ class PracticalPersonaService:
             _LOG.info("[Practical] LQS LLM fallback: %r → %r (conf=%.2f, min=%.2f)", query[:50], matched, conf_val, min_confidence)
         return matched
 
-    def _retrieve_docs(self, query: str, metadata_filter: Optional[Dict[str, Any]] = None, max_docs: Optional[int] = None, slot_context: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    def _retrieve_docs(
+        self, query: str, metadata_filter: Optional[Dict[str, Any]] = None, max_docs: Optional[int] = None,
+        slot_context: Optional[Dict[str, Any]] = None, state=None,
+    ) -> List[Dict[str, Any]]:
         import time
         start = time.time()
 
@@ -2363,7 +2384,7 @@ class PracticalPersonaService:
         # before synonym expansion. Appends formal terms without replacing original keywords,
         # so BM25 and synonym patterns still fire on the original text.
         if _qr_needs_rewrite(query):
-            query = enrich_query_for_retrieval(query)
+            query = enrich_query_for_retrieval(query, state=state)
 
         # Query expansion: Thai/English synonym bridging — patterns defined in utils/query_synonyms.py
         _expansions: list = []
@@ -2391,6 +2412,7 @@ class PracticalPersonaService:
 
         _hybrid_enabled = getattr(conf, "HYBRID_SEARCH_ENABLED", False)
         _rrf_k = int(getattr(conf, "HYBRID_RRF_K", 60))
+        _bm25_ratio = float(getattr(conf, "BM25_BYPASS_MIN_RATIO", 0.35))
 
         def _scored_search(q: str, k: int, flt: Optional[dict] = None) -> list:
             """Dense search (+ BM25 via RRF when HYBRID_SEARCH_ENABLED=true). Attaches _sim to metadata."""
@@ -2410,7 +2432,7 @@ class PracticalPersonaService:
             try:
                 if _hybrid_enabled:
                     from utils.hybrid_retriever import hybrid_scored_search
-                    pairs = hybrid_scored_search(vectorstore, q, k=k, metadata_filter=flt, rrf_k=_rrf_k)
+                    pairs = hybrid_scored_search(vectorstore, q, k=k, metadata_filter=flt, rrf_k=_rrf_k, bm25_bypass_min_ratio=_bm25_ratio)
                 else:
                     kwargs: dict = {"k": k}
                     if flt:
@@ -2568,7 +2590,7 @@ class PracticalPersonaService:
         min_similarity = getattr(conf, 'RETRIEVAL_MIN_SIMILARITY', 0.6)
         filtered_docs = []
         low_quality_docs = []
-        
+
         for d in docs:
             _md_f = (getattr(d, "metadata", {}) or {})
             # BM25-only docs (no Dense score) are trusted by RRF — bypass min_similarity
@@ -2726,6 +2748,11 @@ class PracticalPersonaService:
             "legal_regulatory",     # บทลงโทษ ค่าปรับ ข้อกำหนดทางกฎหมาย
             "terms_and_conditions", # หน้าที่และเงื่อนไขของผู้ประกอบการ
             "restaurant_ai_document",  # เอกสาร/ฟอร์ม AI ร้านอาหาร
+            # know_how docs (feature/pdf-ingestion) — separate lightweight schema,
+            # see data_loader.py's load_from_knowhow_sheet(). full_text is absent
+            # from metadata entirely (not just capped) when knowhow_write_back.py
+            # had to overflow it to S3 — see that method's docstring for why.
+            "title", "category", "page_range", "source_file", "full_text",
         })
         _STORE_FIELD_CAPS = {
             # Must be >= the per-field caps used in the handle() prompt loop below,
@@ -2736,6 +2763,12 @@ class PracticalPersonaService:
             "restaurant_ai_document": 800,
             # marketing / business_guide content fields
             "answer_guideline": 1500, "main_topic": 120, "sub_topic": 150,
+            # know_how docs: full_text is their ONLY substantive content (title/
+            # summary/category are short labels), same "sole content field"
+            # situation as business_guide's answer_guideline — generous cap for
+            # the same reason (_BG_ANSWER_GUIDELINE_CAP below).
+            "title": 200, "category": 100, "page_range": 20, "source_file": 200,
+            "full_text": int(getattr(conf, "LLM_DOC_CHARS_KNOWHOW", 4000)),
         }
         # Business guide docs (no license_type) store all content in answer_guideline.
         # Chroma metadata has the FULL value but _STORE_FIELD_CAPS["answer_guideline"]=1500
@@ -2803,8 +2836,8 @@ class PracticalPersonaService:
         return results
 
     # Topic Registry (auto-discovery from Chroma, no hardcoding)
-    def _retrieve_multi_topic(self, question: str, slot_context: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        return self._retrieve_docs(question, slot_context=slot_context)
+    def _retrieve_multi_topic(self, question: str, slot_context: Optional[Dict[str, Any]] = None, state=None) -> List[Dict[str, Any]]:
+        return self._retrieve_docs(question, slot_context=slot_context, state=state)
 
     def _debug_log(self, stage: str, query: str, docs_json: List[Dict[str, Any]]):
         if not _LOG.isEnabledFor(logging.DEBUG):
@@ -2835,19 +2868,20 @@ class PracticalPersonaService:
         elif user_text == "__auto_post_retrieve__":
             state.context[auto_internal_guard_key] = int(state.context.get(auto_internal_guard_key, 0) or 0) + 1
 
-        # Hard cap on internal retrieve→re-retrieve recursion (2026-09 incident fix).
-        # This counter was being incremented right above on every "__auto_post_retrieve__"
-        # recursive call but was NEVER READ anywhere in this file — a dead tripwire. Found
-        # live: when retrieval genuinely returns 0 docs every time (e.g. a broken/empty
-        # vectorstore connection), the action=="retrieve" guard further down only blocks
-        # re-retrieval when `state.current_docs` is truthy (see "if state.current_docs and
-        # (...)" below) — with docs empty, that guard is skipped entirely, so the LLM keeps
-        # returning action="retrieve" with a freshly-reworded query forever and handle()
-        # keeps recursing with no limit. Reproduced: one single question recursed for 2h22m,
-        # accumulated 5.4M+ tokens, before being killed manually — this closes that gap.
-        # MAX_ROUNDS (conf) is a DIFFERENT, higher-level per-session turn limit enforced in
-        # persona_supervisor.py — it never sees this loop since handle() never returns control
-        # back up while recursing, so it can't help here; this cap is deliberately separate.
+        # Hard cap on internal retrieve→re-retrieve recursion (2026-09 incident fix,
+        # ported from main — see commit 1bf59b8). This counter was being incremented
+        # right above on every "__auto_post_retrieve__" recursive call but was never
+        # READ anywhere in this file — a dead tripwire. When retrieval genuinely
+        # returns 0 docs every time (e.g. a broken/empty vectorstore connection), the
+        # action=="retrieve" guard further down only blocks re-retrieval when
+        # `state.current_docs` is truthy — with docs empty, that guard is skipped
+        # entirely, so the LLM keeps returning action="retrieve" with a freshly-
+        # reworded query forever and handle() keeps recursing with no limit.
+        # Reproduced live: one single question recursed for 2h22m, accumulated 5.4M+
+        # tokens, before being killed manually — this closes that gap. MAX_ROUNDS
+        # (conf) is a DIFFERENT, higher-level per-session turn limit enforced in
+        # persona_supervisor.py — it never sees this loop since handle() never
+        # returns control back up while recursing, so it can't help here.
         _apg_count = int(state.context.get(auto_internal_guard_key, 0) or 0)
         _max_auto_retrieve_loops = int(getattr(conf, "MAX_AUTO_RETRIEVE_LOOPS", 5) or 5)
         if _apg_count > _max_auto_retrieve_loops:
@@ -2900,7 +2934,7 @@ class PracticalPersonaService:
                             _sel_slot_ctx = state.get_collected_slots() or None
                         except Exception:
                             pass
-                        state.current_docs = self._retrieve_docs(selected_lt, slot_context=_sel_slot_ctx)
+                        state.current_docs = self._retrieve_docs(selected_lt, slot_context=_sel_slot_ctx, state=state)
                         state.last_retrieval_query = selected_lt
                         return self.handle(state, "__auto_post_retrieve__", _internal=True)
                     return self.handle(state, user_input, _internal=False)
@@ -2945,7 +2979,7 @@ class PracticalPersonaService:
                 state.round = int(getattr(state, "round", 0) or 0) + 1
                 return state, msg
 
-            if (not _internal) and self._looks_like_greeting(user_text) and not filled_topic_value and not bypassed_menu:
+            if (not _internal) and self._looks_like_greeting(user_text, state=state) and not filled_topic_value and not bypassed_menu:
                 self._append_user_once(state, user_input)
                 msg = self._reply_greeting_with_choices(state, kind="greet")
                 self._append_assistant(state, msg)
@@ -2981,7 +3015,7 @@ class PracticalPersonaService:
                 _topic_slot_ctx = state.get_collected_slots() or None
             except Exception:
                 pass
-            state.current_docs = self._retrieve_docs(q, slot_context=_topic_slot_ctx)
+            state.current_docs = self._retrieve_docs(q, slot_context=_topic_slot_ctx, state=state)
             state.last_retrieval_query = q
             tmp = [
                 {"content": d.get("content", "")[:120], "metadata": d.get("metadata", {})}
@@ -3005,7 +3039,7 @@ class PracticalPersonaService:
                     _mt_slot_ctx = state.get_collected_slots() or None
                 except Exception:
                     pass
-                state.current_docs = self._retrieve_multi_topic(user_text, slot_context=_mt_slot_ctx)
+                state.current_docs = self._retrieve_multi_topic(user_text, slot_context=_mt_slot_ctx, state=state)
                 state.last_retrieval_query = user_text
                 tmp = [
                     {"content": d.get("content", "")[:120], "metadata": d.get("metadata", {})}
@@ -3054,6 +3088,13 @@ class PracticalPersonaService:
         # Cap docs sent to LLM: _prompt_max_docs per license_type to control token usage.
         # For multi-license, each license still gets its own metadata via dedup logic below.
         _all_docs = state.current_docs or []
+        # Pristine snapshot for the multi-entity established-topic guarantee fallback further
+        # below (2026-09) — by the time that block runs, op-intent filtering + sibling-completion
+        # may have already replaced _docs_to_process's license_type composition entirely (see
+        # that block's own comment for the live-reproduced scenario), so deriving a fallback
+        # license from _docs_to_process at that point can pick up a completely unrelated,
+        # already-narrowed pool instead of what was actually retrieved for the query.
+        _all_docs_snapshot_ig = list(_all_docs)
         _lt_order: list = []  # license_types in order of first appearance
         _lt_doc_count: dict = {}
         _mt_order: list = []  # main_topics from non-regulatory docs (no license_type)
@@ -3090,6 +3131,7 @@ class PracticalPersonaService:
                         _base_q_pre,
                         metadata_filter={"entity_type_normalized": _cs_entity_pre},
                         slot_context={"entity_type": _cs_entity_pre},
+                        state=state,
                     )
                     if _pre_docs:
                         _all_docs = _pre_docs
@@ -3168,6 +3210,7 @@ class PracticalPersonaService:
                         _switch_base_q,
                         metadata_filter=_switch_filter,
                         slot_context={"entity_type": _query_et_override},
+                        state=state,
                     )
                     if _switch_docs:
                         _LOG.info(
@@ -3290,6 +3333,7 @@ class PracticalPersonaService:
                         _loc_base_q,
                         metadata_filter=_loc_meta_filter,
                         slot_context={"location": _query_loc_override},
+                        state=state,
                     )
                     if _loc_docs:
                         _LOG.info(
@@ -3440,6 +3484,9 @@ class PracticalPersonaService:
                 # QR Payment / online payment → "ระบบชำระเงินออนไลน์"
                 if self._LQS_QR_PAYMENT_RE.search(q) and re.search(r"ระบบชำระเงิน", lt, re.IGNORECASE):
                     s += 8.0
+                # ใบอนุญาตอาหาร (casual phrasing) → "ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร"
+                if self._LQS_FOOD_PERMIT_RE.search(q) and re.search(r"จัดตั้งสถานที่จำหน่ายอาหาร", lt, re.IGNORECASE):
+                    s += 8.0
                 return s
 
             _focus_query = (user_text or "").strip()
@@ -3588,13 +3635,26 @@ class PracticalPersonaService:
                                             if _s > _best_ot_sc_ff:
                                                 _best_ot_sc_ff = _s
                                                 _best_ot_ff = _ot_cand
-                                        if _best_ot_ff:
+                                        # Require a genuinely POSITIVE score (real Latin-token
+                                        # evidence, e.g. "SAN" matching "SAN PLUS") before
+                                        # overriding — not just "less negative than before".
+                                        # Bug found live (case 7, qa_12case rerun): when the
+                                        # current candidate pool's only non-empty operation_topic
+                                        # scored negative (e.g. "Wechat Pay" vs a query asking
+                                        # about "EDC" fees), this accepted ANY pure-Thai-label
+                                        # operation_topic elsewhere under the same license
+                                        # (scoring a neutral 0 — no Latin tokens at all, so zero
+                                        # actual relevance) and threw away the correctly-matching
+                                        # doc, which has operation_topic=None/empty and was never
+                                        # a candidate in this comparison to begin with.
+                                        if _best_ot_ff and _best_ot_sc_ff > 0:
                                             _ot_fresh = self._retrieve_docs(
                                                 user_text,
                                                 metadata_filter={"$and": [
                                                     {"license_type": _dominant_lt},
                                                     {"operation_topic": _best_ot_ff},
                                                 ]},
+                                                state=state,
                                             )
                                             if _ot_fresh:
                                                 _LOG.info(
@@ -3638,6 +3698,7 @@ class PracticalPersonaService:
                             _tc_query_for_retrieve,
                             metadata_filter={"license_type": _dominant_for_tc},
                             max_docs=8,
+                            state=state,
                         )
                         if _tc_fresh:
                             # Sort: docs with actual cut-off time data (HH:MM น.) come first so
@@ -3838,13 +3899,46 @@ class PracticalPersonaService:
             # would produce an incomplete answer (e.g. 4 of 5 authority-restriction scenarios).
             # Exception: informational (bare topic) queries only need a brief overview — cap to
             # _prompt_max_docs so LLM produces a concise answer rather than a full guide.
-            if bool((state.context or {}).get("_informational_query")):
+            # Non-reg chapter guard (2026-09): _informational_query can be True even when
+            # _all_docs is NOT "one narrow definition doc" but a full non-regulatory
+            # (marketing/business_guide) CHAPTER that persona_supervisor.py's Step 0/sub_topic
+            # exact-match already deliberately expanded to (e.g. a single-topic query like
+            # "การสื่อสารการตลาด" matched a 1-row definition, then expanded to the full 23-row
+            # "กลยุทธ์ด้านการสื่อสาร" chapter it belongs to — see that expansion's own comment,
+            # "qa_12case case 3"). The informational-query classifier only judges the QUERY's
+            # phrasing, not what _all_docs actually contains, so it has no way to know the
+            # difference — capping to _prompt_max_docs here silently throws away 20+ of the
+            # very sub_topics that expansion existed to surface, live-reproduced as this same
+            # case's answer covering only 2-3 of 6+ distinct sub_topics. Detect the same
+            # "single shared non-reg main_topic" shape _is_chapter_overview checks below (that
+            # check runs too late in this function to reuse directly) and skip the cap then.
+            _informational_but_nonreg_chapter = False
+            if bool((state.context or {}).get("_informational_query")) and len(_all_docs) > _prompt_max_docs:
+                # Don't require a single shared main_topic — the "cross-chapter merge (non-reg)"
+                # step (see _merge_cross_chapter_docs_for_nonreg in persona_supervisor.py) can
+                # legitimately add a couple of docs from ANOTHER main_topic on top of the
+                # primary chapter expansion, which made this check require exactly one
+                # main_topic value fail here even though the docs are still genuinely a non-reg
+                # chapter overview (live-reproduced: 23 chapter docs + 2 cross-chapter docs = 2
+                # distinct main_topic values, so the stricter check never triggered and this fix
+                # silently did nothing on its first attempt). data_type + doc count alone is a
+                # sufficient and more robust signal of "this is chapter breadth, not one doc".
+                _dtm_dts = {str((_d.get("metadata") or {}).get("data_type") or "").strip().lower() for _d in _all_docs}
+                if _dtm_dts and _dtm_dts <= {"marketing", "business_guide", ""}:
+                    _informational_but_nonreg_chapter = True
+            if bool((state.context or {}).get("_informational_query")) and not _informational_but_nonreg_chapter:
                 _docs_to_process = _all_docs[:_prompt_max_docs]
                 _LOG.info(
                     "[Practical] Direct topic match (informational overview) — capped %d/%d docs",
                     len(_docs_to_process), len(_all_docs),
                 )
             else:
+                if _informational_but_nonreg_chapter:
+                    _LOG.info(
+                        "[Practical] Direct topic match (informational, but non-reg chapter) — "
+                        "sending all %d docs (cap would have discarded the chapter expansion)",
+                        len(_all_docs),
+                    )
                 _docs_to_process = _all_docs
                 _LOG.info("[Practical] Direct topic match — sending all %d docs (no cap)", len(_all_docs))
         elif _is_chapter_overview:
@@ -3857,6 +3951,7 @@ class PracticalPersonaService:
                     _co_mt,
                     metadata_filter={"main_topic": _co_mt},
                     max_docs=15,
+                    state=state,
                 )
                 _seen_co = {hash((d.get("content") or "")[:200]) for d in _all_docs}
                 _added_co = [d for d in _suppl if hash((d.get("content") or "")[:200]) not in _seen_co]
@@ -3875,7 +3970,7 @@ class PracticalPersonaService:
             _lrq_co = (getattr(state, "last_retrieval_query", None) or "").strip()
             if _lrq_co and _lrq_co.lower() != _co_mt.lower():
                 try:
-                    _suppl_q = self._retrieve_docs(_lrq_co, max_docs=3)
+                    _suppl_q = self._retrieve_docs(_lrq_co, max_docs=3, state=state)
                     _seen_co2 = {hash((d.get("content") or "")[:200]) for d in _all_docs}
                     _added_q = [d for d in _suppl_q if hash((d.get("content") or "")[:200]) not in _seen_co2]
                     if _added_q:
@@ -4111,13 +4206,29 @@ class PracticalPersonaService:
                             # Department filter: when primary doc belongs to a specific bank/authority,
                             # restrict siblings to the same department so cross-bank docs (e.g. กสิกรไทย
                             # siblings included in a ไทยพาณิชย์ answer) don't inflate token count or
-                            # pollute links/content with wrong-bank data.
+                            # pollute links/content with wrong-bank data. This restriction only makes
+                            # sense once that department is actually ESTABLISHED — already collected
+                            # from a prior turn, or explicitly named in the user's CURRENT message.
+                            # 2026-09: found live that it was applying unconditionally, even when no
+                            # bank was named at all (e.g. "ต้องสมัคร QR กับธนาคารไหน") — sibling
+                            # completion then silently locked onto whichever bank the initial ranking
+                            # happened to rank first (always กสิกรไทย, live-verified 3/3 runs) and
+                            # permanently hid ไทยพาณิชย์, even though both banks offer the identical
+                            # service and share the same operation_by_department value ("QR PAYMENT").
+                            # Only skip the restriction in that genuinely-ambiguous case — every
+                            # existing established-department/named-bank path is unchanged.
                             _sib_dept = str(_sm.get("department") or "").strip()
-                            _dept_clauses = (
-                                [{"department": _sib_dept}]
-                                if _sib_dept and _sib_dept.lower() not in ("nan", "none")
-                                else []
-                            )
+                            _dept_established = False
+                            if _sib_dept and _sib_dept.lower() not in ("nan", "none"):
+                                _collected_dept = (
+                                    str(state.get_collected_slot("department") or "").strip()
+                                    if hasattr(state, "get_collected_slot") else ""
+                                )
+                                if _collected_dept and _collected_dept == _sib_dept:
+                                    _dept_established = True
+                                elif _sib_dept.lower() in (user_text or "").lower():
+                                    _dept_established = True
+                            _dept_clauses = [{"department": _sib_dept}] if _dept_established else []
                             # Entity-type filter: include entity-neutral docs (entity_type_normalized='')
                             # but exclude docs belonging to the competing entity type.
                             # Without this, sibling-completion fetches ALL entity variants and floods
@@ -4331,7 +4442,44 @@ class PracticalPersonaService:
                     for _d in _docs_to_process
                 }
                 _et_in_docs.discard("")
-                if len(_et_pre_sibling) >= 2 and not state.get_collected_slot("entity_type") and not has_any_flag(state.context, ENTITY_INJECTION_SKIP_FLAGS):
+                # Field-awareness guard (2026-09): only ask when the field the user is
+                # actually asking about varies by entity — mirrors the prompt's own "Judge
+                # this by the SPECIFIC thing the user asked about" rule (Core rules above),
+                # but enforced here too since the LLM never gets a chance to apply that
+                # judgment when this slot-queue injection fires first and blocks the answer.
+                # Live-reproduced: a pure "ขั้นตอน...เรียงลำดับ" (steps) question, where
+                # operation_steps is IDENTICAL across entity variants (only
+                # identification_documents differs), asked entity_type unnecessarily —
+                # and non-deterministically so, depending on which docs survived op-intent
+                # filtering into _docs_to_process for that particular run.
+                _et_inject_asks_docs = bool(re.search(r"เอกสาร|หลักฐาน", user_text or ""))
+                _et_inject_skip_identical_steps = False
+                if not _et_inject_asks_docs:
+                    # Use _op_pass_docs (the same pre-sibling snapshot _et_pre_sibling itself
+                    # was derived from), not _docs_to_process — sibling-completion can narrow
+                    # or reshape the latter, so comparing against it caused this guard to miss
+                    # cases where _et_pre_sibling still had ≥2 entity types but _docs_to_process
+                    # no longer did (live-reproduced: 1 of 4 repeated identical queries still
+                    # asked unnecessarily before this correction).
+                    _steps_by_entity_ig = {
+                        str((_d.get("metadata") or {}).get("entity_type_normalized") or "").strip():
+                            str((_d.get("metadata") or {}).get("operation_steps") or "").strip()
+                        for _d in _op_pass_docs
+                        if str((_d.get("metadata") or {}).get("entity_type_normalized") or "").strip()
+                    }
+                    _steps_vals_ig = {v for v in _steps_by_entity_ig.values() if v}
+                    if len(_steps_by_entity_ig) >= 2 and len(_steps_vals_ig) == 1:
+                        _et_inject_skip_identical_steps = True
+                        _LOG.info(
+                            "[Practical] entity_type injection skipped — operation_steps identical "
+                            "across entity types %s and query doesn't ask about documents",
+                            sorted(_steps_by_entity_ig.keys()),
+                        )
+                if (
+                    len(_et_pre_sibling) >= 2 and not state.get_collected_slot("entity_type")
+                    and not has_any_flag(state.context, ENTITY_INJECTION_SKIP_FLAGS)
+                    and not _et_inject_skip_identical_steps
+                ):
                     _sq_now = list((state.context or {}).get("topic_slot_queue") or [])
                     if not any(s.get("key") == "entity_type" for s in _sq_now):
                         _et_display = {"บุคคลธรรมดา": "บุคคลธรรมดา", "นิติบุคคล": "นิติบุคคล"}
@@ -4410,6 +4558,7 @@ class PracticalPersonaService:
                 _refetch_query,
                 metadata_filter=_refetch_filter,
                 slot_context={"entity_type": _refetch_et},
+                state=state,
             )
             if _refetch_docs:
                 # Apply same op-intent filter to re-fetched docs
@@ -4530,16 +4679,99 @@ class PracticalPersonaService:
             ).strip()
             _established_license = str((state.context or {}).get("last_topic") or "").strip()
             _multi_entities_mentioned = list((state.context or {}).get("_multi_entity_mentioned") or [])
+            # Fallback when there's no established topic yet (2026-09): "last_topic" is only
+            # set once a prior turn (or an earlier exact-match step this same turn) has locked
+            # onto a topic — a genuine multi-entity comparison asked as the FIRST message in a
+            # session has neither, so this guarantee silently never ran for exactly that case.
+            # Live-reproduced: "ร้านเราเป็นห้างหุ้นส่วนจำกัด กับร้านที่เป็นบุคคลธรรมดา เอกสาร...
+            # ต่างกันไหม" as an opening message retrieved มาตรฐาน SAN + regulatory docs whose
+            # license_type was overwhelmingly "ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร", but only ONE
+            # entity variant happened to survive into _docs_to_process — with no established
+            # license to anchor to, the missing entity's docs were never guaranteed-fetched, and
+            # the LLM fell back to a blanket [[INFO_GAP]] instead of the comparison it had enough
+            # data to attempt. Derive the anchor from the dominant license_type already present
+            # in _docs_to_process instead of requiring it to pre-exist.
+            if not _established_license:
+                _lt_counts_ig: Dict[str, int] = {}
+                for _d_ig in _all_docs_snapshot_ig:
+                    _lt_ig = str((_d_ig.get("metadata") or {}).get("license_type") or "").strip()
+                    if _lt_ig and _lt_ig not in ("nan", "None"):
+                        _lt_counts_ig[_lt_ig] = _lt_counts_ig.get(_lt_ig, 0) + 1
+                if _lt_counts_ig:
+                    # Prefer keyword overlap with the query over raw doc count — a noisy
+                    # retrieval pool can have far MORE docs of an unrelated license_type than
+                    # of the one actually being asked about (live-reproduced: "ขอใบอนุญาตอาหาร"
+                    # pulled in many more "ใบทะเบียนพาณิชย์" rows than the correct "ใบอนุญาตจัดตั้ง
+                    # สถานที่จำหน่ายอาหาร" ones, so a pure max(count) pick anchored to the wrong
+                    # license — harmless that one time only because other correct docs happened
+                    # to already be present, but not reliable). Thai has no spaces between
+                    # words, so a plain word-split overlap check doesn't work — use character
+                    # trigram overlap instead (standard technique for un-segmented Thai text).
+                    # Fall back to count only when nothing overlaps at all.
+                    _q_lower_ig = (user_text or "").lower()
+                    _q_trigrams_ig = {_q_lower_ig[i:i + 3] for i in range(len(_q_lower_ig) - 2)}
+                    def _lt_overlap_score(_lt: str) -> int:
+                        _lt_l = _lt.lower()
+                        _lt_trigrams = {_lt_l[i:i + 3] for i in range(len(_lt_l) - 2)}
+                        return len(_lt_trigrams & _q_trigrams_ig)
+                    _best_overlap = max((_lt_overlap_score(k) for k in _lt_counts_ig), default=0)
+                    if _best_overlap > 0:
+                        _established_license = max(
+                            (k for k in _lt_counts_ig if _lt_overlap_score(k) == _best_overlap),
+                            key=lambda k: _lt_counts_ig[k],
+                        )
+                    else:
+                        _established_license = max(_lt_counts_ig, key=lambda k: _lt_counts_ig[k])
             _target_entities = list(dict.fromkeys(
                 ([_cs_established_entity] if _cs_established_entity else []) + _multi_entities_mentioned
             ))
             if _target_entities and _established_license:
+                _vs_guarantee_ent = getattr(self.retriever, "vectorstore", None)
+                _coll_guarantee_ent = getattr(_vs_guarantee_ent, "_collection", None) if _vs_guarantee_ent else None
+                # Blanket license-level guarantee (2026-09): some licenses (e.g. the food-permit
+                # BMA OSS/self-file channel doc) embed the entity comparison as running text
+                # WITHIN a single row's identification_documents (e.g. "...เอกสารเหมือนกันทั้ง
+                # บุคคลธรรมดาและห้างหุ้นส่วนจำกัด... กรณีนิติบุคคลเพิ่ม หนังสือรับรองนิติบุคคล")
+                # rather than splitting into separate entity_type_normalized rows — for those,
+                # the per-entity guarantee below (which filters by entity_type_normalized) finds
+                # nothing to fetch even though the actual comparison content exists. Also covers
+                # the case live-reproduced for this exact query: op-intent filtering discarded
+                # every retrieved row of the target license (they were all renewal/edit/cancel
+                # variants of the SAME license, correctly excluded on their own terms) leaving
+                # NONE of that license's rows in _docs_to_process at all — not just missing one
+                # entity's rows. Runs BEFORE the per-entity guarantee so a license that DOES
+                # split by entity_type_normalized still gets that finer-grained treatment too.
+                if _coll_guarantee_ent is not None and not any(
+                    str((d.get("metadata") or {}).get("license_type") or "").strip() == _established_license
+                    for d in _docs_to_process
+                ):
+                    try:
+                        _guar_res_lt = _coll_guarantee_ent.get(
+                            where={"license_type": _established_license},
+                            include=["documents", "metadatas"],
+                        )
+                        _guar_max_chars_lt = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700))
+                        _guar_docs_lt = [
+                            {"content": (c or "")[:_guar_max_chars_lt], "metadata": m or {}}
+                            for c, m in zip(
+                                _guar_res_lt.get("documents") or [],
+                                _guar_res_lt.get("metadatas") or [],
+                            )
+                        ]
+                        if _guar_docs_lt:
+                            _docs_to_process = _guar_docs_lt + _docs_to_process
+                            state.current_docs = _docs_to_process
+                            _LOG.info(
+                                "[Practical] established-topic guarantee (license, blanket): license=%r → "
+                                "+%d doc(s) (none of that license_type survived op-intent filtering)",
+                                _established_license, len(_guar_docs_lt),
+                            )
+                    except Exception as _e_guarantee_lt:
+                        _LOG.warning("[Practical] established-topic guarantee (license, blanket) failed: %s", _e_guarantee_lt)
                 _entities_present = {
                     str((d.get("metadata") or {}).get("entity_type_normalized") or "").strip()
                     for d in _docs_to_process
                 }
-                _vs_guarantee_ent = getattr(self.retriever, "vectorstore", None)
-                _coll_guarantee_ent = getattr(_vs_guarantee_ent, "_collection", None) if _vs_guarantee_ent else None
                 if _coll_guarantee_ent is not None:
                     _guar_max_chars_ent = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700))
                     for _target_entity in _target_entities:
@@ -5105,12 +5337,31 @@ class PracticalPersonaService:
         # Soft multi-license hint: when docs span 2+ license types that the user explicitly
         # requested, remind LLM to cover ALL of them in its answer. Unlike multi_license_topics
         # (which forces action='answer'), this is advisory only — LLM can still ask slots first.
+        #
+        # 2026-09 bug fix: this used to trust `_is_multi_license_docs` alone (just counting
+        # distinct license_type values among whatever got RETRIEVED) despite this very
+        # docstring saying "that the user explicitly requested" — those are NOT the same
+        # thing. Live-reproduced: a query about corporate income tax rate ("...เสียภาษีเงินได้
+        # นิติบุคคลอัตราเท่าไหร่") got noisy retrieval hits for 3 totally unrelated licenses
+        # (liquor, signboard tax, VAT — all sharing the word "ภาษี") purely by keyword overlap.
+        # This hint then told the LLM the user asked about all 3 "together", forcing it to
+        # frame its whole answer around licenses the user never mentioned — the actual
+        # relevant business_guide document (which DID have the answer) was never even
+        # referenced in the instruction, and the LLM answered [[INFO_GAP]] instead. Fixed by
+        # requiring each license_type name to actually appear in the user's own query text
+        # (same substring/ASCII-token check already used for main_topic/sub_topic chapter-fetch
+        # matching elsewhere in this codebase) before trusting it as "explicitly requested".
         if _is_multi_license_docs:
-            _hint_lts = list(dict.fromkeys(
+            _hint_lts_raw = list(dict.fromkeys(
                 (d.get("metadata") or {}).get("license_type", "").strip()
                 for d in _all_docs
                 if (d.get("metadata") or {}).get("license_type", "")
             ))
+            _user_text_lower_mlh = user_text.lower()
+            _hint_lts = [
+                lt for lt in _hint_lts_raw
+                if _shared_topic_label_matches_query(lt, _user_text_lower_mlh)
+            ]
             if len(_hint_lts) >= 2:
                 _topic_hint += (
                     f"\n\n💡 MULTI-LICENSE: user ถามเรื่อง {', '.join(_hint_lts)} พร้อมกัน"
@@ -5167,13 +5418,7 @@ Rules:
         # Injected when user asks about fees (ค่าธรรมเนียม/เท่าไหร่/กี่วัน) but has NOT asked
         # to actually register/apply (no action intent). Forces action="answer" with all fee
         # tiers combined — avoids unnecessary entity_type/operation_group asking.
-        _is_fee_info_q = bool(re.search(
-            r"ค่าธรรมเนียม|เท่าไหร่|กี่บาท|กี่วัน|กี่เดือน|กี่ปี|ค่าใช้จ่าย|ระยะเวลา",
-            _intent_text, re.IGNORECASE,
-        )) and not bool(re.search(
-            r"อยากจด|ต้องการจด|จะจด|จะสมัคร|อยากสมัคร|ต้องการสมัคร|วิธีจด|ขั้นตอนการจด",
-            _intent_text, re.IGNORECASE,
-        ))
+        _is_fee_info_q = _shared_is_fee_or_duration_info_query(_intent_text)
         _fee_info_instruction = ""
         if _is_fee_info_q:
             _fee_info_instruction = """
@@ -5181,10 +5426,17 @@ Rules:
 ⚠️ FEE / DURATION INFORMATIONAL QUERY — MANDATORY RULES:
 - action MUST be "answer". DO NOT set action="ask".
 - DO NOT ask for entity_type, registration_type, or operation_group.
-- Scan ALL DOCUMENTS for ค่าธรรมเนียม (fees) or ระยะเวลา (duration) fields.
+- Scan ALL DOCUMENTS for the relevant number(s) — for regulatory DOCUMENTS this is usually a
+  structured ค่าธรรมเนียม (fees) or ระยะเวลา (duration) field; for business_guide/marketing
+  DOCUMENTS (no license_type, content lives in answer_guideline) the number/rate/table may be
+  embedded in that narrative content instead (e.g. a tax-bracket table, a cost percentage) —
+  read the FULL document content, don't limit the scan to fields literally named "fees"/
+  "ระยะเวลา", or you will miss a correct answer that's really there.
 - If values differ by entity or sub-type: list ALL tiers together in one concise answer
   (e.g. "ตั้งใหม่ 50 บาท ทุกประเภท กรณีบริษัทจำกัดมีค่าบริคณห์สนธิเพิ่ม 500 บาท").
-- Keep the answer SHORT — just the fee/duration and one brief contextual note if relevant.
+- Keep the answer SHORT — just the fee/duration/rate and one brief contextual note if relevant
+  (a short tiered table, e.g. 3 tax brackets, still counts as "short" — don't drop tiers to
+  force brevity).
 - Do NOT list full registration steps or document requirements unless explicitly asked.
 """
 
@@ -5679,11 +5931,11 @@ Your JSON response:
                         pass
                 if _known_ent:
                     _retrieved_all = self._retrieve_docs(
-                        q, metadata_filter={"entity_type_normalized": _known_ent}
+                        q, metadata_filter={"entity_type_normalized": _known_ent}, state=state
                     )
                     # Fallback: if filtered returns nothing, try unfiltered + post-filter
                     if not _retrieved_all:
-                        _retrieved_all = self._retrieve_docs(q)
+                        _retrieved_all = self._retrieve_docs(q, state=state)
                         _filtered = [
                             d for d in _retrieved_all
                             if not ((d.get("metadata") or {}).get("entity_type_normalized") or "").strip()
@@ -5693,7 +5945,7 @@ Your JSON response:
                     else:
                         state.current_docs = _retrieved_all
                 else:
-                    state.current_docs = self._retrieve_docs(q)
+                    state.current_docs = self._retrieve_docs(q, state=state)
                 state.last_retrieval_query = q
                 tmp = [
                     {"content": d.get("content", "")[:120], "metadata": d.get("metadata", {})}

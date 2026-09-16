@@ -538,19 +538,44 @@ def build_broad_question_detect_prompt(user_text: str) -> str:
     Called when _BROAD_Q_RE regex misses; catches variant phrasing like
     "อยากทราบว่าต้องจัดการอะไรบ้าง", "ต้องดูแลเรื่องอะไรบ้างสำหรับร้านอาหาร".
     Confidence threshold: 0.75.
+
+    2026-09 bug fix: live-reproduced this over-firing is_broad=true (conf=0.95) on
+    "การหาพื้นที่ฐานลูกค้าทำได้กี่วิธี อะไรบ้าง" — a narrow question about ONE
+    business_guide topic (methods for finding a customer catchment area), not a
+    multi-license/multi-dimension overview. Root cause: every original is_broad=true
+    example ends in "...อะไรบ้าง" ("what are they"), so the model appears to have
+    generalized that ENDING alone as the signal, rather than the actual thing that
+    makes those examples broad — that they span MULTIPLE regulatory/business
+    dimensions (licenses+tax+registration), not that they're phrased as a list.
+    "อะไรบ้าง" is exceedingly common in ordinary Thai questions asking to enumerate
+    sub-items WITHIN one already-narrow topic (factors, methods, types, steps) —
+    that phrasing alone carries no breadth signal. Added an explicit rule plus
+    counter-examples naming this exact failure shape so the distinction is
+    unambiguous: count DISTINCT dimensions being asked about, not "อะไรบ้าง".
+    Consequence when this misfires: triggers the expensive two-pass regulatory
+    sweep, merging in unrelated docs that can blow the session token budget and
+    produce a broken info-gap answer for what should have been a simple question.
     """
     return (
-        "คุณคือ classifier ตรวจว่า user ถาม 'ภาพรวม' (ต้องการรายการหลายอย่างพร้อมกัน) หรือ 'เฉพาะเจาะจง' (ถามเรื่องเดียว)\n"
+        "คุณคือ classifier ตรวจว่า user ถาม 'ภาพรวม' (ครอบคลุมหลายมิติ/หลายใบอนุญาต/หลายหัวข้อพร้อมกัน)"
+        " หรือ 'เฉพาะเจาะจง' (ถามเรื่องเดียว แม้จะขอให้แจกแจงเป็นรายการย่อยภายในเรื่องนั้นก็ตาม)\n"
         f"user_text: {user_text}\n\n"
-        "is_broad=true — user ถามแบบภาพรวม เช่น:\n"
+        "กฎสำคัญ: คำว่า 'อะไรบ้าง'/'มีอะไรบ้าง' เพียงอย่างเดียว **ไม่ใช่สัญญาณว่าเป็นคำถามภาพรวม** —\n"
+        "คำนี้ใช้ได้ทั้งกับคำถามภาพรวมจริง (หลายมิติ) และคำถามเฉพาะเจาะจงที่แค่ขอให้แจกแจงรายการย่อย\n"
+        "ภายในหัวข้อเดียว (เช่น ปัจจัย/วิธีการ/ประเภท/ขั้นตอนของเรื่องเดียว) ให้นับว่า user ถามกี่ 'มิติ'\n"
+        "(ใบอนุญาตประเภทต่างๆ / ภาษีประเภทต่างๆ / การจดทะเบียนหลายแบบ) ไม่ใช่ดูแค่รูปประโยค\n\n"
+        "is_broad=true — ครอบคลุมหลายมิติจริง เช่น:\n"
         "- 'เปิดร้านอาหารต้องทำอะไรบ้าง' → ครอบคลุมหลายด้าน (ใบอนุญาต+ภาษี+จดทะเบียน)\n"
-        "- 'ต้องจ่ายภาษีอะไรบ้าง' → ขอรายการ ไม่ใช่ถามภาษีใดภาษีหนึ่ง\n"
-        "- 'ต้องขอใบอนุญาตอะไรบ้าง' → ขอรายการ\n"
+        "- 'ต้องจ่ายภาษีอะไรบ้าง' → ขอรายการภาษีหลายประเภท ไม่ใช่ถามภาษีใดภาษีหนึ่ง\n"
+        "- 'ต้องขอใบอนุญาตอะไรบ้าง' → ขอรายการใบอนุญาตหลายประเภท\n"
         "- 'ต้องจดทะเบียนอะไรบ้าง' / 'ต้องดูแลอะไรบ้าง'\n\n"
-        "is_broad=false — user ถามเฉพาะเจาะจง เช่น:\n"
+        "is_broad=false — เรื่องเดียว แม้จะลงท้ายด้วย 'อะไรบ้าง' ก็ตาม เช่น:\n"
         "- 'VAT ต้องจดยังไง' → ถาม VAT อย่างเดียว\n"
         "- 'ใบอนุญาตจัดตั้งต้องใช้เอกสารอะไร' → ถามใบอนุญาตเดียว\n"
-        "- 'ขั้นตอนจดทะเบียนพาณิชย์' → เรื่องเดียว\n\n"
+        "- 'ขั้นตอนจดทะเบียนพาณิชย์' → เรื่องเดียว\n"
+        "- 'การหาพื้นที่ฐานลูกค้าทำได้กี่วิธี อะไรบ้าง' → เรื่องเดียว (วิธีหาทำเลลูกค้า) แค่ขอแจกแจง\n"
+        "  วิธีการภายในหัวข้อนั้น ไม่ได้ถามหลายมิติของธุรกิจ\n"
+        "- 'ปัจจัยสำคัญในการเลือกทำเลมีอะไรบ้าง' → เรื่องเดียว (ปัจจัยเลือกทำเล) ไม่ใช่ภาพรวมธุรกิจ\n\n"
         'ตอบ JSON เท่านั้น: {"is_broad": true/false, "confidence": 0.0}\n'
         "confidence < 0.75 → is_broad=false"
     )

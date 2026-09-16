@@ -526,7 +526,7 @@ async def chat(request: ChatRequest, http_request: Request):
         # Session-level token budget: monitor-only (no blocking).
         _pre_prompt = getattr(state, "total_prompt_tokens", 0) or 0
         _pre_completion = getattr(state, "total_completion_tokens", 0) or 0
-        _pre_cost = getattr(state, "total_cost_usd", 0.0) or 0.0
+        _pre_cost = getattr(state, "total_cost", 0.0) or 0.0
         _pre_tokens = _pre_prompt + _pre_completion
         _session_budget = int(getattr(conf, "TOKEN_BUDGET_PER_SESSION", 0) or 0)
         if _session_budget > 0 and _pre_tokens >= _session_budget:
@@ -580,7 +580,8 @@ async def chat(request: ChatRequest, http_request: Request):
                 session_id=session_id,
                 persona_id=state.persona_id,
                 cached=True,
-                cache_stats=cache.get_stats()
+                cache_stats=cache.get_stats(),
+                total_cost=0.0,
             )
 
         logger.info(f"[{session_id}] Cache MISS - Calling LLM")
@@ -600,9 +601,9 @@ async def chat(request: ChatRequest, http_request: Request):
         # calls, and re-pricing that blended token delta at a single assumed model
         # would misprice every Haiku token at the main model's (higher) rate. Each
         # LLM call already accumulates its own correctly-priced cost onto
-        # state.total_cost_usd at the source (llm_call.py, where the real model for
+        # state.total_cost at the source (llm_call.py, where the real model for
         # THAT call is known) — so the delta here is already accurate as-is.
-        _post_cost = getattr(state, "total_cost_usd", 0.0) or 0.0
+        _post_cost = getattr(state, "total_cost", 0.0) or 0.0
         _actual_cost = max(0.0, _post_cost - _pre_cost)
         # Don't cache "no answer found" fallbacks — a transient retrieval/model
         # hiccup would otherwise poison the shared (__shared__) cache key and
@@ -638,7 +639,8 @@ async def chat(request: ChatRequest, http_request: Request):
             session_id=session_id,
             persona_id=state.persona_id,
             cached=False,
-            cache_stats=cache.get_stats()
+            cache_stats=cache.get_stats(),
+            total_cost=round(_actual_cost, 6),
         )
         # If the turn's answer call crossed the session token budget, the actual
         # summarize/trim work (an LLM call) was deferred (see llm_call.py's
@@ -716,7 +718,7 @@ async def _stream_reply(
         # Session-level token budget: monitor-only (no blocking).
         _pre_prompt_st = getattr(state, "total_prompt_tokens", 0) or 0
         _pre_completion_st = getattr(state, "total_completion_tokens", 0) or 0
-        _pre_cost_st = getattr(state, "total_cost_usd", 0.0) or 0.0
+        _pre_cost_st = getattr(state, "total_cost", 0.0) or 0.0
         _pre_tokens_st = _pre_prompt_st + _pre_completion_st
         _session_budget_st = int(getattr(conf, "TOKEN_BUDGET_PER_SESSION", 0) or 0)
         if _session_budget_st > 0 and _pre_tokens_st >= _session_budget_st:
@@ -798,8 +800,8 @@ async def _stream_reply(
                 # Real cost delta — see matching comment in the non-streaming /chat
                 # handler above (a turn often mixes one main-persona call with several
                 # cheap Haiku classifier calls; each already accumulates its own
-                # correctly-priced cost onto state.total_cost_usd at the source).
-                _post_cost_st = getattr(state, "total_cost_usd", 0.0) or 0.0
+                # correctly-priced cost onto state.total_cost at the source).
+                _post_cost_st = getattr(state, "total_cost", 0.0) or 0.0
                 _stream_cost = max(0.0, _post_cost_st - _pre_cost_st)
 
                 # See matching comment in the non-streaming /chat handler above —
@@ -853,7 +855,7 @@ async def _stream_reply(
         yield f"data: {json.dumps({'type': 'chunk', 'text': chunk}, separators=(',', ':'))}\n\n"
         await asyncio.sleep(0.008 if not _stream_cached else 0.003)
 
-    yield f"data: {json.dumps({'type': 'done', 'session_id': session_id, 'persona_id': _stream_persona_id, 'cached': _stream_cached}, separators=(',', ':'))}\n\n"
+    yield f"data: {json.dumps({'type': 'done', 'session_id': session_id, 'persona_id': _stream_persona_id, 'cached': _stream_cached, 'total_cost': round(_stream_cost, 6)}, separators=(',', ':'))}\n\n"
 
 
 @api_v1.post("/chat/stream")

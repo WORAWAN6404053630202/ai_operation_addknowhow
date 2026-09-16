@@ -54,9 +54,11 @@ def _url(path: str) -> str:
     return f"{BASE_URL}{API_PREFIX}{path}"
 
 
-def new_session(session: "requests.Session") -> str:
-    """Call /greeting and return session_id."""
-    resp = session.post(_url("/greeting"), json={}, timeout=DEFAULT_TIMEOUT)
+def new_session(session: "requests.Session", persona_id: str = "practical") -> str:
+    """Call /greeting and return session_id. persona_id defaults to "practical"
+    (the API's own default) — passing it explicitly here only matters for
+    callers that need "academic" (see TestCase.persona_id)."""
+    resp = session.post(_url("/greeting"), json={"persona_id": persona_id}, timeout=DEFAULT_TIMEOUT)
     resp.raise_for_status()
     return resp.json()["session_id"]
 
@@ -232,6 +234,7 @@ class TestCase:
     name: str
     steps: List[Step]
     category: int = 0
+    persona_id: str = "practical"
 
 
 @dataclass
@@ -272,7 +275,7 @@ class TestRunner:
         result = TestResult(test_case=tc)
         session_id = None
         try:
-            session_id = new_session(self._http)
+            session_id = new_session(self._http, persona_id=tc.persona_id)
             for i, step in enumerate(tc.steps):
                 print(f"    step {i+1}: {step.message[:60]!r}")
                 resp_data = chat(self._http, session_id, step.message)

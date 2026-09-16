@@ -110,7 +110,10 @@ from utils.text_patterns import (
     ENTITY_HINT_RE as _SHARED_ENTITY_HINT_RE,
     GENERIC_FOLLOWUP_KEYWORDS_RE as _SHARED_GENERIC_FOLLOWUP_KEYWORDS_RE,
     SPECIFIC_TOPIC_RE as _SHARED_SPECIFIC_TOPIC_RE,
+    SPECIFIC_LICENSE_INDICATOR_RE as _SHARED_SPECIFIC_LICENSE_INDICATOR_RE,
     topic_label_matches_query,
+    filter_by_specific_topic_conflict as _shared_filter_by_specific_topic_conflict,
+    ACTION_INTENT_RE as _SHARED_ACTION_INTENT_RE,
 )
 from utils.prompts_supervisor import (
     build_topic_picker_prompt,
@@ -447,17 +450,9 @@ class PersonaSupervisor:
     # Specificity override for broad_q detection: when these license names/codes appear in the
     # query, it is a targeted question about a specific license — not a broad overview.
     # e.g. "ขอใบภาษีมูลค่าเพิ่ม ภพ.20 ต้องใช้เอกสารอะไรบ้าง" is targeted, not broad.
-    _SPECIFIC_LICENSE_INDICATOR_RE = re.compile(
-        # Specific form/tax codes
-        r"ภพ\.\s*\d|ภส\.\s*\d|ภป\.\s*\d|สณ\.\s*\d|บอจ\.\s*\d|VAT|ภ\.อ\."
-        # Named license types
-        r"|ใบภาษีมูลค่าเพิ่ม|ใบทะเบียนพาณิชย์|ทะเบียนพาณิชย์"
-        r"|ใบอนุญาตจัดตั้ง|ใบอนุญาตจำหน่ายสุรา|ใบอนุญาตจำหน่าย"
-        r"|ใบรับรองมาตรฐานร้านอาหาร|ใบวุฒิบัตรผู้สัมผัสอาหาร"
-        r"|ใบรับรองแพทย์|แบบแสดงรายการภาษีป้าย"
-        r"|ประกันสังคม|กองทุนประกันสังคม",
-        re.IGNORECASE,
-    )
+    # Definition + history moved to utils/text_patterns.py (2026-09) so
+    # persona_academic.py can share it too — see that module's docstring.
+    _SPECIFIC_LICENSE_INDICATOR_RE = _SHARED_SPECIFIC_LICENSE_INDICATOR_RE
     # Broad/overview question: triggers two-pass retrieval (pass1=user intent, pass2=regulatory).
     # Covers two categories:
     #   A) Business-opening questions: "อยากเปิดร้านต้องทำอะไรบ้าง" — spans all dimensions
@@ -552,7 +547,14 @@ class PersonaSupervisor:
         r"|(?:วันพระ|วันหยุดราชการ|วันสำคัญ).{0,30}(?:ขาย|จำหน่าย|ซื้อ).{0,15}(?:เหล้า|สุรา|แอลกอฮอล์|เบียร์|ไวน์)"
         r"|(?:เหล้า|สุรา|แอลกอฮอล์|เบียร์|ไวน์).{0,30}(?:วันพระ|วันหยุดราชการ|วันสำคัญ)"
         r"|ขาย(?:เหล้า|สุรา|แอลกอฮอล์|เบียร์|ไวน์)(?:ได้|ไม่ได้).{0,30}(?:วัน|เวลา|โมง|กี่)"
-        r"|(?:วัน|เวลา|โมง)(?:ไหน|ใด).{0,20}(?:ขาย|จำหน่าย).{0,20}(?:เหล้า|สุรา|แอลกอฮอล์|เบียร์|ไวน์)",
+        r"|(?:วัน|เวลา|โมง)(?:ไหน|ใด).{0,20}(?:ขาย|จำหน่าย).{0,20}(?:เหล้า|สุรา|แอลกอฮอล์|เบียร์|ไวน์)"
+        # Separate-account queries — the account-name/same-bank matching condition
+        # (identification_documents field) is the same regardless of entity type;
+        # only the NAME that must match differs (owner's name vs. company name),
+        # which doesn't change the yes/no conclusion itself.
+        # e.g. "ต้องมีบัญชีธนาคารแยกต่างหากไหม", "ใช้บัญชีเดิมได้ไหม"
+        r"|บัญชี.{0,15}แยก(?:ต่างหาก)?.{0,10}(?:ไหม|หรือไม่|หรือเปล่า)?"
+        r"|(?:ใช้|เปิด)บัญชี(?:เดิม|ใหม่).{0,15}(?:ได้ไหม|ได้หรือไม่|ได้หรือเปล่า)",
         re.IGNORECASE,
     )
     # Post-submission follow-up query: user already applied/submitted documents and is
@@ -943,7 +945,7 @@ class PersonaSupervisor:
             )
             _reply = extract_llm_text(
                 llm_invoke(_llm, [SystemMessage(content=_system), HumanMessage(content=raw_input)],
-                           logger=_LOG, label="Supervisor/deflect")
+                           logger=_LOG, label="Supervisor/deflect", state=state)
             ).strip()
             # Hard-enforce single line — collapse any newlines the LLM sneaks in
             _reply = " ".join(_reply.splitlines()).strip()
@@ -1029,7 +1031,7 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(last_hint: str, candidates: List[str], k: int, banned: List[str]) -> dict:
+        def _call(last_hint: str, candidates: List[str], k: int, banned: List[str], state=None) -> dict:
             cand = [str(x).strip() for x in (candidates or []) if str(x).strip()]
             cand = cand[:40]
             banned2 = [str(x).strip() for x in (banned or []) if str(x).strip()]
@@ -1038,7 +1040,7 @@ class PersonaSupervisor:
             prompt = build_topic_picker_prompt(last_hint, k, banned2, cand)
 
             try:
-                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/topic_picker")).strip()
+                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/topic_picker", state=state)).strip()
             except Exception as e:
                 # LengthFinishReasonError: retry ไม่ช่วย — skip แล้วใช้ fallback
                 if "LengthFinishReasonError" in type(e).__name__ or "LengthFinishReason" in str(e)[:80]:
@@ -1068,10 +1070,10 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_confirm_prompt(user_text)
             try:
-                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/llm")).strip()
+                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/llm", state=state)).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/confirm] LLM call failed: %s", _e)
                 return {}
@@ -1099,10 +1101,10 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, last_query: str = "") -> dict:
+        def _call(user_text: str, last_query: str = "", state=None) -> dict:
             prompt = build_style_detect_prompt(user_text, last_query)
             try:
-                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/llm")).strip()
+                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/llm", state=state)).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/style] LLM call failed: %s", _e)
                 return {}
@@ -1137,11 +1139,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(kind: str, persona_id: str, last_topic_hint: str, include_intro: bool) -> dict:
+        def _call(kind: str, persona_id: str, last_topic_hint: str, include_intro: bool, state=None) -> dict:
             kind_instructions = build_greet_kind_instructions(kind, last_topic_hint)
             prompt = build_greet_prefix_prompt(kind, persona_id, last_topic_hint, include_intro, kind_instructions)
             try:
-                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/greet")).strip()
+                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/greet", state=state)).strip()
             except Exception as _e:
                 _LOG.debug("[Supervisor/greet] LLM call failed: %s", _e)
                 return {}
@@ -1192,13 +1194,13 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(license_type: str, raw_ops: List[str]) -> dict:
+        def _call(license_type: str, raw_ops: List[str], state=None) -> dict:
             if not raw_ops:
                 return {"groups": []}
             prompt = build_op_group_classifier_prompt(license_type, raw_ops)
             try:
                 text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)],
-                                  logger=_LOG, label="Supervisor/op_group_classify")).strip()
+                                  logger=_LOG, label="Supervisor/op_group_classify", state=state)).strip()
                 text = self._strip_code_fences(text)
                 obj = json.loads(text)
                 return obj if isinstance(obj, dict) else {"groups": []}
@@ -1229,13 +1231,13 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(options: List[str]) -> dict:
+        def _call(options: List[str], state=None) -> dict:
             if len(options) <= 1:
                 return {"unique_options": options, "reasoning": "Only one option"}
             prompt = build_deduplicate_options_prompt(options)
-            
+
             try:
-                resp = llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/deduplicate")
+                resp = llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/deduplicate", state=state)
                 txt = extract_llm_text(resp).strip()
                 if txt.startswith("```json"):
                     txt = txt.replace("```json", "").replace("```", "").strip()
@@ -1285,10 +1287,10 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(slot_key: str, user_text: str, options: List[str]) -> dict:
+        def _call(slot_key: str, user_text: str, options: List[str], state=None) -> dict:
             prompt = build_slot_mapper_prompt(slot_key, user_text, options)
             try:
-                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/slot_mapper")).strip()
+                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/slot_mapper", state=state)).strip()
             except Exception as _e:
                 _LOG.debug("[Supervisor/slot_mapper] LLM call failed: %s", _e)
                 return {}
@@ -1302,7 +1304,7 @@ class PersonaSupervisor:
 
         return _call
 
-    def _check_select_all_intent_llm(self, key: str, user_text: str, options: List[str]) -> bool:
+    def _check_select_all_intent_llm(self, key: str, user_text: str, options: List[str], state=None) -> bool:
         """LLM fallback: detect 'select all options' intent for allow_multi slots.
         Called only when all regex/exact/fuzzy paths failed to identify the intent.
         Returns True when user clearly wants ALL options (confidence ≥ 0.70)."""
@@ -1310,7 +1312,7 @@ class PersonaSupervisor:
         try:
             prompt = build_select_all_intent_prompt(key, user_text, options)
             text = extract_llm_text(
-                llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/select_all")
+                llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/select_all", state=state)
             ).strip()
             text = self._strip_code_fences(text)
             obj = json.loads(text)
@@ -1353,10 +1355,10 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, last_query: str, persona: str) -> dict:
+        def _call(user_text: str, last_query: str, persona: str, state=None) -> dict:
             prompt = build_fallback_intent_prompt(user_text, last_query, persona)
             try:
-                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/fallback_intent")).strip()
+                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/fallback_intent", state=state)).strip()
             except Exception as _e:
                 _LOG.debug("[Supervisor/fallback_intent] LLM call failed: %s", _e)
                 return {}
@@ -1548,11 +1550,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, last_query: str) -> dict:
+        def _call(user_text: str, last_query: str, state=None) -> dict:
             prompt = build_entity_type_detect_prompt(user_text, last_query)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/entity_type")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/entity_type", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/entity_type] LLM call failed: %s", _e)
@@ -1582,11 +1584,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, last_query: str) -> dict:
+        def _call(user_text: str, last_query: str, state=None) -> dict:
             prompt = build_location_detect_prompt(user_text, last_query)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/location")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/location", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/location] LLM call failed: %s", _e)
@@ -1616,11 +1618,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, last_query: str) -> dict:
+        def _call(user_text: str, last_query: str, state=None) -> dict:
             prompt = build_operation_type_detect_prompt(user_text, last_query)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/operation_type")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/operation_type", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/operation_type] LLM call failed: %s", _e)
@@ -1650,11 +1652,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_area_size_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/area_size")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/area_size", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/area_size] LLM call failed: %s", _e)
@@ -1684,11 +1686,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, options: List[str]) -> dict:
+        def _call(user_text: str, options: List[str], state=None) -> dict:
             prompt = build_registration_type_detect_prompt(user_text, options)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/registration_type")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/registration_type", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/registration_type] LLM call failed: %s", _e)
@@ -1718,11 +1720,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, candidates: List[str]) -> dict:
+        def _call(user_text: str, candidates: List[str], state=None) -> dict:
             prompt = build_license_type_detect_prompt(user_text, candidates)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/license_type")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/license_type", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/license_type] LLM call failed: %s", _e)
@@ -1751,11 +1753,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, last_academic_query: str, section_count: int) -> dict:
+        def _call(user_text: str, last_academic_query: str, section_count: int, state=None) -> dict:
             prompt = build_academic_resume_detect_prompt(user_text, last_academic_query, section_count)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/academic_resume")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/academic_resume", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/academic_resume] LLM call failed: %s", _e)
@@ -1784,11 +1786,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, last_topic: str) -> dict:
+        def _call(user_text: str, last_topic: str, state=None) -> dict:
             prompt = build_elaborate_detect_prompt(user_text, last_topic)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/elaborate")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/elaborate", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/elaborate] LLM call failed: %s", _e)
@@ -1817,11 +1819,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_broad_question_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/broad_q")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/broad_q", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/broad_q] LLM call failed: %s", _e)
@@ -1850,11 +1852,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_slot_skip_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/slot_skip")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/slot_skip", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/slot_skip] LLM call failed: %s", _e)
@@ -1883,11 +1885,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, last_topic: str) -> dict:
+        def _call(user_text: str, last_topic: str, state=None) -> dict:
             prompt = build_followup_contextual_detect_prompt(user_text, last_topic)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/followup_ctx")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/followup_ctx", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/followup_ctx] LLM call failed: %s", _e)
@@ -1916,11 +1918,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_thanks_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/thanks")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/thanks", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/thanks] LLM call failed: %s", _e)
@@ -1949,11 +1951,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_academic_stop_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/academic_stop")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/academic_stop", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/academic_stop] LLM call failed: %s", _e)
@@ -1982,11 +1984,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, last_topic: str) -> dict:
+        def _call(user_text: str, last_topic: str, state=None) -> dict:
             prompt = build_new_topic_detect_prompt(user_text, last_topic)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/new_topic")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/new_topic", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/new_topic] LLM call failed: %s", _e)
@@ -2015,11 +2017,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_smalltalk_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/smalltalk")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/smalltalk", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/smalltalk] LLM call failed: %s", _e)
@@ -2048,11 +2050,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_switch_without_target_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/switch_no_target")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/switch_no_target", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/switch_no_target] LLM call failed: %s", _e)
@@ -2081,11 +2083,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_link_request_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/link_request")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/link_request", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/link_request] LLM call failed: %s", _e)
@@ -2114,11 +2116,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_mode_status_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/mode_status")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/mode_status", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/mode_status] LLM call failed: %s", _e)
@@ -2147,11 +2149,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_greeting_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/greeting")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/greeting", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/greeting] LLM call failed: %s", _e)
@@ -2187,10 +2189,10 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str, last_topic: str) -> dict:
+        def _call(user_text: str, last_topic: str, state=None) -> dict:
             prompt = build_typo_check_prompt(user_text, last_topic)
             try:
-                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/typo_check")).strip()
+                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/typo_check", state=state)).strip()
             except Exception:
                 return {}
             text = self._strip_code_fences(text)
@@ -2217,11 +2219,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_info_action_q_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/info_action_q")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/info_action_q", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/info_action_q] LLM call failed: %s", _e)
@@ -2250,11 +2252,11 @@ class PersonaSupervisor:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-        def _call(user_text: str) -> dict:
+        def _call(user_text: str, state=None) -> dict:
             prompt = build_legal_q_detect_prompt(user_text)
             try:
                 text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/legal_q")
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/legal_q", state=state)
                 ).strip()
             except Exception as _e:
                 _LOG.warning("[Supervisor/legal_q] LLM call failed: %s", _e)
@@ -2345,7 +2347,7 @@ class PersonaSupervisor:
 
         return {"wants_short": wants_short, "wants_long": wants_long}
 
-    def _infer_user_style_request_hybrid(self, s: str, last_query: str = "") -> Dict[str, Any]:
+    def _infer_user_style_request_hybrid(self, s: str, last_query: str = "", state=None) -> Dict[str, Any]:
         text = s or ""
 
         # 1. Fast-path: deterministic keyword check (no LLM cost)
@@ -2384,9 +2386,9 @@ class PersonaSupervisor:
         res: Dict[str, Any] = {}
         try:
             if self._llm_style_call_arity >= 2:
-                res = self.llm_style_call(text, last_query) or {}
+                res = self.llm_style_call(text, last_query, state=state) or {}
             else:
-                res = self.llm_style_call(text) or {}
+                res = self.llm_style_call(text, state=state) or {}
         except Exception:
             res = {}
 
@@ -3361,6 +3363,7 @@ class PersonaSupervisor:
                     for _qv in _q_match_variants_e
                 )
             ]
+            _matched_ots_e = self._filter_by_specific_topic_conflict(q, _matched_ots_e, label="operation_topic")
             if _matched_ots_e and not _skip_op_topic_for_info:
                 # Prefer exact match over substring match — prevents "รับชำระภาษีป้าย"
                 # from being overtaken by the longer "ยกเลิกรับชำระภาษีป้าย" via max(len).
@@ -3393,6 +3396,39 @@ class PersonaSupervisor:
                         include=["documents", "metadatas"],
                     )
                     _ot_max_e = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700) or 700)
+                    # Non-reg completeness (2026-09, same reasoning as the sub_topic-fetch
+                    # sibling below): an operation_topic exact-match returns only that ONE
+                    # row, which is correct for regulatory content but wrong for the
+                    # marketing/business_guide know-how sheets — those deliberately split
+                    # one broad chapter (e.g. "กลยุทธ์ด้านการสื่อสาร", 23 rows) into many
+                    # sibling operation_topic/sub_topic values, so matching the definition
+                    # row alone silently produces a "definition only" answer to a "what
+                    # strategies should I use" question (live-reproduced, qa_12case case
+                    # 3 — this specific query matches via operation_topic, not sub_topic,
+                    # so needs its own expansion here too). Scoped to non-regulatory
+                    # data_type only — regulatory operation_topic matches are untouched.
+                    _ot_parent_mt_e = ""
+                    try:
+                        _ot_first_md_e = (_ot_res_e.get("metadatas") or [None])[0] or {}
+                        _ot_data_type_e = str(_ot_first_md_e.get("data_type") or "").strip().lower()
+                        _ot_parent_mt_e = str(_ot_first_md_e.get("main_topic") or "").strip()
+                        if _ot_data_type_e in ("marketing", "business_guide") and _ot_parent_mt_e:
+                            _ot_chapter_res_e = _coll_e.get(
+                                where={"main_topic": _ot_parent_mt_e},
+                                include=["documents", "metadatas"],
+                            )
+                            if len(_ot_chapter_res_e.get("metadatas") or []) > len(_ot_res_e.get("metadatas") or []):
+                                _ot_res_e = _ot_chapter_res_e
+                                _LOG.info(
+                                    "[Supervisor] _ensure: op_topic→main_topic expansion (non-reg): "
+                                    "%r → chapter %r (%d docs)",
+                                    _target_ot_e, _ot_parent_mt_e, len(_ot_res_e.get("metadatas") or []),
+                                )
+                        else:
+                            _ot_parent_mt_e = ""
+                    except Exception as _e_ot_expand:
+                        _LOG.warning("[Supervisor] _ensure: op_topic→main_topic expansion failed: %s", _e_ot_expand)
+                        _ot_parent_mt_e = ""
                     _ot_docs_e = [
                         {"content": (c or "")[:_ot_max_e], "metadata": m or {}}
                         for c, m in zip(
@@ -3400,6 +3436,13 @@ class PersonaSupervisor:
                             _ot_res_e.get("metadatas") or [],
                         )
                     ]
+                    # Cross-sheet completeness (2026-09): non-reg chapter-fetch found its
+                    # own chapter but a DIFFERENT, more directly relevant chapter may live
+                    # in another sheet entirely (see _merge_cross_chapter_docs_for_nonreg
+                    # docstring — live-verified case: "กลยุทธ์การตั้งราคา" exact-matches a
+                    # thinner chapter while "กลยุทธ์ด้านราคา" elsewhere is the real answer).
+                    if _ot_parent_mt_e:
+                        _ot_docs_e = self._merge_cross_chapter_docs_for_nonreg(_ot_docs_e, _ot_parent_mt_e, q)
                     # Also fetch the "การ" prefix variant — data often has the same operation
                     # split as e.g. "ยื่นภาษีป้าย" (in-person) + "การยื่นภาษีป้าย" (online).
                     # The query "ยื่นภาษีป้าย" only matches the first; we must include both.
@@ -3471,13 +3514,22 @@ class PersonaSupervisor:
                             )
                             _ot_skip_return = True
                         if not _ot_skip_return:
+                            # Exact op_topic match → clear stale slot queue from prior turns,
+                            # BEFORE the entity-injection check below so a freshly-injected
+                            # entity_type slot isn't wiped out by this same clear (2026-09: this
+                            # exact ordering bug was live-reproduced — the entity_type slot was
+                            # correctly injected below, then silently erased by this pop firing
+                            # afterward at the end of the block; moved here to match the OBD
+                            # path's already-correct pop-before-inject order).
+                            state.context.pop("topic_slot_queue", None)
+                            state.context.pop("pending_slot", None)
                             # Entity variety: same check as OBD path — inject entity_type slot
                             # when docs cover both บุคคลธรรมดา and นิติบุคคล and entity not yet known.
                             # _direct_topic_match blocks the check inside Practical (line 3742).
                             _ot_session_et = str(
                                 (state.context.get("collected_slots") or {}).get("entity_type") or ""
                             ).strip()
-                            if not _ot_session_et:
+                            if not _ot_session_et and self._entity_slot_needed(q):
                                 _et_in_ot = {
                                     str(d.get("metadata", {}).get("entity_type_normalized") or "").strip()
                                     for d in _ot_docs_e
@@ -3572,9 +3624,6 @@ class PersonaSupervisor:
                                         _is_def_q_ot = True
                             if _is_def_q_ot:
                                 state.context["_informational_query"] = True
-                            # Exact op_topic match → clear stale slot queue from prior turns.
-                            state.context.pop("topic_slot_queue", None)
-                            state.context.pop("pending_slot", None)
                             _LOG.info(
                                 "[Supervisor] _ensure: op_topic chapter retrieval: %r → %d docs",
                                 _target_ot_e, len(_ot_docs_e),
@@ -3608,6 +3657,22 @@ class PersonaSupervisor:
                             and (_n == _q_dedup_obd or _n in _q_dedup_obd))
                     ))(re.sub(r"\s+", " ", obd.lower().strip()))
                 ]
+                # Conflicting-specific-topic guard (2026-09): an OBD value being
+                # "unique to a single license_type" doesn't mean a query containing
+                # it is unambiguous — the query can ALSO independently name a
+                # totally different, more specific topic that should take priority.
+                # Live-reproduced: "ร้านอาหารต้องมีบัญชีธนาคารแยกต่างหากไหมคะ ถึงจะ
+                # เปิดรับ QR Payment ได้" contains the short, generic OBD "บัญชีธนาคาร"
+                # (→ license_type "บัญชีธนาคารรับเงิน", an unrelated standalone
+                # account-admin category) AND explicitly names "QR Payment" — the
+                # OBD match short-circuited straight to the wrong 4 docs, even
+                # though plain semantic/hybrid retrieval (verified directly, no
+                # OBD shortcut) already ranks the correct QR Payment docs
+                # correctly on its own. Only fires when the specific-indicator
+                # term isn't part of the matched OBD text itself, so it doesn't
+                # affect the normal case (OBD's own license IS the specific topic
+                # named, e.g. "การสมัคร เครื่องรูดบัตร EDC" when the query says "EDC").
+                _matched_obds_e = self._filter_by_specific_topic_conflict(q, _matched_obds_e, label="OBD")
                 if _matched_obds_e:
                     _target_obd_e = max(_matched_obds_e, key=len)
                     _coll_obd_e = self._get_chroma_collection()
@@ -4118,6 +4183,7 @@ class PersonaSupervisor:
                                     _vstore, q, k=_top_k_rare,
                                     metadata_filter={"license_type": _rare_lt},
                                     rrf_k=int(getattr(conf, "HYBRID_RRF_K", 60)),
+                                    bm25_bypass_min_ratio=float(getattr(conf, "BM25_BYPASS_MIN_RATIO", 0.35)),
                                 )
                             else:
                                 _scored = _vstore.similarity_search_with_relevance_scores(
@@ -4187,7 +4253,7 @@ class PersonaSupervisor:
         # before embedding. Use a SEPARATE variable so q stays clean for last_retrieval_query
         # (mutating q would cause Jaccard cache poisoning — see comment at last_retrieval_query
         # assignment below).
-        _q_embed = enrich_query_for_retrieval(q) if _qr_needs_rewrite(q) else q
+        _q_embed = enrich_query_for_retrieval(q, state=state) if _qr_needs_rewrite(q) else q
 
         # Query expansion: use shared SYNONYM_PATTERNS (utils/query_synonyms.py) — covers all 3 sheets
         _sv_expansions: list = []
@@ -4225,6 +4291,7 @@ class PersonaSupervisor:
                 mt for mt in _main_topic_candidates
                 if len(mt) >= 5 and topic_label_matches_query(mt, _q_lower_sv, _last_raw_human)
             ]
+            _matched_mts = self._filter_by_specific_topic_conflict(q, _matched_mts, label="main_topic")
             # When multiple main_topics match, pick the longest one (most specific).
             # E.g. query "การบริหารจัดการพนักงานภายในร้านอาหาร" matches both
             # "การฝึกอบรมพนักงาน" and "การบริหารจัดการพนักงานภายในร้านอาหาร" —
@@ -4282,6 +4349,7 @@ class PersonaSupervisor:
                 st for st in _sub_topic_candidates
                 if len(st) >= 8 and topic_label_matches_query(st, _q_lower_sv, _last_raw_human)
             ]
+            _matched_sts = self._filter_by_specific_topic_conflict(q, _matched_sts, label="sub_topic")
             # Also check operation_topic values — rows like the exemption row have
             # operation_topic='การจดทะเบียนพาณิชย์ที่ได้รับการยกเว้น' but sub_topic=None,
             # so they're invisible to sub_topic matching. Prefer the longer match overall.
@@ -4290,6 +4358,7 @@ class PersonaSupervisor:
                 ot for ot in _op_topic_candidates
                 if len(ot) >= 8 and topic_label_matches_query(ot, _q_lower_sv, _last_raw_human)
             ]
+            _matched_ots = self._filter_by_specific_topic_conflict(q, _matched_ots, label="sub_topic(operation_topic)")
             _target_st_sv = ""
             _use_op_topic_filter = False
             if _matched_sts or _matched_ots:
@@ -4314,6 +4383,82 @@ class PersonaSupervisor:
                             _st_res.get("documents") or [],
                             _st_res.get("metadatas") or [],
                         ))
+                        # Non-reg completeness (2026-09): a sub_topic exact-match only
+                        # returns that ONE row — for regulatory content this is correct
+                        # (each sub_topic is its own self-contained answer), but the
+                        # marketing/business_guide know-how sheets deliberately split one
+                        # broad chapter into 20+ sibling sub_topics (e.g. "กลยุทธ์ด้านการ
+                        # สื่อสาร" has 23 rows: Sales Objectives, Contact Points, IMC,
+                        # Social Media, ...). Matching just one sibling (e.g. "การสื่อสาร
+                        # การตลาด", the definition row) and stopping there silently
+                        # produces a "definition only" answer to a "what strategies
+                        # should I use" question — live-reproduced (qa_12case rerun,
+                        # case 3). Expand to the full main_topic chapter, but ONLY for
+                        # this non-regulatory data_type — regulatory sub_topic behavior
+                        # (the vast majority of chapter-fetch traffic, heavily tested)
+                        # is completely untouched.
+                        _st_data_type = ""
+                        _st_parent_mt = ""
+                        if (not _use_op_topic_filter) and _st_docs_raw:
+                            _st_first_md = _st_docs_raw[0][1] or {}
+                            _st_data_type = str(_st_first_md.get("data_type") or "").strip().lower()
+                            _st_parent_mt = str(_st_first_md.get("main_topic") or "").strip()
+                            if _st_data_type in ("marketing", "business_guide") and _st_parent_mt:
+                                # Generic-label guard (2026-09): unlike regulatory Sheet
+                                # chapter names (curated, usually specific), non-regulatory
+                                # sub_topic labels come from auto-generated book/marketing
+                                # chapter splits and can be broad generic terms that still
+                                # clear the len>=8 gate above (e.g. "ภาษีเงินได้" — a general
+                                # tax category, not a unique chapter name). Live-reproduced:
+                                # this exact label exact-matched an unrelated cost-reduction
+                                # chapter for a query that actually needed a DIFFERENT
+                                # chapter's SME tax table, silently locking onto the wrong
+                                # chapter with no error and hiding the correct answer even
+                                # though plain semantic/hybrid retrieval already ranked the
+                                # right chapter #1 on its own. Require semantic retrieval to
+                                # at least AGREE (or have no non-regulatory opinion) before
+                                # trusting the exact match — regulatory sub_topic behavior
+                                # (the vast majority of this mechanism's traffic, heavily
+                                # tested) is completely untouched by this check.
+                                try:
+                                    _st_sem_check = self._practical._retrieve_docs(q)
+                                except Exception as _e_st_sem:
+                                    _st_sem_check = []
+                                    _LOG.warning("[Supervisor] sub_topic non-reg semantic sanity check failed: %s", _e_st_sem)
+                                _st_sem_top_mt = ""
+                                for _d_sem in _st_sem_check:
+                                    _md_sem = (_d_sem or {}).get("metadata") or {}
+                                    if str(_md_sem.get("data_type") or "").strip().lower() in ("marketing", "business_guide"):
+                                        _st_sem_top_mt = str(_md_sem.get("main_topic") or "").strip()
+                                        break
+                                if _st_sem_top_mt and _st_sem_top_mt != _st_parent_mt:
+                                    _LOG.info(
+                                        "[Supervisor] sub_topic exact-match %r (chapter %r) rejected — "
+                                        "semantic top hit disagrees (chapter %r); falling back to normal retrieval",
+                                        _target_st_sv, _st_parent_mt, _st_sem_top_mt,
+                                    )
+                                    _st_docs_raw = []
+                                    _st_data_type = ""
+                                    _st_parent_mt = ""
+                            if _st_docs_raw and _st_data_type in ("marketing", "business_guide") and _st_parent_mt:
+                                try:
+                                    _st_chapter_res = _coll_st_sv.get(
+                                        where={"main_topic": _st_parent_mt},
+                                        include=["documents", "metadatas"],
+                                    )
+                                    _st_chapter_docs = list(zip(
+                                        _st_chapter_res.get("documents") or [],
+                                        _st_chapter_res.get("metadatas") or [],
+                                    ))
+                                    if len(_st_chapter_docs) > len(_st_docs_raw):
+                                        _st_docs_raw = _st_chapter_docs
+                                        _LOG.info(
+                                            "[Supervisor] sub_topic→main_topic expansion (non-reg): "
+                                            "%r → chapter %r (%d docs)",
+                                            _target_st_sv, _st_parent_mt, len(_st_docs_raw),
+                                        )
+                                except Exception as _e_st_expand:
+                                    _LOG.warning("[Supervisor] sub_topic→main_topic expansion failed: %s", _e_st_expand)
                         if _st_docs_raw:
                             _doc_chars_st_sv = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700) or 700)
                             _st_slim: List[Dict[str, Any]] = []
@@ -4324,12 +4469,59 @@ class PersonaSupervisor:
                                         continue
                                     _slim_st[_k_st] = str(_v_st)
                                 _st_slim.append({"content": (_fc_st or "")[:_doc_chars_st_sv], "metadata": _slim_st})
+                            # Cross-sheet completeness (2026-09): see
+                            # _merge_cross_chapter_docs_for_nonreg docstring — a different,
+                            # more directly relevant chapter may live in another sheet.
+                            if (not _use_op_topic_filter) and _st_data_type in ("marketing", "business_guide") and _st_parent_mt:
+                                _st_slim = self._merge_cross_chapter_docs_for_nonreg(_st_slim, _st_parent_mt, q)
                             state.current_docs = _st_slim
                             state.last_retrieval_query = _anchored_q if _anchored_q else q
                             state.context["last_user_legal_query"] = q
                             state.context["last_topic"] = _target_st_sv
                             state.context["_subtopic_chapter_used"] = True
                             if _use_op_topic_filter:
+                                # Entity variety: same check as the Step 0 op_topic path —
+                                # inject entity_type slot when docs cover both บุคคลธรรมดา
+                                # and นิติบุคคล and entity not yet known. Without this, setting
+                                # _direct_topic_match below silently disables persona_practical.py's
+                                # own entity-variety check with no replacement (2026-09 audit finding).
+                                _st_et_injected = False
+                                _st_session_et = str(
+                                    (state.context.get("collected_slots") or {}).get("entity_type") or ""
+                                ).strip()
+                                if not _st_session_et and self._entity_slot_needed(q):
+                                    _et_in_st = {
+                                        str(d.get("metadata", {}).get("entity_type_normalized") or "").strip()
+                                        for d in _st_slim
+                                    } - {"", "nan", "None"}
+                                    _st_combined_content = any(
+                                        re.search(r"บุคคลธรรมดา\s*\d+\.", str((raw_m or {}).get("identification_documents") or ""))
+                                        and re.search(r"นิติบุคคล\s*\d+\.", str((raw_m or {}).get("identification_documents") or ""))
+                                        for _fc_st2, raw_m in _st_docs_raw
+                                    )
+                                    _st_et_mixed = (
+                                        ("นิติบุคคล" in _et_in_st and "บุคคลธรรมดา" in _et_in_st)
+                                        or _st_combined_content
+                                    )
+                                    if _st_et_mixed:
+                                        _sq_st = list((state.context or {}).get("topic_slot_queue") or [])
+                                        _et_already_known_st = bool(
+                                            (state.get_collected_slots() if hasattr(state, "get_collected_slots") else {}).get("entity_type")
+                                        )
+                                        if not _et_already_known_st and not any(s.get("key") == "entity_type" for s in _sq_st):
+                                            _et_sorted_st = sorted(_et_in_st) if len(_et_in_st) >= 2 else ["นิติบุคคล", "บุคคลธรรมดา"]
+                                            state.context["topic_slot_queue"] = [{
+                                                "key": "entity_type",
+                                                "options": _et_sorted_st,
+                                                "display_options": _et_sorted_st,
+                                                "question": "ร้านของคุณดำเนินการในรูปแบบใดครับ",
+                                            }] + _sq_st
+                                            _st_et_injected = True
+                                            _LOG.info(
+                                                "[Supervisor] sub_topic(operation_topic) %r has mixed entity types %s"
+                                                " — asking entity_type first",
+                                                _target_st_sv, _et_sorted_st,
+                                            )
                                 # Exact operation_topic match → entity-neutral direct answer
                                 state.context["_direct_topic_match"] = True
                                 _is_def_q_st = bool(self._DEFINITION_Q_RE.search(q))
@@ -4349,8 +4541,14 @@ class PersonaSupervisor:
                                             _is_def_q_st = True
                                 if _is_def_q_st:
                                     state.context["_informational_query"] = True
-                                    state.context.pop("topic_slot_queue", None)
-                                    state.context.pop("pending_slot", None)
+                                    # Don't clear a topic_slot_queue we JUST injected above for
+                                    # this exact entity-mixed match (2026-09: identical ordering
+                                    # bug live-reproduced and fixed in the Step 0 op_topic path —
+                                    # see that block's comment) — a definition-style query with
+                                    # entity-variant docs should still ask before answering.
+                                    if not _st_et_injected:
+                                        state.context.pop("topic_slot_queue", None)
+                                        state.context.pop("pending_slot", None)
                             _st_filter_used = True
                             _LOG.info(
                                 "[Supervisor] %s chapter retrieval: %r → %d docs",
@@ -4384,6 +4582,7 @@ class PersonaSupervisor:
 
         _sv_hybrid = getattr(conf, "HYBRID_SEARCH_ENABLED", False)
         _sv_rrf_k = int(getattr(conf, "HYBRID_RRF_K", 60))
+        _sv_bm25_ratio = float(getattr(conf, "BM25_BYPASS_MIN_RATIO", 0.35))
         _sv_vstore = getattr(self.retriever, "vectorstore", None)
 
         def _sv_search(q: str, k: int, metadata_filter: Optional[dict] = None) -> list:
@@ -4392,6 +4591,7 @@ class PersonaSupervisor:
                 from utils.hybrid_retriever import hybrid_scored_search
                 return [d for d, _ in hybrid_scored_search(
                     _sv_vstore, q, k=k, rrf_k=_sv_rrf_k, metadata_filter=metadata_filter,
+                    bm25_bypass_min_ratio=_sv_bm25_ratio,
                 )]
             if metadata_filter and _sv_vstore is not None:
                 try:
@@ -4537,6 +4737,11 @@ class PersonaSupervisor:
                             )
                             _missing_lts_sorted = sorted(_missing_lts)
 
+                            # Positive signal for a genuine "new registration" OBD value —
+                            # this naming convention ("การจด.../การขอ.../การสมัคร...") holds
+                            # consistently across this dataset's license types.
+                            _NEW_REG_OBD_RE = re.compile(r"^(การจด|การขอ|การสมัคร)")
+
                             def _fetch_sweep_docs_for_lt(lt_miss: str) -> list:
                                 try:
                                     _hits = _sv_vstore.similarity_search(
@@ -4551,28 +4756,62 @@ class PersonaSupervisor:
                                             )
                                         )
                                     ]
-                                    if not _good:
-                                        # similarity_search returned only edit-type docs for this
-                                        # license_type (e.g. VAT: 22/25 Chroma docs are edit-type,
-                                        # similarity always surfaces those). Fall back to a direct
-                                        # metadata scan so we find the new-reg doc reliably.
+                                    # 2026-09: `_good` being non-empty does NOT guarantee it's
+                                    # actually the new-registration doc — _SWEEP_EDIT_RE is a
+                                    # blocklist of lifecycle-change keywords, and an obscure edge
+                                    # case can slip past it while still not being what a "new
+                                    # registration" question needs. Live-reproduced: VAT's
+                                    # similarity_search top-2 were "ย้ายสถานประกอบการ" (correctly
+                                    # excluded) and "ผู้ประกอบการจดทะเบียนซึ่งเป็นบุคคลธรรมดาถึงแก่
+                                    # ความตาย" (VAT registration transfer on the owner's death —
+                                    # not excluded by the blocklist, but not a new-registration
+                                    # doc either), so `_good` looked non-empty and the fallback
+                                    # below never ran — VAT silently vanished from "which licenses
+                                    # do I need to open a restaurant" answers (qa_12case case 10).
+                                    # Only trust `_good` as-is when something in it actually LOOKS
+                                    # like new registration; otherwise still attempt the fallback
+                                    # scan below and prefer whatever it finds.
+                                    _good_confirmed = any(
+                                        _NEW_REG_OBD_RE.search(
+                                            (getattr(d, "metadata", {}) or {}).get("operation_by_department", "")
+                                        )
+                                        for d in _good
+                                    )
+                                    if not _good or not _good_confirmed:
+                                        # similarity_search returned only edit-type (or otherwise
+                                        # unconfirmed) docs for this license_type (e.g. VAT: 22/25
+                                        # Chroma docs are edit-type, similarity always surfaces
+                                        # those). Fall back to a direct metadata scan, preferring a
+                                        # confirmed new-reg OBD match, so we find the new-reg doc
+                                        # reliably instead of settling for a weak/atypical survivor.
                                         _fb_raw = _coll_sw.get(
                                             where={"license_type": lt_miss},
                                             include=["documents", "metadatas"],
                                         )
                                         from langchain_core.documents import Document as _LCDoc
+                                        _fb_confirmed: Optional["_LCDoc"] = None
+                                        _fb_unconfirmed: Optional["_LCDoc"] = None
                                         for _fb_doc, _fb_meta in zip(
                                             _fb_raw.get("documents") or [],
                                             _fb_raw.get("metadatas") or [],
                                         ):
                                             _op = (_fb_meta.get("operation_by_department") or "").strip()
-                                            if not _SWEEP_EDIT_RE.search(_op):
-                                                _good = [_LCDoc(page_content=_fb_doc, metadata=_fb_meta)]
-                                                _LOG.debug(
-                                                    "[Supervisor] sweep fallback coll.get %r: new-reg doc found (op=%r)",
-                                                    lt_miss, _op[:60],
-                                                )
+                                            if _SWEEP_EDIT_RE.search(_op):
+                                                continue
+                                            _cand = _LCDoc(page_content=_fb_doc, metadata=_fb_meta)
+                                            if _NEW_REG_OBD_RE.search(_op):
+                                                _fb_confirmed = _cand
                                                 break
+                                            if _fb_unconfirmed is None:
+                                                _fb_unconfirmed = _cand
+                                        _fb_pick = _fb_confirmed or _fb_unconfirmed
+                                        if _fb_pick is not None:
+                                            _good = [_fb_pick]
+                                            _LOG.debug(
+                                                "[Supervisor] sweep fallback coll.get %r: new-reg doc found (op=%r, confirmed=%s)",
+                                                lt_miss, (_fb_pick.metadata or {}).get("operation_by_department", "")[:60],
+                                                _fb_confirmed is not None,
+                                            )
                                     return _good[:2]
                                 except Exception as _lt_e:
                                     _LOG.debug("[Supervisor] sweep skip %r: %s", lt_miss, _lt_e)
@@ -4711,23 +4950,10 @@ class PersonaSupervisor:
     )
     # Action patterns — user wants to perform a registration/application step.
     # Overrides _INFO_Q_RE: even if query looks informational, treat as action.
-    _ACTION_Q_RE = re.compile(
-        r"(อยากจด|อยากสมัคร|อยากขอ|อยากยื่น|อยากลงทะเบียน|"
-        r"ต้องการจด|ต้องการสมัคร|ต้องการขอ|ต้องการยื่น|ต้องการลงทะเบียน|"
-        r"จะจด|จะสมัคร|จะขอใบ|จะยื่น|จะลงทะเบียน|"
-        r"วิธีจด|วิธีสมัคร|วิธีลงทะเบียน|วิธีการลงทะเบียน|"
-        r"ขั้นตอนการจด|ขั้นตอนการสมัคร|ขั้นตอนการขอ|ขั้นตอนการลงทะเบียน|"
-        r"ต้องการแก้ไข|ต้องการเปลี่ยนแปลง|ต้องการยกเลิก|ต้องการต่ออายุ|"
-        r"อยากแก้ไข|อยากเปลี่ยนแปลง|อยากยกเลิก|อยากต่ออายุ|"
-        r"จะแก้ไข|จะเปลี่ยนแปลง|จะยกเลิก|จะต่ออายุ|"
-        r"วิธีแก้ไข|วิธีเปลี่ยนแปลง|วิธียกเลิก|วิธีต่ออายุ|"
-        r"ขั้นตอนการแก้ไข|ขั้นตอนการเปลี่ยนแปลง|ขั้นตอนการยกเลิก|ขั้นตอนการต่ออายุ|"
-        r"จะเปิด|จะทำร้าน|จะทำธุรกิจ|อยากเปิด|อยากทำร้าน|อยากทำธุรกิจ|"
-        # Bare "ขอใบ(อนุญาต)" / "ยื่นขอใบ" without modal prefix — implies action, not info.
-        # Negative lookahead: exclude renewal context (ต่ออายุ/หมดอายุ within 20 chars).
-        r"(?:ขอ|ยื่น(?:\s*ขอ)?)\s*ใบ(?:อนุญาต)?(?!.{0,20}(?:ต่ออายุ|ต่อ\s*อายุ|หมดอายุ|สิ้นอายุ)))",
-        re.IGNORECASE,
-    )
+    # Promoted to utils.text_patterns.ACTION_INTENT_RE (2026-09) as the single
+    # shared definition — see that module for why (a narrower drifted copy of
+    # this exact pattern was found in persona_practical.py's fee-info gate).
+    _ACTION_Q_RE = _SHARED_ACTION_INTENT_RE
     # Document/requirement question — "เอกสารอะไรบ้าง", "ต้องใช้เอกสารอะไรบ้าง" etc. These
     # always have an entity/registration-type-dependent answer (the required-documents list
     # is exactly the field that splits by entity_type in the source data), so they must never
@@ -5318,7 +5544,7 @@ class PersonaSupervisor:
             )
             if _lt_infoq:
                 try:
-                    _og_res_iq = self._get_operation_groups_for_entity(_lt_infoq, "")
+                    _og_res_iq = self._get_operation_groups_for_entity(_lt_infoq, "", state=state)
                     _og_labels_iq, _og_raw_iq = (
                         _og_res_iq if isinstance(_og_res_iq, tuple) else (_og_res_iq, {})
                     )
@@ -6100,6 +6326,7 @@ class PersonaSupervisor:
                         _broad_lq = [d for d, _ in hybrid_scored_search(
                             _vstore_lq, _lq_query, k=5,
                             rrf_k=int(getattr(conf, "HYBRID_RRF_K", 60)),
+                            bm25_bypass_min_ratio=float(getattr(conf, "BM25_BYPASS_MIN_RATIO", 0.35)),
                         )]
                     else:
                         _tmp_broad_lq = _vstore_lq.as_retriever(search_kwargs={"k": 5})
@@ -6263,7 +6490,7 @@ class PersonaSupervisor:
         # NOTE: intentionally outside the `if "location"` block — operation_group applies to
         # ALL licenses regardless of whether location is known (e.g. ทะเบียนพาณิชย์, VAT,
         # ประกันสังคม have no location slot but do have multiple operation groups).
-        _op_res_lq = self._get_operation_groups_for_entity(license_type, _known_entity_lq)
+        _op_res_lq = self._get_operation_groups_for_entity(license_type, _known_entity_lq, state=state)
         _op_grps_lq, _raw_op_map_lq = (
             _op_res_lq if isinstance(_op_res_lq, tuple) else (_op_res_lq, {})
         )
@@ -6541,7 +6768,7 @@ class PersonaSupervisor:
             return None
         return best_opt
 
-    def _map_pending_slot_reply(self, pending: Dict[str, Any], user_input: str) -> Tuple[Optional[str], Optional[str]]:
+    def _map_pending_slot_reply(self, pending: Dict[str, Any], user_input: str, state=None) -> Tuple[Optional[str], Optional[str]]:
         options = pending.get("options") or []
         allow_multi = bool(pending.get("allow_multi", False))
         key = str(pending.get("key") or "").strip()
@@ -6722,7 +6949,7 @@ class PersonaSupervisor:
         # mapped to ONE option by the single-choice LLM below.
         # Guaranteed to fire here when all regex/exact/fuzzy paths above failed.
         if allow_multi and options and len(options) >= 2:
-            if self._check_select_all_intent_llm(key, raw.strip(), [str(x).strip() for x in options]):
+            if self._check_select_all_intent_llm(key, raw.strip(), [str(x).strip() for x in options], state=state):
                 return ", ".join([str(x).strip() for x in options if str(x).strip()]), None
 
         # Audit finding, 2026-08-05: free-text matching below (LLM + fuzzy) uses the FULL
@@ -6737,7 +6964,7 @@ class PersonaSupervisor:
         # Example: location slot with options ["กรุงเทพฯ", "ต่างจังหวัด"] and user says "กทม"
         if isinstance(_match_pool, list) and len(_match_pool) >= 2 and self.llm_slot_mapper_call:
             try:
-                res = self.llm_slot_mapper_call(key, raw.strip(), [str(x).strip() for x in _match_pool]) or {}
+                res = self.llm_slot_mapper_call(key, raw.strip(), [str(x).strip() for x in _match_pool], state=state) or {}
             except Exception:
                 res = {}
             try:
@@ -7056,12 +7283,132 @@ class PersonaSupervisor:
         except Exception:
             _LOG.warning("[Supervisor] startup: license type validation failed", exc_info=True)
 
+    def _filter_by_specific_topic_conflict(
+        self, q: str, candidates: List[str], label: str = "candidate",
+    ) -> List[str]:
+        """Thin wrapper around utils.text_patterns.filter_by_specific_topic_conflict
+        (moved there 2026-09 so persona_academic.py can share the same guard —
+        see that function's docstring for the full history/rationale)."""
+        return _shared_filter_by_specific_topic_conflict(q, candidates, label=label, log_prefix="[Supervisor] ")
+
     def _get_chroma_collection(self):
         """Return the raw Chroma collection object from the practical retriever, or None."""
         vectorstore = getattr(self._practical.retriever, "vectorstore", None)
         if vectorstore is None:
             return None
         return getattr(vectorstore, "_collection", None)
+
+    def _merge_cross_chapter_docs_for_nonreg(
+        self, existing_docs: List[Dict], existing_main_topic: str, q: str, max_add: int = 5,
+    ) -> List[Dict]:
+        """2026-09: for non-regulatory (marketing/business_guide) chapter-fetch results,
+        additionally pull in docs from OTHER main_topics via the normal hybrid retrieval
+        path.
+
+        Chapter-fetch guarantees completeness of whichever chapter it exact-matched — but
+        the marketing/business_guide know-how content sometimes has the SAME concept
+        covered in two different sheets under two different main_topic labels (e.g. a
+        query naming "กลยุทธ์การตั้งราคา" exact-matches the thinner "เพิ่มยอดขายง่ายๆ" chapter
+        from one book, while "กลยุทธ์ด้านราคา" — a different sheet's much more comprehensive
+        26-item chapter — is what the question actually needs). Live-verified that plain
+        semantic/hybrid retrieval (bypassing chapter-fetch) already finds that other chapter
+        correctly on its own; chapter-fetch just never gives it a chance to run. This only
+        ADDS docs on top of what chapter-fetch found — never removes or reorders anything —
+        so a clean single-chapter match for OTHER non-reg questions is unaffected beyond a
+        few extra candidate docs the LLM is free to ignore if not relevant (Evidence-First
+        rule already constrains it to cite only genuinely relevant DOCUMENTS).
+        Scoped to non-regulatory data_type only, both here and at each call site.
+
+        REVISED 2026-09 (qa_12case case 12 follow-up): originally only added the top
+        `max_add` semantically-ranked individual docs from the other main_topic — capped
+        low to avoid ballooning doc count for the common case, but for a genuinely
+        comprehensive sibling chapter that cap silently excludes real categories the LLM
+        never gets a chance to cite. Live-reproduced: case 12's query ("ตั้งราคาเมนู...
+        มีหลักคิดยังไงบ้าง") exact-matched the WRONG primary chapter ("การเข้าใจพื้นฐานการ
+        ขายสินค้า" — a generic sales-basics chapter whose sub_topic happens to be literally
+        named "การตั้งราคา") while the actually-relevant "กลยุทธ์ด้านราคา" chapter only rode
+        along as a secondary merge capped at 5 of its 26 items — missing the "คู่แข่ง
+        เปลี่ยนแปลงราคา" category entirely, and the answer fell back on ungrounded general
+        pricing knowledge to fill the gap instead. Fixed: once a sibling main_topic is
+        identified as relevant via the semantic top-hit, fetch its FULL chapter (same
+        `where={"main_topic": ...}` pattern the primary chapter already gets) instead of
+        a capped sample — the same "guarantee completeness of whichever chapter is
+        relevant" principle already applied to the primary match, now applied consistently
+        to the secondary one too. Still bounded: only the single most relevant OTHER
+        main_topic gets the full-chapter treatment, not every semantic hit's chapter —
+        this isn't a general "fetch everything" widening. Falls back to the original
+        capped-sample behavior if the full fetch fails or no other main_topic stands out.
+        """
+        try:
+            _sem_docs = self._practical._retrieve_docs(q)
+        except Exception as e:
+            _LOG.warning("[Supervisor] cross-chapter merge retrieval failed: %s", e)
+            return existing_docs
+
+        _seen_hashes = {hash((d.get("content") or "")[:200]) for d in existing_docs}
+        _added: List[Dict] = []
+
+        # Single most relevant OTHER main_topic among the top semantic hits (already
+        # ranked, so the first qualifying one is the best candidate for a full fetch).
+        _other_mt = ""
+        for d in _sem_docs:
+            md = d.get("metadata") or {}
+            if str(md.get("data_type") or "").strip().lower() not in ("marketing", "business_guide"):
+                continue
+            _mt = str(md.get("main_topic") or "").strip()
+            if _mt and _mt != existing_main_topic:
+                _other_mt = _mt
+                break
+
+        if _other_mt:
+            try:
+                _cc_coll = self._get_chroma_collection()
+                _cc_res = _cc_coll.get(where={"main_topic": _other_mt}, include=["documents", "metadatas"])
+                for c, m in zip(_cc_res.get("documents") or [], _cc_res.get("metadatas") or []):
+                    _h = hash((c or "")[:200])
+                    if _h in _seen_hashes:
+                        continue
+                    _seen_hashes.add(_h)
+                    _added.append({"content": c or "", "metadata": m or {}})
+            except Exception as e:
+                _LOG.warning(
+                    "[Supervisor] cross-chapter full-fetch failed for %r, falling back to capped sample: %s",
+                    _other_mt, e,
+                )
+
+        if not _added:
+            # Fallback: original capped top-K sample — covers the full-fetch failure
+            # case above, and the case where no single OTHER main_topic stood out
+            # clearly enough among the top hits to justify a full-chapter fetch.
+            for d in _sem_docs:
+                md = d.get("metadata") or {}
+                if str(md.get("data_type") or "").strip().lower() not in ("marketing", "business_guide"):
+                    continue
+                _mt = str(md.get("main_topic") or "").strip()
+                if not _mt or _mt == existing_main_topic:
+                    continue
+                _h = hash((d.get("content") or "")[:200])
+                if _h in _seen_hashes:
+                    continue
+                _seen_hashes.add(_h)
+                _added.append(d)
+                if len(_added) >= max_add:
+                    break
+        if _added:
+            _LOG.info(
+                "[Supervisor] cross-chapter merge (non-reg): +%d doc(s) from other main_topic(s) "
+                "for chapter %r", len(_added), existing_main_topic,
+            )
+        # Merged docs go FIRST, not appended at the end: persona_practical.py's
+        # "_direct_topic_match" informational-overview cap does a plain [:N] slice on
+        # whatever chapter-fetch returned, so appending at the end meant the merged
+        # docs were silently sliced off entirely whenever the primary chapter alone
+        # already had ≥N docs (live-verified: cap kept 5/17, all 5 from the primary
+        # chapter, 0 from the merge). Putting the semantically-ranked cross-chapter
+        # hits first ensures they survive that cap — reasonable given the primary
+        # chapter is, by construction of this whole code path, the one whose exact
+        # text match didn't fully satisfy the query in the first place.
+        return _added + existing_docs
 
     def _discover_slots_for_license(self, license_type: str, known_entity_type: Optional[str] = None) -> List[Dict]:
         """
@@ -7820,7 +8167,7 @@ class PersonaSupervisor:
         # — deliberately NOT a new mechanism, this one was already proven in production.
         if not matched and values_full and len(values_full) >= 2 and self.llm_slot_mapper_call:
             try:
-                _dc_res = self.llm_slot_mapper_call(field, user_input.strip(), [str(v).strip() for v in values_full]) or {}
+                _dc_res = self.llm_slot_mapper_call(field, user_input.strip(), [str(v).strip() for v in values_full], state=state) or {}
                 _dc_confv = float(_dc_res.get("confidence", 0.0) or 0.0)
             except Exception:
                 _dc_res, _dc_confv = {}, 0.0
@@ -8154,7 +8501,7 @@ class PersonaSupervisor:
         # contaminates entity_type detection when the user switches license topics.
         _lq = last_query or ""
         try:
-            res = self._llm_entity_type_call(q, _lq) or {}
+            res = self._llm_entity_type_call(q, _lq, state=state) or {}
         except Exception as _e:
             _LOG.warning("[Supervisor/entity_type] fallback failed: %s", _e)
             cache[q] = None
@@ -8194,7 +8541,7 @@ class PersonaSupervisor:
         # contaminate location detection when user switches to a new topic.
         _lq = ""
         try:
-            res = self._llm_location_call(q, _lq) or {}
+            res = self._llm_location_call(q, _lq, state=state) or {}
         except Exception as _e:
             _LOG.warning("[Supervisor/location] fallback failed: %s", _e)
             cache[q] = None
@@ -8224,7 +8571,7 @@ class PersonaSupervisor:
         # contaminate operation_type detection when user switches to a new topic.
         _lq = ""
         try:
-            res = self._llm_operation_type_call(q, _lq) or {}
+            res = self._llm_operation_type_call(q, _lq, state=state) or {}
         except Exception as _e:
             _LOG.warning("[Supervisor/operation_type] fallback failed: %s", _e)
             cache[q] = None
@@ -8251,7 +8598,7 @@ class PersonaSupervisor:
         if q in cache:
             return cache[q]
         try:
-            res = self._llm_area_size_call(q) or {}
+            res = self._llm_area_size_call(q, state=state) or {}
         except Exception as _e:
             _LOG.warning("[Supervisor/area_size] fallback failed: %s", _e)
             cache[q] = None
@@ -8281,7 +8628,7 @@ class PersonaSupervisor:
         if _cache_key in cache:
             return cache[_cache_key]
         try:
-            res = self._llm_registration_type_call(q, options) or {}
+            res = self._llm_registration_type_call(q, options, state=state) or {}
         except Exception as _e:
             _LOG.warning("[Supervisor/registration_type] fallback failed: %s", _e)
             cache[_cache_key] = None
@@ -8335,7 +8682,7 @@ class PersonaSupervisor:
 
         candidates = [lt for _, lt in self._MULTI_TOPIC_LICENSE_KEYWORDS]
         try:
-            res = self._llm_license_type_call(q, candidates) or {}
+            res = self._llm_license_type_call(q, candidates, state=state) or {}
         except Exception as _e:
             _LOG.warning("[Supervisor/license_type] fallback failed: %s", _e)
             cache[q] = []
@@ -8359,7 +8706,7 @@ class PersonaSupervisor:
         cache[q] = []
         return []
 
-    def _classify_yes_no_hybrid(self, user_text: str) -> Dict[str, Any]:
+    def _classify_yes_no_hybrid(self, user_text: str, state=None) -> Dict[str, Any]:
         """
         Hybrid yes/no classifier: deterministic fast-path → LLM fallback when unclear.
         Returns same shape as _classify_yes_no_det: {yes, no, confidence, method}.
@@ -8376,7 +8723,7 @@ class PersonaSupervisor:
 
         # LLM fallback (uses the existing confirm LLM call — already set up in __init__)
         try:
-            res = self.llm_confirm_call(stripped) or {}
+            res = self.llm_confirm_call(stripped, state=state) or {}
         except Exception as _e:
             _LOG.warning("[Supervisor/yes_no_hybrid] LLM call failed: %s", _e)
             return det
@@ -8414,7 +8761,7 @@ class PersonaSupervisor:
         section_count = len(section_catalog) if isinstance(section_catalog, dict) else 0
 
         try:
-            res = self._llm_academic_resume_call(q, last_academic_q or "", section_count) or {}
+            res = self._llm_academic_resume_call(q, last_academic_q or "", section_count, state=state) or {}
         except Exception as _e:
             _LOG.warning("[Supervisor/academic_resume] LLM check failed: %s", _e)
             cache[q] = False
@@ -8450,7 +8797,7 @@ class PersonaSupervisor:
         if cache_key in cache:
             return cache[cache_key]
         try:
-            res = self._llm_elaborate_call(q, last_topic) or {}
+            res = self._llm_elaborate_call(q, last_topic, state=state) or {}
             conf = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_elaborate")) and conf >= 0.75
         except Exception as _e:
@@ -8475,7 +8822,7 @@ class PersonaSupervisor:
         if cache_key in cache:
             return cache[cache_key]
         try:
-            res = self._llm_broad_q_call(q) or {}
+            res = self._llm_broad_q_call(q, state=state) or {}
             conf_val = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_broad")) and conf_val >= 0.75
         except Exception as _e:
@@ -8502,7 +8849,7 @@ class PersonaSupervisor:
         if cache_key in cache:
             return cache[cache_key]
         try:
-            res = self._llm_slot_skip_call(q) or {}
+            res = self._llm_slot_skip_call(q, state=state) or {}
             conf = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_skip")) and conf >= 0.75
         except Exception as _e:
@@ -8532,7 +8879,7 @@ class PersonaSupervisor:
         if cache_key in cache:
             return cache[cache_key]
         try:
-            res = self._llm_followup_contextual_call(q, last_topic) or {}
+            res = self._llm_followup_contextual_call(q, last_topic, state=state) or {}
             conf = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_followup")) and conf >= 0.75
         except Exception as _e:
@@ -8559,7 +8906,7 @@ class PersonaSupervisor:
         if cache_key in cache:
             return cache[cache_key]
         try:
-            res = self._llm_thanks_call(q) or {}
+            res = self._llm_thanks_call(q, state=state) or {}
             conf = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_thanks")) and conf >= 0.75
         except Exception as _e:
@@ -8590,7 +8937,7 @@ class PersonaSupervisor:
             cache[cache_key] = False
             return False
         try:
-            res = self._llm_academic_stop_call(q) or {}
+            res = self._llm_academic_stop_call(q, state=state) or {}
             conf = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_stop")) and conf >= 0.80
         except Exception as _e:
@@ -8621,7 +8968,7 @@ class PersonaSupervisor:
         last_topic = ((state.context or {}).get("last_user_legal_query") or "").strip()
         conf_val = 0.0
         try:
-            res = self._llm_new_topic_call(q, last_topic) or {}
+            res = self._llm_new_topic_call(q, last_topic, state=state) or {}
             conf_val = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_new_topic")) and conf_val >= 0.75
         except Exception as _e:
@@ -8650,7 +8997,7 @@ class PersonaSupervisor:
         if cache_key in cache:
             return cache[cache_key]
         try:
-            res = self._llm_smalltalk_call(q) or {}
+            res = self._llm_smalltalk_call(q, state=state) or {}
             conf = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_smalltalk")) and conf >= 0.75
         except Exception as _e:
@@ -8676,7 +9023,7 @@ class PersonaSupervisor:
         if cache_key in cache:
             return cache[cache_key]
         try:
-            res = self._llm_switch_without_target_call(q) or {}
+            res = self._llm_switch_without_target_call(q, state=state) or {}
             conf = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_switch")) and conf >= 0.80
         except Exception as _e:
@@ -8706,7 +9053,7 @@ class PersonaSupervisor:
             cache[cache_key] = False
             return False
         try:
-            res = self._llm_link_request_call(q) or {}
+            res = self._llm_link_request_call(q, state=state) or {}
             conf = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_link_request")) and conf >= 0.75
         except Exception as _e:
@@ -8732,7 +9079,7 @@ class PersonaSupervisor:
         if cache_key in cache:
             return cache[cache_key]
         try:
-            res = self._llm_mode_status_call(q) or {}
+            res = self._llm_mode_status_call(q, state=state) or {}
             conf_val = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_mode_status")) and conf_val >= 0.75
         except Exception as _e:
@@ -8759,7 +9106,7 @@ class PersonaSupervisor:
         if cache_key in cache:
             return cache[cache_key]
         try:
-            res = self._llm_greeting_call(q) or {}
+            res = self._llm_greeting_call(q, state=state) or {}
             conf_val = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_greeting")) and conf_val >= 0.80
         except Exception as _e:
@@ -8797,7 +9144,7 @@ class PersonaSupervisor:
             return (cached.get("is_info", False), cached.get("is_action", False))
         conf_val = 0.0
         try:
-            res = self._llm_info_action_q_call(q) or {}
+            res = self._llm_info_action_q_call(q, state=state) or {}
             conf_val = float(res.get("confidence") or 0.0)
             if conf_val >= 0.75:
                 is_action = bool(res.get("is_action"))
@@ -8832,7 +9179,7 @@ class PersonaSupervisor:
             return cache[cache_key]
         conf_val = 0.0
         try:
-            res = self._llm_legal_q_call(q) or {}
+            res = self._llm_legal_q_call(q, state=state) or {}
             conf_val = float(res.get("confidence") or 0.0)
             result = bool(res.get("is_legal")) and conf_val >= 0.60
         except Exception as _e:
@@ -8852,7 +9199,7 @@ class PersonaSupervisor:
         saving 1-3s for ambiguous-style inputs that would otherwise trigger serial LLM.
         """
         try:
-            result = self._infer_user_style_request_hybrid(text, last_q)
+            result = self._infer_user_style_request_hybrid(text, last_q, state=state)
             if state is not None and state.context is not None:
                 state.context.setdefault("_style_pw_cache", {})[(text[:80], (last_q or "")[:80])] = result
         except Exception as _e:
@@ -9047,20 +9394,27 @@ class PersonaSupervisor:
         Broad questions need more docs (across license types) to answer all dimensions.
         LLM fallback fires when regex misses and query is substantive (≥8 chars).
         """
-        if self._BROAD_Q_RE.search(query or ""):
-            # Specificity override: if a specific license name or form code appears in the query,
-            # it is a targeted single-license question — not a broad overview — even if the phrasing
-            # contains "เอกสารอะไรบ้าง" or similar. Without this override, group D of _BROAD_Q_RE
-            # misclassifies "ขอใบภาษีมูลค่าเพิ่ม ภพ.20 ต้องใช้เอกสารอะไรบ้าง" as broad, causing
-            # sibling-completion to pull docs from unrelated licenses and bloating the prompt to 47K tokens.
-            if not self._SPECIFIC_LICENSE_INDICATOR_RE.search(query or ""):
-                return True
-            # Specific license named → let LLM decide (it will correctly say not-broad)
-        if state is not None and len((query or "").strip()) >= 8:
+        q = query or ""
+        # Specificity override: if a specific license/device name or form code is named,
+        # this is a targeted single-item question — never a broad multi-category overview,
+        # by definition. This is now a HARD short-circuit rather than "let the LLM decide" —
+        # a 2026-09 live QA rerun found _broad_question_llm_check itself over-fires on exactly
+        # these cases (0.95-confidence "broad" for both "จดทะเบียนพาณิชย์แบบบุคคลธรรมดา
+        # ต้องเตรียมเอกสารอะไรบ้าง" and "ขั้นตอนการสมัครเครื่อง EDC...เรียงลำดับ", despite each
+        # naming one specific item), which then triggers 2-pass wide retrieval that dilutes the
+        # actually-relevant docs with unrelated business_guide chapters and derails the final
+        # answer — so the LLM's judgment on this narrow question class can't be trusted.
+        if self._SPECIFIC_LICENSE_INDICATOR_RE.search(q):
+            return False
+        if self._BROAD_Q_RE.search(q):
+            return True
+        if state is not None and len(q.strip()) >= 8:
             return self._broad_question_llm_check(query, state)
         return False
 
-    def _get_operation_groups_for_entity(self, license_type: str, entity_type_normalized: str) -> Tuple[List[str], Dict]:
+    def _get_operation_groups_for_entity(
+        self, license_type: str, entity_type_normalized: str, state=None
+    ) -> Tuple[List[str], Dict]:
         """
         ดึง operation_by_department จาก Chroma แล้วจัดกลุ่มเป็นหมวดหลัก
         คืน (slot_options, raw_op_map) เสมอ:
@@ -9068,6 +9422,17 @@ class PersonaSupervisor:
           raw_op_map    = {display_label: [raw operation_by_department values]}
                          ใช้สร้าง enriched query ตอน retrieval
         ไม่มี hardcode — ทุกอย่างมาจากข้อมูลจริงใน Chroma
+
+        `state` is optional (2026-09, cost-tracking accuracy sweep) — this whole
+        result is cached at the instance level (self._op_groups_cache), so the
+        underlying LLM call (Supervisor/op_group_classify) fires at most once per
+        unique (license_type, ops) across the ENTIRE process lifetime, not once
+        per turn. Passing state here only attributes that one rare cache-miss
+        call to whichever session happened to trigger it first — low-value, so
+        only the call sites where state was already trivially in scope were
+        updated to pass it; the _discover_slots_for_license() call path (which
+        has no state of its own) was deliberately left unattributed rather than
+        threading state through that separate, more widely-called helper too.
         """
         try:
             vectorstore = getattr(self._practical.retriever, "vectorstore", None)
@@ -9135,7 +9500,7 @@ class PersonaSupervisor:
             # ── Try LLM classifier first (zero hardcode, handles future license types) ──
             def _build_from_llm(op_set: set) -> Optional[Tuple[List[str], Dict]]:
                 try:
-                    res = self._llm_op_group_classifier(license_type, sorted(op_set)) or {}
+                    res = self._llm_op_group_classifier(license_type, sorted(op_set), state=state) or {}
                     groups_raw = res.get("groups") or []
                     if not groups_raw:
                         return None
@@ -9219,7 +9584,7 @@ class PersonaSupervisor:
             _LOG.warning("[Supervisor] _get_operation_groups_for_entity failed: %s", e)
             return [], {}
 
-    def _group_sub_operations(self, sub_ops: List[str], license_type: str) -> Tuple[List[str], Dict]:
+    def _group_sub_operations(self, sub_ops: List[str], license_type: str, state=None) -> Tuple[List[str], Dict]:
         """
         Groups a long list of raw sub-operation strings into ≤5 user-friendly category labels.
         Used when operation_sub_type would have >5 options (e.g. 26 แก้ไข sub-ops for
@@ -9251,7 +9616,7 @@ class PersonaSupervisor:
             _prompt = build_sub_op_group_classifier_prompt(license_type, sub_ops)
             _text = extract_llm_text(
                 llm_invoke(_sub_llm, [HumanMessage(content=_prompt)],
-                           logger=_LOG, label="Supervisor/sub_op_group")
+                           logger=_LOG, label="Supervisor/sub_op_group", state=state)
             ).strip()
             _text = self._strip_code_fences(_text)
             _obj = json.loads(_text)
@@ -9369,7 +9734,7 @@ class PersonaSupervisor:
             state.context.pop("topic_slot_queue", None)
             return self._handle_inner(state, user_input)
 
-        mapped, err = self._map_pending_slot_reply(pending, user_input)
+        mapped, err = self._map_pending_slot_reply(pending, user_input, state=state)
 
         if err:
             # The generic "answer with a number" catch-all fires when the user's text matched
@@ -9548,6 +9913,9 @@ class PersonaSupervisor:
                     mt for mt in _fb_mt_candidates
                     if mt.lower() in _fb_q_lower and len(mt) >= 5
                 ]
+                _fb_matched_mts = self._filter_by_specific_topic_conflict(
+                    str(mapped), _fb_matched_mts, label="fallback main_topic"
+                )
                 if _fb_matched_mts:
                     _fb_target_mt = max(_fb_matched_mts, key=len)
                     try:
@@ -9594,6 +9962,9 @@ class PersonaSupervisor:
                                 or ot.lower() in _fb_raw_lower
                             )
                         ]
+                        _fb_matched_ots = self._filter_by_specific_topic_conflict(
+                            _fb_raw_lower, _fb_matched_ots, label="fallback operation_topic"
+                        )
                         if _fb_matched_ots:
                             _fb_target_ot = max(_fb_matched_ots, key=len)
                             _fb_ot_coll = self._get_chroma_collection()
@@ -9615,6 +9986,48 @@ class PersonaSupervisor:
                                     state.last_retrieval_query = str(mapped)
                                     state.context["last_topic"] = _fb_target_ot
                                     state.context["last_user_legal_query"] = str(mapped)
+                                    # Entity variety: same check as the primary retrieval path's
+                                    # op_topic/sub_topic sites — inject entity_type slot when docs
+                                    # cover both บุคคลธรรมดา and นิติบุคคล and entity not yet known.
+                                    # Without this, _direct_topic_match below silently disables
+                                    # persona_practical.py's own entity-variety check with no
+                                    # replacement (2026-09 audit finding — this duplicated fallback
+                                    # path had zero entity-injection logic of its own).
+                                    _fb_session_et = str(
+                                        (state.context.get("collected_slots") or {}).get("entity_type") or ""
+                                    ).strip()
+                                    if not _fb_session_et and self._entity_slot_needed(str(mapped)):
+                                        _et_in_fb = {
+                                            str(d.get("metadata", {}).get("entity_type_normalized") or "").strip()
+                                            for d in _fb_ot_docs
+                                        } - {"", "nan", "None"}
+                                        _fb_combined_content = any(
+                                            re.search(r"บุคคลธรรมดา\s*\d+\.", str((m or {}).get("identification_documents") or ""))
+                                            and re.search(r"นิติบุคคล\s*\d+\.", str((m or {}).get("identification_documents") or ""))
+                                            for m in (_fb_ot_res.get("metadatas") or [])
+                                        )
+                                        _fb_et_mixed = (
+                                            ("นิติบุคคล" in _et_in_fb and "บุคคลธรรมดา" in _et_in_fb)
+                                            or _fb_combined_content
+                                        )
+                                        if _fb_et_mixed:
+                                            _sq_fb = list((state.context or {}).get("topic_slot_queue") or [])
+                                            _et_already_known_fb = bool(
+                                                (state.get_collected_slots() if hasattr(state, "get_collected_slots") else {}).get("entity_type")
+                                            )
+                                            if not _et_already_known_fb and not any(s.get("key") == "entity_type" for s in _sq_fb):
+                                                _et_sorted_fb = sorted(_et_in_fb) if len(_et_in_fb) >= 2 else ["นิติบุคคล", "บุคคลธรรมดา"]
+                                                state.context["topic_slot_queue"] = [{
+                                                    "key": "entity_type",
+                                                    "options": _et_sorted_fb,
+                                                    "display_options": _et_sorted_fb,
+                                                    "question": "ร้านของคุณดำเนินการในรูปแบบใดครับ",
+                                                }] + _sq_fb
+                                                _LOG.info(
+                                                    "[Supervisor] topic-slot op_topic %r has mixed entity types %s"
+                                                    " — asking entity_type first",
+                                                    _fb_target_ot, _et_sorted_fb,
+                                                )
                                     state.context["_direct_topic_match"] = True
                                     _LOG.info(
                                         "[Supervisor] topic-slot op_topic retrieval: %r → %d docs",
@@ -10114,7 +10527,7 @@ class PersonaSupervisor:
 
                         # Append operation_group slot (skip if already collected for THIS topic)
                         _op_res_nt = self._get_operation_groups_for_entity(
-                            _license_type_for_slots, _known_entity_for_new_topic
+                            _license_type_for_slots, _known_entity_for_new_topic, state=state
                         )
                         _op_grps_nt, _raw_op_map_nt = (
                             _op_res_nt if isinstance(_op_res_nt, tuple) else (_op_res_nt, {})
@@ -10263,7 +10676,7 @@ class PersonaSupervisor:
                         if _license_type_for_slots:
                             try:
                                 _og_res_3b = self._get_operation_groups_for_entity(
-                                    _license_type_for_slots, ""
+                                    _license_type_for_slots, "", state=state
                                 )
                                 _og_labels_3b, _og_raw_3b = (
                                     _og_res_3b if isinstance(_og_res_3b, tuple) else (_og_res_3b, {})
@@ -10451,7 +10864,7 @@ class PersonaSupervisor:
                     # so the user sees "ชื่อ / กรรมการ / ที่ตั้ง / ..." instead of 26 items.
                     if len(_sub_ops) > 5:
                         _grp_opts, _grp_raw = self._group_sub_operations(
-                            _sub_ops, _saved_license or ""
+                            _sub_ops, _saved_license or "", state=state
                         )
                         if len(_grp_opts) >= 2:
                             state.context["topic_slot_queue"] = [{
@@ -11492,7 +11905,7 @@ class PersonaSupervisor:
                         # so it is asked in practical BEFORE switching to academic
                         _license_type_for_og = _license_type_for_area
                         if _license_type_for_og and _entity_val:
-                            _op_result = self._get_operation_groups_for_entity(_license_type_for_og, _entity_val)
+                            _op_result = self._get_operation_groups_for_entity(_license_type_for_og, _entity_val, state=state)
                             _op_groups, _raw_op_map = _op_result if isinstance(_op_result, tuple) else (_op_result, {})
                             # Only add to queue when ≥2 distinct options — single option means nothing to choose
                             if len(_op_groups) >= 2:
@@ -12095,7 +12508,7 @@ class PersonaSupervisor:
 
         res: Dict[str, Any] = {}
         try:
-            res = self.llm_topic_picker_call(last_hint or "", cand, int(k), banned) or {}
+            res = self.llm_topic_picker_call(last_hint or "", cand, int(k), banned, state=state) or {}
         except Exception:
             res = {}
 
@@ -12261,7 +12674,7 @@ class PersonaSupervisor:
 
         res: Dict[str, Any] = {}
         try:
-            res = self.llm_greet_prefix_call(kind, pid, last_hint, bool(include_intro)) or {}
+            res = self.llm_greet_prefix_call(kind, pid, last_hint, bool(include_intro), state=state) or {}
         except Exception:
             res = {}
 
@@ -12924,7 +13337,7 @@ class PersonaSupervisor:
                         if not _is_resume:
                             try:
                                 _last_q = state.get_last_retrieval_query() or (state.context or {}).get("last_topic", "")
-                                _fi = self.llm_fallback_intent_call(raw_stripped, _last_q or "", "academic") or {}
+                                _fi = self.llm_fallback_intent_call(raw_stripped, _last_q or "", "academic", state=state) or {}
                                 _cached_fallback_intent = _fi
                                 _intent = str(_fi.get("intent") or "").strip().lower()
                                 # Only "elaborate" (wants more detail on SAME topic) triggers resume.
@@ -13092,7 +13505,7 @@ class PersonaSupervisor:
         # _last_q_for_style pre-computed above before pre-warm block.
         _style_pw_key = (raw_stripped[:80], (_last_q_for_style or "")[:80])
         _style_pw_hit = (state.context or {}).get("_style_pw_cache", {}).get(_style_pw_key)
-        style = _style_pw_hit if _style_pw_hit is not None else self._infer_user_style_request_hybrid(raw_stripped, _last_q_for_style)
+        style = _style_pw_hit if _style_pw_hit is not None else self._infer_user_style_request_hybrid(raw_stripped, _last_q_for_style, state=state)
         # _is_short_depth_followup: allows academic switch even when input has legal keywords.
         # Two paths:
         # A) Regex path: explicit depth keyword (e.g. เจาะลึก, ละเอียด) — always accepted.
@@ -13200,7 +13613,7 @@ class PersonaSupervisor:
                 # Ambiguous short input — ask LLM
                 try:
                     _last_topic = (state.context or {}).get("last_user_legal_query", "") or (state.context or {}).get("last_topic", "")
-                    _typo_res = self.llm_typo_check_call(raw_stripped, _last_topic) or {}
+                    _typo_res = self.llm_typo_check_call(raw_stripped, _last_topic, state=state) or {}
                     if _typo_res.get("is_typo") and float(_typo_res.get("confidence") or 0.0) >= 0.75:
                         _is_typo = True
                         _typo_suggested = str(_typo_res.get("suggested") or "").strip()
@@ -13229,7 +13642,7 @@ class PersonaSupervisor:
             _yn_ctx = (state.context or {}).get("last_user_legal_query", "").strip()
             if _yn_ctx and raw_stripped and len(raw_stripped) <= 10 and not self._THANKS_RE.search(raw_stripped):
                 try:
-                    _yn = self._classify_yes_no_hybrid(raw_stripped)
+                    _yn = self._classify_yes_no_hybrid(raw_stripped, state=state)
                     _yn_conf = float(_yn.get("confidence") or 0.0)
                     if _yn.get("yes") and _yn_conf >= 0.78:
                         # Guard: if there's still a pending slot, "yes" confirms something related
@@ -13556,7 +13969,7 @@ class PersonaSupervisor:
             try:
                 last_q_fb = (state.context or {}).get("last_user_legal_query", "")
                 persona_fb = normalize_persona_id(getattr(state, "persona_id", "practical"))
-                intent_res = self.llm_fallback_intent_call(raw_stripped, last_q_fb, persona_fb) or {}
+                intent_res = self.llm_fallback_intent_call(raw_stripped, last_q_fb, persona_fb, state=state) or {}
             except Exception as _e:
                 _LOG.warning("[Supervisor] fallback_intent_llm error: %s", _e)
                 intent_res = {}
