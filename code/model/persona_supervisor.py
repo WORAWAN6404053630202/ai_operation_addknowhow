@@ -477,7 +477,20 @@ class PersonaSupervisor:
         r"|(ขั้นตอน|กระบวนการ|ต้องทำอะไร).{0,30}(ทั้งหมด|ทุกอย่าง|ครบถ้วน|ทุกด้าน)"
         # E) Registration/compliance overview: "ต้องจดอะไรบ้าง", "ต้องขึ้นทะเบียนอะไรบ้าง"
         r"|(ต้องจด|ต้องขึ้นทะเบียน|ต้องลงทะเบียน).{0,20}(อะไรบ้าง|อะไร|อะไรบ้างครับ)"
-        r"|(จดทะเบียน|ขึ้นทะเบียน|ลงทะเบียน).{0,20}(อะไรบ้าง|อะไรที่ต้อง|ทั้งหมด)",
+        r"|(จดทะเบียน|ขึ้นทะเบียน|ลงทะเบียน).{0,20}(อะไรบ้าง|อะไรที่ต้อง|ทั้งหมด)"
+        # F) Marketing/sales-growth overview: "เทคนิคเพิ่มยอดขาย" style questions span multiple
+        # marketing dimensions (product/price/place/promotion) at once — live-verified (2026-09):
+        # a dense-embedding similarity_search_with_score for "เทคนิคในการทำให้ยอดขายขึ้น" against
+        # the real 872-doc marketing/business_guide corpus topped out at 0.408, below the 0.6
+        # RETRIEVAL_MIN_SIMILARITY floor for every single candidate — the narrow single-pass path
+        # this query fell through to had zero qualifying evidence and asked a clarifying question
+        # instead of answering, even though clearly-relevant strategy docs exist. Routing this
+        # shape into the existing two-pass broad-question retrieval (which uses hybrid/BM25-fused
+        # search, not floor-gated the same way) surfaces them correctly.
+        r"|(เทคนิค|วิธี|ทำยังไง|ทำอย่างไร|ทำไง).{0,10}(เพิ่ม|ทำให้|ให้).{0,10}ยอดขาย"
+        r"|เพิ่มยอดขาย"
+        r"|(ทำการตลาด|การตลาด).{0,15}(ยังไง|อย่างไร|ให้ขายดี|ให้ดีขึ้น)"
+        r"|ขายดี.{0,10}(ยังไง|อย่างไร|ทำไง|ทำยังไง)",
         re.IGNORECASE,
     )
     # Operation inference: detect from user query which operation_group is clearly implied
@@ -2639,7 +2652,15 @@ class PersonaSupervisor:
     # "ดัง" uses negative-lookahead to exclude "ดังนั้น", "ดังกล่าว", "ดังต่อไปนี้" etc.
     _MARKETING_NOT_ELAB_RE = re.compile(
         r"มีกระแส|ยอดนิยม|โด่งดัง|ไวรัล|viral\b|ฮิต\b|ให้ดัง|ร้านดัง|ทำให้ดัง|คาเฟ่ดัง|กาแฟดัง|ที่ดัง"
-        r"|ดัง\b(?!\s*(?:นั้น|กล่าว|ต่อไป|ข้างต้น|สุด|มาก|กว่า|กล่าว))",
+        r"|ดัง\b(?!\s*(?:นั้น|กล่าว|ต่อไป|ข้างต้น|สุด|มาก|กว่า|กล่าว))"
+        # Sales/marketing-technique phrasing (mirrors _BROAD_Q_RE category F) — also never a
+        # regulatory-topic elaboration, and used here so the broad-question two-pass retrieval's
+        # Pass 2 regulatory sweep gets correctly skipped for this query shape too (no license/tax
+        # docs should get injected into a pure "how do I sell more" answer).
+        r"|(เทคนิค|วิธี|ทำยังไง|ทำอย่างไร|ทำไง).{0,10}(เพิ่ม|ทำให้|ให้).{0,10}ยอดขาย"
+        r"|เพิ่มยอดขาย"
+        r"|(ทำการตลาด|การตลาด).{0,15}(ยังไง|อย่างไร|ให้ขายดี|ให้ดีขึ้น)"
+        r"|ขายดี.{0,10}(ยังไง|อย่างไร|ทำไง|ทำยังไง)",
         re.IGNORECASE,
     )
     # Channel-preference follow-up: user wants offline/in-person instead of online.
