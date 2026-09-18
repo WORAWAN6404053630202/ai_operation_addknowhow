@@ -13446,6 +13446,14 @@ class PersonaSupervisor:
         elif (
             raw_stripped
             and not self._LEGAL_SIGNAL_RE.search(raw_stripped)
+            # Marketing/sales-technique signal (live-verified 2026-09): LEGAL_SIGNAL_RE has zero
+            # marketing vocabulary, so a query like "เทคนิคในการทำให้ยอดขายขึ้น" fell all the way
+            # to this guardrail's Chroma fallback below -- which only checks plain dense
+            # similarity_search_with_relevance_scores (k=1, threshold 0.72). That query's real
+            # top dense score against the actual matching "เพิ่มยอดขายง่าย ๆ..." chapter was only
+            # 0.408 (confirmed live), so the fallback missed it too and every such question got
+            # deflected with a generic clarifying question instead of ever reaching retrieval.
+            and not self._MARKETING_NOT_ELAB_RE.search(raw_stripped)
             and not self._LIKELY_SELECTION_RE.match(raw_stripped)
             and not self._ANY_NUMBER_RE.search(raw_stripped)
             and not self._QUESTION_MARKERS_RE.search(raw_stripped)
