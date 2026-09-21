@@ -1437,7 +1437,19 @@ class PersonaSupervisor:
         if self._QUESTION_MARKERS_RE.search(t):
             return False
 
-        if self._EN_GREETING_RE.match(t) or self._EN_GOOD_TIME_RE.match(t):
+        # Guard (2026-09): substantial content after the greeting word → it's a question/
+        # statement, not a pure greeting. The TH_WATDEE/TH_SAWASDEE_FUZZY branch below already
+        # had this guard; EN_GREETING/EN_GOOD_TIME and TH_DEE did not, so e.g. "hi เทคนิคในการ
+        # ทำให้ยอดขายขึ้น" and "ดีครับ เทคนิคในการทำให้ยอดขายขึ้น" were unconditionally
+        # classified as pure greetings regardless of what followed — live-verified to route a
+        # real business question into the greeting/deflect handler instead of retrieval. Using
+        # each match object's own .end() (rather than a hand-written strip regex) so the
+        # trailing text is always exactly "whatever the greeting pattern itself didn't consume".
+        _en_greet_m = self._EN_GREETING_RE.match(t) or self._EN_GOOD_TIME_RE.match(t)
+        if _en_greet_m:
+            _greet_trailing = t[_en_greet_m.end():].strip()
+            if len(_greet_trailing) >= 8:
+                return False
             return True
         if self._TH_WATDEE_RE.match(t) or self._TH_SAWASDEE_FUZZY_RE.match(t):
             # Guard: substantial content after the greeting word → it's a question, not a pure greeting.
@@ -1445,7 +1457,11 @@ class PersonaSupervisor:
             if len(_greet_trailing) >= 8:
                 return False
             return True
-        if self._TH_DEE_RE.match(t) and not self._QUESTION_MARKERS_RE.search(t):
+        _th_dee_m = self._TH_DEE_RE.match(t)
+        if _th_dee_m and not self._QUESTION_MARKERS_RE.search(t):
+            _greet_trailing = t[_th_dee_m.end():].strip()
+            if len(_greet_trailing) >= 8:
+                return False
             return True
 
         if len(t) <= 14 and self._NOISE_ONLY_RE.match(t):
@@ -12871,6 +12887,14 @@ class PersonaSupervisor:
                 and not self._LEGAL_SIGNAL_RE.search(_remainder)
                 and not self._looks_like_legal_question(_remainder, state)
                 and not self._LIKELY_SELECTION_RE.match(_remainder)
+                # Defense-in-depth (2026-09): _handle_deflect's own docstring lists this
+                # "greeting+personal-question" site as one of 3 callers sharing the same
+                # off-topic-guardrail intent — the other 2 (2.2c, unknown_intent) already got
+                # this marketing bypass when a real "เทคนิคในการทำให้ยอดขายขึ้น"-style query was
+                # found deflecting instead of answering. This site had the identical gap and
+                # is reachable independently of _looks_like_greeting_or_thanks' own fix above
+                # (e.g. via the self-intro/greeting_llm_check routes into _handle_greeting).
+                and not self._MARKETING_NOT_ELAB_RE.search(_remainder)
             ):
                 # Noise check: very short OR mostly-repeated-char remainder (e.g. "yyyyyyd", "d") = greeting extension
                 _NOISE_REMAINDER_RE = re.compile(r"^[a-zA-Z]{1,3}$|^[a-zA-Z]*(.)\1{3,}[a-zA-Z]*$", re.IGNORECASE)
