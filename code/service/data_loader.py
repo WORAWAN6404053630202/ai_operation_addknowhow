@@ -501,25 +501,37 @@ class DataLoader:
         # Answer body: all actionable fields
         # NOTE: legal_regulatory is placed early (position 2) to ensure penalty/law keywords
         # are always embedded in the vector — they are short but critical for retrieval.
+        # terms_and_conditions is placed early too (position 3, right after legal_regulatory)
+        # for the same reason — live-verified (2026-09) it can hold actionable facts (e.g. a
+        # card-payment settlement-cutoff-time table) that similarity/BM25 search must be able
+        # to find, not just boilerplate. It used to sit near the END of this list with no cap
+        # of its own, so for any doc whose earlier fields (operation_steps, identification_
+        # documents) were already near their own caps, it silently never made it into the
+        # final `text[:max_chars]` clamp at all — the doc embedded fine, just with zero trace
+        # of its terms_and_conditions content, so no query could ever surface it via retrieval
+        # even though the full text was sitting right there in metadata the whole time.
         # identification_documents is long and can tolerate being partially truncated.
         body_parts = []
-        # NOTE: All three long fields are capped for embedding budget only.
-        # Full values are always available in metadata for the LLM to read.
-        # Caps ensure every field's keywords appear in the vector regardless of doc length.
+        # NOTE: every field below is capped for embedding budget only — full values are
+        # always available in metadata for the LLM to read regardless of this cap. Every
+        # field having its OWN cap (not just relying on the final overall clamp) is what
+        # guarantees each one's keywords have a chance to appear in the vector regardless
+        # of how much content precedes it — the terms_and_conditions bug above happened
+        # precisely because it was the one field that didn't follow this rule yet.
         if md.get("operation_steps"):
             body_parts.append(f"ขั้นตอนการดำเนินการ:\n{md['operation_steps'][:600]}")
         if md.get("legal_regulatory"):
             body_parts.append(f"ข้อกำหนดกฎหมาย/บทลงโทษ:\n{md['legal_regulatory'][:300]}")
+        if md.get("terms_and_conditions"):
+            body_parts.append(f"เงื่อนไขและหลักเกณฑ์:\n{md['terms_and_conditions'][:600]}")
         if md.get("identification_documents"):
             body_parts.append(f"เอกสารที่ต้องใช้:\n{md['identification_documents'][:500]}")
         if md.get("fees"):
-            body_parts.append(f"ค่าธรรมเนียม:\n{md['fees']}")
+            body_parts.append(f"ค่าธรรมเนียม:\n{md['fees'][:800]}")
         if md.get("operation_duration"):
-            body_parts.append(f"ระยะเวลาดำเนินการ: {md['operation_duration']}")
+            body_parts.append(f"ระยะเวลาดำเนินการ: {md['operation_duration'][:400]}")
         if md.get("service_channel"):
             body_parts.append(f"ช่องทางยื่นคำขอ/ติดต่อ:\n{md['service_channel'][:150]}")
-        if md.get("terms_and_conditions"):
-            body_parts.append(f"เงื่อนไขและหลักเกณฑ์:\n{md['terms_and_conditions']}")
         if md.get("answer_guideline"):
             body_parts.append(f"แนวคำตอบ:\n{md['answer_guideline']}")
         if md.get("restaurant_ai_document"):

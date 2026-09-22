@@ -81,6 +81,15 @@ class LocalVectorStoreManager:
             http_client=get_shared_http_client(),
             request_timeout=conf.EMBEDDING_REQUEST_TIMEOUT,
             max_retries=3,
+            # Live-verified (2026-09): langchain's default chunk_size (1000) sends up to
+            # 1000 documents' text in ONE request during bulk ingest — OpenRouter's backend
+            # has a hard 60s worker timeout regardless of client-side request_timeout, and a
+            # batch that size reliably exceeds it (confirmed via repeated 504 "Worker
+            # upstream fetch timed out after 60000ms" errors, not transient flakiness).
+            # Only affects embed_documents (bulk ingest); embed_query (per-message runtime
+            # embedding) always sends a single text regardless of this setting, so normal
+            # chat traffic is unaffected.
+            chunk_size=25,
         )
         print("[Embedding] Loaded successfully")
 
