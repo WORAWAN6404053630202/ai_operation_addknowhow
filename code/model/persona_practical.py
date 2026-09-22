@@ -2370,6 +2370,41 @@ class PracticalPersonaService:
             _LOG.info("[Practical] LQS LLM fallback: %r → %r (conf=%.2f, min=%.2f)", query[:50], matched, conf_val, min_confidence)
         return matched
 
+    # Live-verified (2026-09) against the real corpus: structural/section labels like
+    # "กฎหมาย", "บทสรุป", "เบ็ดเตล็ด", "บทกำหนดโทษ", "บทเฉพาะกาล" top out at 10 Thai
+    # characters and are too generic to substring-match safely (a user query merely
+    # mentioning "กฎหมาย" would false-positive-trigger a sweep). Every genuine,
+    # specific chapter topic in the corpus is ≥12 chars (e.g. "กฎหมายแรงงาน",
+    # "กลยุทธ์ด้านราคา") — this threshold sits in that natural gap.
+    _NONREG_TOPIC_MIN_LEN = 12
+
+    def _get_nonreg_main_topics(self, vectorstore) -> List[str]:
+        """Distinct main_topic values for non-regulatory (marketing/business_guide)
+        rows, fetched live from Chroma and cached per-process (invalidated by
+        redeploy/re-ingest, which restarts the process). Sorted longest-first so a
+        substring check never matches a short topic name that's itself a substring
+        of a longer, more specific one. Zero hardcoded topic names — any topic
+        added to the data shows up here automatically.
+        """
+        _cached = getattr(self, "_nonreg_main_topics_cache", None)
+        if _cached is not None:
+            return _cached
+        _topics: set = set()
+        if vectorstore is not None:
+            _coll = getattr(vectorstore, "_collection", None)
+            if _coll is not None:
+                try:
+                    _result = _coll.get(where={"data_type": {"$in": ["marketing", "business_guide"]}}, include=["metadatas"])
+                    for _md in (_result.get("metadatas") or []):
+                        _mt = str((_md or {}).get("main_topic") or "").strip()
+                        if _mt and len(_mt) >= self._NONREG_TOPIC_MIN_LEN:
+                            _topics.add(_mt)
+                except Exception as _mt_lookup_e:
+                    _LOG.debug("[Practical] nonreg main_topic fetch failed: %s", _mt_lookup_e)
+        _sorted = sorted(_topics, key=len, reverse=True)
+        self._nonreg_main_topics_cache = _sorted
+        return _sorted
+
     def _retrieve_docs(
         self, query: str, metadata_filter: Optional[Dict[str, Any]] = None, max_docs: Optional[int] = None,
         slot_context: Optional[Dict[str, Any]] = None, state=None,
@@ -2583,6 +2618,118 @@ class PracticalPersonaService:
                         _r3_added, _missing_terms, len(docs),
                     )
 
+        # ── Round 4: chapter-completeness sweep (business_guide/marketing) ──────
+        # Mirrors persona_supervisor.py's regulatory coverage-sweep guarantee (its
+        # broad-question path deterministically fetches every missing license_type
+        # instead of trusting similarity search to find them all) — but for
+        # non-regulatory "chapter" content, keyed on main_topic instead of
+        # license_type.
+        #
+        # Anchor detection has TWO independent paths, tried in order:
+        #   (a) Round 2's majority-vote anchor, when it happened to land on
+        #       main_topic (cheap, no extra query).
+        #   (b) Direct containment check: does expanded_query literally contain
+        #       one of the corpus's actual main_topic values? This path exists
+        #       because (a) requires ≥2 of the top-5 Round-1 docs to already
+        #       share a main_topic — but live-verified (2026-09) case
+        #       "อยากได้คำแนะนำเรื่องการตั้งราคาเมนูให้เหมาะสม มีหลักคิดยังไงบ้าง"
+        #       scored a best dense rank of 215th/942 (~0 similarity) against the
+        #       correct "กลยุทธ์ด้านราคา" chapter, so Round 1's top-5 was scattered
+        #       across unrelated topics and (a) never found a majority. Casual
+        #       phrasing just doesn't share vocabulary with the formal chapter
+        #       text at the embedding level. Path (b) instead leans on
+        #       query_synonyms.py, which already exists to bridge exactly this
+        #       gap — its expansion for "ตั้งราคา" appends the literal string
+        #       "กลยุทธ์ด้านราคา" into expanded_query, so a substring check
+        #       against the corpus's live main_topic list finds it deterministically
+        #       even when similarity search alone can't. The main_topic list itself
+        #       is fetched from Chroma (cached per-process), not hardcoded — so any
+        #       FUTURE main_topic is covered automatically the moment a synonym
+        #       pattern (or the query text itself) mentions it by name.
+        if docs and not metadata_filter:
+            _r4_anchor: str = _r2_anchor if (_r2_field == "main_topic" and _r2_anchor) else ""
+            if not _r4_anchor:
+                try:
+                    for _mt_cand in self._get_nonreg_main_topics(vectorstore):
+                        if _mt_cand and _mt_cand in expanded_query:
+                            _r4_anchor = _mt_cand
+                            break
+                except Exception as _mt_e:
+                    _LOG.debug("[Practical] nonreg main_topic lookup failed: %s", _mt_e)
+            if _r4_anchor:
+                try:
+                    _chapter_is_nonreg = _r4_anchor in self._get_nonreg_main_topics(vectorstore)
+                    if _chapter_is_nonreg and vectorstore is not None:
+                        _coll_ch = getattr(vectorstore, "_collection", None)
+                        if _coll_ch is not None:
+                            _ch_result = _coll_ch.get(where={"main_topic": _r4_anchor}, include=["documents", "metadatas"])
+                            _seen_ch = {hash((getattr(d, "page_content", "") or "")[:120]) for d in docs}
+                            # Group by sub_topic (fallback operation_topic) and round-robin
+                            # pick across groups, capped at max_docs — same "bounded fetch,
+                            # not the whole chapter" shape as persona_supervisor.py's
+                            # regulatory sweep (k=2 per missing license_type, not unlimited).
+                            # This guarantees every distinct sub-category within the chapter
+                            # gets a representative doc BEFORE any one category gets a second,
+                            # which is what actually fixes "missing 2 of 4 categories" — just
+                            # adding all 26 docs to the candidate pool and hoping the reranker
+                            # sorts them diversely into the final max_docs slots was not a
+                            # guarantee, only a hope.
+                            _ch_groups: Dict[str, list] = {}
+                            for _ch_content, _ch_meta in zip(
+                                _ch_result.get("documents") or [], _ch_result.get("metadatas") or []
+                            ):
+                                _ch_h = hash((_ch_content or "")[:120])
+                                if _ch_h in _seen_ch:
+                                    continue
+                                _seen_ch.add(_ch_h)
+                                _grp_key = str((_ch_meta or {}).get("sub_topic") or (_ch_meta or {}).get("operation_topic") or "").strip() or "_"
+                                _ch_groups.setdefault(_grp_key, []).append((_ch_content, _ch_meta))
+
+                            # A full-chapter question genuinely needs more than the terse
+                            # default doc budget to cover every distinct sub-topic — same
+                            # reasoning as the existing max_docs=8/15 overrides elsewhere in
+                            # this file for other broad-retrieval call sites. Bounded so a
+                            # chapter with e.g. 80 sub-topics can't blow up token cost.
+                            _n_groups_total = len(_ch_groups)
+                            _sweep_cap_ceiling = int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL_CHAPTER_SWEEP", 12))
+                            if _n_groups_total > max_docs:
+                                max_docs = min(_n_groups_total, _sweep_cap_ceiling)
+
+                            from langchain_core.documents import Document as _ChDoc
+                            _pinned: list = []
+                            _cap = max(1, max_docs)
+                            while _ch_groups and len(_pinned) < _cap:
+                                for _grp_key in list(_ch_groups.keys()):
+                                    if len(_pinned) >= _cap:
+                                        break
+                                    _content, _meta = _ch_groups[_grp_key].pop(0)
+                                    # _bm25_hit bypasses the min_similarity filter below — these docs
+                                    # are trusted by construction (exact main_topic metadata match),
+                                    # not by a similarity score, same reasoning as real BM25 hits.
+                                    # _chapter_sweep_pin additionally protects them from being DROPPED
+                                    # (not just reordered) by the reranker's own top_k cutoff further
+                                    # below — discovered live (2026-09): prepending to `docs` only
+                                    # guarantees survival through the FINAL docs[:max_docs] slice, but
+                                    # the reranker runs before that and re-sorts+truncates to its own
+                                    # RERANKER_TOP_K purely by cross-encoder score, with no notion of
+                                    # "pinned" — so a real test with 9 pinned sub-topics only saw 7
+                                    # survive to the final answer, silently dropped mid-pipeline.
+                                    _pinned.append(_ChDoc(page_content=_content or "", metadata={**(_meta or {}), "_bm25_hit": True, "_chapter_sweep_pin": True}))
+                                    if not _ch_groups[_grp_key]:
+                                        del _ch_groups[_grp_key]
+                            if _pinned:
+                                # Pin at the front (not appended) so this chapter's coverage
+                                # survives the final docs[:max_docs] truncation regardless of
+                                # how the reranker/metadata-boost stages later score them.
+                                docs = _pinned + docs
+                                _n_groups = len({str((p.metadata or {}).get("sub_topic") or (p.metadata or {}).get("operation_topic") or "") for p in _pinned})
+                                _LOG.info(
+                                    "[Practical] Round 4 chapter sweep +%d docs (%d sub-topics, main_topic=%r) total=%d",
+                                    len(_pinned), _n_groups, _r4_anchor[:40], len(docs),
+                                )
+                except Exception as _ch_e:
+                    _LOG.debug("[Practical] chapter sweep failed: %s", _ch_e)
+
         retrieval_ms = (time.time() - start) * 1000
 
         # Token Optimization: Filter by similarity score
@@ -2650,6 +2797,14 @@ class PracticalPersonaService:
         # a tiebreaker on near-equal scores rather than overriding the reranker.
         if getattr(conf, "RERANKER_ENABLED", False) and len(docs) >= 3:
             try:
+                # Chapter-sweep pins (Round 4) must survive reranking, not just be
+                # reordered by it — the reranker truncates to its own RERANKER_TOP_K
+                # purely by cross-encoder score, with no notion of "pinned", so a doc
+                # added specifically to guarantee sub-topic coverage can still be
+                # silently dropped here even though it survived the min_similarity
+                # filter above. Live-verified (2026-09): 9 pinned sub-topics went in,
+                # only 7 came out the other side of this exact step.
+                _pin_before = [d for d in docs if (getattr(d, "metadata", {}) or {}).get("_chapter_sweep_pin")]
                 from utils.reranker import rerank as _do_rerank
                 _rr_model = getattr(conf, "RERANKER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
                 _rr_top_k = int(getattr(conf, "RERANKER_TOP_K", len(docs)))
@@ -2658,6 +2813,12 @@ class PracticalPersonaService:
                 _rr_min_score = getattr(conf, "RERANKER_MIN_SCORE", None)
                 # Use original query (Thai only) not expanded_query which may contain English synonyms
                 docs = _do_rerank(query, docs, model_name=_rr_model, top_k=_rr_top_k, backend=_rr_backend, onnx_file=_rr_onnx_file, min_score=_rr_min_score)
+                if _pin_before:
+                    _seen_after = {hash((getattr(d, "page_content", "") or "")[:120]) for d in docs}
+                    _re_add = [p for p in _pin_before if hash((getattr(p, "page_content", "") or "")[:120]) not in _seen_after]
+                    if _re_add:
+                        docs = _re_add + docs
+                        _LOG.info("[Practical] reranker dropped %d chapter-sweep pin(s) — re-admitted", len(_re_add))
                 _LOG.debug("[Practical] reranker applied — %d docs kept", len(docs))
             except Exception as _rr_exc:
                 _LOG.warning("[Practical] reranker failed (%s) — continuing without rerank", _rr_exc)
@@ -2710,6 +2871,22 @@ class PracticalPersonaService:
         # Sort descending by blend score; preserve original order on ties (stable sort)
         _boosted.sort(key=lambda x: x[1], reverse=True)
         docs = [_d for _d, _ in _boosted]
+
+        # Re-assert chapter-sweep pins ahead of everything else, right before the
+        # final docs[:max_docs] truncation. Reordering by relevance (this boost step,
+        # and the reranker before it) is fine and expected for both groups — but a
+        # pinned doc must never lose its slot in the final cut just because its blend
+        # score landed lower than a non-pinned doc's. Doing this only once (earlier,
+        # right after Round 4) wasn't enough: both the reranker and this boost step
+        # independently re-sort `docs` by their own score afterward, silently undoing
+        # a front-position guarantee set upstream — live-verified (2026-09), pins
+        # still lost slots here even after being re-admitted post-reranker. Sorting
+        # within each group is preserved; only the pinned-vs-not grouping is forced.
+        if any((getattr(d, "metadata", {}) or {}).get("_chapter_sweep_pin") for d in docs):
+            _pin_group = [d for d in docs if (getattr(d, "metadata", {}) or {}).get("_chapter_sweep_pin")]
+            _rest_group = [d for d in docs if not (getattr(d, "metadata", {}) or {}).get("_chapter_sweep_pin")]
+            docs = _pin_group + _rest_group
+
         # Log when boost changed the ranking
         _boost_changed = any(
             _boosted[i][1] != _boosted[i][0].metadata.get("_sim", _boosted[i][1])
