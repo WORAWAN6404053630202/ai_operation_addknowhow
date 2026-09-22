@@ -84,7 +84,19 @@ LLM_DOCS_MAX_ACADEMIC = _safe_int("LLM_DOCS_MAX_ACADEMIC", 12)    # raised: 5 �
 LLM_DOC_CHARS_PRACTICAL = _safe_int("LLM_DOC_CHARS_PRACTICAL", 700)   # reduced 1200→700: metadata fields carry key info
 LLM_DOC_CHARS_ACADEMIC = _safe_int("LLM_DOC_CHARS_ACADEMIC", 700)    # raised: 500 → 700 (need full metadata fields)
 LLM_DOC_CHARS_BUSINESS_GUIDE = _safe_int("LLM_DOC_CHARS_BUSINESS_GUIDE", 3500)  # business_guide: answer_guideline is sole content field — needs full coverage
-PAGE_CONTENT_MAX_CHARS = _safe_int("PAGE_CONTENT_MAX_CHARS", 2500)    # raised 1800→2500: fit legal_regulatory into embedding
+# Raised 1800→2500 (fit legal_regulatory) then 2500→7500 (2026-09, fit terms_and_conditions
+# — a card-payment settlement-time table went silently missing from search because it sat
+# near the end of _build_page_content's field ordering with no cap of its own, so the blunt
+# overall clamp cut it off before this constant's last raise ever reached it). This has now
+# happened twice — the durable fix is to size this clamp so it stops being a routine
+# truncator at all: every one of _build_page_content's 9 body fields now has its own cap
+# (600+300+600+500+800+400+150+2500+300=6150) + head (~500) + labels/separators (~150)
+# ≈ 6800 worst case if EVERY field hit its own cap simultaneously on one row — 7500 leaves
+# margin above that. Still far inside bge-m3's real ~8192-token window (vs. the 512-token
+# e5-large limit this constant was originally sized for), so no embedding-quality tradeoff
+# from being "too small" for the model — the risk was always this clamp being too TIGHT for
+# the content, never the model being unable to handle the text.
+PAGE_CONTENT_MAX_CHARS = _safe_int("PAGE_CONTENT_MAX_CHARS", 7500)
 
 # RAG Quality: Minimum similarity threshold
 RETRIEVAL_MIN_SIMILARITY = _safe_float("RETRIEVAL_MIN_SIMILARITY", 0.6)

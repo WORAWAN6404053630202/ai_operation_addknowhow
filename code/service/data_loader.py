@@ -16,6 +16,8 @@ from langchain_core.documents import Document
 from typing import List, Optional, Dict
 from urllib.parse import urlparse, parse_qs
 
+import conf
+
 
 class DataLoader:
     """
@@ -43,9 +45,16 @@ class DataLoader:
         self.departments_found = set()
 
         # RAG content tuning knobs (safe defaults)
-        self.page_content_max_chars = int(getattr(config, "PAGE_CONTENT_MAX_CHARS", 1800) or 1800)
+        # Live-verified (2026-09): the only call site (scripts/ingest_local.py) constructs
+        # this class with config={} (a plain dict), and getattr(a_dict, "SOME_NAME", default)
+        # can never find "SOME_NAME" as a dict ATTRIBUTE (dicts hold data via keys, not
+        # attributes) — so this silently fell back to the hardcoded default below on every
+        # single ingest, regardless of what conf.PAGE_CONTENT_MAX_CHARS was actually set to.
+        # A prior fix (1800→2500, see conf.py's comment on that constant) never actually
+        # took effect for this exact reason — read from the real conf module directly instead.
+        self.page_content_max_chars = int(getattr(conf, "PAGE_CONTENT_MAX_CHARS", 1800) or 1800)
         self.include_research_reference_in_content = bool(
-            getattr(config, "INCLUDE_RESEARCH_REF_IN_CONTENT", False)
+            getattr(conf, "INCLUDE_RESEARCH_REF_IN_CONTENT", False)
         )
 
     @staticmethod
@@ -533,9 +542,15 @@ class DataLoader:
         if md.get("service_channel"):
             body_parts.append(f"ช่องทางยื่นคำขอ/ติดต่อ:\n{md['service_channel'][:150]}")
         if md.get("answer_guideline"):
-            body_parts.append(f"แนวคำตอบ:\n{md['answer_guideline']}")
+            # 2500 covers the real corpus's p95 (2253 chars) fully — this is the SOLE
+            # content field for business_guide/marketing rows (no license_type fields
+            # to compete with), and one of the last fields for regulatory rows, so it
+            # was the last of the 9 body fields still relying on the blunt overall
+            # clamp instead of its own cap (same bug class as terms_and_conditions,
+            # just not yet proven by a real case — see PAGE_CONTENT_MAX_CHARS below).
+            body_parts.append(f"แนวคำตอบ:\n{md['answer_guideline'][:2500]}")
         if md.get("restaurant_ai_document"):
-            body_parts.append(f"เอกสาร/ฟอร์ม: {md['restaurant_ai_document']}")
+            body_parts.append(f"เอกสาร/ฟอร์ม: {md['restaurant_ai_document'][:300]}")
 
         body = self._join_nonempty(body_parts)
 

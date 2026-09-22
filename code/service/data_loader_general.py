@@ -24,6 +24,8 @@ from urllib.parse import parse_qs, urlparse
 import pandas as pd
 from langchain_core.documents import Document
 
+import conf
+
 
 class GeneralDataLoader:
     """
@@ -70,14 +72,23 @@ class GeneralDataLoader:
         ),
     }
 
-    def __init__(self, data_type: str, page_content_max_chars: int = 1800):
+    def __init__(self, data_type: str, page_content_max_chars: Optional[int] = None):
         """
         data_type: "marketing" | "business_guide" (stored in doc metadata)
         """
         assert data_type in ("marketing", "business_guide"), \
             f"data_type must be 'marketing' or 'business_guide', got {data_type!r}"
         self.data_type = data_type
-        self.page_content_max_chars = page_content_max_chars
+        # Live-verified (2026-09): both real call sites (scripts/ingest_local.py) construct
+        # this class without passing page_content_max_chars at all, so the old hardcoded
+        # default of 1800 silently ignored conf.PAGE_CONTENT_MAX_CHARS entirely — same bug
+        # class as DataLoader's config={} issue (see that class's __init__ for the other
+        # half of this fix). Default to the real conf value unless a caller explicitly
+        # overrides it.
+        self.page_content_max_chars = (
+            page_content_max_chars if page_content_max_chars is not None
+            else int(getattr(conf, "PAGE_CONTENT_MAX_CHARS", 1800) or 1800)
+        )
         self.documents: List[Document] = []
 
     # ------------------------------------------------------------------

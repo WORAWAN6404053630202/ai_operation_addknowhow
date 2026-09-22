@@ -120,6 +120,18 @@ def _normalize_metadata(md: Dict[str, Any]) -> Dict[str, Any]:
 _VALID_DATA_TYPES = {"regulatory", "marketing", "business_guide"}
 _VALID_ENTITY_TYPES = {"นิติบุคคล", "บุคคลธรรมดา", ""}
 
+# Every field data_loader.py's _build_page_content folds into the embedded text.
+# Keep this list in sync with that function — it's how _validate_documents (below)
+# catches the "field has real content but never made it into page_content" bug
+# class (e.g. a settlement-time table that was silently unsearchable for months
+# because it sat behind other fields with no cap of its own). If a new field gets
+# added to _build_page_content, add it here too so it's covered by the same check.
+_PAGE_CONTENT_BODY_FIELDS = [
+    "operation_steps", "legal_regulatory", "terms_and_conditions",
+    "identification_documents", "fees", "operation_duration",
+    "service_channel", "answer_guideline", "restaurant_ai_document",
+]
+
 
 def _validate_documents(docs: List[Document]) -> int:
     """
@@ -161,6 +173,22 @@ def _validate_documents(docs: List[Document]) -> int:
             issues.append(
                 f"page_content too short ({len(content)} chars) — embedding quality will be poor"
             )
+
+        # Field-coverage check — catches a populated field that is completely absent
+        # from page_content (silently unsearchable, even though the LLM would still
+        # see the full value via metadata on a lucky retrieval hit). Checks only a
+        # short prefix of each field's value, not the whole thing, so a field that
+        # was legitimately truncated by ITS OWN cap inside _build_page_content
+        # (expected, not a bug) doesn't false-positive here — only TOTAL absence is
+        # flagged. See PAGE_CONTENT_MAX_CHARS in conf.py for the history of this
+        # exact bug class (terms_and_conditions, 2026-09; legal_regulatory before it).
+        for field in _PAGE_CONTENT_BODY_FIELDS:
+            val = str(md.get(field) or "").strip()
+            if val and val[:30] not in content:
+                issues.append(
+                    f"{field} has content but is completely missing from page_content "
+                    "— will never be found by similarity/BM25 search"
+                )
 
         # Non-regulatory docs must have operation_topic for supervisor topic routing.
         if dt in ("marketing", "business_guide"):
