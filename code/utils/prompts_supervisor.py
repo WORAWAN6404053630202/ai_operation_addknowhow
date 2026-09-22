@@ -555,6 +555,20 @@ def build_broad_question_detect_prompt(user_text: str) -> str:
     Consequence when this misfires: triggers the expensive two-pass regulatory
     sweep, merging in unrelated docs that can blow the session token budget and
     produce a broken info-gap answer for what should have been a simple question.
+
+    NOTE on "broad" terminology (2026-09, cross-file audit): this prompt's
+    is_broad=true controls RETRIEVAL SCOPE only (fetch docs across multiple
+    license/tax/registration dimensions). It is a DIFFERENT axis from Practical's
+    own prompts_practical.py "TARGETED-CATEGORY GATE", which controls ANSWER
+    FORMAT (whether to show only a license list vs. a full multi-section
+    overview) and uses the same example phrase ("ต้องขอใบอนุญาตอะไรบ้าง") with
+    opposite-sounding terminology. This is intentional, not a bug: a query can
+    correctly be is_broad=true HERE (needs wide retrieval to cover licenses+tax+
+    registration) while ALSO being a "targeted category" question THERE (the
+    answer itself should stay a clean license list, not sprout unrelated
+    kitchen-hygiene/marketing sections). Do not "fix" one file's definition of
+    "broad" to match the other's — they answer different questions at different
+    pipeline stages. If editing either, re-check this note first.
     """
     return (
         "คุณคือ classifier ตรวจว่า user ถาม 'ภาพรวม' (ครอบคลุมหลายมิติ/หลายใบอนุญาต/หลายหัวข้อพร้อมกัน)"

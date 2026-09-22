@@ -4743,10 +4743,21 @@ class PersonaSupervisor:
                         # Filter to actual government-issued permits/licenses only.
                         # ^ใบ covers ใบอนุญาต/ใบทะเบียน/ใบวุฒิบัตร/ใบรับรอง/ใบภาษี.
                         # ^แบบแสดง covers แบบแสดงรายการภาษีป้าย.
+                        # ภาษี (2026-09, live-verified gap): catches the 2 remaining tax-law
+                        # entries that aren't shaped like a "ใบ..." permit but are still a real,
+                        # universally-applicable compliance obligation for any new business owner
+                        # — ประมวลรัษฎากร (income tax code) and รวมกฎหมายที่ดิน...ภาษีที่ดิน (land/
+                        # building tax). A user asked "จะเปิดร้านอาหารต้องขอใบอนุญาตอะไรบ้าง...
+                        # เพิ่งเริ่มทำเป็นบุคคลธรรมดาคนเดียว" and the answer covered VAT/signboard
+                        # tax (already matched ^ใบ/^แบบแสดง) but silently dropped these two —
+                        # confirmed via a full scan of all 76 regulatory license_types that these
+                        # are the ONLY 2 "ภาษี"-containing entries this pattern was missing; every
+                        # other excluded entry (labor court procedure, criminal code, the
+                        # constitution, etc.) is correctly out of scope for this sweep.
                         # Excludes: ทะเบียนนายจ้าง/ผู้ประกันตน (employee registrations,
                         # not permits), and all operational tools (payment, banking, staffing).
                         _PERMIT_LT_RE = re.compile(
-                            r"^ใบ|^แบบแสดง|ภพ\.|ภ\.ป|สณ\.|ภส\.", re.UNICODE
+                            r"^ใบ|^แบบแสดง|ภพ\.|ภ\.ป|สณ\.|ภส\.|ภาษี", re.UNICODE
                         )
                         _missing_lts = {lt for lt in _missing_lts if _PERMIT_LT_RE.search(lt)}
                         # Re-include license types explicitly named in the user's query
