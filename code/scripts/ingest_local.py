@@ -182,9 +182,18 @@ def _validate_documents(docs: List[Document]) -> int:
         # (expected, not a bug) doesn't false-positive here — only TOTAL absence is
         # flagged. See PAGE_CONTENT_MAX_CHARS in conf.py for the history of this
         # exact bug class (terms_and_conditions, 2026-09; legal_regulatory before it).
+        #
+        # Both `md` and `content` have already been through normalize_documents by
+        # the time this runs, so they're normally in sync — but a prefix compared
+        # pre-normalization can occasionally land on a duplicate-token boundary that
+        # _normalize_text collapses (e.g. a source typo like "X X เป็น..." dedup'd
+        # to "X เป็น..."), shifting where the prefix starts. Re-normalizing val
+        # before the prefix check removes that class of false positive without
+        # weakening the check — it still only tolerates a normalization artifact,
+        # never a field that's genuinely absent.
         for field in _PAGE_CONTENT_BODY_FIELDS:
             val = str(md.get(field) or "").strip()
-            if val and val[:30] not in content:
+            if val and val[:30] not in content and _normalize_text(val)[:30] not in content:
                 issues.append(
                     f"{field} has content but is completely missing from page_content "
                     "— will never be found by similarity/BM25 search"
