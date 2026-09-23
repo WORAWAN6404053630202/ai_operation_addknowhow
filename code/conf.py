@@ -84,19 +84,24 @@ LLM_DOCS_MAX_ACADEMIC = _safe_int("LLM_DOCS_MAX_ACADEMIC", 12)    # raised: 5 �
 LLM_DOC_CHARS_PRACTICAL = _safe_int("LLM_DOC_CHARS_PRACTICAL", 700)   # reduced 1200→700: metadata fields carry key info
 LLM_DOC_CHARS_ACADEMIC = _safe_int("LLM_DOC_CHARS_ACADEMIC", 700)    # raised: 500 → 700 (need full metadata fields)
 LLM_DOC_CHARS_BUSINESS_GUIDE = _safe_int("LLM_DOC_CHARS_BUSINESS_GUIDE", 3500)  # business_guide: answer_guideline is sole content field — needs full coverage
-# Raised 1800→2500 (fit legal_regulatory) then 2500→7500 (2026-09, fit terms_and_conditions
-# — a card-payment settlement-time table went silently missing from search because it sat
-# near the end of _build_page_content's field ordering with no cap of its own, so the blunt
-# overall clamp cut it off before this constant's last raise ever reached it). This has now
-# happened twice — the durable fix is to size this clamp so it stops being a routine
-# truncator at all: every one of _build_page_content's 9 body fields now has its own cap
-# (600+300+600+500+800+400+150+2500+300=6150) + head (~500) + labels/separators (~150)
-# ≈ 6800 worst case if EVERY field hit its own cap simultaneously on one row — 7500 leaves
-# margin above that. Still far inside bge-m3's real ~8192-token window (vs. the 512-token
-# e5-large limit this constant was originally sized for), so no embedding-quality tradeoff
-# from being "too small" for the model — the risk was always this clamp being too TIGHT for
-# the content, never the model being unable to handle the text.
-PAGE_CONTENT_MAX_CHARS = _safe_int("PAGE_CONTENT_MAX_CHARS", 7500)
+# Raised 1800→2500 (fit legal_regulatory), 2500→7500 (2026-09, fit terms_and_conditions —
+# a card-payment settlement-time table went silently missing from search because it sat near
+# the end of _build_page_content's field ordering with no cap of its own), 7500→12000 (same
+# session: auditing every field's cap against the REAL corpus length distribution — not just
+# reacting to the one reported case — found operation_steps, legal_regulatory, terms_and_
+# conditions, identification_documents, and service_channel were ALL under-sized, silently
+# truncating 18-56% of the docs that have each field), then 12000→18000 (same session again:
+# an alcohol-license EDC requirement was STILL truncated at the p95+ caps because it sat past
+# even those — caps now cover each field's real CURRENT MAX + ~25% headroom instead of just
+# p95, per user request to genuinely stop losing content rather than just reduce how often it
+# happens). New worst case: 1800+2000+2300+2100+900+300+600+5500+300=15800 + head (~500) +
+# labels/separators (~150) ≈ 16450 if EVERY field hit its own cap simultaneously on one row —
+# 18000 leaves margin above that. Confirmed safe: feature/pdf-ingestion's own testing (direct
+# OpenRouter embeddings calls, bypassing langchain, see code/utils/pdf_text_chunking.py's
+# module docstring) already empirically proved baai/bge-m3 embeds up to ~42,300 Thai
+# characters with NO silent truncation — 18000 stays well under that with real margin to
+# spare, so this is not a guess about model capacity, just reusing an already-verified fact.
+PAGE_CONTENT_MAX_CHARS = _safe_int("PAGE_CONTENT_MAX_CHARS", 18000)
 
 # RAG Quality: Minimum similarity threshold
 RETRIEVAL_MIN_SIMILARITY = _safe_float("RETRIEVAL_MIN_SIMILARITY", 0.6)

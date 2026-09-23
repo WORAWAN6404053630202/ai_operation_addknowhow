@@ -527,28 +527,43 @@ class DataLoader:
         # guarantees each one's keywords have a chance to appear in the vector regardless
         # of how much content precedes it — the terms_and_conditions bug above happened
         # precisely because it was the one field that didn't follow this rule yet.
+        # Caps below (2026-09) sized to fully cover the real corpus's current max
+        # length per field, not just p95+ — live-verified case: a special-business
+        # EDC requirement ("ร้านขายเหล้าต้องแนบใบอนุญาตจำหน่ายสุรา") sat at character
+        # 798 of a 1456-char operation_steps value, past the old 600-char cap, so it
+        # silently never reached the vector even though this field WAS present and
+        # NOT flagged by the field-coverage check (that check only catches a field
+        # being completely absent, not a real fact buried past its own cap — a
+        # narrower, harder-to-detect version of the same bug class). Auditing every
+        # field's real corpus distribution found this was not a one-off: identification_
+        # documents was truncating 56% of docs that have it, service_channel 45%,
+        # legal_regulatory 35%, terms_and_conditions 27%, operation_steps 18%. Each
+        # cap below is the field's real current max + ~25% headroom for growth — safe
+        # to be this generous because feature/pdf-ingestion's own testing already
+        # empirically confirmed (direct OpenRouter embeddings calls, bypassing
+        # langchain) that baai/bge-m3 embeds up to ~42,300 Thai characters with NO
+        # silent truncation; a hard error only past that, never a quiet drop. See
+        # code/utils/pdf_text_chunking.py's module docstring for that finding.
         if md.get("operation_steps"):
-            body_parts.append(f"ขั้นตอนการดำเนินการ:\n{md['operation_steps'][:600]}")
+            body_parts.append(f"ขั้นตอนการดำเนินการ:\n{md['operation_steps'][:1800]}")
         if md.get("legal_regulatory"):
-            body_parts.append(f"ข้อกำหนดกฎหมาย/บทลงโทษ:\n{md['legal_regulatory'][:300]}")
+            body_parts.append(f"ข้อกำหนดกฎหมาย/บทลงโทษ:\n{md['legal_regulatory'][:2000]}")
         if md.get("terms_and_conditions"):
-            body_parts.append(f"เงื่อนไขและหลักเกณฑ์:\n{md['terms_and_conditions'][:600]}")
+            body_parts.append(f"เงื่อนไขและหลักเกณฑ์:\n{md['terms_and_conditions'][:2300]}")
         if md.get("identification_documents"):
-            body_parts.append(f"เอกสารที่ต้องใช้:\n{md['identification_documents'][:500]}")
+            body_parts.append(f"เอกสารที่ต้องใช้:\n{md['identification_documents'][:2100]}")
         if md.get("fees"):
-            body_parts.append(f"ค่าธรรมเนียม:\n{md['fees'][:800]}")
+            body_parts.append(f"ค่าธรรมเนียม:\n{md['fees'][:900]}")
         if md.get("operation_duration"):
-            body_parts.append(f"ระยะเวลาดำเนินการ: {md['operation_duration'][:400]}")
+            body_parts.append(f"ระยะเวลาดำเนินการ: {md['operation_duration'][:300]}")
         if md.get("service_channel"):
-            body_parts.append(f"ช่องทางยื่นคำขอ/ติดต่อ:\n{md['service_channel'][:150]}")
+            body_parts.append(f"ช่องทางยื่นคำขอ/ติดต่อ:\n{md['service_channel'][:600]}")
         if md.get("answer_guideline"):
-            # 2500 covers the real corpus's p95 (2253 chars) fully — this is the SOLE
-            # content field for business_guide/marketing rows (no license_type fields
-            # to compete with), and one of the last fields for regulatory rows, so it
-            # was the last of the 9 body fields still relying on the blunt overall
-            # clamp instead of its own cap (same bug class as terms_and_conditions,
-            # just not yet proven by a real case — see PAGE_CONTENT_MAX_CHARS below).
-            body_parts.append(f"แนวคำตอบ:\n{md['answer_guideline'][:2500]}")
+            # Sole content field for business_guide/marketing rows (no license_type
+            # fields to compete with), and one of the last fields for regulatory
+            # rows, so it was the last of the 9 body fields still relying on the
+            # blunt overall clamp instead of its own cap.
+            body_parts.append(f"แนวคำตอบ:\n{md['answer_guideline'][:5500]}")
         if md.get("restaurant_ai_document"):
             body_parts.append(f"เอกสาร/ฟอร์ม: {md['restaurant_ai_document'][:300]}")
 

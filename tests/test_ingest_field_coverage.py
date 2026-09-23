@@ -38,14 +38,14 @@ from service.data_loader_general import GeneralDataLoader
 # Every field DataLoader._build_page_content folds into the embedded text,
 # with its own cap (must stay in sync with data_loader.py).
 _REGULATORY_BODY_FIELDS = {
-    "operation_steps": 600,
-    "legal_regulatory": 300,
-    "terms_and_conditions": 600,
-    "identification_documents": 500,
-    "fees": 800,
-    "operation_duration": 400,
-    "service_channel": 150,
-    "answer_guideline": 2500,
+    "operation_steps": 1800,
+    "legal_regulatory": 2000,
+    "terms_and_conditions": 2300,
+    "identification_documents": 2100,
+    "fees": 900,
+    "operation_duration": 300,
+    "service_channel": 600,
+    "answer_guideline": 5500,
     "restaurant_ai_document": 300,
 }
 
