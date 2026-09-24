@@ -1598,8 +1598,16 @@ class PracticalPersonaService:
             model_kwargs={"response_format": {"type": "json_object"}},
             extra_body=_extra_body,
         )
-
-    # Normalization / detectors
+        # Root cause (2026-09-24) of a total prompt-caching outage: the call site
+        # that builds the cached system message used to read the model name via
+        # getattr(self.llm, "model", ""), but langchain_openai (as pinned in this
+        # project's requirements.txt, 0.3.35) stores it under `.model_name`, not
+        # `.model` — that getattr always silently returned "", so the "anthropic/"
+        # in model_name check in build_cached_system_message was always False and
+        # cache_control was never attached on any real call, ever. Storing the
+        # already-known-correct value here avoids depending on the installed
+        # library's internal attribute name at all.
+        self._model_name = model_name
     def _normalize_for_intent(self, s: str) -> str:
         t = (s or "").strip().lower()
         t = re.sub(r"[!！?？。,，]+", " ", t)
@@ -2220,13 +2228,7 @@ class PracticalPersonaService:
         last_err = None
         for _ in range(max_retries):
             try:
-                _sys_msg = build_cached_system_message(SYSTEM_PROMPT_PRACTICAL, getattr(self.llm, "model", ""))
-                if getattr(conf, "DEBUG_LOG_LLM_REQUEST_BODY", False):
-                    _LOG.warning(
-                        "[DEBUG sys_msg at construction] content_type=%s is_same_llm=%s llm_id=%s model=%s",
-                        type(_sys_msg.content).__name__, _llm is self.llm, id(_llm),
-                        getattr(_llm, "model", ""),
-                    )
+                _sys_msg = build_cached_system_message(SYSTEM_PROMPT_PRACTICAL, self._model_name)
                 resp = llm_invoke(_llm, [_sys_msg, HumanMessage(content=prompt)], logger=_LOG, label="Practical/json", state=state)
                 text = extract_llm_text(resp).strip()
 
