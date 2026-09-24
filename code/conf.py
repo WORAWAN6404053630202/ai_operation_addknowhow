@@ -240,6 +240,17 @@ DEBUG_LATENCY = os.getenv("DEBUG_LATENCY", "true").lower() == "true"
 # 1) OpenRouter provider routing — route to the fastest-throughput provider for a given
 #    model. Same model/weights/output, just a different serving path. "" disables it.
 PROVIDER_ROUTING_SORT = os.getenv("PROVIDER_ROUTING_SORT", "throughput").strip().lower()
+# 1b) Pin Anthropic-model calls to OpenRouter's "anthropic" backend specifically
+#    (provider.order=["anthropic"], allow_fallbacks left at OpenRouter's default/true).
+#    Root-caused 2026-09: without this, OpenRouter is free to serve the same model via
+#    Anthropic direct, AWS Bedrock, or GCP Vertex on every call, and prompt-cache state
+#    (cache_control) does not carry over between those backends — so cache_read_tokens
+#    was 0 on effectively every real production call despite the caching mechanism
+#    itself (build_cached_system_message) being independently verified correct in
+#    isolation. Pinning to one backend is what makes repeated cache hits possible at
+#    all; allow_fallbacks stays true so a genuine Anthropic-side outage still fails
+#    over instead of erroring out (only loses the cache benefit during that window).
+PROVIDER_PIN_ANTHROPIC = os.getenv("PROVIDER_PIN_ANTHROPIC", "true").lower() == "true"
 # 2) Anthropic top-level prompt caching for the (large, static) system prompt prefix.
 #    No-op for non-Anthropic models (e.g. GPT-5.1 already gets implicit OpenAI-side
 #    caching with no request change needed). Applied only to the main answer-generation
