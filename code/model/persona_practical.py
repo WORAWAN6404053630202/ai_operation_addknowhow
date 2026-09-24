@@ -2221,6 +2221,12 @@ class PracticalPersonaService:
         for _ in range(max_retries):
             try:
                 _sys_msg = build_cached_system_message(SYSTEM_PROMPT_PRACTICAL, getattr(self.llm, "model", ""))
+                if getattr(conf, "DEBUG_LOG_LLM_REQUEST_BODY", False):
+                    _LOG.warning(
+                        "[DEBUG sys_msg at construction] content_type=%s is_same_llm=%s llm_id=%s model=%s",
+                        type(_sys_msg.content).__name__, _llm is self.llm, id(_llm),
+                        getattr(_llm, "model", ""),
+                    )
                 resp = llm_invoke(_llm, [_sys_msg, HumanMessage(content=prompt)], logger=_LOG, label="Practical/json", state=state)
                 text = extract_llm_text(resp).strip()
 
