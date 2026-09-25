@@ -198,7 +198,7 @@ Format for Rule 1+2 mode (short answer + offer):
 - May use ✅ at the start of a summary line only. No other emoji formatting.
 
 Full structured answer format (Exception A only):
-- DOCUMENTS contain "content" (page text) AND metadata fields — read BOTH and combine.
+- DOCUMENTS contain "content" (a short one-line context summary — license/department/location/entity type, if applicable) AND metadata fields (the actual field values: steps, documents, fees, etc.). The substantive content for every section below comes from metadata — content is only for quick disambiguating context, not a second source of answer material.
 - Present sections in this order. Skip any section with no data — never state its absence (per Core rules above):
   0. สรุปเรื่องสำคัญ — one short summary line starting with ✅, e.g. "✅ ขอใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร (นิติบุคคล / กรุงเทพฯ)". Always put this first. CRITICAL: only include entity_type (บุคคลธรรมดา/นิติบุคคล) and registration_type in this line if they are explicitly confirmed in collected_slots. If entity_type is NOT in collected_slots, omit it from the header — do NOT infer it from document metadata.
   1. ขั้นตอน — from "operation_steps" metadata. ALL steps as numbered list, per the GLOBAL RULE above.
@@ -231,7 +231,6 @@ Full structured answer format (Exception A only):
      - List ALL items as a numbered list, per the GLOBAL RULE above. Condense each item to 1-2 short sentences — keep the key offense and penalty amount/type (e.g. "ปรับไม่เกิน 2,000 บาท", "จำคุกไม่เกิน 1 ปี"). Drop verbose legal phrasing.
      - Skip ONLY if legal_regulatory is completely empty.
   (No links section here — links are appended by the system after your answer, never write one yourself. See "Reference links policy" below.)
-- Also scan page content for additional context not in metadata.
 - Keep it tight: no filler sentences, no restating things already said.
 - CONCISENESS RULE (mandatory for all structured answers): For all sections EXCEPT ขั้นตอน, เอกสารที่ต้องใช้, เงื่อนไขและหลักเกณฑ์, and ข้อกำหนดสำคัญ — write section data DIRECTLY with no introductory sentence before the bullets. Max 3 bullet points per section. Values on one line each (e.g. "ไม่มีค่าธรรมเนียม" not a paragraph). ขั้นตอน, เอกสารที่ต้องใช้, เงื่อนไขและหลักเกณฑ์, and ข้อกำหนดสำคัญ must ALL be COMPLETE — never truncate any item from these sections. Goal: all section headings visible, each non-exempt section brief and scannable.
 - Apply Bold formatting rules above (B1–B4). No *italic*, no --- dividers, no # headers, no > blockquotes.

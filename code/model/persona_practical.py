@@ -341,6 +341,41 @@ _LLM_METADATA_WHITELIST = frozenset({
     "restaurant_ai_document",  # เอกสาร/ฟอร์ม AI ร้านอาหาร (bypasses content truncation via metadata track)
 })
 
+
+def _build_head_only_content(md: Dict[str, Any]) -> str:
+    """Short disambiguator line built directly from metadata fields — replaces the
+    full page_content string (which duplicates every _LLM_METADATA_WHITELIST field
+    as labeled prose, ~75-85% the size of metadata itself, verified against real
+    corpus data during the 2026-09 cost-reduction audit) in docs_json sent to the
+    LLM. Mirrors data_loader.py's _build_page_content() head section exactly, since
+    that's the one part carrying info NOT otherwise in metadata: location, area_size,
+    and operation_by_department are deliberately excluded from
+    _LLM_METADATA_WHITELIST (see its own comments) and only ever reached the LLM via
+    this head line — preserved here, everything else (steps/fees/documents/etc.) is
+    already sent in full via metadata so is safe to drop from content entirely.
+    NOT used for the sub_topic-completeness aggregated doc (_comb_content_pr) — that
+    one's content is a genuine synthesis, not a metadata-duplicate; see its
+    "_keep_full_content" marker in the docs_json build loop below."""
+    parts = []
+    if md.get("license_type"):
+        parts.append(f"ใบอนุญาต/ทะเบียน: {md['license_type']}")
+    if md.get("operation_by_department"):
+        parts.append(f"การดำเนินการ: {md['operation_by_department']}")
+    if md.get("location"):
+        parts.append(f"พื้นที่: {md['location']}")
+    if md.get("area_size"):
+        parts.append(f"ขนาดพื้นที่ร้าน: {md['area_size']}")
+    if md.get("entity_type_normalized"):
+        parts.append(f"ประเภทผู้ประกอบการ: {md['entity_type_normalized']}")
+    elif md.get("registration_type"):
+        parts.append(f"ประเภทการจดทะเบียน: {md['registration_type']}")
+    if md.get("operation_topic"):
+        parts.append(f"หัวข้อ: {md['operation_topic']}")
+    if md.get("department"):
+        parts.append(f"หน่วยงาน: {md['department']}")
+    return "\n".join(parts)
+
+
 # P0: practical policy "last gate"
 try:
     from utils.practical_lint import enforce_practical_policy  # type: ignore
@@ -2975,6 +3010,13 @@ class PracticalPersonaService:
             "legal_regulatory",     # บทลงโทษ ค่าปรับ ข้อกำหนดทางกฎหมาย
             "terms_and_conditions", # หน้าที่และเงื่อนไขของผู้ประกอบการ
             "restaurant_ai_document",  # เอกสาร/ฟอร์ม AI ร้านอาหาร
+            # location/area_size (2026-09 cost-reduction audit): needed so the new
+            # head-only content line (_build_head_only_content) can still show them —
+            # neither is in _LLM_METADATA_WHITELIST (never sent as a separate metadata
+            # key), they only ever reached the LLM via content's head line, which this
+            # whitelist must not silently drop now that content is built from md here
+            # instead of from the ingest-time page_content string.
+            "location", "area_size",
             # know_how docs (feature/pdf-ingestion) — separate lightweight schema,
             # see data_loader.py's load_from_knowhow_sheet(). full_text is absent
             # from metadata entirely (not just capped) when knowhow_write_back.py
@@ -2984,9 +3026,12 @@ class PracticalPersonaService:
         _STORE_FIELD_CAPS = {
             # Must be >= the per-field caps used in the handle() prompt loop below,
             # otherwise the storage cut dominates and the prompt cap has no effect.
+            # terms_and_conditions/service_channel raised 1800/500→2300/600 (2026-09
+            # cost-reduction audit): matches data_loader.py's embedding-time cap —
+            # real corpus had 1/2 docs respectively exceeding the old, tighter values.
             "operation_steps": 2000, "identification_documents": 4000,
-            "research_reference": 3100, "fees": 900, "service_channel": 500,
-            "legal_regulatory": 2000, "terms_and_conditions": 1800,
+            "research_reference": 3100, "fees": 900, "service_channel": 600,
+            "legal_regulatory": 2000, "terms_and_conditions": 2300,
             "restaurant_ai_document": 800,
             # marketing / business_guide content fields
             "answer_guideline": 1500, "main_topic": 120, "sub_topic": 150,
@@ -3304,10 +3349,19 @@ class PracticalPersonaService:
             "operation_steps": 2000,  # raised 900→2000: multi-phase online channels (e.g. 3-phase ภาษีป้าย) need ~1500 chars
             "identification_documents": 4000,  # must never truncate — missing items = legal error; current max in data is 3156 chars
             "fees": 900,
-            "operation_duration": 200,
-            "service_channel": 400,
-            "legal_regulatory": 1250,
-            "terms_and_conditions": 1800,
+            # operation_duration/service_channel/legal_regulatory/terms_and_conditions
+            # raised (2026-09 cost-reduction audit): these were tighter than data_loader.
+            # py's embedding-time cap for the same field, so a handful of real docs
+            # (1-2 each) had MORE text in the old duplicated "content" field than in
+            # metadata — an asymmetry that made content non-redundant for those few
+            # docs. Matching (or exceeding) the embedding cap here closes that gap so
+            # metadata is never less complete than content, which is what makes it
+            # safe to stop sending full duplicated content at all (see
+            # _build_head_only_content below).
+            "operation_duration": 300,
+            "service_channel": 600,
+            "legal_regulatory": 2000,
+            "terms_and_conditions": 2300,
             "restaurant_ai_document": 650,
         }
         _LONG_FIELDS_DEDUP = {"operation_steps", "legal_regulatory", "identification_documents"}  # deduped per (license_type, entity_type_normalized, service_channel); terms_and_conditions excluded (cut-off time rows differ per doc)
@@ -4031,7 +4085,13 @@ class PracticalPersonaService:
                             )[:1500]
                             if _refs_pr:
                                 _comb_md_pr["research_reference"] = "\n".join(_refs_pr[:5])
-                            _aggregated_pr = [{"content": _comb_content_pr, "metadata": _comb_md_pr}]
+                            # _keep_full_content: this doc's "content" is a genuine synthesis
+                            # (per-item answer_guideline snippets) with no equivalent in
+                            # _comb_md_pr's own collapsed answer_guideline (just a type-name
+                            # list) — the docs_json build loop's head-only-content trim must
+                            # skip this one doc and keep its content as-is. See
+                            # _build_head_only_content's docstring for the general case.
+                            _aggregated_pr = [{"content": _comb_content_pr, "metadata": _comb_md_pr, "_keep_full_content": True}]
                             state.current_docs = _aggregated_pr
                             _all_docs = _aggregated_pr
                             _LOG.info(
@@ -5348,22 +5408,35 @@ class PracticalPersonaService:
                 filtered_md[k] = v_str
             if any(k in filtered_md for k in _LONG_FIELDS_DEDUP):
                 _long_fields_sent_by_lt[_lt_et_key] = True
-            # Chapter overview: trim content to 300 chars per doc — LLM only needs enough to
-            # write 2-4 bullet points per sub_topic. Full 700-char content across 15+ docs
-            # causes prompt > 35K tokens → JSON malformation risk on long Thai responses.
-            _raw_content = (d.get("content", "") or "")
-            # Strip "อ้างอิง: Website...\nhttps://..." from non-regulatory doc content.
-            # Marketing/bakery docs have this appended at ingest; links shown only on explicit ask.
-            if (md.get("data_type") or "").strip() in ("marketing", "business_guide"):
-                _raw_content = re.sub(r'\nอ้างอิง:.*', '', _raw_content, flags=re.DOTALL).strip()
-            # Chapter overview: clip to 300 chars per doc to control token budget across many docs.
-            # Exception: a single aggregated doc (sub_topic completeness path) must NOT be clipped
-            # — its content is the numbered list of ALL items and truncation would hide most entries.
-            _content_for_llm = (
-                _raw_content[:300]
-                if _is_chapter_overview and len(_docs_to_process) > 1
-                else _raw_content
-            )
+            # Head-only content (2026-09 cost-reduction audit): the old full page_content
+            # duplicated every _LLM_METADATA_WHITELIST field as labeled prose (~75-85% the
+            # size of metadata itself, verified against real corpus data) — metadata above
+            # already carries the complete version of every one of those fields (caps raised
+            # to match/exceed data_loader.py's embedding-time caps, see _FIELD_CAPS above),
+            # so sending the full body again here was pure duplication. _build_head_only_
+            # content keeps just the short disambiguator line (license/department/location/
+            # area_size/entity/topic) — the one part that carried info NOT in metadata
+            # (location, area_size, operation_by_department are deliberately excluded from
+            # _LLM_METADATA_WHITELIST).
+            # EXCEPTION — _keep_full_content: the sub_topic-completeness aggregated doc's
+            # content is a genuine synthesis (per-item answer_guideline snippets) with no
+            # metadata equivalent — must keep its real content, not just a head line.
+            if d.get("_keep_full_content"):
+                _raw_content = (d.get("content", "") or "")
+                # Strip "อ้างอิง: Website...\nhttps://..." from non-regulatory doc content.
+                # Marketing/bakery docs have this appended at ingest; links shown only on explicit ask.
+                if (md.get("data_type") or "").strip() in ("marketing", "business_guide"):
+                    _raw_content = re.sub(r'\nอ้างอิง:.*', '', _raw_content, flags=re.DOTALL).strip()
+                # Chapter overview: clip to 300 chars per doc to control token budget across many docs.
+                # The aggregated doc itself is always the sole entry in _docs_to_process when this
+                # marker is set, so len(_docs_to_process) > 1 is false and it's never clipped here.
+                _content_for_llm = (
+                    _raw_content[:300]
+                    if _is_chapter_overview and len(_docs_to_process) > 1
+                    else _raw_content
+                )
+            else:
+                _content_for_llm = _build_head_only_content(md)
             docs_json.append(
                 {
                     "metadata": filtered_md,

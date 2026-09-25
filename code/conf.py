@@ -83,7 +83,7 @@ LLM_DOCS_MAX_ACADEMIC = _safe_int("LLM_DOCS_MAX_ACADEMIC", 12)    # raised: 5 �
 
 LLM_DOC_CHARS_PRACTICAL = _safe_int("LLM_DOC_CHARS_PRACTICAL", 700)   # reduced 1200→700: metadata fields carry key info
 LLM_DOC_CHARS_ACADEMIC = _safe_int("LLM_DOC_CHARS_ACADEMIC", 700)    # raised: 500 → 700 (need full metadata fields)
-LLM_DOC_CHARS_BUSINESS_GUIDE = _safe_int("LLM_DOC_CHARS_BUSINESS_GUIDE", 3500)  # business_guide: answer_guideline is sole content field — needs full coverage
+LLM_DOC_CHARS_BUSINESS_GUIDE = _safe_int("LLM_DOC_CHARS_BUSINESS_GUIDE", 5500)  # business_guide: answer_guideline is sole content field — needs full coverage. Raised 3500→5500 (2026-09 cost-reduction audit): real corpus max is 4901 chars, 2 docs were silently truncated at 3500; matches data_loader.py's embedding-time cap (also 5500) so metadata is never less complete than content.
 # Raised 1800→2500 (fit legal_regulatory), 2500→7500 (2026-09, fit terms_and_conditions —
 # a card-payment settlement-time table went silently missing from search because it sat near
 # the end of _build_page_content's field ordering with no cap of its own), 7500→12000 (same
