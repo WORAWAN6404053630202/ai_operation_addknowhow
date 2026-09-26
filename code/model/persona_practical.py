@@ -5724,20 +5724,26 @@ Rules:
             _fee_info_instruction = """
 
 ⚠️ FEE / DURATION INFORMATIONAL QUERY — MANDATORY RULES:
-- action MUST be "answer". DO NOT set action="ask".
-- DO NOT ask for entity_type, registration_type, or operation_group.
+- DO NOT ask for entity_type, registration_type, or operation_group — this query has no
+  registration/application intent, so asking those feels presumptuous. If the fee/duration
+  differs by entity_type/registration_type/operation_group specifically, action MUST be
+  "answer" with all those variants listed together in one concise answer
+  (e.g. "ตั้งใหม่ 50 บาท ทุกประเภท กรณีบริษัทจำกัดมีค่าบริคณห์สนธิเพิ่ม 500 บาท").
+- 2026-09 update: this does NOT override the Multi-tier rule / Decision policy 2b above for
+  OTHER differentiating conditions (e.g. shop area, location). If the fee/duration genuinely
+  differs by one of those and it is NOT already in collected_slots, action should be "ask" for
+  that ONE condition instead — do not list every tier as a substitute for asking. Only
+  entity_type/registration_type/operation_group are exempt from asking here.
 - Scan ALL DOCUMENTS for the relevant number(s) — for regulatory DOCUMENTS this is usually a
   structured ค่าธรรมเนียม (fees) or ระยะเวลา (duration) field; for business_guide/marketing
   DOCUMENTS (no license_type, content lives in answer_guideline) the number/rate/table may be
   embedded in that narrative content instead (e.g. a tax-bracket table, a cost percentage) —
   read the FULL document content, don't limit the scan to fields literally named "fees"/
   "ระยะเวลา", or you will miss a correct answer that's really there.
-- If values differ by entity or sub-type: list ALL tiers together in one concise answer
-  (e.g. "ตั้งใหม่ 50 บาท ทุกประเภท กรณีบริษัทจำกัดมีค่าบริคณห์สนธิเพิ่ม 500 บาท").
-- Keep the answer SHORT — just the fee/duration/rate and one brief contextual note if relevant
-  (a short tiered table, e.g. 3 tax brackets, still counts as "short" — don't drop tiers to
-  force brevity).
-- Do NOT list full registration steps or document requirements unless explicitly asked.
+- When action="answer": keep it SHORT — just the fee/duration/rate and one brief contextual
+  note if relevant (a short tiered table, e.g. 3 tax brackets, still counts as "short" — don't
+  drop tiers to force brevity). Do NOT list full registration steps or document requirements
+  unless explicitly asked.
 """
 
         # General informational/definitional query instruction:
