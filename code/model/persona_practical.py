@@ -4101,29 +4101,56 @@ class PracticalPersonaService:
                 except Exception as _pr_st_e:
                     _LOG.warning("[Practical] Sub_topic supplement failed: %s", _pr_st_e)
 
-        # Chapter overview detection: when ALL docs share the same main_topic AND
-        # data_type is marketing/business_guide → bypass the per-license cap so the LLM
-        # sees ALL chapter docs and can cover every sub_topic. Without this, the cap of
+        # Chapter overview detection: when the dominant main_topic AND data_type is
+        # marketing/business_guide → bypass the per-license cap so the LLM sees ALL
+        # chapter docs and can cover every sub_topic. Without this, the cap of
         # LLM_DOCS_MAX_PRACTICAL=6 would silently drop docs 7-N, causing subtopics to go missing.
         _is_chapter_overview = False
         if _all_docs and not _is_multi_license_docs:
-            _co_mts = {
-                ((_d.get("metadata") or {}).get("main_topic") or "").strip()
-                for _d in _all_docs
-            }
-            _co_dts = {
-                ((_d.get("metadata") or {}).get("data_type") or "").strip().lower()
-                for _d in _all_docs
-            }
+            _co_mt_counts: dict = {}
+            for _d in _all_docs:
+                _mt = ((_d.get("metadata") or {}).get("main_topic") or "").strip()
+                if _mt:
+                    _co_mt_counts[_mt] = _co_mt_counts.get(_mt, 0) + 1
             _subtopic_chapter_used = bool((state.context or {}).get("_subtopic_chapter_used"))
-            if (
-                len(_co_mts) == 1
-                and next(iter(_co_mts))
-                and _co_dts <= {"marketing", "business_guide", ""}
-                and not _subtopic_chapter_used
-            ):
-                _is_chapter_overview = True
-                _LOG.info("[Practical] Chapter overview detected — bypassing doc cap (main_topic=%r, %d docs)", next(iter(_co_mts)), len(_all_docs))
+            if _co_mt_counts:
+                # Dominant main_topic (2026-09 robustness fix, mirrors the analogous fix a
+                # few dozen lines below for _informational_but_nonreg_chapter — see that
+                # comment for the live-reproduced precedent). Requiring ALL docs to share
+                # exactly one main_topic breaks when even a few stray cross-chapter docs get
+                # pulled in alongside a real chapter expansion (live-reproduced: 23 real
+                # chapter docs + 5 unrelated-main_topic docs → 2 distinct main_topic values →
+                # never triggered, so the "cover every sub_topic" mandate never applied even
+                # though 82% of retrieved docs were genuinely one chapter). Use whichever
+                # main_topic dominates instead, and check data_type purity only within that
+                # dominant chapter's own docs (a stray doc's data_type shouldn't veto it).
+                _co_mt_dominant, _co_mt_dominant_n = max(_co_mt_counts.items(), key=lambda kv: kv[1])
+                _co_dominant_docs = [
+                    _d for _d in _all_docs
+                    if ((_d.get("metadata") or {}).get("main_topic") or "").strip() == _co_mt_dominant
+                ]
+                _co_dts = {
+                    ((_d.get("metadata") or {}).get("data_type") or "").strip().lower()
+                    for _d in _co_dominant_docs
+                }
+                if (
+                    _co_mt_dominant_n >= len(_all_docs) / 2
+                    and _co_dts <= {"marketing", "business_guide", ""}
+                    and not _subtopic_chapter_used
+                ):
+                    # NOTE: detection only — deliberately does NOT mutate _all_docs/
+                    # state.current_docs here. This flag is read by an earlier elif
+                    # branch too (_direct_topic_match's _informational_but_nonreg_chapter,
+                    # a few dozen lines below), which intentionally KEEPS cross-chapter
+                    # docs added by _merge_cross_chapter_docs_for_nonreg (see its
+                    # docstring's qa_12case case 12 — a deliberate full second-chapter
+                    # merge, not noise). Dropping strays unconditionally here would strip
+                    # those before that branch ever runs. The actual drop (when wanted)
+                    # happens only inside the "elif _is_chapter_overview:" branch itself,
+                    # which is mutually exclusive with _direct_topic_match.
+                    _is_chapter_overview = True
+                    _co_mts = {_co_mt_dominant}
+                    _LOG.info("[Practical] Chapter overview detected — bypassing doc cap (main_topic=%r, %d/%d docs)", _co_mt_dominant, _co_mt_dominant_n, len(_all_docs))
 
         # Topic Focus Filter: when the query contains English tokens that uniquely identify
         # one topic among several in _all_docs (e.g. "WeChat Pay" in a set that also includes
@@ -4229,10 +4256,26 @@ class PracticalPersonaService:
                 _docs_to_process = _all_docs
                 _LOG.info("[Practical] Direct topic match — sending all %d docs (no cap)", len(_all_docs))
         elif _is_chapter_overview:
+            _co_mt = next(iter(_co_mts))
+            # Drop any minority stray docs from OTHER main_topics before building the
+            # sub_topic list below (2026-09) — scoped to THIS branch only (unlike the
+            # detection above, which deliberately left _all_docs untouched so the
+            # _direct_topic_match branch's cross-chapter merge could stay intact). Here,
+            # keeping them would leak unrelated sub_topics into the "Required sections"
+            # mandate (_chapter_overview_instruction below enumerates every sub_topic
+            # found in _docs_to_process), forcing the LLM to write sections for a
+            # different chapter's content it was never asked about.
+            _co_strays = [
+                _d for _d in _all_docs
+                if ((_d.get("metadata") or {}).get("main_topic") or "").strip() != _co_mt
+            ]
+            if _co_strays:
+                _all_docs = [_d for _d in _all_docs if _d not in _co_strays]
+                state.current_docs = _all_docs
+                _LOG.info("[Practical] Chapter overview: dropped %d stray docs from other main_topics", len(_co_strays))
             # Supplement: the reranker cap inside _retrieve_docs may have silently dropped
             # sub_topic docs that ranked lower than LLM_DOCS_MAX_PRACTICAL.
             # Re-retrieve with a main_topic metadata filter to recover any missing sub_topics.
-            _co_mt = next(iter(_co_mts))
             try:
                 _suppl = self._retrieve_docs(
                     _co_mt,
@@ -5972,14 +6015,35 @@ Rules:
         # knows exactly which sub_topics to present as separate named sections.
         _chapter_overview_instruction = ""
         if _is_chapter_overview:
+            # Scope the subtopic mandate to the dominant chapter only (2026-09) —
+            # regardless of which upstream branch actually built _docs_to_process.
+            # _is_chapter_overview can be True even when it was the _direct_topic_match
+            # branch (not the "elif _is_chapter_overview" one) that supplied
+            # _docs_to_process — that branch intentionally leaves a few genuinely-relevant
+            # cross-chapter docs unfiltered (see _merge_cross_chapter_docs_for_nonreg /
+            # _informational_but_nonreg_chapter), so _docs_to_process itself is NOT pruned
+            # there. Without this scoping, a mixed doc set leaks an unrelated chapter's
+            # sub_topics into "Required sections", forcing the LLM to write sections for
+            # content the user never asked about (live-reproduced: a promotion-strategy
+            # chapter's 6 sub_topics got listed alongside the actually-asked-about
+            # communication chapter's 10, because _direct_topic_match had fired instead of
+            # the dedicated chapter-overview branch that drops strays). This filter is
+            # display/mandate-only — it does NOT touch _docs_to_process/docs_json, so any
+            # extra cross-chapter docs the other branch chose to keep are still visible to
+            # the LLM, just not forced into the required-sections list.
+            _co_mt_disp = next(iter(_co_mts)) if _co_mts else ""
+            _chapter_docs_disp = (
+                [_d for _d in _docs_to_process if ((_d.get("metadata") or {}).get("main_topic") or "").strip() == _co_mt_disp]
+                if _co_mt_disp else _docs_to_process
+            )
             _chapter_subtopics: list = []
-            for _d in _docs_to_process:
+            for _d in _chapter_docs_disp:
                 _st = ((_d.get("metadata") or {}).get("sub_topic") or "").strip()
                 if _st and _st not in _chapter_subtopics:
                     _chapter_subtopics.append(_st)
             if len(_chapter_subtopics) >= 2:
                 _st_list_str = "\n".join(f"  {i+1}. {st}" for i, st in enumerate(_chapter_subtopics))
-                _chapter_mt = next(
+                _chapter_mt = _co_mt_disp or next(
                     ((_d.get("metadata") or {}).get("main_topic") or "").strip()
                     for _d in _docs_to_process
                     if (_d.get("metadata") or {}).get("main_topic")
