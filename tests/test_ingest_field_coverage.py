@@ -181,3 +181,87 @@ class TestIngestValidationCoverageCheck:
         )
         warnings = ingest_local._validate_documents([doc])
         assert warnings == 0
+
+
+@pytest.mark.unit
+class TestGeneralLoaderPageContentBoilerplate:
+    """2026-09 fix: GeneralDataLoader._build_page_content used to label every
+    field ("หัวข้อหลัก: X หัวข้อย่อย: Y ประเภท: Z แหล่งข้อมูล: W แนวคำตอบ: ...
+    อ้างอิง: ...") — live-reproduced this repeated label boilerplate
+    dominates the embedding vector so completely that two TOTALLY UNRELATED
+    documents came out 0.867 cosine-similar to each other, while a
+    genuinely relevant document for a real query scored only 0.243 —
+    indistinguishable from noise. Fixed by dropping the labels and the
+    low-value content_type/source_book/research_reference fields (all still
+    preserved verbatim in metadata for any downstream use) from the embedded
+    text entirely, keeping just the bare main_topic/sub_topic/answer_guideline
+    values. No network access, no embeddings — pure string-building logic."""
+
+    def test_no_label_boilerplate_in_output(self):
+        dl = GeneralDataLoader(data_type="business_guide")
+        content = dl._build_page_content(
+            source_book="เปิดร้านเบเกอรี่",
+            main_topic="การเข้าใจพื้นฐานการขายสินค้า",
+            sub_topic="การตั้งราคา",
+            content_type="ความรู้ทั่วไป",
+            answer_guideline="ควรตั้งราคาจากต้นทุนและราคาตลาดควบคู่กัน",
+            research_reference="หนังสือ ครบเครื่องเปิดร้าน 2",
+        )
+        for label in ("หัวข้อหลัก:", "หัวข้อย่อย:", "ประเภท:", "แหล่งข้อมูล:", "แนวคำตอบ:", "อ้างอิง:"):
+            assert label not in content
+
+    def test_topic_and_answer_values_still_present(self):
+        dl = GeneralDataLoader(data_type="marketing")
+        content = dl._build_page_content(
+            source_book="เปิดร้านเบเกอรี่",
+            main_topic="การเข้าใจพื้นฐานการขายสินค้า",
+            sub_topic="การตั้งราคา",
+            content_type="ความรู้ทั่วไป",
+            answer_guideline="ควรตั้งราคาจากต้นทุนและราคาตลาดควบคู่กัน",
+            research_reference="หนังสือ ครบเครื่องเปิดร้าน 2",
+        )
+        assert "การเข้าใจพื้นฐานการขายสินค้า" in content
+        assert "การตั้งราคา" in content
+        assert "ควรตั้งราคาจากต้นทุนและราคาตลาดควบคู่กัน" in content
+
+    def test_low_value_fields_excluded_from_embedded_text(self):
+        # source_book/content_type/research_reference are preserved in
+        # metadata elsewhere (unaffected by this function) but must not
+        # dilute the embedded page_content — confirmed empirically to add
+        # no retrieval value, only noise.
+        dl = GeneralDataLoader(data_type="marketing")
+        content = dl._build_page_content(
+            source_book="เปิดร้านเบเกอรี่ ชื่อหนังสือที่ไม่ซ้ำใคร",
+            main_topic="หัวข้อ A",
+            sub_topic="หัวข้อ B",
+            content_type="ประเภทพิเศษที่ไม่ซ้ำใคร",
+            answer_guideline="คำตอบจริง",
+            research_reference="อ้างอิงที่ไม่ซ้ำใครเลย",
+        )
+        assert "เปิดร้านเบเกอรี่" not in content
+        assert "ประเภทพิเศษที่ไม่ซ้ำใคร" not in content
+        assert "อ้างอิงที่ไม่ซ้ำใครเลย" not in content
+
+    def test_missing_optional_fields_do_not_crash_or_leave_blank_lines(self):
+        dl = GeneralDataLoader(data_type="business_guide")
+        content = dl._build_page_content(
+            source_book=None,
+            main_topic="หัวข้อหลักเดียว",
+            sub_topic=None,
+            content_type=None,
+            answer_guideline="คำตอบ",
+            research_reference=None,
+        )
+        assert content == "หัวข้อหลักเดียว\nคำตอบ"
+
+    def test_still_respects_page_content_max_chars_clamp(self):
+        dl = GeneralDataLoader(data_type="marketing", page_content_max_chars=50)
+        content = dl._build_page_content(
+            source_book=None,
+            main_topic="หัวข้อ",
+            sub_topic=None,
+            content_type=None,
+            answer_guideline="ก" * 200,
+            research_reference=None,
+        )
+        assert len(content) <= 50
