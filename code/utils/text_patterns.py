@@ -330,6 +330,34 @@ SPECIFIC_TOPIC_RE = re.compile(
 _ASCII_ID_RE = re.compile(r'[A-Za-z][A-Za-z0-9\-]{2,}|[0-9][A-Za-z][A-Za-z0-9\-]{1,}')
 
 
+# Thai nominalizing prefixes: "การ" turns a verb into a gerund/noun (ตั้งราคา
+# "to price" -> การตั้งราคา "pricing"), "ความ" turns an adjective/state into an
+# abstract noun. Sheet labels consistently use the formal nominalized form
+# (การตั้งราคา), but real customer questions are often phrased as the bare verb
+# (ควรตั้งราคายังไง) with no "การ" at all — a live-reproduced case (2026-09,
+# "ร้านอาหารเล็กๆ ควรตั้งราคาเมนูยังไงให้แข่งขันได้") found this caused the
+# exact-match chapter-fetch shortcut to silently miss, falling back to weaker
+# hybrid retrieval that dropped the single most relevant sub_topic doc entirely.
+_THAI_NOMINALIZER_PREFIXES = ("การ", "ความ")
+# Minimum length of the prefix-stripped remainder before it's used as a match
+# candidate — without this, a short/generic stem (e.g. "การผลิต" -> "ผลิต",
+# "produce/production", 4 chars) would false-positive-match almost any
+# food-business query. 5 chars keeps this in line with the existing
+# main_topic length gate's own threshold philosophy (see docstring below).
+_NOMINALIZER_STRIP_MIN_LEN = 5
+
+
+def _strip_thai_nominalizer(label_lower: str) -> str:
+    """Return `label_lower` with a leading การ/ความ removed, or "" if it
+    doesn't start with one of those prefixes or the remainder would be too
+    short/generic to safely match on its own (see _NOMINALIZER_STRIP_MIN_LEN)."""
+    for prefix in _THAI_NOMINALIZER_PREFIXES:
+        if label_lower.startswith(prefix):
+            remainder = label_lower[len(prefix):]
+            return remainder if len(remainder) >= _NOMINALIZER_STRIP_MIN_LEN else ""
+    return ""
+
+
 def topic_label_matches_query(label: str, query_lower: str, raw_human_lower: str = "") -> bool:
     """True if `label` (a main_topic/sub_topic/operation_topic value) should be
     treated as explicitly named by the user's current turn.
@@ -337,14 +365,18 @@ def topic_label_matches_query(label: str, query_lower: str, raw_human_lower: str
     Checks, in order: (1) `label` as a literal substring of `query_lower`
     (the query used for retrieval — possibly LLM-rewritten), (2) the same
     against `raw_human_lower` (the raw pre-rewrite user message, when
-    provided), (3) an ASCII-identifier match — every ASCII token (3+ chars,
-    e.g. "B2B") in `label` must appear somewhere in either text, catching
-    cases where the LLM rewriter drops surrounding Thai particles but keeps
-    the distinctive ASCII term. Callers should additionally gate on a
-    minimum `len(label)` themselves (5 for main_topic, 8 for sub_topic in
-    the current call sites) to avoid short/generic labels matching too
-    broadly — that threshold is corpus-specific, not part of this function's
-    contract.
+    provided), (3) if `label` starts with a Thai nominalizing prefix (การ/
+    ความ) and the remainder is long enough to be specific, the same two
+    checks against the prefix-stripped form — catches colloquial verb-form
+    phrasing that never uses the sheet's formal nominalized label (2026-09,
+    see _strip_thai_nominalizer), (4) an ASCII-identifier match — every ASCII
+    token (3+ chars, e.g. "B2B") in `label` must appear somewhere in either
+    text, catching cases where the LLM rewriter drops surrounding Thai
+    particles but keeps the distinctive ASCII term. Callers should
+    additionally gate on a minimum `len(label)` themselves (5 for main_topic,
+    8 for sub_topic in the current call sites) to avoid short/generic labels
+    matching too broadly — that threshold is corpus-specific, not part of
+    this function's contract.
 
     Callers must lowercase `query_lower`/`raw_human_lower` themselves (and
     should reuse the same lowercased strings across all label checks in a
@@ -355,6 +387,12 @@ def topic_label_matches_query(label: str, query_lower: str, raw_human_lower: str
         return True
     if raw_human_lower and label_lower in raw_human_lower:
         return True
+    stripped = _strip_thai_nominalizer(label_lower)
+    if stripped:
+        if stripped in query_lower:
+            return True
+        if raw_human_lower and stripped in raw_human_lower:
+            return True
     tokens = _ASCII_ID_RE.findall(label)
     if not tokens:
         return False

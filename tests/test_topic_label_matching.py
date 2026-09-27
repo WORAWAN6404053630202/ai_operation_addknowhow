@@ -14,7 +14,7 @@ share this one function. No LLM/Chroma connection required.
 """
 import pytest
 
-from utils.text_patterns import topic_label_matches_query
+from utils.text_patterns import topic_label_matches_query, _strip_thai_nominalizer
 
 
 @pytest.mark.unit
@@ -73,4 +73,75 @@ class TestTopicLabelMatchesQuery:
     def test_case_insensitive_ascii_match(self):
         assert topic_label_matches_query(
             "การตลาดแบบ b2b", query_lower="b2b คืออะไร", raw_human_lower=""
+        )
+
+
+@pytest.mark.unit
+class TestThaiNominalizerStripping:
+    """2026-09 fix: sheet labels use the formal nominalized form (การ.../
+    ความ...) but real customer questions are often phrased as the bare verb/
+    adjective with no nominalizer at all. Live-reproduced case: "ร้านอาหาร
+    เล็กๆ ควรตั้งราคาเมนูยังไงให้แข่งขันได้" never matched sub_topic label
+    "การตั้งราคา" (no "การ" in the query), so the exact-match chapter-fetch
+    shortcut silently missed and fell back to weaker hybrid retrieval that
+    dropped the single most relevant doc entirely."""
+
+    def test_bare_verb_form_matches_nominalized_label(self):
+        assert topic_label_matches_query(
+            "การตั้งราคา",
+            query_lower="ร้านอาหารเล็กๆ ควรตั้งราคาเมนูยังไงให้แข่งขันได้ มีกลยุทธ์แนะนำไหมคะ",
+            raw_human_lower="",
+        )
+
+    def test_bare_verb_form_matches_via_raw_human_lower_only(self):
+        # Same asymmetry the plain-substring check already handles (see
+        # test_label_missing_from_rewritten_query_but_present_in_raw_message)
+        # must also hold for the nominalizer-stripped form.
+        assert topic_label_matches_query(
+            "การตั้งราคา",
+            query_lower="กลยุทธ์การแข่งขันด้านราคา",
+            raw_human_lower="ควรตั้งราคายังไงให้แข่งขันได้",
+        )
+
+    def test_full_nominalized_form_still_matches_directly(self):
+        # Regression pin: adding the stripped-form check must not disturb the
+        # original exact/full-label match (case 2's already-fixed question).
+        assert topic_label_matches_query(
+            "การตั้งราคา",
+            query_lower="อยากได้คำแนะนำเรื่องการตั้งราคาเมนูให้เหมาะสม มีหลักคิดยังไงบ้าง",
+            raw_human_lower="",
+        )
+
+    def test_khwaam_prefix_also_stripped(self):
+        assert topic_label_matches_query(
+            "ความรับผิดชอบต่อสังคม",
+            query_lower="ร้านต้องรับผิดชอบต่อสังคมยังไงบ้าง",
+            raw_human_lower="",
+        )
+
+    def test_short_generic_stem_does_not_false_positive_match(self):
+        # "การผลิต" (production) strips to "ผลิต" (produce/manufacture) — only
+        # 4 chars, common enough to appear in almost any food-business
+        # question. Must NOT match just because "ผลิต" appears somewhere
+        # unrelated to the actual "การผลิต" topic.
+        assert not topic_label_matches_query(
+            "การผลิต",
+            query_lower="ร้านผลิตขนมเองควรตั้งราคายังไง",
+            raw_human_lower="",
+        )
+
+    def test_strip_helper_rejects_short_remainder(self):
+        assert _strip_thai_nominalizer("การผลิต") == ""
+
+    def test_strip_helper_accepts_specific_remainder(self):
+        assert _strip_thai_nominalizer("การตั้งราคา") == "ตั้งราคา"
+
+    def test_strip_helper_no_prefix_returns_empty(self):
+        assert _strip_thai_nominalizer("กลยุทธ์ด้านราคา") == ""
+
+    def test_label_without_nominalizer_prefix_unaffected(self):
+        # Sanity check: labels that never had การ/ความ to begin with behave
+        # exactly as before (plain substring / ASCII fallback only).
+        assert not topic_label_matches_query(
+            "กลยุทธ์ด้านราคา", query_lower="ขอสอบถามเรื่องภาษีหน่อยค่ะ", raw_human_lower=""
         )
