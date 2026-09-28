@@ -523,6 +523,51 @@ class PracticalPersonaService:
             found.add(_m.group(1))
         return found
 
+    @classmethod
+    def _extract_inline_service_urls(cls, line: str) -> List[Tuple[str, str]]:
+        """Extract (label, url) pairs from a single service_channel/operation_steps
+        line — pulled out of the Pass 1b link-scanning loop in handle() so this
+        parsing logic is unit-testable on its own (mirrors why
+        _extract_thai_phone_numbers above is a separate method).
+
+        2026-09 bug fix, live-reproduced: service_channel often packs multiple
+        contact entries with URLs onto ONE undelimited line (no newline between
+        them), e.g. "แผนก A 24 ชม. https://... แผนก B จันทร์-ศุกร์ 09.00-18.00 น.
+        https://...". Two compounding bugs here:
+        1. Each URL's label used to be computed from the WHOLE line prefix, not
+           the segment since the previous URL — for the 2nd+ URL this pulled the
+           FIRST entry's own text (and URL) in too, pushing the segment well past
+           the 50-char "extract last item" fallback below even when each real
+           entry was individually short.
+        2. That fallback's own numbered-list-marker regex (`\\d+[.)]\\s*`) matched
+           "09.00-18.00 น." (a time-of-day, not a list) at both "09." and "18."
+           (digit+dot each), splitting the text into garbage fragments and
+           leaving a bare "น." as the final label. Fixed by requiring the marker
+           NOT be immediately followed by another digit — a genuine list marker
+           ("2.ทำสิ่งนี้") is followed by a word character, never another digit,
+           which is exactly what distinguishes it from a decimal/time value.
+
+        Does NOT dedup against a global _link_seen set or filter .pdf URLs —
+        callers still own that cross-line/cross-doc bookkeeping.
+        """
+        results: List[Tuple[str, str]] = []
+        prev_end = 0
+        for _m in cls._INLINE_URL_RE.finditer(line):
+            _raw_url = _m.group(1).rstrip(".,;)")
+            if _raw_url.lower().startswith("www."):
+                _raw_url = "https://" + _raw_url
+            _before = line[prev_end:_m.start()].strip().rstrip(':：-').strip()
+            prev_end = _m.end()
+            _before = re.sub(r'^[\d\.\-\*•]+\.?\s*', '', _before).strip()
+            if len(_before) > 50:
+                _segs = re.split(r'\d+[.)]\s*(?!\d)', _before)
+                if len(_segs) > 1:
+                    _before = re.sub(r'^[\d\.\-\*•]+\.?\s*', '', _segs[-1]).strip()
+                else:
+                    _before = _before[-50:].lstrip(' .,').strip()
+            results.append((_before, _raw_url))
+        return results
+
     _NUM_OPTION_LINE_RE = re.compile(r"^\s*(\d{1,2})\)\s*(.+?)\s*$")
     # Shared with persona_supervisor.py — see utils/text_patterns.py. Reconciled to
     # supervisor's stricter version (requires >=1 digit) — this file's copy was missing
@@ -1589,6 +1634,10 @@ class PracticalPersonaService:
     )
 
     # ── Inline handle() patterns compiled once here ──────────────────────────────
+    _INLINE_URL_RE = re.compile(
+        r"(https?://[^\s฀-๿]{8,}|www\.[a-zA-Z0-9][\w.\-]+(?:/[^\s฀-๿]*)?)",
+        re.IGNORECASE,
+    )
     _TC_QUERY_RE = re.compile(r"ตัดรอบ|cut.?off|เงื่อนไขและหลักเกณฑ์|หลักเกณฑ์การให้บริการ")
     _TC_TIME_RE = re.compile(r"\d{1,2}[.:]\d{2}\s*น\.?")
     _NO_FORMS_Q_RE = re.compile(
@@ -5311,10 +5360,10 @@ class PracticalPersonaService:
         # Pass 1b: extract inline URLs from non-reference metadata fields (service_channel,
         # operation_steps). The prompt instructs the LLM to omit these URLs from the body text,
         # but we surface them here so they appear in the 🌐 links section via the safety net.
-        _INLINE_URL_RE = re.compile(
-            r"(https?://[^\s฀-๿]{8,}|www\.[a-zA-Z0-9][\w.\-]+(?:/[^\s฀-๿]*)?)",
-            re.IGNORECASE,
-        )
+        # Per-line (desc, url) parsing lives in _extract_inline_service_urls (see its docstring
+        # for the 2026-09 bug history) — this loop owns the cross-line/cross-doc bookkeeping
+        # (fallback label carry-over, global dedup, .pdf filtering) that method deliberately
+        # doesn't.
         _INLINE_SCAN_FIELDS = ("service_channel", "operation_steps")
         for _di in (_docs_for_links if _docs_for_links is not None else _docs_to_process):
             for _isf in _INLINE_SCAN_FIELDS:
@@ -5328,33 +5377,19 @@ class PracticalPersonaService:
                     _isf_line_s = _isf_line.strip()
                     if not _isf_line_s:
                         continue
-                    _line_url_ms = list(_INLINE_URL_RE.finditer(_isf_line_s))
-                    if not _line_url_ms:
+                    _line_pairs = self._extract_inline_service_urls(_isf_line_s)
+                    if not _line_pairs:
                         _clean_desc = re.sub(r'^[\d\.\-\*•]+\.?\s*', '', _isf_line_s).rstrip(':：').strip()
                         if _clean_desc:
                             _prev_desc_isf = _clean_desc
                         continue
-                    for _m in _line_url_ms:
-                        _raw_url = _m.group(1).rstrip(".,;)")
-                        if _raw_url.lower().startswith("www."):
-                            _raw_url = "https://" + _raw_url
+                    for _desc_isf, _raw_url in _line_pairs:
                         if _raw_url in _link_seen:
                             continue
                         if _raw_url.lower().endswith(".pdf"):
                             continue
                         _link_seen.add(_raw_url)
-                        _before_url = _isf_line_s[:_m.start()].strip().rstrip(':：-').strip()
-                        _before_url = re.sub(r'^[\d\.\-\*•]+\.?\s*', '', _before_url).strip()
-                        # service_channel is often one long line: all text before the URL is
-                        # a huge preamble. Extract only the last numbered-item label so the
-                        # desc stays short (e.g. "เว็บไซต์" instead of the full channel text).
-                        if len(_before_url) > 50:
-                            _isf_segs = re.split(r'\d+[.)]\s*', _before_url)
-                            if len(_isf_segs) > 1:
-                                _before_url = re.sub(r'^[\d\.\-\*•]+\.?\s*', '', _isf_segs[-1]).strip()
-                            else:
-                                _before_url = _before_url[-50:].lstrip(' .,').strip()
-                        _desc_isf = _before_url if _before_url else _prev_desc_isf
+                        _desc_isf = _desc_isf if _desc_isf else _prev_desc_isf
                         _link_service.append((_desc_isf, _raw_url))
                         # Sentinel -2: inline service_channel URL — always keep through narrow_answer filter.
                         # service_channel represents "where to submit" for the license type, not a
