@@ -3997,6 +3997,62 @@ class PracticalPersonaService:
                                 except Exception as _ff_ot_err:
                                     _LOG.debug("[Practical] op-topic Latin correction failed: %s", _ff_ot_err)
 
+        # QR Payment account-name cross-reference (2026-09, live-reproduced): a customer
+        # asking about updating their bank account's OWNER NAME (e.g. after marriage) has
+        # their retrieval correctly include the QR-Payment-specific "name cannot be edited,
+        # must cancel and re-apply" docs (license_type="ระบบชำระเงินออนไลน์",
+        # registration_type="เจ้าของเดิม ชื่อบัญชีเดิม") ALONGSIDE the general
+        # license_type="บัญชีธนาคารรับเงิน" process doc at first — but the FOCUS FILTER just
+        # above (keeps only the single dominant license_type by keyword score, since the
+        # query never says "QR Payment") strips them back out, silently omitting the single
+        # most consequential fact for any restaurant that happens to accept QR Payment. This
+        # runs AFTER the focus filter (including its op-topic Latin-correction sub-step)
+        # fully resolves, specifically so it can't just get stripped straight back out by
+        # the same mechanism. Deliberately a narrow, hard-coded cross-reference (not a
+        # general "always re-add every filtered-out license_type" mechanism, which would
+        # defeat the focus filter's whole purpose) — scoped to the exact operation_topic
+        # that names this specific scenario, so it can't fire for unrelated bank-account
+        # questions (phone number change, etc.).
+        if any(
+            ((_d.get("metadata") or {}).get("operation_topic") or "").strip() == "การแก้ไข ชื่อเจ้าของบัญชี"
+            for _d in _all_docs
+        ) and not any(
+            ((_d.get("metadata") or {}).get("license_type") or "").strip() == "ระบบชำระเงินออนไลน์"
+            and ((_d.get("metadata") or {}).get("registration_type") or "").strip() == "เจ้าของเดิม ชื่อบัญชีเดิม"
+            for _d in _all_docs
+        ):
+            try:
+                _qr_vs = getattr(self.retriever, "vectorstore", None)
+                _qr_coll = getattr(_qr_vs, "_collection", None) if _qr_vs else None
+                if _qr_coll is not None:
+                    _qr_res = _qr_coll.get(
+                        where={"$and": [
+                            {"license_type": "ระบบชำระเงินออนไลน์"},
+                            {"registration_type": "เจ้าของเดิม ชื่อบัญชีเดิม"},
+                        ]},
+                        include=["documents", "metadatas"],
+                    )
+                    _qr_added = [
+                        {"content": c or "", "metadata": m or {}}
+                        for c, m in zip(_qr_res.get("documents") or [], _qr_res.get("metadatas") or [])
+                    ]
+                    if _qr_added:
+                        # Prepend, not append: several downstream cap paths (e.g. the
+                        # final "else: _docs_to_process = _all_docs[:_prompt_max_docs]"
+                        # fallback) just take a first-N slice — live-reproduced that
+                        # appending here let this exact fix get silently truncated back
+                        # out by that later slice, since the added docs landed past
+                        # position N. Prepending guarantees they survive any such cap.
+                        _all_docs = _qr_added + _all_docs
+                        state.current_docs = _all_docs
+                        _LOG.info(
+                            "[Practical] QR Payment account-name cross-reference: +%d doc(s) (banks: %s)",
+                            len(_qr_added),
+                            [((_d.get("metadata") or {}).get("department") or "") for _d in _qr_added],
+                        )
+            except Exception as _qr_xref_e:
+                _LOG.warning("[Practical] QR Payment account-name cross-reference failed: %s", _qr_xref_e)
+
         # Terms-and-conditions miss check: if query asks about cut-off times / conditions
         # but NO current doc has non-empty terms_and_conditions → stale state, force fresh
         # filtered retrieval so the service-description doc can be found.
