@@ -3699,13 +3699,53 @@ class PracticalPersonaService:
                 _base, _prompt_max_docs,
             )
 
+        # Broad/generic tax question (2026-09, live-reproduced): "ปีนี้เราต้องเสียภาษีปะ
+        # ต้องเสียเท่าไหร่" names no specific tax sub-type (not "ภาษีป้าย", not "VAT"/
+        # "ภาษีมูลค่าเพิ่ม") — it's inherently asking about ALL taxes a restaurant owes, which
+        # legitimately spans 2 regulatory license_types (signboard tax + VAT) AND business_guide
+        # rows with no license_type at all (income tax has no regulatory doc, only a
+        # business_guide overview row). The regex license-scorer below correctly scores every
+        # candidate 0 for a query this generic, which then falls through to an LLM fallback
+        # that is FORCED to pick exactly one license_type (its prompt has no "multiple/none of
+        # these specifically" option) — it picked "ภาษีป้าย" alone, and the subsequent
+        # dominant-license narrowing dropped the VAT docs AND every business_guide tax row
+        # (license_type="" never matches a non-empty dominant_lt), leaving an answer about
+        # signboard tax only. Detected here, BEFORE the regex/LLM scoring below ever runs, so
+        # neither can mis-fire on this query; narrowed to a tax-topic allowlist on _all_docs
+        # directly (drops only unrelated marketing/business_guide noise — e.g. "กลยุทธ์ด้านราคา",
+        # "สำรวจร้านคู่แข่ง" — that unfiltered retrieval also happened to pull in), then routed
+        # through the SAME "broad query" skip as the "บอกทุกอย่าง" case below so FOCUS FILTER's
+        # single-dominant-license narrowing never runs on it at all.
+        _TAX_TOPIC_LABEL_RE = re.compile(r"ภาษี", re.IGNORECASE)
+        _is_broad_tax_query = bool(
+            _TAX_TOPIC_LABEL_RE.search(user_text or "")
+            and not self._LQS_SIGN_TAX_RE.search(user_text or "")
+            and not self._LQS_VAT_RE.search(user_text or "")
+        )
+        if _is_broad_tax_query:
+            _tax_lts = {lt for lt in _lt_order if _TAX_TOPIC_LABEL_RE.search(lt)}
+            _tax_relevant_docs = [
+                d for d in _all_docs
+                if (d.get("metadata") or {}).get("license_type", "").strip() in _tax_lts
+                or _TAX_TOPIC_LABEL_RE.search(
+                    " ".join(str((d.get("metadata") or {}).get(k) or "") for k in ("main_topic", "sub_topic", "operation_topic"))
+                )
+            ]
+            if _tax_relevant_docs:
+                _LOG.info(
+                    "[Practical] broad tax query: keeping %d tax-relevant doc(s) across %s (dropped %d unrelated noise doc(s))",
+                    len(_tax_relevant_docs), sorted(_tax_lts) or ["(business_guide only)"], len(_all_docs) - len(_tax_relevant_docs),
+                )
+                _all_docs = _tax_relevant_docs
+                state.current_docs = _all_docs
+
         # FOCUS FILTER: when docs span multiple license_types AND this is a single-topic query
         # (not an explicit "broad overview" request like "บอกทุกอย่าง"), keep only docs from the
         # dominant license_type — the one with the most docs and highest similarity to the query.
         # This prevents stale docs from the previous topic bleeding into the current answer.
         # Exception: if the multi-license set was intentionally built for a multi-topic query
         # (_multi_topic_retrieval flag), skip this filter.
-        _is_broad_query = bool(
+        _is_broad_query = _is_broad_tax_query or bool(
             re.search(r"บอกทุกอย่าง|รายละเอียดทั้งหมด|อยากรู้ครบ|ทุกอย่างที่|ทุกด้าน|ทุกเรื่อง", user_text or "")
         )
         _is_multi_topic_flag = bool((state.context or {}).get("_multi_topic_retrieval"))
