@@ -3445,22 +3445,70 @@ class PersonaSupervisor:
                     # so needs its own expansion here too). Scoped to non-regulatory
                     # data_type only — regulatory operation_topic matches are untouched.
                     _ot_parent_mt_e = ""
+                    _ot_nonreg_rejected_e = False
                     try:
                         _ot_first_md_e = (_ot_res_e.get("metadatas") or [None])[0] or {}
                         _ot_data_type_e = str(_ot_first_md_e.get("data_type") or "").strip().lower()
                         _ot_parent_mt_e = str(_ot_first_md_e.get("main_topic") or "").strip()
                         if _ot_data_type_e in ("marketing", "business_guide") and _ot_parent_mt_e:
-                            _ot_chapter_res_e = _coll_e.get(
-                                where={"main_topic": _ot_parent_mt_e},
-                                include=["documents", "metadatas"],
-                            )
-                            if len(_ot_chapter_res_e.get("metadatas") or []) > len(_ot_res_e.get("metadatas") or []):
-                                _ot_res_e = _ot_chapter_res_e
+                            # Regulatory-dominance guard (2026-09, live-reproduced — this op_topic
+                            # sibling never had the "Generic-label guard" applied to it at all,
+                            # unlike the sub_topic chapter-fetch block further below in this same
+                            # method, which got it during an earlier fix; this block was a fully
+                            # separate, unguarded duplicate of the same exact-match-hijack shape).
+                            # A query naming a specific regulatory checklist item can still
+                            # literally contain a short, coincidental operation_topic label
+                            # belonging to an unrelated business_guide/marketing chapter (e.g.
+                            # "จดทะเบียนพาณิชย์แบบบุคคลธรรมดา ต้องเตรียมเอกสารอะไรบ้าง" matching
+                            # a 2-line business_guide definition row over the real regulatory
+                            # document-requirements row, which plain semantic retrieval ranks
+                            # far higher). Checked BEFORE trusting this op_topic exact match.
+                            #
+                            # Score threshold (2026-09, live-reproduced): an earlier version of
+                            # this check rejected on "top hit is regulatory" alone, no score floor
+                            # — that INCORRECTLY fired on the SME income-tax-bracket case, where the
+                            # "regulatory" top hit was an unrelated VAT-registration row that only
+                            # coincidentally shared the word "ภาษี" (score ~0.55-0.57, not a
+                            # genuinely confident match). See
+                            # _NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE's docstring for the
+                            # calibration data.
+                            #
+                            # Deliberately NOT porting the sub_topic sibling's SECOND check here
+                            # (reject when the best business_guide/marketing hit's main_topic
+                            # merely DISAGREES with this exact match, regardless of score) — tested
+                            # live against the SME tax-bracket case and found it correctly rejects
+                            # this exact op_topic match (its semantic top business_guide hit is a
+                            # different, more-correct chapter) but the subsequent Step 0b/normal-
+                            # retrieval fallback then fails to surface that correct chapter either,
+                            # turning a pre-existing PARTIAL answer (right general tax rate, missing
+                            # the SME-specific bracket — imperfect but present) into a total answer-
+                            # generation failure. That fallback-retrieval weakness is a separate,
+                            # real, pre-existing gap worth fixing on its own, but porting the
+                            # disagreement check here without first fixing it would trade one
+                            # customer-visible bug for a worse one on this exact query — out of
+                            # scope for the specific defect (regulatory data silently overridden by
+                            # a coincidental label match) this guard exists to close today.
+                            _ot_sem_top_dt_e, _ot_sem_top_score_e, _ot_sem_top_mt_e = self._nonreg_chapter_semantic_check(q)
+                            if _ot_sem_top_dt_e == "regulatory" and _ot_sem_top_score_e >= self._NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE:
                                 _LOG.info(
-                                    "[Supervisor] _ensure: op_topic→main_topic expansion (non-reg): "
-                                    "%r → chapter %r (%d docs)",
-                                    _target_ot_e, _ot_parent_mt_e, len(_ot_res_e.get("metadatas") or []),
+                                    "[Supervisor] _ensure: op_topic exact-match %r (chapter %r) rejected — "
+                                    "overall semantic top hit is a confident regulatory match (score=%.3f), not "
+                                    "marketing/business_guide; falling through to Step 0b/normal retrieval",
+                                    _target_ot_e, _ot_parent_mt_e, _ot_sem_top_score_e,
                                 )
+                                _ot_nonreg_rejected_e = True
+                            if not _ot_nonreg_rejected_e:
+                                _ot_chapter_res_e = _coll_e.get(
+                                    where={"main_topic": _ot_parent_mt_e},
+                                    include=["documents", "metadatas"],
+                                )
+                                if len(_ot_chapter_res_e.get("metadatas") or []) > len(_ot_res_e.get("metadatas") or []):
+                                    _ot_res_e = _ot_chapter_res_e
+                                    _LOG.info(
+                                        "[Supervisor] _ensure: op_topic→main_topic expansion (non-reg): "
+                                        "%r → chapter %r (%d docs)",
+                                        _target_ot_e, _ot_parent_mt_e, len(_ot_res_e.get("metadatas") or []),
+                                    )
                         else:
                             _ot_parent_mt_e = ""
                     except Exception as _e_ot_expand:
@@ -3518,7 +3566,11 @@ class PersonaSupervisor:
                             if re.search(_lt_pat, _q_lower_lt, re.IGNORECASE):
                                 _matched_lt_e = _lt_name
                                 break
-                        _ot_skip_return = False
+                        # _ot_nonreg_rejected_e set above by the semantic-agreement guard —
+                        # start _ot_skip_return from it so a rejected non-reg exact match falls
+                        # through to Step 0b/normal retrieval exactly like the existing
+                        # "license-filter 0 docs" / "weak Group-B match" fall-through cases below.
+                        _ot_skip_return = _ot_nonreg_rejected_e
                         _ot_was_group_b_match = not _exact_ots_e and not _group_a
                         if _matched_lt_e:
                             _ot_docs_filtered = [
@@ -4457,18 +4509,44 @@ class PersonaSupervisor:
                                 # trusting the exact match — regulatory sub_topic behavior
                                 # (the vast majority of this mechanism's traffic, heavily
                                 # tested) is completely untouched by this check.
-                                try:
-                                    _st_sem_check = self._practical._retrieve_docs(q)
-                                except Exception as _e_st_sem:
-                                    _st_sem_check = []
-                                    _LOG.warning("[Supervisor] sub_topic non-reg semantic sanity check failed: %s", _e_st_sem)
-                                _st_sem_top_mt = ""
-                                for _d_sem in _st_sem_check:
-                                    _md_sem = (_d_sem or {}).get("metadata") or {}
-                                    if str(_md_sem.get("data_type") or "").strip().lower() in ("marketing", "business_guide"):
-                                        _st_sem_top_mt = str(_md_sem.get("main_topic") or "").strip()
-                                        break
-                                if _st_sem_top_mt and _st_sem_top_mt != _st_parent_mt:
+                                # Regulatory-dominance guard (2026-09, live-reproduced): the
+                                # check below only compares AMONG marketing/business_guide
+                                # candidates, so it's blind to the case where the exact-matched
+                                # label is a coincidental hit on a short, generic business_guide
+                                # row (e.g. sub_topic="การจดทะเบียนพาณิชย์", a 2-line definition)
+                                # while the REAL answer — a detailed regulatory row with the
+                                # actual document checklist — outranks every business_guide doc
+                                # in genuine semantic retrieval but is invisible to this guard
+                                # entirely. "จดทะเบียนพาณิชย์แบบบุคคลธรรมดา ต้องเตรียมเอกสารอะไรบ้าง"
+                                # exact-matched this business_guide chapter and silently replaced
+                                # the correct regulatory document-requirements row, dropping 3 of
+                                # 8 required documents from the final answer. Checked BEFORE the
+                                # existing marketing/business_guide-vs-business_guide check since
+                                # it's a stronger, unconditional signal: if a regulatory doc is a
+                                # CONFIDENT best semantic match overall, no business_guide chapter
+                                # (however label-exact) should override it.
+                                #
+                                # Score threshold (2026-09, live-reproduced): a first version of
+                                # this check rejected on "top hit is regulatory" alone, no score
+                                # floor — that INCORRECTLY fired on the SME income-tax-bracket
+                                # case (see _nonreg_chapter_semantic_check's docstring), where the
+                                # "regulatory" top hit was an unrelated VAT-registration row that
+                                # only coincidentally shared the word "ภาษี" (score ~0.55-0.57) while
+                                # the REAL tax-bracket answer lived in the business_guide chapter
+                                # this check was about to reject — breaking answer generation
+                                # entirely with nothing else relevant retrieved.
+                                _st_sem_top_dt, _st_sem_top_score, _st_sem_top_mt = self._nonreg_chapter_semantic_check(q)
+                                if _st_sem_top_dt == "regulatory" and _st_sem_top_score >= self._NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE:
+                                    _LOG.info(
+                                        "[Supervisor] sub_topic exact-match %r (chapter %r) rejected — "
+                                        "overall semantic top hit is a confident regulatory match (score=%.3f), not "
+                                        "marketing/business_guide; falling back to normal retrieval",
+                                        _target_st_sv, _st_parent_mt, _st_sem_top_score,
+                                    )
+                                    _st_docs_raw = []
+                                    _st_data_type = ""
+                                    _st_parent_mt = ""
+                                elif _st_sem_top_mt and _st_sem_top_mt != _st_parent_mt:
                                     _LOG.info(
                                         "[Supervisor] sub_topic exact-match %r (chapter %r) rejected — "
                                         "semantic top hit disagrees (chapter %r); falling back to normal retrieval",
@@ -7330,6 +7408,66 @@ class PersonaSupervisor:
                 )
         except Exception:
             _LOG.warning("[Supervisor] startup: license type validation failed", exc_info=True)
+
+    # Regulatory-dominance confidence threshold for _nonreg_chapter_semantic_check below.
+    # Calibrated against two real, live-reproduced cases (2026-09): the commercial-
+    # registration case (regulatory top hit scores 0.735-0.756 — a confident, correct
+    # signal that business_guide's exact match should be rejected) vs. the SME
+    # income-tax-bracket case (the "regulatory" top hit is an unrelated VAT-registration
+    # row that only scores 0.55-0.57 — a weak, coincidental keyword overlap, NOT a
+    # genuinely better answer; rejecting business_guide there left NO usable content at
+    # all and broke answer generation entirely). 0.70 sits with comfortable margin
+    # below the confirmed-good case and above the confirmed-bad case.
+    _NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE = 0.70
+
+    def _nonreg_chapter_semantic_check(self, q: str) -> Tuple[str, float, str]:
+        """Cheap, score-aware semantic sanity check shared by every non-regulatory
+        (marketing/business_guide) exact-match chapter-fetch site in
+        _ensure_practical_retrieval_for_legal (operation_topic AND sub_topic — both are
+        separate, independently-written duplicates of the same exact-match-hijack shape,
+        see 2026-09 comments at each call site for the live-reproduced bugs this guards
+        against).
+
+        Returns (top_data_type, top_score, top_nonreg_main_topic):
+          - top_data_type: data_type of the single best-scoring doc overall (lowercased).
+          - top_score: that doc's raw similarity score (0.0 if unavailable).
+          - top_nonreg_main_topic: main_topic of the best-scoring doc AMONG
+            marketing/business_guide results specifically (empty if none in top-5).
+
+        Deliberately bypasses PracticalPersonaService._retrieve_docs()'s full pipeline
+        (reranker, Round-2 anchor expansion, synonym/query-rewrite) — that pipeline
+        doesn't propagate a usable score onto its returned dicts (reranker replaces
+        ordering without keeping a queryable score field), which is exactly what this
+        check needs. A small raw top-5 dense/hybrid lookup is cheap and sufficient for a
+        sanity check; full retrieval quality is not what's being assessed here.
+        """
+        try:
+            vstore = getattr(self.retriever, "vectorstore", None)
+            if vstore is None:
+                return "", 0.0, ""
+            if getattr(conf, "HYBRID_SEARCH_ENABLED", False):
+                from utils.hybrid_retriever import hybrid_scored_search
+                pairs = hybrid_scored_search(
+                    vstore, q, k=5,
+                    rrf_k=int(getattr(conf, "HYBRID_RRF_K", 60)),
+                    bm25_bypass_min_ratio=float(getattr(conf, "BM25_BYPASS_MIN_RATIO", 0.35)),
+                )
+            else:
+                pairs = vstore.similarity_search_with_relevance_scores(q, k=5)
+            if not pairs:
+                return "", 0.0, ""
+            _top_doc, _top_score = pairs[0]
+            _top_dt = str((_top_doc.metadata or {}).get("data_type") or "").strip().lower()
+            _top_nonreg_mt = ""
+            for _d, _s in pairs:
+                _md = _d.metadata or {}
+                if str(_md.get("data_type") or "").strip().lower() in ("marketing", "business_guide"):
+                    _top_nonreg_mt = str(_md.get("main_topic") or "").strip()
+                    break
+            return _top_dt, float(_top_score or 0.0), _top_nonreg_mt
+        except Exception as _e_nrc:
+            _LOG.warning("[Supervisor] _nonreg_chapter_semantic_check failed: %s", _e_nrc)
+            return "", 0.0, ""
 
     def _filter_by_specific_topic_conflict(
         self, q: str, candidates: List[str], label: str = "candidate",
