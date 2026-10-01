@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import List
+from typing import List, Tuple
+
+import conf
 
 _LOG = logging.getLogger(__name__)
 
@@ -585,6 +587,79 @@ def filter_by_specific_topic_conflict(
         log_prefix, label, candidates, _si_matches,
     )
     return []
+
+
+# ── Regulatory-dominance guard for exact-match chapter-fetch sites ─────────
+# Shared by persona_supervisor.py (operation_topic / sub_topic / main_topic
+# chapter-fetch sites inside _ensure_practical_retrieval_for_legal) and
+# persona_academic.py's own independent copy of main_topic chapter retrieval
+# (_retrieve_docs). Moved here 2026-09/2026-10 (same reasoning as
+# filter_by_specific_topic_conflict above — one shared implementation instead
+# of letting independently-written duplicates drift) after persona_academic.py
+# was confirmed, live-reproduced, to have the exact same bug as
+# persona_supervisor.py's main_topic site: "การจดทะเบียนและขอใบอนุญาตร้านอาหาร
+# ต้องทำยังไง" exact-matched a shallow 4-row business_guide chapter in BOTH
+# personas' independent main_topic-matching code, discarding a confident
+# (0.73 similarity) regulatory food-permit answer in both.
+
+# Calibrated against two real, live-reproduced cases (2026-09): the commercial-
+# registration case (regulatory top hit scores 0.735-0.756 — a confident,
+# correct signal that a business_guide exact match should be rejected) vs. the
+# SME income-tax-bracket case (the "regulatory" top hit is an unrelated
+# VAT-registration row that only scores 0.55-0.57 — a weak, coincidental
+# keyword overlap, NOT a genuinely better answer; rejecting business_guide
+# there left NO usable content at all and broke answer generation entirely).
+# 0.70 sits with comfortable margin below the confirmed-good case and above
+# the confirmed-bad case.
+NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE = 0.70
+
+
+def nonreg_chapter_semantic_check(retriever, q: str, log_prefix: str = "") -> Tuple[str, float, str]:
+    """Cheap, score-aware semantic sanity check for every non-regulatory
+    (marketing/business_guide) exact-match chapter-fetch site across both
+    persona_supervisor.py and persona_academic.py.
+
+    Returns (top_data_type, top_score, top_nonreg_main_topic):
+      - top_data_type: data_type of the single best-scoring doc overall (lowercased).
+      - top_score: that doc's raw similarity score (0.0 if unavailable).
+      - top_nonreg_main_topic: main_topic of the best-scoring doc AMONG
+        marketing/business_guide results specifically (empty if none in top-5).
+
+    Deliberately bypasses the callers' own full `_retrieve_docs()` pipelines
+    (reranker, Round-2 anchor expansion, synonym/query-rewrite) — those
+    pipelines don't propagate a usable score onto their returned dicts
+    (reranking replaces ordering without keeping a queryable score field),
+    which is exactly what this check needs. A small raw top-5 dense/hybrid
+    lookup is cheap and sufficient for a sanity check; full retrieval quality
+    is not what's being assessed here.
+    """
+    try:
+        vstore = getattr(retriever, "vectorstore", None)
+        if vstore is None:
+            return "", 0.0, ""
+        if getattr(conf, "HYBRID_SEARCH_ENABLED", False):
+            from utils.hybrid_retriever import hybrid_scored_search
+            pairs = hybrid_scored_search(
+                vstore, q, k=5,
+                rrf_k=int(getattr(conf, "HYBRID_RRF_K", 60)),
+                bm25_bypass_min_ratio=float(getattr(conf, "BM25_BYPASS_MIN_RATIO", 0.35)),
+            )
+        else:
+            pairs = vstore.similarity_search_with_relevance_scores(q, k=5)
+        if not pairs:
+            return "", 0.0, ""
+        _top_doc, _top_score = pairs[0]
+        _top_dt = str((_top_doc.metadata or {}).get("data_type") or "").strip().lower()
+        _top_nonreg_mt = ""
+        for _d, _s in pairs:
+            _md = _d.metadata or {}
+            if str(_md.get("data_type") or "").strip().lower() in ("marketing", "business_guide"):
+                _top_nonreg_mt = str(_md.get("main_topic") or "").strip()
+                break
+        return _top_dt, float(_top_score or 0.0), _top_nonreg_mt
+    except Exception as _e_nrc:
+        _LOG.warning("%s_nonreg_chapter_semantic_check failed: %s", log_prefix, _e_nrc)
+        return "", 0.0, ""
 
 
 # ── Thai-aware keyword extraction for topic/relevance scoring ───────────────

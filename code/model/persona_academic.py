@@ -29,6 +29,8 @@ from utils.text_patterns import (
     extract_info_gap_tag as _shared_extract_info_gap_tag,
     filter_by_specific_topic_conflict as _shared_filter_by_specific_topic_conflict,
     extract_thai_keywords as _shared_extract_thai_keywords,
+    nonreg_chapter_semantic_check as _shared_nonreg_chapter_semantic_check,
+    NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE as _SHARED_NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE,
 )
 
 _LOG = logging.getLogger("restbiz.academic")
@@ -670,6 +672,35 @@ class AcademicPersonaService:
                     )
                     if _matched_mts_ac:
                         _target_mt_ac = max(_matched_mts_ac, key=len)
+                        # Regulatory-dominance guard (2026-10, live-reproduced): this is an
+                        # independent copy of persona_supervisor.py's main_topic chapter-fetch
+                        # exact-match (same substring-match shape, written separately for
+                        # Academic mode) — confirmed to have the EXACT same bug, reproduced
+                        # with the same real query: "การจดทะเบียนและขอใบอนุญาตร้านอาหารต้องทำยังไง"
+                        # exact-matches this main_topic's shallow 4-row business_guide chapter
+                        # (just a "2 ประเภท" definition + a VAT-registration stub) while plain
+                        # semantic retrieval ranks a regulatory food-permit document at 0.73 —
+                        # well above the dominance threshold. See
+                        # utils.text_patterns.nonreg_chapter_semantic_check's docstring for the
+                        # full pattern and calibration data (shared with persona_supervisor.py
+                        # so the two copies can't drift onto different thresholds).
+                        _mt_sem_top_dt_ac, _mt_sem_top_score_ac, _ = _shared_nonreg_chapter_semantic_check(
+                            self.retriever, query, log_prefix="[Academic] "
+                        )
+                        _mt_rejected_ac = (
+                            _mt_sem_top_dt_ac == "regulatory"
+                            and _mt_sem_top_score_ac >= _SHARED_NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE
+                        )
+                        if _mt_rejected_ac:
+                            _LOG.info(
+                                "[Academic] main_topic exact-match %r rejected — overall semantic top "
+                                "hit is a confident regulatory match (score=%.3f); falling through to "
+                                "sub_topic/semantic retrieval",
+                                _target_mt_ac, _mt_sem_top_score_ac,
+                            )
+                    else:
+                        _mt_rejected_ac = False
+                    if _matched_mts_ac and not _mt_rejected_ac:
                         _ch_res = _coll_ac.get(
                             where={"main_topic": _target_mt_ac},
                             include=["documents", "metadatas"],
