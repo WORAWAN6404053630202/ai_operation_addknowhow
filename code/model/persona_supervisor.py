@@ -9957,27 +9957,102 @@ class PersonaSupervisor:
             # the per-entity count, keeps prompt size/cost bounded regardless of how the
             # underlying data shape evolves, without relying on that shape staying as-is.
             _total_merge_cap = 8
-            _merged_docs: List[Dict[str, Any]] = []
             _seen_content_hashes: set = set()
+
+            # Per-entity semantic search (unchanged shape) — collected into a dict first
+            # instead of appended straight into one flat list, so the interleave step below
+            # can control ordering across entities (see why, further down).
+            _entity_doc_lists: Dict[str, List[Dict[str, Any]]] = {}
             for _ev in _entity_vals:
-                if len(_merged_docs) >= _total_merge_cap:
-                    _LOG.info(
-                        "[Supervisor] merge_both_entity_docs: total cap (%d) reached before entity %r — stopping",
-                        _total_merge_cap, _ev,
-                    )
-                    break
                 try:
-                    _ev_docs = self._practical._retrieve_docs(
+                    _entity_doc_lists[_ev] = self._practical._retrieve_docs(
                         query,
                         metadata_filter={"license_type": _lt_for_merge, "entity_type_normalized": _ev},
                         max_docs=_per_entity_cap,
                     )
                 except Exception as _e_ev:
                     _LOG.warning("[Supervisor] merge_both_entity_docs: per-entity retrieve failed for %r: %s", _ev, _e_ev)
+                    _entity_doc_lists[_ev] = []
+
+            # Guaranteed inclusion of a legal/penalty-bearing doc per entity (2026-10,
+            # live-reproduced, 2 iterations): a real case needed the
+            # "ป้ายชื่อต้องตรงกับชื่อที่จดทะเบียน" signage/legal text, which lives in a
+            # general "about this entity" row that's SEPARATE from the operation-specific
+            # sub-case rows (e.g. นิติบุคคล's name-change has 4 sub-case variants:
+            # จองชื่อแล้ว/ยังไม่จองชื่อ/ชื่อพิเศษ/ไม่มีตราประทับ) — raising the per-entity cap
+            # from 3 to 5 didn't reliably surface it (ranking against an operation-specific
+            # query structurally favors operation-specific rows every time, not a close call
+            # a bigger cap fixes). First attempt tried identifying "the general profile doc"
+            # by an operation_topic naming pattern ("รูปแบบ<entity>", whitespace-collapsed)
+            # — this BROKE on real data: นิติบุคคล's profile row really is "รูปแบบนิติบุคคล"
+            # (no internal space) but the sub-case rows are labelled "รูปแบบ นิติบุคคล" (WITH
+            # a space) — collapsing whitespace made the matcher treat them as the same row,
+            # the same two-near-identical-labels trap already hit once this session (the
+            # op-intent filter bug). บุคคลธรรมดา's equivalent row is named completely
+            # differently again ("บุคคลธรรมดา กิจการเจ้าของคนเดียว") — confirming topic-name
+            # pattern-matching can't generalize here at all. Match on the FIELD actually
+            # needed instead: any doc for this entity with a non-empty legal_regulatory,
+            # picking the longest if several exist — direct metadata lookup, zero reliance
+            # on embedding similarity, so this can never lose a ranking competition again.
+            for _ev in _entity_vals:
+                _docs_for_ev = _entity_doc_lists.get(_ev) or []
+                _already_has_legal = any(
+                    str((_d.get("metadata") or {}).get("legal_regulatory") or "").strip()
+                    for _d in _docs_for_ev
+                )
+                if _already_has_legal:
                     continue
-                for _d_ev in _ev_docs[:_per_entity_cap]:
+                try:
+                    _res_legal = _coll_for_merge.get(
+                        where={"$and": [{"license_type": _lt_for_merge}, {"entity_type_normalized": _ev}]},
+                        include=["metadatas", "documents"],
+                    )
+                except Exception as _e_legal:
+                    _LOG.warning("[Supervisor] merge_both_entity_docs: legal-doc lookup failed for %r: %s", _ev, _e_legal)
+                    continue
+                _best_legal_doc: Optional[Dict[str, Any]] = None
+                _best_legal_len = 0
+                for _lmd, _ldoc in zip(_res_legal.get("metadatas") or [], _res_legal.get("documents") or []):
+                    _legal_text = str((_lmd or {}).get("legal_regulatory") or "").strip()
+                    if len(_legal_text) > _best_legal_len:
+                        _best_legal_len = len(_legal_text)
+                        _best_legal_doc = {"content": _ldoc or "", "metadata": _lmd or {}}
+                if _best_legal_doc is not None:
+                    _entity_doc_lists.setdefault(_ev, []).append(_best_legal_doc)
+                    _LOG.info(
+                        "[Supervisor] merge_both_entity_docs: guaranteed legal_regulatory doc for %r (topic=%r, not in top-%d)",
+                        _ev, (_best_legal_doc["metadata"] or {}).get("operation_topic"), _per_entity_cap,
+                    )
+
+            # Interleave round-robin across entities instead of block-concatenating one
+            # entity's docs before the other (2026-10, live-reproduced): _entity_vals is
+            # alphabetically sorted, and in Thai that puts "นิติบุคคล" (ขึ้นต้น น, U+0E19)
+            # before "บุคคลธรรมดา" (ขึ้นต้น บ, U+0E1A) EVERY time, for EVERY license_type
+            # this split exists for — not a coincidence of this one case. Block-concatenating
+            # meant นิติบุคคล's docs always landed at the very front of the prompt and
+
+            # บุคคลธรรมดา's always came after — confirmed via direct, deterministic
+            # reproduction (no embedding ranking involved) that this ordering is 100%
+            # fixed, call after call. A real case showed the downstream effect: the
+            # LLM consistently wrote a complete, detailed section for whichever entity's
+            # docs it saw first (นิติบุคคล) and a shortchanged one for whichever it saw
+            # later (บุคคลธรรมดา) — an LLM attention/position effect, not random
+            # variance, so no prompt-wording fix could have closed it; only removing the
+            # structural position advantage can. Round-robin (doc 1 of every entity, then
+            # doc 2 of every entity, ...) means neither entity structurally owns the
+            # front of the prompt.
+            _merged_docs: List[Dict[str, Any]] = []
+            _max_len = max((len(v) for v in _entity_doc_lists.values()), default=0)
+            for _i in range(_max_len):
+                if len(_merged_docs) >= _total_merge_cap:
+                    break
+                for _ev in _entity_vals:
                     if len(_merged_docs) >= _total_merge_cap:
                         break
+                    _docs_for_ev = _entity_doc_lists.get(_ev) or []
+                    if _i >= len(_docs_for_ev):
+                        continue
+                    _d_ev = _docs_for_ev[_i]
                     _h = hash((_d_ev.get("content") or "")[:120])
                     if _h not in _seen_content_hashes:
                         _seen_content_hashes.add(_h)
