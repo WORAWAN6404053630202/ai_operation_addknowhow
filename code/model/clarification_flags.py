@@ -44,6 +44,11 @@ DYNAMIC_CLARIFICATION_SKIP_FLAGS: FrozenSet[str] = frozenset({
     "_broad_question",          # user wants an overview, not a menu
     "_definition_query",        # "X คืออะไร" — entity/location/area irrelevant to the answer
     "_non_reg_dominant_query",  # doc mix is mostly non-regulatory — unreliable for divergence checks
+    "_entity_type_explicitly_skipped",  # user said "ทั้งสองแบบครับ" to an entity_type slot
+                                         # question (see persona_supervisor.py's
+                                         # _SKIPPED_SLOT_KEYS_CTX_KEY) — re-asking the identical
+                                         # question via a DIFFERENT mechanism is the same bug
+                                         # class this whole registry exists to prevent.
 })
 
 # Checked by persona_practical.py before it independently injects an entity_type
@@ -70,6 +75,13 @@ ENTITY_INJECTION_SKIP_FLAGS: FrozenSet[str] = frozenset({
     "_non_reg_dominant_query",
     "_multi_topic_retrieval",
     "multi_license_topics",
+    # User already explicitly declined to pick one entity_type ("ทั้งสองแบบครับ") —
+    # see DYNAMIC_CLARIFICATION_SKIP_FLAGS' matching entry for the full history. Without
+    # this, persona_supervisor.py's slot_skip handling correctly stops asking via its own
+    # topic_slot_queue, then deliberately merges in BOTH entity types' docs so the final
+    # answer can cover both — which this injection check would otherwise see as "docs span
+    # 2+ entity types, not collected yet" and re-ask the IDENTICAL question right back.
+    "_entity_type_explicitly_skipped",
 })
 
 

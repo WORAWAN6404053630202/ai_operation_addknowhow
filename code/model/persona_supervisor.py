@@ -407,6 +407,16 @@ class PersonaSupervisor:
         r"ไม่รู้|ไม่แน่ใจ|ยังไม่รู้|ยังไม่แน่ใจ|ยังไม่ตัดสินใจ|ยังไม่ได้ตัดสินใจ|ยังหาข้อมูลอยู่"
         r"|ข้ามก่อน|ข้ามไปก่อน|ข้ามได้มั้ย|ข้ามได้ไหม|ขอข้าม|ข้ามไปเลย|ข้ามเลย|ข้ามข้อนี้|ข้ามคำถามนี้|ข้ามได้เลย"
         r"|ไม่ต้องถาม|ยังไม่รู้เลย|ไม่ทราบครับ|ไม่ทราบค่ะ|ไม่ทราบนะ"
+        # "Both" answers to a forced single-choice slot (2026-10, live-reproduced):
+        # a slot question always offers a closed set of options and expects exactly
+        # one — "ทั้งสองแบบครับ"/"มีทั้งคู่"/"ทั้งคู่เลยครับ" (both apply to me) is
+        # neither a valid single answer nor a "ไม่รู้" (don't-know) answer, so it fell
+        # through this regex AND the LLM fallback's narrower "don't know/skip" framing
+        # to _build_slot_mismatch_message's confusing "my data only covers X, Y — not
+        # your answer 'ทั้งสองแบบครับ'" dead end, on a real customer's shop-closure
+        # question. Treated the same as "ไม่รู้" — skip this slot, same already-working
+        # downstream behavior (see build_slot_skip_detect_prompt's matching update).
+        r"|ทั้งสองแบบ|ทั้งสองอย่าง|ทั้งคู่|ทั้งสองเลย|มีทั้งคู่|มีทั้งสอง"
         r"|skip(?:\s+this)?",
         re.IGNORECASE,
     )
@@ -805,6 +815,36 @@ class PersonaSupervisor:
     # _handle_inner (search "pending_feedback_choice"). Feature code itself (this
     # method, _handle_feedback_selection, google_sheets_service.py) is left intact.
     _FEEDBACK_MENU_ENABLED = False
+
+    # state.context key tracking slot keys the user has explicitly declined to answer
+    # (via slot_skip) — see _route_pending_slot_to_persona's slot_skip branch and every
+    # `remaining = [s for s in all_slots if ...]` site below. Deliberately session-scoped,
+    # same lifetime as collected_slots (never cleared per-topic) — the existing "no slot
+    # re-ask" rule already keeps an actual ANSWER (e.g. entity_type=บุคคลธรรมดา) valid
+    # across later, unrelated topics in the same session; an explicit DECLINE ("ทั้งสอง
+    # แบบครับ" / can't single-select) is the same kind of durable fact about this user and
+    # should be respected the same way, not just for the one topic that happened to ask it.
+    _SKIPPED_SLOT_KEYS_CTX_KEY = "_skipped_slot_keys"
+
+    # Slot keys whose answers are short, natural-language-ish responses that may
+    # superficially resemble an unrelated intent (persona switch, greeting, legal
+    # question, etc.) — e.g. "นิติค่ะ", "กสิกรครับ", "ทั้งสองแบบครับ". Originally a
+    # local variable only inside _should_route_pending_slot_now's own switch/persona/
+    # greeting/legal-question guards; promoted to a class constant 2026-10 so the SAME
+    # set can gate the EARLIER silent-switch-to-academic checks (2.3/2.4/2.5 in
+    # _handle_inner) too — those run strictly BEFORE _should_route_pending_slot_now is
+    # ever called, so having the exemption only inside that later function could never
+    # protect a pending slot of one of these keys from being hijacked first. Live-
+    # reproduced: a customer answering "ทั้งสองแบบเลยครับ" to a registration_type slot
+    # question got silently switched to Academic mode by section 2.3 (style/depth-
+    # request classifier scored it "wants_long") — "registration_type" is already in
+    # this set and _should_route_pending_slot_now would have exempted it correctly, but
+    # that check was never reached because 2.3 already returned first.
+    _SLOT_REPLY_ALWAYS_KEYS = frozenset({
+        "topic", "operation_group", "operation_sub_type", "operation_topic",
+        "registration_type", "department", "entity_type", "location",
+        "shop_area_type", "area_size", "choice",
+    })
 
     def _maybe_offer_feedback(self, state: ConversationState, user_input: str, reply: str) -> str:
         """Called once per turn from handle() (the single choke point every persona reply
@@ -6425,7 +6465,30 @@ class PersonaSupervisor:
                     except Exception as _e_ot_7:
                         _LOG.warning("[Supervisor] Step7 op_topic re-retrieve failed: %s", _e_ot_7)
 
-        remaining = [s for s in all_slots if s["key"] not in collected_keys]
+        # Also exclude slot keys the user already explicitly declined to single-select
+        # (e.g. "ทั้งสองแบบครับ") — see _SKIPPED_SLOT_KEYS_CTX_KEY's docstring. Without this,
+        # a skip only removes the one pending_slot instance; this same discovery step would
+        # otherwise re-add the identical key moments later from the next unfiltered retrieval
+        # (docs still span multiple values for it) and re-ask it in rephrased wording forever.
+        _skipped_keys_lq = set(state.context.get(self._SKIPPED_SLOT_KEYS_CTX_KEY) or [])
+        remaining = [
+            s for s in all_slots
+            if s["key"] not in collected_keys and s["key"] not in _skipped_keys_lq
+        ]
+
+        # Guarantee comprehensive coverage for THIS topic too (2026-10): entity_type was
+        # just filtered out of `remaining` above purely because the user declined it on some
+        # EARLIER, possibly unrelated topic this session (see _SKIPPED_SLOT_KEYS_CTX_KEY and
+        # _merge_both_entity_docs_after_skip's docstrings) — not because it's already known.
+        # Without this, THIS topic silently never gets asked AND never gets the compensating
+        # both-entity merge either, leaving it to luck (an unrelated sibling-completion
+        # mechanism) whether the final answer actually covers both entity types.
+        if (
+            "entity_type" in _skipped_keys_lq
+            and "entity_type" not in collected_keys
+            and any(s["key"] == "entity_type" for s in all_slots)
+        ):
+            self._merge_both_entity_docs_after_skip(state, query, license_type_hint=license_type)
 
         if not remaining:
             return
@@ -7187,7 +7250,7 @@ class PersonaSupervisor:
         # detection, greeting detection, or legal-question guards.
         _ps = ctx.get("pending_slot")
         pending_key = str((_ps.get("key") if isinstance(_ps, dict) else None) or "")
-        _SLOT_REPLY_ALWAYS = {"topic", "operation_group", "operation_sub_type", "operation_topic", "registration_type", "department", "entity_type", "location", "shop_area_type", "area_size", "choice"}
+        _SLOT_REPLY_ALWAYS = self._SLOT_REPLY_ALWAYS_KEYS
 
         # Switch/persona guards: exempt _SLOT_REPLY_ALWAYS slots so that e.g. typing a bank name
         # ("kasikorn") while answering the department slot is never mis-classified as a persona
@@ -9829,6 +9892,109 @@ class PersonaSupervisor:
         )
         return _fb_opts, _fb_map
 
+    def _merge_both_entity_docs_after_skip(
+        self, state: ConversationState, query: str, license_type_hint: str = "",
+    ) -> None:
+        """Called whenever entity_type is being silently withheld from a slot_queue because
+        the user already explicitly declined ("ทั้งสองแบบครับ") to pick one — SOMEWHERE in
+        this session, not necessarily for the CURRENT topic (see _SKIPPED_SLOT_KEYS_CTX_KEY's
+        docstring: deliberately session-scoped, same lifetime as collected_slots, matching how
+        an actual stated entity_type answer already persists across unrelated later topics —
+        2026-10 design discussion: a decline is as durable a fact about this user as an answer
+        is, so it should be remembered the same way; what must NOT vary by topic is whether the
+        resulting answer is actually comprehensive).
+
+        2026-10 follow-up fix: originally only called from the slot_skip branch for the EXACT
+        topic that triggered the skip. Live-tested that this left later, unrelated topics that
+        ALSO have an entity split (e.g. asking about a liquor license after declining
+        entity_type for a commercial-registration question) silently unprotected — they
+        happened to still get a reasonable answer via an unrelated sibling-completion
+        mechanism in persona_practical.py, but nothing guaranteed that for every topic. Now
+        called from BOTH the slot_skip branch (license_type_hint="", derived from
+        state.current_docs) AND _maybe_build_slot_queue_from_docs's own discover-slots step
+        (license_type_hint=<that function's own license_type>) so every topic where entity_type
+        would have been asked, had it not been pre-emptively skipped, gets the same guarantee.
+
+        Fetches each real entity_type_normalized value's own best-matching docs for `query`
+        independently (same per-entity-scored-search shape used elsewhere in this file for
+        analogous "don't let one category starve another out of a shared top-K" situations)
+        and prepends them onto state.current_docs. Prepending, not appending, because
+        multiple downstream caps in persona_practical.py take a first-N slice of
+        state.current_docs — appending here would let this exact fix get silently truncated
+        back out, the same failure mode already fixed once this session for the QR Payment
+        cross-reference (see that fix's own comment in persona_practical.py for the precedent).
+        """
+        try:
+            _lt_for_merge = (license_type_hint or "").strip()
+            if not _lt_for_merge:
+                for _d in (state.current_docs or []):
+                    if not isinstance(_d, dict):
+                        continue
+                    _lt_for_merge = str((_d.get("metadata") or {}).get("license_type") or "").strip()
+                    if _lt_for_merge:
+                        break
+            if not _lt_for_merge:
+                return
+            _coll_for_merge = self._get_chroma_collection()
+            if _coll_for_merge is None:
+                return
+            _res_for_merge = _coll_for_merge.get(where={"license_type": _lt_for_merge}, include=["metadatas"])
+            _entity_vals = sorted({
+                str((_m or {}).get("entity_type_normalized") or "").strip()
+                for _m in (_res_for_merge.get("metadatas") or [])
+            } - {"", "nan", "None"})
+            if len(_entity_vals) < 2:
+                # No real entity split for this license_type — nothing to merge; the
+                # normal retrieval already covers it correctly on its own.
+                return
+            _per_entity_cap = 3
+            # Hard total ceiling independent of how many entity values exist (2026-10,
+            # defensive): today's real data only ever has 2 (นิติบุคคล/บุคคลธรรมดา), so
+            # _per_entity_cap alone already bounds this at 6 docs in practice — but nothing
+            # upstream guarantees a future license_type/corpus update can't introduce 3+
+            # entity_type_normalized values (e.g. a third "ห้างหุ้นส่วนสามัญ"-style bucket
+            # some sheet row uses inconsistently). Capping the TOTAL merged count, not just
+            # the per-entity count, keeps prompt size/cost bounded regardless of how the
+            # underlying data shape evolves, without relying on that shape staying as-is.
+            _total_merge_cap = 8
+            _merged_docs: List[Dict[str, Any]] = []
+            _seen_content_hashes: set = set()
+            for _ev in _entity_vals:
+                if len(_merged_docs) >= _total_merge_cap:
+                    _LOG.info(
+                        "[Supervisor] merge_both_entity_docs: total cap (%d) reached before entity %r — stopping",
+                        _total_merge_cap, _ev,
+                    )
+                    break
+                try:
+                    _ev_docs = self._practical._retrieve_docs(
+                        query,
+                        metadata_filter={"license_type": _lt_for_merge, "entity_type_normalized": _ev},
+                        max_docs=_per_entity_cap,
+                    )
+                except Exception as _e_ev:
+                    _LOG.warning("[Supervisor] merge_both_entity_docs: per-entity retrieve failed for %r: %s", _ev, _e_ev)
+                    continue
+                for _d_ev in _ev_docs[:_per_entity_cap]:
+                    if len(_merged_docs) >= _total_merge_cap:
+                        break
+                    _h = hash((_d_ev.get("content") or "")[:120])
+                    if _h not in _seen_content_hashes:
+                        _seen_content_hashes.add(_h)
+                        _merged_docs.append(_d_ev)
+            if _merged_docs:
+                _existing = [
+                    d for d in (state.current_docs or [])
+                    if hash((d.get("content") or "")[:120]) not in _seen_content_hashes
+                ]
+                state.current_docs = _merged_docs + _existing
+                _LOG.info(
+                    "[Supervisor] merge_both_entity_docs: license=%r entities=%s → +%d doc(s) prepended (total=%d)",
+                    _lt_for_merge, _entity_vals, len(_merged_docs), len(state.current_docs),
+                )
+        except Exception as _e_merge:
+            _LOG.warning("[Supervisor] merge_both_entity_docs failed: %s", _e_merge)
+
     def _route_pending_slot_to_persona(self, state: ConversationState, user_input: str) -> Tuple[ConversationState, str]:
         _raw_pending = (state.context or {}).get("pending_slot")
         pending = _raw_pending if isinstance(_raw_pending, dict) else {}
@@ -9846,6 +10012,28 @@ class PersonaSupervisor:
             _LOG.info("[Supervisor] slot_skip detected for slot=%r input=%r", pending.get("key"), _raw_ui[:50])
             state.context = state.context or {}
             state.context.pop("pending_slot", None)
+            # Record this key as explicitly declined (2026-10, live-reproduced): without this,
+            # a skip only removes the CURRENT pending_slot instance — _maybe_build_slot_queue_from_docs
+            # re-discovers slot dimensions from the next unfiltered retrieval and, finding the
+            # same key still ambiguous (e.g. docs still span both entity_type values because the
+            # user never actually picked one), re-adds and re-asks the SAME key in newly-rephrased
+            # wording. A real customer answering "ทั้งสองแบบครับ" to an entity_type question hit
+            # exactly this: skip → re-ask → skip → re-ask, never converging to an answer covering
+            # both. Tracked keys are checked at every `remaining = [s for s in all_slots if ...]`
+            # site (see _SKIPPED_SLOT_KEYS_CTX_KEY's other usages) so a key the user has already
+            # declined once is never re-asked again this session, on this topic.
+            _skipped_key = str(pending.get("key") or "").strip()
+            if _skipped_key:
+                _skipped_set = set(state.context.get(self._SKIPPED_SLOT_KEYS_CTX_KEY) or [])
+                _skipped_set.add(_skipped_key)
+                state.context[self._SKIPPED_SLOT_KEYS_CTX_KEY] = list(_skipped_set)
+                if _skipped_key == "entity_type":
+                    # See clarification_flags.py's ENTITY_INJECTION_SKIP_FLAGS /
+                    # DYNAMIC_CLARIFICATION_SKIP_FLAGS entries for why this flag exists:
+                    # persona_practical.py's own independent entity-injection check (and
+                    # _maybe_dynamic_clarification below) must not re-ask the identical
+                    # question through their own separate mechanisms.
+                    state.context["_entity_type_explicitly_skipped"] = True
             _next_queue = list(state.context.get("topic_slot_queue") or [])
             if _next_queue:
                 # Advance to next slot in queue
@@ -9867,6 +10055,23 @@ class PersonaSupervisor:
                 _last_q = (state.context.get("last_user_legal_query") or state.context.get("last_topic") or "").strip()
                 if _last_q and not _last_q.startswith("__"):
                     self._ensure_practical_retrieval_for_legal(state, _last_q)
+                    # entity_type explicitly declined, not just "unknown" (2026-10, live-
+                    # reproduced): the retrieval _ensure_practical_retrieval_for_legal just ran
+                    # filters for entity_type_normalized=="" (entity-neutral docs only) when no
+                    # entity is known — correct for a genuinely universal fact, but when the
+                    # user explicitly said "ทั้งสองแบบครับ" the entity-SPECIFIC docs for BOTH
+                    # values are exactly what's needed, and this filter silently excludes both.
+                    # Real corpus shape confirmed: the cancellation procedure for ใบทะเบียนพาณิชย์
+                    # lives inside each entity's own general "รูปแบบ [entity]" row, not a row
+                    # named after the operation — plain semantic search on the user's "ยกเลิก..."
+                    # phrasing ranked unrelated rows (lost-certificate, apply-on-behalf-of, etc.)
+                    # above it, so the final answer was INFO_GAP even though the real answer was
+                    # retrievable. Fetch each entity value's own best-matching docs directly
+                    # (same per-entity-scored-search pattern, so neither entity's content can
+                    # starve the other out of a shared top-K) and merge, instead of trusting one
+                    # blended semantic search to rank both fairly.
+                    if "entity_type" in (state.context.get(self._SKIPPED_SLOT_KEYS_CTX_KEY) or []):
+                        self._merge_both_entity_docs_after_skip(state, _last_q)
                     st2, reply = self._practical.handle(state, _last_q, _internal=False)
                     reply = self._normalize_male(reply)
                     self._add_assistant(st2, reply)
@@ -11964,7 +12169,11 @@ class PersonaSupervisor:
                             _collected_keys = set(_cs_area.keys()) | set(_ctx_slots_area.keys())
                         except Exception:
                             _collected_keys = set()
-                        _remaining = [s for s in _all_slots if s["key"] not in _collected_keys]
+                        _skipped_keys_area = set(state.context.get(self._SKIPPED_SLOT_KEYS_CTX_KEY) or [])
+                        _remaining = [
+                            s for s in _all_slots
+                            if s["key"] not in _collected_keys and s["key"] not in _skipped_keys_area
+                        ]
                         # Also remove entity_type itself (just answered)
                         _remaining = [s for s in _remaining if s["key"] != "entity_type"]
 
@@ -13589,6 +13798,19 @@ class PersonaSupervisor:
         # BYPASS: skip entirely when pending_slot is active — user is answering a slot question,
         # not asking a new topic (e.g. "นิติ" as answer to entity_type question).
         _pending_slot_active = bool((state.context or {}).get("pending_slot"))
+        # Whether the CURRENT pending_slot (if any) is one of the "always treat as a slot
+        # reply" keys — computed once here, reused by sections 2.3/2.4/2.5 below (each of
+        # which can return early via _silent_switch_to_academic) so none of them hijack an
+        # answer to one of these slots before _should_route_pending_slot_now/2.6 ever gets
+        # a chance to apply the SAME exemption. See _SLOT_REPLY_ALWAYS_KEYS's docstring for
+        # the live-reproduced bug this closes ("ทั้งสองแบบเลยครับ" answering a
+        # registration_type question silently switched personas instead of being treated
+        # as a slot reply/skip).
+        _pending_slot_key_for_ps = str(
+            (((state.context or {}).get("pending_slot") or {}).get("key")
+             if isinstance((state.context or {}).get("pending_slot"), dict) else None) or ""
+        )
+        _pending_slot_is_reply_always = _pending_slot_key_for_ps in self._SLOT_REPLY_ALWAYS_KEYS
         # Also bypass 2.2c when there is an active legal conversation — short follow-ups
         # like "แล้วถ้าเป็นนิติบุคคลอ่ะ" lack standalone keywords but are clearly in-domain.
         _has_active_legal_ctx = bool(
@@ -13685,10 +13907,27 @@ class PersonaSupervisor:
         # "ละเอียดกว่านี้" — these are style requests even if they contain a legal keyword.
         # Heuristic: wants_long + short input (≤10 words) + explicit depth modifier present.
         _raw_is_legal = self._looks_like_legal_question(raw_stripped, state)
+        # Computed BEFORE the (potentially expensive) style classifier call below so that
+        # call can be skipped entirely during a protected pending_slot (2026-10 efficiency
+        # fix — see _pending_slot_is_reply_always's docstring for the correctness side of
+        # this same gate). "ทั้ง..." excluded on purpose: it's the exact word family
+        # ("ทั้งสองแบบ", "ทั้งหมดเลย") that is ALSO this slot's own skip-decline vocabulary
+        # (_SLOT_SKIP_RE / build_slot_skip_detect_prompt) — live-reproduced that trusting
+        # the depth-keyword regex on "ทั้งหมดเลยค่ะ" during a pending slot would silently
+        # reopen the exact academic-mode-hijack bug this whole chain exists to close,
+        # because the skip-interpretation can only be confirmed later (LLM fallback,
+        # inside _route_pending_slot_to_persona) — never trust this regex alone on a "ทั้ง..."
+        # phrase while a slot is pending; let it fall through to slot-skip handling instead.
+        _has_explicit_depth = bool(self._DEPTH_DETAIL_RE.search(raw_stripped))
+        _explicit_depth_safe_during_slot = _has_explicit_depth and "ทั้ง" not in raw_stripped
+        _skip_style_classifier_for_slot = _pending_slot_is_reply_always and not _explicit_depth_safe_during_slot
         # _last_q_for_style pre-computed above before pre-warm block.
         _style_pw_key = (raw_stripped[:80], (_last_q_for_style or "")[:80])
         _style_pw_hit = (state.context or {}).get("_style_pw_cache", {}).get(_style_pw_key)
-        style = _style_pw_hit if _style_pw_hit is not None else self._infer_user_style_request_hybrid(raw_stripped, _last_q_for_style, state=state)
+        if _skip_style_classifier_for_slot:
+            style: Dict[str, Any] = {}
+        else:
+            style = _style_pw_hit if _style_pw_hit is not None else self._infer_user_style_request_hybrid(raw_stripped, _last_q_for_style, state=state)
         # _is_short_depth_followup: allows academic switch even when input has legal keywords.
         # Two paths:
         # A) Regex path: explicit depth keyword (e.g. เจาะลึก, ละเอียด) — always accepted.
@@ -13702,7 +13941,6 @@ class PersonaSupervisor:
         # asking about a specific item from the PREVIOUS answer, not requesting a new academic
         # deep-dive.  Practical LLM can handle this via conversation history.
         _is_numbered_item_ref = bool(re.search(r'ช่องทางที่\s*\d+|วิธีที่\s*\d+', raw_stripped))
-        _has_explicit_depth = bool(self._DEPTH_DETAIL_RE.search(raw_stripped))
         _is_short_depth_followup = (
             style.get("wants_long")
             and _raw_is_legal
@@ -13720,19 +13958,36 @@ class PersonaSupervisor:
                 )
             )
         )
-        if style.get("wants_long") and (not _raw_is_legal or _is_short_depth_followup):
+        # Pending-slot exemption (2026-10, live-reproduced — see _SLOT_REPLY_ALWAYS_KEYS):
+        # an answer to one of these slots (e.g. registration_type's "ทั้งสองแบบเลยครับ")
+        # must never be hijacked into a persona switch here, before 2.6/
+        # _should_route_pending_slot_now ever gets a chance to apply the identical
+        # exemption — that later check is useless if this earlier one already returned.
+        # Narrow carve-out: an UNAMBIGUOUS explicit depth request ("...แบบละเอียดเจาะลึก...")
+        # unrelated to "ทั้ง..." wording is still honored even mid-slot (see
+        # _explicit_depth_safe_during_slot above) — a genuine "switch me to deep mode"
+        # request shouldn't be silently swallowed just because a slot happens to be pending.
+        if (
+            (not _pending_slot_is_reply_always or _explicit_depth_safe_during_slot)
+            and style.get("wants_long")
+            and (not _raw_is_legal or _is_short_depth_followup)
+        ):
             return self._silent_switch_to_academic(state, raw_stripped)
         # wants_short or legal question: continue to practical routing below
 
         # 2.4) explicit target in text + switch verb -> silent switch
         explicit_target = self._infer_target_persona_from_text(raw_stripped)
-        if explicit_target in {"academic", "practical"} and any(v in self._normalize_for_intent(raw_stripped) for v in self._SWITCH_VERBS):
+        if (
+            not _pending_slot_is_reply_always
+            and explicit_target in {"academic", "practical"}
+            and any(v in self._normalize_for_intent(raw_stripped) for v in self._SWITCH_VERBS)
+        ):
             if explicit_target == "academic":
                 return self._silent_switch_to_academic(state, raw_stripped)
             # explicit_target == "practical": already in practical, continue routing
 
         # 2.5) switch without target -> silent switch to academic (toggle)
-        if self._looks_like_switch_without_target(raw_stripped, state):
+        if not _pending_slot_is_reply_always and self._looks_like_switch_without_target(raw_stripped, state):
             cur = normalize_persona_id(state.persona_id)
             if cur != "academic":
                 return self._silent_switch_to_academic(state, raw_stripped)

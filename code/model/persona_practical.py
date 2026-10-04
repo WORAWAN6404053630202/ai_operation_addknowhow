@@ -481,6 +481,25 @@ class PracticalPersonaService:
     _DONT_KNOW_RE = re.compile(r"^\s*(ไม่รู้|ไม่แน่ใจ|ไม่ทราบ|งง|แล้วแต่|อะไรก็ได้)\s*$")
     _ASK_TYPES_RE = re.compile(r"(มีประเภทอะไรบ้าง|ประเภทอะไรบ้าง|มีแบบไหนบ้าง|มีอะไรบ้าง)\s*$")
 
+    # Entity-type re-invite closer (2026-10, live-reproduced): prompts_practical.py's
+    # "IMPORTANT distinction" rule tells the model not to close an answer by inviting
+    # the user to state บุคคลธรรมดา/นิติบุคคล again after they already explicitly
+    # declined to single-select — but like the action="ask" case above, this is an
+    # advisory instruction the model still drifts from at a real, non-trivial rate.
+    # Phrasing varies too much to anchor one regex to it, AND the invite sometimes
+    # spans multiple ครับ-delimited clauses (confirmed across 15 real calls):
+    # "ถ้าคุณบอกว่าเป็นบุคคลธรรมดา หรือ นิติบุคคล...ได้เลยครับ" (one clause),
+    # "...บอกรูปแบบธุรกิจของคุณได้เลยครับ" (entity+tell+offer all one clause),
+    # "...ลองบอกผมว่าคุณจดทะเบียนเป็นแบบไหนครับ เพื่อให้ผมอธิบาย...ชัดเจนยิ่งขึ้นครับ"
+    # (the tell-verb and the detail-offer land in two SEPARATE clauses). So detection
+    # scans clauses after the entity-type mention for the first one containing a
+    # tell-verb, then checks whether a detail-offer word appears anywhere in the
+    # REST of the paragraph from there — if so, that clause and everything after it
+    # is dropped, keeping the informative clause(s) before it intact.
+    _ENTITY_REINVITE_TELL_VERB_RE = re.compile(r"บอก|แจ้ง|ระบุ")
+    _ENTITY_REINVITE_ENTITY_RE = re.compile(r"รูปแบบ|บุคคลธรรมดา|นิติบุคคล")
+    _ENTITY_REINVITE_DETAIL_OFFER_RE = re.compile(r"ได้เลย|ละเอียด|ชัดเจน|อธิบาย")
+
     # Phone-number detection for the hallucination-prevention whitelist (Layers 2+3
     # below). Live-reproduced bug (2026-09): the original design required a specific
     # keyword immediately before a number (โทร/สายด่วน/Tel/Fax/...) to recognize it as
@@ -1368,6 +1387,48 @@ class PracticalPersonaService:
             else:
                 t = t.rstrip(" .") + "ครับ"
         return t
+
+    def _strip_entity_reinvite_closer(self, text: str) -> str:
+        """Drop any closing paragraph that re-invites the user to state their
+        entity_type (บุคคลธรรมดา/นิติบุคคล) after they already explicitly declined
+        to single-select. See _ENTITY_REINVITE_*_RE's docstring for why this exists
+        as a deterministic fallback alongside the prompt rule. Only call this when
+        state.context["_entity_type_explicitly_skipped"] is True — the keyword
+        combination (ถ้า...บอก + entity-type word + ได้เลย) is narrow but not
+        impossible in an unrelated context, so it's gated to the one situation
+        where that combination can only mean the re-invite pattern.
+        """
+        t = text or ""
+        out_paragraphs = []
+        for p in re.split(r"\n\s*\n", t):
+            if not self._ENTITY_REINVITE_ENTITY_RE.search(p):
+                out_paragraphs.append(p)
+                continue
+            # Mark clause boundaries: after a sentence-final polite particle, or
+            # right before a "ถ้า"/"ลอง" that opens a new clause. (Variable-width
+            # alternation can't sit inside a lookbehind in Python's re, hence the
+            # two-step mark-then-split instead of a single split regex.)
+            marked = re.sub(r"(ครับ|ค่ะ|คะ)\s+", "\\1\x01", p)
+            marked = re.sub(r"\s+(ถ้า|ลอง)", "\x01\\1", marked)
+            clauses = marked.split("\x01")
+            entity_idx = next(
+                (i for i, c in enumerate(clauses) if self._ENTITY_REINVITE_ENTITY_RE.search(c)),
+                None,
+            )
+            cut_idx = None
+            if entity_idx is not None:
+                for i in range(entity_idx, len(clauses)):
+                    if self._ENTITY_REINVITE_TELL_VERB_RE.search(clauses[i]):
+                        tail = " ".join(clauses[i:])
+                        if self._ENTITY_REINVITE_DETAIL_OFFER_RE.search(tail):
+                            cut_idx = i
+                            break
+            kept_clauses = clauses[:cut_idx] if cut_idx is not None else clauses
+            joined = " ".join(c.strip() for c in kept_clauses if c.strip())
+            if joined.strip():
+                out_paragraphs.append(joined)
+        result = "\n\n".join(out_paragraphs).strip()
+        return result or t
 
     def _apply_practical_lint(self, text: str, kind: str) -> str:
         t = (text or "").strip()
@@ -4570,6 +4631,22 @@ class PracticalPersonaService:
                         _op_include_re,
                         str((d.get("metadata") or {}).get("registration_type") or ""),
                     )
+                ) or (
+                    # Rescue: keep doc if the operation label ITSELF is dual-purpose and
+                    # matches the user's intent keyword too (2026-10, live-reproduced).
+                    # Example: ใบทะเบียนพาณิชย์'s cancellation row for บุคคลธรรมดา is labeled
+                    # operation_by_department="ยกเลิก เปลี่ยนแปลง" (one combined portal menu
+                    # entry covering both ops) — _eff_op(d) matches _op_exclude_re on
+                    # "เปลี่ยนแปลง" and gets dropped for a ยกเลิก-intent query, even though its
+                    # own label also matches _op_include_re on "ยกเลิก" and its operation_steps
+                    # ("1.การยกเลิก ภายใน 30 วัน...") genuinely IS the cancellation procedure —
+                    # confirmed via direct retrieval test: this doc ranked #1 for the exact
+                    # real query that hit this bug, then got silently filtered out here.
+                    # Without this, that's the ONLY op-filter case that removes the single doc
+                    # that actually answers the question, not just a wrong-entity/wrong-license
+                    # doc — so the rescue checks _eff_op(d) itself, not just registration_type.
+                    _op_include_re
+                    and re.search(_op_include_re, _eff_op(d))
                 ) or not (
                     # Check operation_by_department first (holds the actual operation label e.g. "ยกเลิก",
                     # "ต่ออายุหนังสือรับรองการแจ้ง"); fall back to operation_topic then topic for licenses
@@ -6305,6 +6382,57 @@ Your JSON response:
                 _exec_raw = {}
         exec_ = _exec_raw if isinstance(_exec_raw, dict) else {}
 
+        # Deterministic safety net (2026-10, live-reproduced — same retry-once shape as
+        # _call_llm_json_with_truncation_retry above, for a DIFFERENT failure mode): the
+        # prompt now tells the model not to action="ask" about entity_type when the user
+        # already explicitly declined to single-select and DOCUMENTS were deliberately
+        # assembled with both entity types' content (see prompts_practical.py's Multi-tier
+        # rule exception + persona_supervisor.py's _entity_type_explicitly_skipped flag) —
+        # but a prompt instruction is advisory, not a guarantee, and this exact mistake was
+        # observed recurring at a real, non-trivial rate even after that fix (~1 in 5 real
+        # calls, temperature=0.2). Catching it here, deterministically, after the fact, is
+        # the only way to actually close the gap rather than just reduce its odds. Scoped
+        # narrowly: only retries when action="ask" AND the question is unmistakably the
+        # entity_type question (both option words present) AND Supervisor already recorded
+        # this exact decline — never fires for a genuine first-time entity_type ask.
+        if (
+            action == "ask"
+            and bool((state.context or {}).get("_entity_type_explicitly_skipped"))
+            and "บุคคลธรรมดา" in str(exec_.get("question") or "")
+            and "นิติบุคคล" in str(exec_.get("question") or "")
+        ):
+            _LOG.warning(
+                "[Practical] action='ask' re-asked entity_type despite _entity_type_explicitly_skipped "
+                "— retrying once with a corrective reminder instead of surfacing this question: %r",
+                exec_.get("question"),
+            )
+            _entity_retry_prompt = (
+                prompt
+                + "\n\n[SYSTEM REMINDER] The user already explicitly declined to pick one "
+                "entity_type (บุคคลธรรมดา vs นิติบุคคล) earlier in this conversation. DOCUMENTS "
+                "were deliberately assembled to include BOTH entity types' content for exactly "
+                "this reason. Do NOT action=\"ask\" about entity_type — action=\"answer\" using "
+                "one labeled section per entity_type_normalized present in DOCUMENTS instead."
+            )
+            try:
+                _retry_decision = self._call_llm_json_with_truncation_retry(_entity_retry_prompt, state=state)
+                _retry_action = (_retry_decision.get("action") or "ask").strip()
+                if _retry_action != "ask":
+                    decision = _retry_decision
+                    action = _retry_action
+                    _retry_exec_raw = decision.get("execution", {})
+                    if isinstance(_retry_exec_raw, str):
+                        try:
+                            _retry_exec_raw = json.loads(_retry_exec_raw)
+                        except Exception:
+                            _retry_exec_raw = {}
+                    exec_ = _retry_exec_raw if isinstance(_retry_exec_raw, dict) else {}
+                    _LOG.info("[Practical] entity_type re-ask retry succeeded — action=%r", action)
+                else:
+                    _LOG.warning("[Practical] entity_type re-ask retry STILL action='ask' — keeping original question")
+            except Exception as _e_entity_retry:
+                _LOG.warning("[Practical] entity_type re-ask retry failed: %s — keeping original decision", _e_entity_retry)
+
         # Diagnostic-only (2026-09, paired with the docs_json log above) —
         # catches the exact failing moment if this info-gap pattern recurs:
         # logs docs actually sent to the LLM alongside its "not found" answer,
@@ -6326,13 +6454,26 @@ Your JSON response:
 
         if action == "retrieve":
             # Guard: block LLM re-retrieval when docs are already loaded.
-            # Two conditions — either is sufficient to block:
+            # Three conditions — any one is sufficient to block:
             #   1) topic_slot_queue non-empty AND docs exist (original guard — slot ask phase)
             #   2) _internal=True AND docs exist — supervisor already set the right docs
             #      (covers the case where queue was JUST cleared after last slot filled,
             #       but LLM ignores rule 2 and returns action='retrieve' anyway)
+            #   3) _entity_type_explicitly_skipped AND docs exist (2026-10, live-reproduced):
+            #      this call shape hits NEITHER of the above two — topic_slot_queue was just
+            #      popped empty and persona_supervisor.py deliberately calls with _internal=False
+            #      (see its own "No more slots" branch) — yet state.current_docs at this point
+            #      was hand-assembled by _merge_both_entity_docs_after_skip specifically because
+            #      plain semantic search for this query is unreliable (confirmed: it can rank a
+            #      same-named-but-different row higher — a "รูปแบบ นิติบุคคล" EDIT-form doc
+            #      outranked the real "รูปแบบนิติบุคคล" entity-profile doc for a cancellation
+            #      query in one live run). Letting the LLM's own action="retrieve" silently
+            #      overwrite that merged set with a fresh ungated search reintroduces exactly
+            #      the failure merge was built to prevent — observed live as a complete
+            #      INFO_GAP on docs that were correct one step earlier.
             _pending_queue = (state.context or {}).get("topic_slot_queue") or []
-            if state.current_docs and (_pending_queue or _internal):
+            _entity_merge_active = bool((state.context or {}).get("_entity_type_explicitly_skipped"))
+            if state.current_docs and (_pending_queue or _internal or _entity_merge_active):
                 # Track how many consecutive times retrieve has been blocked.
                 # If LLM keeps returning 'retrieve' despite blocked (e.g. sees wrong-entity docs
                 # and refuses to answer), force action='answer' after 2 blocks to break the loop.
@@ -6653,6 +6794,8 @@ Your JSON response:
                 ans, _info_gap_tagged = _shared_extract_info_gap_tag(ans)
                 if _info_gap_tagged:
                     state.context["_info_gap_detected"] = True
+                if bool((state.context or {}).get("_entity_type_explicitly_skipped")):
+                    ans = self._strip_entity_reinvite_closer(ans)
             else:
                 # Empty LLM output — Python-decided fallback, not LLM output, so it can
                 # never carry the tag; flag the gap directly (see text_patterns.py).
