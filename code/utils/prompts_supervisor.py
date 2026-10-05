@@ -744,6 +744,34 @@ def build_info_action_q_detect_prompt(user_text: str) -> str:
     )
 
 
+def build_license_dominance_detect_prompt(user_text: str, license_a: str, license_b: str) -> str:
+    """
+    Classify whether a query touching 2 different license_types is dominantly about ONE of
+    them (the other just mentioned as context/precondition, e.g. "จด VAT แล้ว...") or
+    genuinely asks about BOTH as co-equal questions.
+    Called when retrieved docs for a query span 2 distinct license_type values with neither
+    clearly dominant by doc count (2026-10, live-reproduced — a query mentioning VAT
+    registration status as context while actually asking about POS device approval got
+    silently locked onto VAT alone, because the code previously just took the first
+    retrieved doc's license_type with no check for this).
+    Returns: {"dominant": "A" | "B" | "both"}
+    """
+    return (
+        "คุณคือระบบวิเคราะห์ว่าคำถามของลูกค้าร้านอาหารถามเกี่ยวกับ license/ใบอนุญาตใดเป็นหลัก\n"
+        "เอกสารที่ค้นเจอมี 2 license_type ปนกัน ต้องวิเคราะห์ว่าคำถามถามเรื่องไหนจริงๆ\n\n"
+        f'คำถาม: "{user_text}"\n\n'
+        f"A) {license_a}\n"
+        f"B) {license_b}\n\n"
+        "วิเคราะห์ 3 แบบ:\n"
+        '- "A": คำถามถามเรื่อง A เป็นหลัก ส่วน B แค่ถูกเอ่ยถึงเป็นบริบท/เงื่อนไขที่มีอยู่แล้ว ไม่ใช่สิ่งที่ถามจริง\n'
+        '  ตัวอย่าง: "ร้านจด VAT แล้ว ใช้ POS ต้องขออนุมัติเครื่องกับสรรพากรไหม" — จด VAT เป็นบริบท (มีอยู่แล้ว) คำถามจริงคือเรื่องขออนุมัติเครื่อง POS → ตอบ B ถ้า A=VAT, B=POS\n'
+        '- "B": กลับกัน B เป็นบริบท A เป็นคำถามจริง\n'
+        '- "both": คำถามถามทั้ง A และ B เท่าเทียมกันจริงๆ ทั้งคู่เป็นสิ่งที่ต้องตอบ ไม่ใช่แค่ฝั่งใดฝั่งหนึ่งเป็นบริบท\n'
+        '  ตัวอย่าง: "ต้องขอทั้ง VAT และ POS ID เลยไหม ขั้นตอนแต่ละอย่างเป็นยังไง" → both\n\n'
+        'ตอบเป็น JSON เท่านั้น: {"dominant": "A"} หรือ {"dominant": "B"} หรือ {"dominant": "both"}'
+    )
+
+
 def build_smalltalk_detect_prompt(user_text: str) -> str:
     """
     Detect whether user is making small talk / asking personal off-topic questions to the bot

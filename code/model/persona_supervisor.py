@@ -150,6 +150,7 @@ from utils.prompts_supervisor import (
     build_info_action_q_detect_prompt,
     build_legal_q_detect_prompt,
     build_new_topic_detect_prompt,
+    build_license_dominance_detect_prompt,
 )
 from utils.persona_profile import (
     normalize_persona_id,
@@ -709,6 +710,14 @@ class PersonaSupervisor:
         (r"ใบรับรองมาตรฐานร้านอาหาร|มาตรฐานร้านอาหาร|san\b|สุขาภิบาลอาหาร.*มาตรฐาน|มาตรฐาน.*สุขาภิบาล", "ใบรับรองมาตรฐานร้านอาหาร"),
         # บัญชีและการเงิน — accounting / bookkeeping
         (r"ปิดงบ|ปิดบัญชี|ปิงบ|งบการเงิน|งบบัญชี|จัดการการเงิน|จัดการเงิน|ทำบัญชี|ตรวจสอบบัญชี|สำนักงานบัญชี|ผู้ทำบัญชี|ผู้สอบบัญชี", "จัดการการเงิน"),
+        # POS ID (2026-10, live-reproduced): was missing entirely — a query mentioning
+        # VAT alongside a POS-device-approval question matched ONLY the VAT pattern above,
+        # so this predictive multi-topic step never flagged POS ID as a second candidate
+        # license at all, even though this function exists specifically to catch multi-topic
+        # queries before retrieval. Downstream retrieval then filtered to VAT only, and the
+        # real POS ID documents (which DO fully answer the question — steps, forms, fees,
+        # penalties) never reached the LLM.
+        (r"pos\s*id|เครื่องบันทึกการเก็บเงิน|ขออนุมัติเครื่อง\s*pos|ภ\.?อ\.?11|ภ\.?พ\.?06", "POS ID"),
     ]
 
     # --------------------------
@@ -5732,12 +5741,56 @@ class PersonaSupervisor:
                             _LOG.warning("[Supervisor] info-query fee doc supplement failed: %s", _e_fee)
             # Fix A: if query clearly implies one operation, infer operation_group and
             # re-retrieve focused docs so practical answers only that operation.
-            _lt_infoq = next(
-                (((d.get("metadata") or {}).get("license_type") or "").strip()
-                 for d in docs if isinstance(d, dict)
-                 if ((d.get("metadata") or {}).get("license_type") or "").strip()),
-                "",
-            )
+            # Determine the dominant license_type among retrieved docs — NOT just the first
+            # one seen (2026-10, live-reproduced: "ร้านจด VAT แล้วใช้ POS ออกใบกำกับภาษี
+            # ต้องขออนุมัติเครื่องกับสรรพากรก่อนไหมคะ" retrieved both VAT and POS ID docs, but
+            # the old code took whichever doc happened to be first in the list — VAT, since it's
+            # the first word of the query — and silently filtered out POS ID for the rest of
+            # this turn, even though POS ID was the actual regulatory process being asked
+            # about). Count distinct license_types first; only invoke the LLM tie-breaker when
+            # counts don't already make one dominant (≥60% of docs or ≥2× the runner-up — same
+            # dominance threshold already used for entity disambiguation elsewhere in this
+            # file) — EXCEPT raw doc count turned out to be an unreliable dominance signal for
+            # license_type specifically (unlike for entity_type, where it transfers fine):
+            # live-reproduced with the VAT+POS ID case, VAT retrieved 10 docs vs POS ID's 5,
+            # clearing a 60%-dominance bar easily — but that 2:1 ratio just reflects VAT having
+            # more sub-topic rows indexed in the corpus overall, not that the QUESTION is twice
+            # as much about VAT. Doc count answers "how much does this corpus have on each
+            # license", not "which one is this question about" — so for license_type the LLM
+            # tie-breaker is invoked whenever 2+ distinct license_types appear at all, skipping
+            # only when the second-place license has just a single stray doc (likely noise/
+            # keyword-overlap, not a real second topic).
+            _lt_counts_iq: Dict[str, int] = {}
+            for _d_iq in docs:
+                if not isinstance(_d_iq, dict):
+                    continue
+                _lt_iq = ((_d_iq.get("metadata") or {}).get("license_type") or "").strip()
+                if _lt_iq:
+                    _lt_counts_iq[_lt_iq] = _lt_counts_iq.get(_lt_iq, 0) + 1
+            _lt_infoq = ""
+            if len(_lt_counts_iq) == 1:
+                _lt_infoq = next(iter(_lt_counts_iq))
+            elif len(_lt_counts_iq) >= 2:
+                _sorted_lts_iq = sorted(_lt_counts_iq, key=_lt_counts_iq.get, reverse=True)
+                _top_lt_iq, _second_lt_iq = _sorted_lts_iq[0], _sorted_lts_iq[1]
+                _second_n_iq = _lt_counts_iq[_second_lt_iq]
+                if _second_n_iq < 2:
+                    _lt_infoq = _top_lt_iq
+                else:
+                    _dominant_iq = self._classify_license_dominance(query, _top_lt_iq, _second_lt_iq, state=state)
+                    if _dominant_iq:
+                        _lt_infoq = _dominant_iq
+                        _LOG.info(
+                            "[Supervisor] info-query multi-license: classifier picked dominant=%r (candidates=%s)",
+                            _dominant_iq, _sorted_lts_iq[:2],
+                        )
+                    else:
+                        _LOG.info(
+                            "[Supervisor] info-query multi-license: classifier says genuinely both — merging %s",
+                            _sorted_lts_iq[:2],
+                        )
+                        self._merge_multi_license_docs(state, query, _sorted_lts_iq[:2])
+                        docs = state.current_docs or docs
             if _lt_infoq:
                 try:
                     _og_res_iq = self._get_operation_groups_for_entity(_lt_infoq, "", state=state)
@@ -10069,6 +10122,119 @@ class PersonaSupervisor:
                 )
         except Exception as _e_merge:
             _LOG.warning("[Supervisor] merge_both_entity_docs failed: %s", _e_merge)
+
+    def _classify_license_dominance(
+        self, query: str, license_a: str, license_b: str, state: ConversationState = None,
+    ) -> str:
+        """Cheap LLM tie-breaker for when retrieved docs span 2 distinct license_types with
+        neither clearly dominant by doc count (2026-10, live-reproduced — see
+        _merge_multi_license_docs's docstring for the real case this was built for).
+
+        Returns license_a, license_b, or "" (meaning genuinely about both — caller should
+        merge rather than pick one). Deliberately NOT a regex/keyword heuristic: the earlier
+        attempt at this (checking _SUPERVISOR_KW_OVERRIDE / _MULTI_TOPIC_LICENSE_KEYWORDS for
+        a "which keyword appears" answer) can't actually tell "A is just context, B is the
+        real ask" from "both are equally the real ask" — that's a judgment about what the
+        SENTENCE is doing, not what words appear in it, and hand-coding detection for every
+        future context-vs-ask phrasing pattern doesn't scale (same reasoning already applied
+        to the EDC case's "ติดต่อใคร" scope decision — see [[edc_department_vs_service_channel_2026-10]]).
+        """
+        try:
+            prompt = build_license_dominance_detect_prompt(query, license_a, license_b)
+            model = getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL)
+            timeout = int(getattr(conf, "LLM_TOPIC_PICKER_TIMEOUT", 8))
+            llm = ChatOpenAI(
+                model=model,
+                openai_api_key=conf.OPENROUTER_API_KEY,
+                openai_api_base=conf.OPENROUTER_BASE_URL,
+                http_client=get_shared_http_client(),
+                temperature=0.0,
+                max_tokens=300,
+                request_timeout=timeout,
+                model_kwargs={"response_format": {"type": "json_object"}},
+            )
+            text = extract_llm_text(
+                llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/license_dominance", state=state)
+            ).strip()
+            text = self._strip_code_fences(text)
+            obj = json.loads(text)
+            choice = str(obj.get("dominant") or "").strip().upper()
+            if choice == "A":
+                return license_a
+            if choice == "B":
+                return license_b
+            return ""  # "both" or anything unparseable → treat as genuinely multi, safer default
+        except Exception as _e_dom:
+            _LOG.warning("[Supervisor] license_dominance classify failed: %s — defaulting to first-seen license", _e_dom)
+            return license_a
+
+    def _merge_multi_license_docs(
+        self, state: ConversationState, query: str, license_types: List[str],
+    ) -> None:
+        """Called when a query's retrieved docs span 2+ distinct license_types and
+        _classify_license_dominance decided none is dominant — the query is genuinely about
+        more than one license at once (2026-10, live-reproduced: "ร้านจด VAT แล้วใช้ POS
+        ออกใบกำกับภาษี ต้องขออนุมัติเครื่องกับสรรพากรก่อนไหมคะ" mentions VAT only as an
+        already-true precondition, but a near-identical-shaped question COULD genuinely ask
+        about 2 licenses as co-equal asks — this fix covers that case too, not just the one
+        that happened to be tested).
+
+        Fetches each license_type's own best-matching docs independently (same per-category
+        search shape as _merge_both_entity_docs_after_skip, generalized from entity_type to
+        license_type) and interleaves them into state.current_docs round-robin — NOT
+        block-concatenated by license, for the same reason _merge_both_entity_docs_after_skip
+        stopped block-concatenating by entity: whichever license's docs land first in the
+        prompt gets more complete treatment from the LLM, a positional effect confirmed live
+        in [[name_change_entity_order_bias_2026-10]].
+
+        Relies on prompts_practical.py's existing "No cross-license_type overgeneralization"
+        rule (one section per license_type actually present in DOCUMENTS) to format the
+        resulting answer — not yet verified live whether that rule's completeness holds up
+        for a genuine 2-license answer the way the analogous entity_type rule needed an
+        explicit completeness mandate added; check this before assuming it just works.
+        """
+        try:
+            _per_license_cap = 3
+            _total_cap = 8
+            _license_doc_lists: Dict[str, List[Dict[str, Any]]] = {}
+            for _lt in license_types:
+                try:
+                    _license_doc_lists[_lt] = self._practical._retrieve_docs(
+                        query, metadata_filter={"license_type": _lt}, max_docs=_per_license_cap,
+                    )
+                except Exception as _e_lt:
+                    _LOG.warning("[Supervisor] merge_multi_license: retrieve failed for %r: %s", _lt, _e_lt)
+                    _license_doc_lists[_lt] = []
+
+            _merged_docs: List[Dict[str, Any]] = []
+            _seen_hashes: set = set()
+            _max_len = max((len(v) for v in _license_doc_lists.values()), default=0)
+            for _i in range(_max_len):
+                if len(_merged_docs) >= _total_cap:
+                    break
+                for _lt in license_types:
+                    if len(_merged_docs) >= _total_cap:
+                        break
+                    _docs_for_lt = _license_doc_lists.get(_lt) or []
+                    if _i >= len(_docs_for_lt):
+                        continue
+                    _d = _docs_for_lt[_i]
+                    _h = hash((_d.get("content") or "")[:120])
+                    if _h not in _seen_hashes:
+                        _seen_hashes.add(_h)
+                        _merged_docs.append(_d)
+            if _merged_docs:
+                _existing = [
+                    d for d in (state.current_docs or [])
+                    if hash((d.get("content") or "")[:120]) not in _seen_hashes
+                ]
+                state.current_docs = _merged_docs + _existing
+                _LOG.info(
+                    "[Supervisor] merge_multi_license: licenses=%s → +%d doc(s) prepended (total=%d)",
+                    license_types, len(_merged_docs), len(state.current_docs),
+                )
+        except Exception as _e_merge_lt:
+            _LOG.warning("[Supervisor] merge_multi_license failed: %s", _e_merge_lt)
 
     def _route_pending_slot_to_persona(self, state: ConversationState, user_input: str) -> Tuple[ConversationState, str]:
         _raw_pending = (state.context or {}).get("pending_slot")
