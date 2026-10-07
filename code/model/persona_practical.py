@@ -1430,6 +1430,82 @@ class PracticalPersonaService:
         result = "\n\n".join(out_paragraphs).strip()
         return result or t
 
+    def _retry_if_entity_coverage_incomplete(self, ans: str, prompt: str, state: ConversationState) -> str:
+        """Deterministic safety net (2026-10, live-reproduced — same retry-once shape as
+        the action="ask" net elsewhere in this file, for a more severe variant of the same
+        failure class): confirmed via a live 4-run batch that retrieval and doc-merging for
+        the real case this was built from were 100% deterministic every time (5 standalone
+        re-checks of the per-entity semantic search, 3 of the department-scope exact-match
+        fetch — zero variance in either) — so when one entity's whole section goes missing
+        from the final answer, it is provably the generation step dropping it, not a hidden
+        retrieval bug. Call this only when state.context["_entity_type_explicitly_skipped"]
+        is True (caller's responsibility — mirrors _strip_entity_reinvite_closer's own
+        calling convention).
+
+        Scoped narrowly to when it matters most: only fires if BOTH entity values are
+        genuinely present in the DOCUMENTS actually used (not just the flag being set — a
+        license with no real entity split wouldn't have 2+ distinct
+        entity_type_normalized values in current_docs at all) AND the answer text never
+        names one of them even once.
+        """
+        _entities_in_docs_ans = {
+            str((d.get("metadata") or {}).get("entity_type_normalized") or "").strip()
+            for d in (state.current_docs or [])
+            if isinstance(d, dict)
+        } - {"", "nan", "None"}
+        if len(_entities_in_docs_ans) < 2:
+            return ans
+        _missing_entities_ans = [ev for ev in _entities_in_docs_ans if ev not in ans]
+        if not _missing_entities_ans:
+            return ans
+        _LOG.warning(
+            "[Practical] answer missing entity section(s) %s despite "
+            "_entity_type_explicitly_skipped and both present in DOCUMENTS "
+            "— retrying once with a corrective reminder",
+            _missing_entities_ans,
+        )
+        _entity_coverage_retry_prompt = (
+            prompt
+            + "\n\n[SYSTEM REMINDER] Your previous answer completely omitted "
+            f"the section(s) for: {', '.join(_missing_entities_ans)}. DOCUMENTS "
+            "contain full content for EVERY entity_type_normalized value present "
+            "— write one clearly-labeled, complete section per entity type, "
+            "omitting none of them."
+        )
+        try:
+            _retry_decision_ans = self._call_llm_json_with_truncation_retry(
+                _entity_coverage_retry_prompt, state=state
+            )
+            _retry_exec_raw_ans = _retry_decision_ans.get("execution", {})
+            if isinstance(_retry_exec_raw_ans, str):
+                try:
+                    _retry_exec_raw_ans = json.loads(_retry_exec_raw_ans)
+                except Exception:
+                    _retry_exec_raw_ans = {}
+            _retry_exec_ans = _retry_exec_raw_ans if isinstance(_retry_exec_raw_ans, dict) else {}
+            _retry_ans = (_retry_exec_ans.get("answer") or "").strip()
+            if _retry_ans:
+                _retry_ans, _ = _shared_extract_info_gap_tag(_retry_ans)
+                _retry_ans = self._strip_entity_reinvite_closer(_retry_ans)
+                _still_missing = [ev for ev in _entities_in_docs_ans if ev not in _retry_ans]
+                if len(_still_missing) < len(_missing_entities_ans):
+                    _LOG.info(
+                        "[Practical] entity coverage retry improved answer — still missing=%s",
+                        _still_missing,
+                    )
+                    return _retry_ans
+                _LOG.warning(
+                    "[Practical] entity coverage retry did not help (still missing=%s) "
+                    "— keeping original answer",
+                    _still_missing,
+                )
+        except Exception as _e_coverage_retry:
+            _LOG.warning(
+                "[Practical] entity coverage retry failed: %s — keeping original answer",
+                _e_coverage_retry,
+            )
+        return ans
+
     def _apply_practical_lint(self, text: str, kind: str) -> str:
         t = (text or "").strip()
         if not t:
@@ -6796,6 +6872,7 @@ Your JSON response:
                     state.context["_info_gap_detected"] = True
                 if bool((state.context or {}).get("_entity_type_explicitly_skipped")):
                     ans = self._strip_entity_reinvite_closer(ans)
+                    ans = self._retry_if_entity_coverage_incomplete(ans, prompt, state)
             else:
                 # Empty LLM output — Python-decided fallback, not LLM output, so it can
                 # never carry the tag; flag the gap directly (see text_patterns.py).

@@ -3688,9 +3688,15 @@ class PersonaSupervisor:
                                 )
                                 if _ot_et_mixed:
                                     _sq_ot = list((state.context or {}).get("topic_slot_queue") or [])
+                                    # Also true when entity_type was explicitly declined ("ทั้งสองแบบครับ"),
+                                    # not just when it was actually answered — a skip is recorded in
+                                    # _SKIPPED_SLOT_KEYS_CTX_KEY, never in collected_slots, so checking
+                                    # collected_slots alone re-adds this slot to the queue every single
+                                    # turn after a skip, forever (2026-10, live-reproduced: QR Payment
+                                    # kept re-asking entity_type on every turn despite repeated skips).
                                     _et_already_known_ot = bool(
                                         (state.get_collected_slots() if hasattr(state, "get_collected_slots") else {}).get("entity_type")
-                                    )
+                                    ) or "entity_type" in (state.context.get(self._SKIPPED_SLOT_KEYS_CTX_KEY) or [])
                                     if not _et_already_known_ot and not any(s.get("key") == "entity_type" for s in _sq_ot):
                                         _et_sorted_ot = sorted(_et_in_ot) if len(_et_in_ot) >= 2 else ["นิติบุคคล", "บุคคลธรรมดา"]
                                         state.context["topic_slot_queue"] = [{
@@ -3954,9 +3960,12 @@ class PersonaSupervisor:
                                 )
                                 if _obd_et_mixed:
                                     _sq_obd = list((state.context or {}).get("topic_slot_queue") or [])
+                                    # Also true for an explicit decline, not just an actual answer —
+                                    # see the _et_already_known_ot sibling site above for the real
+                                    # case this was found in (QR Payment kept re-asking forever).
                                     _et_already_known_obd = bool(
                                         (state.get_collected_slots() if hasattr(state, "get_collected_slots") else {}).get("entity_type")
-                                    )
+                                    ) or "entity_type" in (state.context.get(self._SKIPPED_SLOT_KEYS_CTX_KEY) or [])
                                     if not _et_already_known_obd and not any(s.get("key") == "entity_type" for s in _sq_obd):
                                         _et_sorted_obd = sorted(_et_in_obd) if len(_et_in_obd) >= 2 else ["นิติบุคคล", "บุคคลธรรมดา"]
                                         state.context["topic_slot_queue"] = [{
@@ -4699,9 +4708,12 @@ class PersonaSupervisor:
                                     )
                                     if _st_et_mixed:
                                         _sq_st = list((state.context or {}).get("topic_slot_queue") or [])
+                                        # Also true for an explicit decline, not just an actual answer —
+                                        # see the _et_already_known_ot sibling site above for the real
+                                        # case this was found in (QR Payment kept re-asking forever).
                                         _et_already_known_st = bool(
                                             (state.get_collected_slots() if hasattr(state, "get_collected_slots") else {}).get("entity_type")
-                                        )
+                                        ) or "entity_type" in (state.context.get(self._SKIPPED_SLOT_KEYS_CTX_KEY) or [])
                                         if not _et_already_known_st and not any(s.get("key") == "entity_type" for s in _sq_st):
                                             _et_sorted_st = sorted(_et_in_st) if len(_et_in_st) >= 2 else ["นิติบุคคล", "บุคคลธรรมดา"]
                                             state.context["topic_slot_queue"] = [{
@@ -10625,9 +10637,12 @@ class PersonaSupervisor:
                                         )
                                         if _fb_et_mixed:
                                             _sq_fb = list((state.context or {}).get("topic_slot_queue") or [])
+                                            # Also true for an explicit decline, not just an actual answer —
+                                            # see the _et_already_known_ot sibling site above for the real
+                                            # case this was found in (QR Payment kept re-asking forever).
                                             _et_already_known_fb = bool(
                                                 (state.get_collected_slots() if hasattr(state, "get_collected_slots") else {}).get("entity_type")
-                                            )
+                                            ) or "entity_type" in (state.context.get(self._SKIPPED_SLOT_KEYS_CTX_KEY) or [])
                                             if not _et_already_known_fb and not any(s.get("key") == "entity_type" for s in _sq_fb):
                                                 _et_sorted_fb = sorted(_et_in_fb) if len(_et_in_fb) >= 2 else ["นิติบุคคล", "บุคคลธรรมดา"]
                                                 state.context["topic_slot_queue"] = [{
