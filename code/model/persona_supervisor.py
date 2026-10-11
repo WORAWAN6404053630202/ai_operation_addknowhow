@@ -110,7 +110,12 @@ from utils.text_patterns import (
     ENTITY_HINT_RE as _SHARED_ENTITY_HINT_RE,
     GENERIC_FOLLOWUP_KEYWORDS_RE as _SHARED_GENERIC_FOLLOWUP_KEYWORDS_RE,
     SPECIFIC_TOPIC_RE as _SHARED_SPECIFIC_TOPIC_RE,
+    SPECIFIC_LICENSE_INDICATOR_RE as _SHARED_SPECIFIC_LICENSE_INDICATOR_RE,
     topic_label_matches_query,
+    filter_by_specific_topic_conflict as _shared_filter_by_specific_topic_conflict,
+    ACTION_INTENT_RE as _SHARED_ACTION_INTENT_RE,
+    nonreg_chapter_semantic_check as _shared_nonreg_chapter_semantic_check,
+    NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE as _SHARED_NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE,
 )
 from utils.prompts_supervisor import (
     build_topic_picker_prompt,
@@ -145,6 +150,7 @@ from utils.prompts_supervisor import (
     build_info_action_q_detect_prompt,
     build_legal_q_detect_prompt,
     build_new_topic_detect_prompt,
+    build_license_dominance_detect_prompt,
 )
 from utils.persona_profile import (
     normalize_persona_id,
@@ -402,6 +408,16 @@ class PersonaSupervisor:
         r"ไม่รู้|ไม่แน่ใจ|ยังไม่รู้|ยังไม่แน่ใจ|ยังไม่ตัดสินใจ|ยังไม่ได้ตัดสินใจ|ยังหาข้อมูลอยู่"
         r"|ข้ามก่อน|ข้ามไปก่อน|ข้ามได้มั้ย|ข้ามได้ไหม|ขอข้าม|ข้ามไปเลย|ข้ามเลย|ข้ามข้อนี้|ข้ามคำถามนี้|ข้ามได้เลย"
         r"|ไม่ต้องถาม|ยังไม่รู้เลย|ไม่ทราบครับ|ไม่ทราบค่ะ|ไม่ทราบนะ"
+        # "Both" answers to a forced single-choice slot (2026-10, live-reproduced):
+        # a slot question always offers a closed set of options and expects exactly
+        # one — "ทั้งสองแบบครับ"/"มีทั้งคู่"/"ทั้งคู่เลยครับ" (both apply to me) is
+        # neither a valid single answer nor a "ไม่รู้" (don't-know) answer, so it fell
+        # through this regex AND the LLM fallback's narrower "don't know/skip" framing
+        # to _build_slot_mismatch_message's confusing "my data only covers X, Y — not
+        # your answer 'ทั้งสองแบบครับ'" dead end, on a real customer's shop-closure
+        # question. Treated the same as "ไม่รู้" — skip this slot, same already-working
+        # downstream behavior (see build_slot_skip_detect_prompt's matching update).
+        r"|ทั้งสองแบบ|ทั้งสองอย่าง|ทั้งคู่|ทั้งสองเลย|มีทั้งคู่|มีทั้งสอง"
         r"|skip(?:\s+this)?",
         re.IGNORECASE,
     )
@@ -447,25 +463,9 @@ class PersonaSupervisor:
     # Specificity override for broad_q detection: when these license names/codes appear in the
     # query, it is a targeted question about a specific license — not a broad overview.
     # e.g. "ขอใบภาษีมูลค่าเพิ่ม ภพ.20 ต้องใช้เอกสารอะไรบ้าง" is targeted, not broad.
-    _SPECIFIC_LICENSE_INDICATOR_RE = re.compile(
-        # Specific form/tax codes
-        r"ภพ\.\s*\d|ภส\.\s*\d|ภป\.\s*\d|สณ\.\s*\d|บอจ\.\s*\d|VAT|ภ\.อ\."
-        # Named license types
-        r"|ใบภาษีมูลค่าเพิ่ม|ใบทะเบียนพาณิชย์|ทะเบียนพาณิชย์"
-        r"|ใบอนุญาตจัดตั้ง|ใบอนุญาตจำหน่ายสุรา|ใบอนุญาตจำหน่าย"
-        r"|ใบรับรองมาตรฐานร้านอาหาร|ใบวุฒิบัตรผู้สัมผัสอาหาร"
-        r"|ใบรับรองแพทย์|แบบแสดงรายการภาษีป้าย"
-        r"|ประกันสังคม|กองทุนประกันสังคม"
-        # 2026-09: added after live QA rerun found the LLM broad_q classifier
-        # (_broad_question_llm_check) firing 0.95-confidence "broad" on
-        # single-device questions naming EDC or QR Payment specifically (e.g.
-        # "ขั้นตอนการสมัครเครื่อง EDC...เรียงลำดับ") — these terms weren't in
-        # this list at all, so the specificity override never had a chance to
-        # apply. license_type values confirmed in Chroma: "เครื่องรูดบัตร EDC",
-        # "ระบบชำระเงินออนไลน์" (QR Payment's actual license_type).
-        r"|EDC|เครื่องรูดบัตร|รูดบัตร|\bQR\b|QR\s*Payment|คิวอาร์|ระบบชำระเงินออนไลน์|ระบบชำระเงิน",
-        re.IGNORECASE,
-    )
+    # Definition + history moved to utils/text_patterns.py (2026-09) so
+    # persona_academic.py can share it too — see that module's docstring.
+    _SPECIFIC_LICENSE_INDICATOR_RE = _SHARED_SPECIFIC_LICENSE_INDICATOR_RE
     # Broad/overview question: triggers two-pass retrieval (pass1=user intent, pass2=regulatory).
     # Covers two categories:
     #   A) Business-opening questions: "อยากเปิดร้านต้องทำอะไรบ้าง" — spans all dimensions
@@ -490,7 +490,20 @@ class PersonaSupervisor:
         r"|(ขั้นตอน|กระบวนการ|ต้องทำอะไร).{0,30}(ทั้งหมด|ทุกอย่าง|ครบถ้วน|ทุกด้าน)"
         # E) Registration/compliance overview: "ต้องจดอะไรบ้าง", "ต้องขึ้นทะเบียนอะไรบ้าง"
         r"|(ต้องจด|ต้องขึ้นทะเบียน|ต้องลงทะเบียน).{0,20}(อะไรบ้าง|อะไร|อะไรบ้างครับ)"
-        r"|(จดทะเบียน|ขึ้นทะเบียน|ลงทะเบียน).{0,20}(อะไรบ้าง|อะไรที่ต้อง|ทั้งหมด)",
+        r"|(จดทะเบียน|ขึ้นทะเบียน|ลงทะเบียน).{0,20}(อะไรบ้าง|อะไรที่ต้อง|ทั้งหมด)"
+        # F) Marketing/sales-growth overview: "เทคนิคเพิ่มยอดขาย" style questions span multiple
+        # marketing dimensions (product/price/place/promotion) at once — live-verified (2026-09):
+        # a dense-embedding similarity_search_with_score for "เทคนิคในการทำให้ยอดขายขึ้น" against
+        # the real 872-doc marketing/business_guide corpus topped out at 0.408, below the 0.6
+        # RETRIEVAL_MIN_SIMILARITY floor for every single candidate — the narrow single-pass path
+        # this query fell through to had zero qualifying evidence and asked a clarifying question
+        # instead of answering, even though clearly-relevant strategy docs exist. Routing this
+        # shape into the existing two-pass broad-question retrieval (which uses hybrid/BM25-fused
+        # search, not floor-gated the same way) surfaces them correctly.
+        r"|(เทคนิค|วิธี|ทำยังไง|ทำอย่างไร|ทำไง).{0,10}(เพิ่ม|ทำให้|ให้).{0,10}ยอดขาย"
+        r"|เพิ่มยอดขาย"
+        r"|(ทำการตลาด|การตลาด).{0,15}(ยังไง|อย่างไร|ให้ขายดี|ให้ดีขึ้น)"
+        r"|ขายดี.{0,10}(ยังไง|อย่างไร|ทำไง|ทำยังไง)",
         re.IGNORECASE,
     )
     # Operation inference: detect from user query which operation_group is clearly implied
@@ -560,7 +573,14 @@ class PersonaSupervisor:
         r"|(?:วันพระ|วันหยุดราชการ|วันสำคัญ).{0,30}(?:ขาย|จำหน่าย|ซื้อ).{0,15}(?:เหล้า|สุรา|แอลกอฮอล์|เบียร์|ไวน์)"
         r"|(?:เหล้า|สุรา|แอลกอฮอล์|เบียร์|ไวน์).{0,30}(?:วันพระ|วันหยุดราชการ|วันสำคัญ)"
         r"|ขาย(?:เหล้า|สุรา|แอลกอฮอล์|เบียร์|ไวน์)(?:ได้|ไม่ได้).{0,30}(?:วัน|เวลา|โมง|กี่)"
-        r"|(?:วัน|เวลา|โมง)(?:ไหน|ใด).{0,20}(?:ขาย|จำหน่าย).{0,20}(?:เหล้า|สุรา|แอลกอฮอล์|เบียร์|ไวน์)",
+        r"|(?:วัน|เวลา|โมง)(?:ไหน|ใด).{0,20}(?:ขาย|จำหน่าย).{0,20}(?:เหล้า|สุรา|แอลกอฮอล์|เบียร์|ไวน์)"
+        # Separate-account queries — the account-name/same-bank matching condition
+        # (identification_documents field) is the same regardless of entity type;
+        # only the NAME that must match differs (owner's name vs. company name),
+        # which doesn't change the yes/no conclusion itself.
+        # e.g. "ต้องมีบัญชีธนาคารแยกต่างหากไหม", "ใช้บัญชีเดิมได้ไหม"
+        r"|บัญชี.{0,15}แยก(?:ต่างหาก)?.{0,10}(?:ไหม|หรือไม่|หรือเปล่า)?"
+        r"|(?:ใช้|เปิด)บัญชี(?:เดิม|ใหม่).{0,15}(?:ได้ไหม|ได้หรือไม่|ได้หรือเปล่า)",
         re.IGNORECASE,
     )
     # Post-submission follow-up query: user already applied/submitted documents and is
@@ -690,6 +710,14 @@ class PersonaSupervisor:
         (r"ใบรับรองมาตรฐานร้านอาหาร|มาตรฐานร้านอาหาร|san\b|สุขาภิบาลอาหาร.*มาตรฐาน|มาตรฐาน.*สุขาภิบาล", "ใบรับรองมาตรฐานร้านอาหาร"),
         # บัญชีและการเงิน — accounting / bookkeeping
         (r"ปิดงบ|ปิดบัญชี|ปิงบ|งบการเงิน|งบบัญชี|จัดการการเงิน|จัดการเงิน|ทำบัญชี|ตรวจสอบบัญชี|สำนักงานบัญชี|ผู้ทำบัญชี|ผู้สอบบัญชี", "จัดการการเงิน"),
+        # POS ID (2026-10, live-reproduced): was missing entirely — a query mentioning
+        # VAT alongside a POS-device-approval question matched ONLY the VAT pattern above,
+        # so this predictive multi-topic step never flagged POS ID as a second candidate
+        # license at all, even though this function exists specifically to catch multi-topic
+        # queries before retrieval. Downstream retrieval then filtered to VAT only, and the
+        # real POS ID documents (which DO fully answer the question — steps, forms, fees,
+        # penalties) never reached the LLM.
+        (r"pos\s*id|เครื่องบันทึกการเก็บเงิน|ขออนุมัติเครื่อง\s*pos|ภ\.?อ\.?11|ภ\.?พ\.?06", "POS ID"),
     ]
 
     # --------------------------
@@ -796,6 +824,36 @@ class PersonaSupervisor:
     # _handle_inner (search "pending_feedback_choice"). Feature code itself (this
     # method, _handle_feedback_selection, google_sheets_service.py) is left intact.
     _FEEDBACK_MENU_ENABLED = False
+
+    # state.context key tracking slot keys the user has explicitly declined to answer
+    # (via slot_skip) — see _route_pending_slot_to_persona's slot_skip branch and every
+    # `remaining = [s for s in all_slots if ...]` site below. Deliberately session-scoped,
+    # same lifetime as collected_slots (never cleared per-topic) — the existing "no slot
+    # re-ask" rule already keeps an actual ANSWER (e.g. entity_type=บุคคลธรรมดา) valid
+    # across later, unrelated topics in the same session; an explicit DECLINE ("ทั้งสอง
+    # แบบครับ" / can't single-select) is the same kind of durable fact about this user and
+    # should be respected the same way, not just for the one topic that happened to ask it.
+    _SKIPPED_SLOT_KEYS_CTX_KEY = "_skipped_slot_keys"
+
+    # Slot keys whose answers are short, natural-language-ish responses that may
+    # superficially resemble an unrelated intent (persona switch, greeting, legal
+    # question, etc.) — e.g. "นิติค่ะ", "กสิกรครับ", "ทั้งสองแบบครับ". Originally a
+    # local variable only inside _should_route_pending_slot_now's own switch/persona/
+    # greeting/legal-question guards; promoted to a class constant 2026-10 so the SAME
+    # set can gate the EARLIER silent-switch-to-academic checks (2.3/2.4/2.5 in
+    # _handle_inner) too — those run strictly BEFORE _should_route_pending_slot_now is
+    # ever called, so having the exemption only inside that later function could never
+    # protect a pending slot of one of these keys from being hijacked first. Live-
+    # reproduced: a customer answering "ทั้งสองแบบเลยครับ" to a registration_type slot
+    # question got silently switched to Academic mode by section 2.3 (style/depth-
+    # request classifier scored it "wants_long") — "registration_type" is already in
+    # this set and _should_route_pending_slot_now would have exempted it correctly, but
+    # that check was never reached because 2.3 already returned first.
+    _SLOT_REPLY_ALWAYS_KEYS = frozenset({
+        "topic", "operation_group", "operation_sub_type", "operation_topic",
+        "registration_type", "department", "entity_type", "location",
+        "shop_area_type", "area_size", "choice",
+    })
 
     def _maybe_offer_feedback(self, state: ConversationState, user_input: str, reply: str) -> str:
         """Called once per turn from handle() (the single choke point every persona reply
@@ -1430,7 +1488,19 @@ class PersonaSupervisor:
         if self._QUESTION_MARKERS_RE.search(t):
             return False
 
-        if self._EN_GREETING_RE.match(t) or self._EN_GOOD_TIME_RE.match(t):
+        # Guard (2026-09): substantial content after the greeting word → it's a question/
+        # statement, not a pure greeting. The TH_WATDEE/TH_SAWASDEE_FUZZY branch below already
+        # had this guard; EN_GREETING/EN_GOOD_TIME and TH_DEE did not, so e.g. "hi เทคนิคในการ
+        # ทำให้ยอดขายขึ้น" and "ดีครับ เทคนิคในการทำให้ยอดขายขึ้น" were unconditionally
+        # classified as pure greetings regardless of what followed — live-verified to route a
+        # real business question into the greeting/deflect handler instead of retrieval. Using
+        # each match object's own .end() (rather than a hand-written strip regex) so the
+        # trailing text is always exactly "whatever the greeting pattern itself didn't consume".
+        _en_greet_m = self._EN_GREETING_RE.match(t) or self._EN_GOOD_TIME_RE.match(t)
+        if _en_greet_m:
+            _greet_trailing = t[_en_greet_m.end():].strip()
+            if len(_greet_trailing) >= 8:
+                return False
             return True
         if self._TH_WATDEE_RE.match(t) or self._TH_SAWASDEE_FUZZY_RE.match(t):
             # Guard: substantial content after the greeting word → it's a question, not a pure greeting.
@@ -1438,7 +1508,11 @@ class PersonaSupervisor:
             if len(_greet_trailing) >= 8:
                 return False
             return True
-        if self._TH_DEE_RE.match(t) and not self._QUESTION_MARKERS_RE.search(t):
+        _th_dee_m = self._TH_DEE_RE.match(t)
+        if _th_dee_m and not self._QUESTION_MARKERS_RE.search(t):
+            _greet_trailing = t[_th_dee_m.end():].strip()
+            if len(_greet_trailing) >= 8:
+                return False
             return True
 
         if len(t) <= 14 and self._NOISE_ONLY_RE.match(t):
@@ -2645,7 +2719,15 @@ class PersonaSupervisor:
     # "ดัง" uses negative-lookahead to exclude "ดังนั้น", "ดังกล่าว", "ดังต่อไปนี้" etc.
     _MARKETING_NOT_ELAB_RE = re.compile(
         r"มีกระแส|ยอดนิยม|โด่งดัง|ไวรัล|viral\b|ฮิต\b|ให้ดัง|ร้านดัง|ทำให้ดัง|คาเฟ่ดัง|กาแฟดัง|ที่ดัง"
-        r"|ดัง\b(?!\s*(?:นั้น|กล่าว|ต่อไป|ข้างต้น|สุด|มาก|กว่า|กล่าว))",
+        r"|ดัง\b(?!\s*(?:นั้น|กล่าว|ต่อไป|ข้างต้น|สุด|มาก|กว่า|กล่าว))"
+        # Sales/marketing-technique phrasing (mirrors _BROAD_Q_RE category F) — also never a
+        # regulatory-topic elaboration, and used here so the broad-question two-pass retrieval's
+        # Pass 2 regulatory sweep gets correctly skipped for this query shape too (no license/tax
+        # docs should get injected into a pure "how do I sell more" answer).
+        r"|(เทคนิค|วิธี|ทำยังไง|ทำอย่างไร|ทำไง).{0,10}(เพิ่ม|ทำให้|ให้).{0,10}ยอดขาย"
+        r"|เพิ่มยอดขาย"
+        r"|(ทำการตลาด|การตลาด).{0,15}(ยังไง|อย่างไร|ให้ขายดี|ให้ดีขึ้น)"
+        r"|ขายดี.{0,10}(ยังไง|อย่างไร|ทำไง|ทำยังไง)",
         re.IGNORECASE,
     )
     # Channel-preference follow-up: user wants offline/in-person instead of online.
@@ -3369,6 +3451,7 @@ class PersonaSupervisor:
                     for _qv in _q_match_variants_e
                 )
             ]
+            _matched_ots_e = self._filter_by_specific_topic_conflict(q, _matched_ots_e, label="operation_topic")
             if _matched_ots_e and not _skip_op_topic_for_info:
                 # Prefer exact match over substring match — prevents "รับชำระภาษีป้าย"
                 # from being overtaken by the longer "ยกเลิกรับชำระภาษีป้าย" via max(len).
@@ -3401,6 +3484,87 @@ class PersonaSupervisor:
                         include=["documents", "metadatas"],
                     )
                     _ot_max_e = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700) or 700)
+                    # Non-reg completeness (2026-09, same reasoning as the sub_topic-fetch
+                    # sibling below): an operation_topic exact-match returns only that ONE
+                    # row, which is correct for regulatory content but wrong for the
+                    # marketing/business_guide know-how sheets — those deliberately split
+                    # one broad chapter (e.g. "กลยุทธ์ด้านการสื่อสาร", 23 rows) into many
+                    # sibling operation_topic/sub_topic values, so matching the definition
+                    # row alone silently produces a "definition only" answer to a "what
+                    # strategies should I use" question (live-reproduced, qa_12case case
+                    # 3 — this specific query matches via operation_topic, not sub_topic,
+                    # so needs its own expansion here too). Scoped to non-regulatory
+                    # data_type only — regulatory operation_topic matches are untouched.
+                    _ot_parent_mt_e = ""
+                    _ot_nonreg_rejected_e = False
+                    try:
+                        _ot_first_md_e = (_ot_res_e.get("metadatas") or [None])[0] or {}
+                        _ot_data_type_e = str(_ot_first_md_e.get("data_type") or "").strip().lower()
+                        _ot_parent_mt_e = str(_ot_first_md_e.get("main_topic") or "").strip()
+                        if _ot_data_type_e in ("marketing", "business_guide") and _ot_parent_mt_e:
+                            # Regulatory-dominance guard (2026-09, live-reproduced — this op_topic
+                            # sibling never had the "Generic-label guard" applied to it at all,
+                            # unlike the sub_topic chapter-fetch block further below in this same
+                            # method, which got it during an earlier fix; this block was a fully
+                            # separate, unguarded duplicate of the same exact-match-hijack shape).
+                            # A query naming a specific regulatory checklist item can still
+                            # literally contain a short, coincidental operation_topic label
+                            # belonging to an unrelated business_guide/marketing chapter (e.g.
+                            # "จดทะเบียนพาณิชย์แบบบุคคลธรรมดา ต้องเตรียมเอกสารอะไรบ้าง" matching
+                            # a 2-line business_guide definition row over the real regulatory
+                            # document-requirements row, which plain semantic retrieval ranks
+                            # far higher). Checked BEFORE trusting this op_topic exact match.
+                            #
+                            # Score threshold (2026-09, live-reproduced): an earlier version of
+                            # this check rejected on "top hit is regulatory" alone, no score floor
+                            # — that INCORRECTLY fired on the SME income-tax-bracket case, where the
+                            # "regulatory" top hit was an unrelated VAT-registration row that only
+                            # coincidentally shared the word "ภาษี" (score ~0.55-0.57, not a
+                            # genuinely confident match). See
+                            # _NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE's docstring for the
+                            # calibration data.
+                            #
+                            # Deliberately NOT porting the sub_topic sibling's SECOND check here
+                            # (reject when the best business_guide/marketing hit's main_topic
+                            # merely DISAGREES with this exact match, regardless of score) — tested
+                            # live against the SME tax-bracket case and found it correctly rejects
+                            # this exact op_topic match (its semantic top business_guide hit is a
+                            # different, more-correct chapter) but the subsequent Step 0b/normal-
+                            # retrieval fallback then fails to surface that correct chapter either,
+                            # turning a pre-existing PARTIAL answer (right general tax rate, missing
+                            # the SME-specific bracket — imperfect but present) into a total answer-
+                            # generation failure. That fallback-retrieval weakness is a separate,
+                            # real, pre-existing gap worth fixing on its own, but porting the
+                            # disagreement check here without first fixing it would trade one
+                            # customer-visible bug for a worse one on this exact query — out of
+                            # scope for the specific defect (regulatory data silently overridden by
+                            # a coincidental label match) this guard exists to close today.
+                            _ot_sem_top_dt_e, _ot_sem_top_score_e, _ot_sem_top_mt_e = self._nonreg_chapter_semantic_check(q)
+                            if _ot_sem_top_dt_e == "regulatory" and _ot_sem_top_score_e >= self._NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE:
+                                _LOG.info(
+                                    "[Supervisor] _ensure: op_topic exact-match %r (chapter %r) rejected — "
+                                    "overall semantic top hit is a confident regulatory match (score=%.3f), not "
+                                    "marketing/business_guide; falling through to Step 0b/normal retrieval",
+                                    _target_ot_e, _ot_parent_mt_e, _ot_sem_top_score_e,
+                                )
+                                _ot_nonreg_rejected_e = True
+                            if not _ot_nonreg_rejected_e:
+                                _ot_chapter_res_e = _coll_e.get(
+                                    where={"main_topic": _ot_parent_mt_e},
+                                    include=["documents", "metadatas"],
+                                )
+                                if len(_ot_chapter_res_e.get("metadatas") or []) > len(_ot_res_e.get("metadatas") or []):
+                                    _ot_res_e = _ot_chapter_res_e
+                                    _LOG.info(
+                                        "[Supervisor] _ensure: op_topic→main_topic expansion (non-reg): "
+                                        "%r → chapter %r (%d docs)",
+                                        _target_ot_e, _ot_parent_mt_e, len(_ot_res_e.get("metadatas") or []),
+                                    )
+                        else:
+                            _ot_parent_mt_e = ""
+                    except Exception as _e_ot_expand:
+                        _LOG.warning("[Supervisor] _ensure: op_topic→main_topic expansion failed: %s", _e_ot_expand)
+                        _ot_parent_mt_e = ""
                     _ot_docs_e = [
                         {"content": (c or "")[:_ot_max_e], "metadata": m or {}}
                         for c, m in zip(
@@ -3408,6 +3572,13 @@ class PersonaSupervisor:
                             _ot_res_e.get("metadatas") or [],
                         )
                     ]
+                    # Cross-sheet completeness (2026-09): non-reg chapter-fetch found its
+                    # own chapter but a DIFFERENT, more directly relevant chapter may live
+                    # in another sheet entirely (see _merge_cross_chapter_docs_for_nonreg
+                    # docstring — live-verified case: "กลยุทธ์การตั้งราคา" exact-matches a
+                    # thinner chapter while "กลยุทธ์ด้านราคา" elsewhere is the real answer).
+                    if _ot_parent_mt_e:
+                        _ot_docs_e = self._merge_cross_chapter_docs_for_nonreg(_ot_docs_e, _ot_parent_mt_e, q)
                     # Also fetch the "การ" prefix variant — data often has the same operation
                     # split as e.g. "ยื่นภาษีป้าย" (in-person) + "การยื่นภาษีป้าย" (online).
                     # The query "ยื่นภาษีป้าย" only matches the first; we must include both.
@@ -3446,7 +3617,11 @@ class PersonaSupervisor:
                             if re.search(_lt_pat, _q_lower_lt, re.IGNORECASE):
                                 _matched_lt_e = _lt_name
                                 break
-                        _ot_skip_return = False
+                        # _ot_nonreg_rejected_e set above by the semantic-agreement guard —
+                        # start _ot_skip_return from it so a rejected non-reg exact match falls
+                        # through to Step 0b/normal retrieval exactly like the existing
+                        # "license-filter 0 docs" / "weak Group-B match" fall-through cases below.
+                        _ot_skip_return = _ot_nonreg_rejected_e
                         _ot_was_group_b_match = not _exact_ots_e and not _group_a
                         if _matched_lt_e:
                             _ot_docs_filtered = [
@@ -3479,13 +3654,22 @@ class PersonaSupervisor:
                             )
                             _ot_skip_return = True
                         if not _ot_skip_return:
+                            # Exact op_topic match → clear stale slot queue from prior turns,
+                            # BEFORE the entity-injection check below so a freshly-injected
+                            # entity_type slot isn't wiped out by this same clear (2026-09: this
+                            # exact ordering bug was live-reproduced — the entity_type slot was
+                            # correctly injected below, then silently erased by this pop firing
+                            # afterward at the end of the block; moved here to match the OBD
+                            # path's already-correct pop-before-inject order).
+                            state.context.pop("topic_slot_queue", None)
+                            state.context.pop("pending_slot", None)
                             # Entity variety: same check as OBD path — inject entity_type slot
                             # when docs cover both บุคคลธรรมดา and นิติบุคคล and entity not yet known.
                             # _direct_topic_match blocks the check inside Practical (line 3742).
                             _ot_session_et = str(
                                 (state.context.get("collected_slots") or {}).get("entity_type") or ""
                             ).strip()
-                            if not _ot_session_et:
+                            if not _ot_session_et and self._entity_slot_needed(q):
                                 _et_in_ot = {
                                     str(d.get("metadata", {}).get("entity_type_normalized") or "").strip()
                                     for d in _ot_docs_e
@@ -3504,9 +3688,15 @@ class PersonaSupervisor:
                                 )
                                 if _ot_et_mixed:
                                     _sq_ot = list((state.context or {}).get("topic_slot_queue") or [])
+                                    # Also true when entity_type was explicitly declined ("ทั้งสองแบบครับ"),
+                                    # not just when it was actually answered — a skip is recorded in
+                                    # _SKIPPED_SLOT_KEYS_CTX_KEY, never in collected_slots, so checking
+                                    # collected_slots alone re-adds this slot to the queue every single
+                                    # turn after a skip, forever (2026-10, live-reproduced: QR Payment
+                                    # kept re-asking entity_type on every turn despite repeated skips).
                                     _et_already_known_ot = bool(
                                         (state.get_collected_slots() if hasattr(state, "get_collected_slots") else {}).get("entity_type")
-                                    )
+                                    ) or "entity_type" in (state.context.get(self._SKIPPED_SLOT_KEYS_CTX_KEY) or [])
                                     if not _et_already_known_ot and not any(s.get("key") == "entity_type" for s in _sq_ot):
                                         _et_sorted_ot = sorted(_et_in_ot) if len(_et_in_ot) >= 2 else ["นิติบุคคล", "บุคคลธรรมดา"]
                                         state.context["topic_slot_queue"] = [{
@@ -3580,9 +3770,6 @@ class PersonaSupervisor:
                                         _is_def_q_ot = True
                             if _is_def_q_ot:
                                 state.context["_informational_query"] = True
-                            # Exact op_topic match → clear stale slot queue from prior turns.
-                            state.context.pop("topic_slot_queue", None)
-                            state.context.pop("pending_slot", None)
                             _LOG.info(
                                 "[Supervisor] _ensure: op_topic chapter retrieval: %r → %d docs",
                                 _target_ot_e, len(_ot_docs_e),
@@ -3616,6 +3803,22 @@ class PersonaSupervisor:
                             and (_n == _q_dedup_obd or _n in _q_dedup_obd))
                     ))(re.sub(r"\s+", " ", obd.lower().strip()))
                 ]
+                # Conflicting-specific-topic guard (2026-09): an OBD value being
+                # "unique to a single license_type" doesn't mean a query containing
+                # it is unambiguous — the query can ALSO independently name a
+                # totally different, more specific topic that should take priority.
+                # Live-reproduced: "ร้านอาหารต้องมีบัญชีธนาคารแยกต่างหากไหมคะ ถึงจะ
+                # เปิดรับ QR Payment ได้" contains the short, generic OBD "บัญชีธนาคาร"
+                # (→ license_type "บัญชีธนาคารรับเงิน", an unrelated standalone
+                # account-admin category) AND explicitly names "QR Payment" — the
+                # OBD match short-circuited straight to the wrong 4 docs, even
+                # though plain semantic/hybrid retrieval (verified directly, no
+                # OBD shortcut) already ranks the correct QR Payment docs
+                # correctly on its own. Only fires when the specific-indicator
+                # term isn't part of the matched OBD text itself, so it doesn't
+                # affect the normal case (OBD's own license IS the specific topic
+                # named, e.g. "การสมัคร เครื่องรูดบัตร EDC" when the query says "EDC").
+                _matched_obds_e = self._filter_by_specific_topic_conflict(q, _matched_obds_e, label="OBD")
                 if _matched_obds_e:
                     _target_obd_e = max(_matched_obds_e, key=len)
                     _coll_obd_e = self._get_chroma_collection()
@@ -3757,9 +3960,12 @@ class PersonaSupervisor:
                                 )
                                 if _obd_et_mixed:
                                     _sq_obd = list((state.context or {}).get("topic_slot_queue") or [])
+                                    # Also true for an explicit decline, not just an actual answer —
+                                    # see the _et_already_known_ot sibling site above for the real
+                                    # case this was found in (QR Payment kept re-asking forever).
                                     _et_already_known_obd = bool(
                                         (state.get_collected_slots() if hasattr(state, "get_collected_slots") else {}).get("entity_type")
-                                    )
+                                    ) or "entity_type" in (state.context.get(self._SKIPPED_SLOT_KEYS_CTX_KEY) or [])
                                     if not _et_already_known_obd and not any(s.get("key") == "entity_type" for s in _sq_obd):
                                         _et_sorted_obd = sorted(_et_in_obd) if len(_et_in_obd) >= 2 else ["นิติบุคคล", "บุคคลธรรมดา"]
                                         state.context["topic_slot_queue"] = [{
@@ -4126,6 +4332,7 @@ class PersonaSupervisor:
                                     _vstore, q, k=_top_k_rare,
                                     metadata_filter={"license_type": _rare_lt},
                                     rrf_k=int(getattr(conf, "HYBRID_RRF_K", 60)),
+                                    bm25_bypass_min_ratio=float(getattr(conf, "BM25_BYPASS_MIN_RATIO", 0.35)),
                                 )
                             else:
                                 _scored = _vstore.similarity_search_with_relevance_scores(
@@ -4233,14 +4440,43 @@ class PersonaSupervisor:
                 mt for mt in _main_topic_candidates
                 if len(mt) >= 5 and topic_label_matches_query(mt, _q_lower_sv, _last_raw_human)
             ]
+            _matched_mts = self._filter_by_specific_topic_conflict(q, _matched_mts, label="main_topic")
             # When multiple main_topics match, pick the longest one (most specific).
             # E.g. query "การบริหารจัดการพนักงานภายในร้านอาหาร" matches both
             # "การฝึกอบรมพนักงาน" and "การบริหารจัดการพนักงานภายในร้านอาหาร" —
             # longest match is the correct chapter the user is asking about.
             if _matched_mts:
                 _target_mt_sv = max(_matched_mts, key=len)
+                # Regulatory-dominance guard (2026-09, live-reproduced — a THIRD independent
+                # duplicate of the same exact-match-hijack shape as the op_topic/sub_topic
+                # sites earlier in this method; see _nonreg_chapter_semantic_check's docstring
+                # for the full pattern and calibration data). main_topic is NEVER populated on
+                # regulatory rows (confirmed: 0/1037), so this site can't directly serve a
+                # business_guide row AS IF it were the regulatory answer the way op_topic/
+                # sub_topic could — but it still unconditionally `return`s below, which means
+                # it can silently PREVENT the query from ever reaching the op_topic/OBD/
+                # sub_topic/normal-retrieval paths that would have found a strong regulatory
+                # match. Confirmed real: "การจดทะเบียนและขอใบอนุญาตร้านอาหารต้องทำยังไง" exact-
+                # matches this shallow 4-row business_guide chapter (just a "2 ประเภท" definition
+                # + a VAT-registration stub) while plain semantic retrieval ranks a regulatory
+                # food-permit document at 0.73 — well above the dominance threshold — and the
+                # Supervisor's OWN license_type classifier, computed moments earlier for this
+                # exact query, had already correctly identified 4 specific relevant regulatory
+                # licenses that this hijack discards entirely.
+                _mt_sem_top_dt, _mt_sem_top_score, _ = self._nonreg_chapter_semantic_check(q)
+                _mt_rejected = (
+                    _mt_sem_top_dt == "regulatory"
+                    and _mt_sem_top_score >= self._NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE
+                )
+                if _mt_rejected:
+                    _LOG.info(
+                        "[Supervisor] main_topic exact-match %r rejected — overall semantic top hit "
+                        "is a confident regulatory match (score=%.3f); falling through to "
+                        "op_topic/OBD/sub_topic/normal retrieval",
+                        _target_mt_sv, _mt_sem_top_score,
+                    )
                 try:
-                    _vstore_mt_sv = getattr(self.retriever, "vectorstore", None)
+                    _vstore_mt_sv = getattr(self.retriever, "vectorstore", None) if not _mt_rejected else None
                     _coll_mt_sv = getattr(_vstore_mt_sv, "_collection", None) if _vstore_mt_sv else None
                     if _coll_mt_sv is not None:
                         _mt_res = _coll_mt_sv.get(
@@ -4290,6 +4526,7 @@ class PersonaSupervisor:
                 st for st in _sub_topic_candidates
                 if len(st) >= 8 and topic_label_matches_query(st, _q_lower_sv, _last_raw_human)
             ]
+            _matched_sts = self._filter_by_specific_topic_conflict(q, _matched_sts, label="sub_topic")
             # Also check operation_topic values — rows like the exemption row have
             # operation_topic='การจดทะเบียนพาณิชย์ที่ได้รับการยกเว้น' but sub_topic=None,
             # so they're invisible to sub_topic matching. Prefer the longer match overall.
@@ -4298,6 +4535,7 @@ class PersonaSupervisor:
                 ot for ot in _op_topic_candidates
                 if len(ot) >= 8 and topic_label_matches_query(ot, _q_lower_sv, _last_raw_human)
             ]
+            _matched_ots = self._filter_by_specific_topic_conflict(q, _matched_ots, label="sub_topic(operation_topic)")
             _target_st_sv = ""
             _use_op_topic_filter = False
             if _matched_sts or _matched_ots:
@@ -4322,6 +4560,108 @@ class PersonaSupervisor:
                             _st_res.get("documents") or [],
                             _st_res.get("metadatas") or [],
                         ))
+                        # Non-reg completeness (2026-09): a sub_topic exact-match only
+                        # returns that ONE row — for regulatory content this is correct
+                        # (each sub_topic is its own self-contained answer), but the
+                        # marketing/business_guide know-how sheets deliberately split one
+                        # broad chapter into 20+ sibling sub_topics (e.g. "กลยุทธ์ด้านการ
+                        # สื่อสาร" has 23 rows: Sales Objectives, Contact Points, IMC,
+                        # Social Media, ...). Matching just one sibling (e.g. "การสื่อสาร
+                        # การตลาด", the definition row) and stopping there silently
+                        # produces a "definition only" answer to a "what strategies
+                        # should I use" question — live-reproduced (qa_12case rerun,
+                        # case 3). Expand to the full main_topic chapter, but ONLY for
+                        # this non-regulatory data_type — regulatory sub_topic behavior
+                        # (the vast majority of chapter-fetch traffic, heavily tested)
+                        # is completely untouched.
+                        _st_data_type = ""
+                        _st_parent_mt = ""
+                        if (not _use_op_topic_filter) and _st_docs_raw:
+                            _st_first_md = _st_docs_raw[0][1] or {}
+                            _st_data_type = str(_st_first_md.get("data_type") or "").strip().lower()
+                            _st_parent_mt = str(_st_first_md.get("main_topic") or "").strip()
+                            if _st_data_type in ("marketing", "business_guide") and _st_parent_mt:
+                                # Generic-label guard (2026-09): unlike regulatory Sheet
+                                # chapter names (curated, usually specific), non-regulatory
+                                # sub_topic labels come from auto-generated book/marketing
+                                # chapter splits and can be broad generic terms that still
+                                # clear the len>=8 gate above (e.g. "ภาษีเงินได้" — a general
+                                # tax category, not a unique chapter name). Live-reproduced:
+                                # this exact label exact-matched an unrelated cost-reduction
+                                # chapter for a query that actually needed a DIFFERENT
+                                # chapter's SME tax table, silently locking onto the wrong
+                                # chapter with no error and hiding the correct answer even
+                                # though plain semantic/hybrid retrieval already ranked the
+                                # right chapter #1 on its own. Require semantic retrieval to
+                                # at least AGREE (or have no non-regulatory opinion) before
+                                # trusting the exact match — regulatory sub_topic behavior
+                                # (the vast majority of this mechanism's traffic, heavily
+                                # tested) is completely untouched by this check.
+                                # Regulatory-dominance guard (2026-09, live-reproduced): the
+                                # check below only compares AMONG marketing/business_guide
+                                # candidates, so it's blind to the case where the exact-matched
+                                # label is a coincidental hit on a short, generic business_guide
+                                # row (e.g. sub_topic="การจดทะเบียนพาณิชย์", a 2-line definition)
+                                # while the REAL answer — a detailed regulatory row with the
+                                # actual document checklist — outranks every business_guide doc
+                                # in genuine semantic retrieval but is invisible to this guard
+                                # entirely. "จดทะเบียนพาณิชย์แบบบุคคลธรรมดา ต้องเตรียมเอกสารอะไรบ้าง"
+                                # exact-matched this business_guide chapter and silently replaced
+                                # the correct regulatory document-requirements row, dropping 3 of
+                                # 8 required documents from the final answer. Checked BEFORE the
+                                # existing marketing/business_guide-vs-business_guide check since
+                                # it's a stronger, unconditional signal: if a regulatory doc is a
+                                # CONFIDENT best semantic match overall, no business_guide chapter
+                                # (however label-exact) should override it.
+                                #
+                                # Score threshold (2026-09, live-reproduced): a first version of
+                                # this check rejected on "top hit is regulatory" alone, no score
+                                # floor — that INCORRECTLY fired on the SME income-tax-bracket
+                                # case (see _nonreg_chapter_semantic_check's docstring), where the
+                                # "regulatory" top hit was an unrelated VAT-registration row that
+                                # only coincidentally shared the word "ภาษี" (score ~0.55-0.57) while
+                                # the REAL tax-bracket answer lived in the business_guide chapter
+                                # this check was about to reject — breaking answer generation
+                                # entirely with nothing else relevant retrieved.
+                                _st_sem_top_dt, _st_sem_top_score, _st_sem_top_mt = self._nonreg_chapter_semantic_check(q)
+                                if _st_sem_top_dt == "regulatory" and _st_sem_top_score >= self._NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE:
+                                    _LOG.info(
+                                        "[Supervisor] sub_topic exact-match %r (chapter %r) rejected — "
+                                        "overall semantic top hit is a confident regulatory match (score=%.3f), not "
+                                        "marketing/business_guide; falling back to normal retrieval",
+                                        _target_st_sv, _st_parent_mt, _st_sem_top_score,
+                                    )
+                                    _st_docs_raw = []
+                                    _st_data_type = ""
+                                    _st_parent_mt = ""
+                                elif _st_sem_top_mt and _st_sem_top_mt != _st_parent_mt:
+                                    _LOG.info(
+                                        "[Supervisor] sub_topic exact-match %r (chapter %r) rejected — "
+                                        "semantic top hit disagrees (chapter %r); falling back to normal retrieval",
+                                        _target_st_sv, _st_parent_mt, _st_sem_top_mt,
+                                    )
+                                    _st_docs_raw = []
+                                    _st_data_type = ""
+                                    _st_parent_mt = ""
+                            if _st_docs_raw and _st_data_type in ("marketing", "business_guide") and _st_parent_mt:
+                                try:
+                                    _st_chapter_res = _coll_st_sv.get(
+                                        where={"main_topic": _st_parent_mt},
+                                        include=["documents", "metadatas"],
+                                    )
+                                    _st_chapter_docs = list(zip(
+                                        _st_chapter_res.get("documents") or [],
+                                        _st_chapter_res.get("metadatas") or [],
+                                    ))
+                                    if len(_st_chapter_docs) > len(_st_docs_raw):
+                                        _st_docs_raw = _st_chapter_docs
+                                        _LOG.info(
+                                            "[Supervisor] sub_topic→main_topic expansion (non-reg): "
+                                            "%r → chapter %r (%d docs)",
+                                            _target_st_sv, _st_parent_mt, len(_st_docs_raw),
+                                        )
+                                except Exception as _e_st_expand:
+                                    _LOG.warning("[Supervisor] sub_topic→main_topic expansion failed: %s", _e_st_expand)
                         if _st_docs_raw:
                             _doc_chars_st_sv = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700) or 700)
                             _st_slim: List[Dict[str, Any]] = []
@@ -4332,12 +4672,62 @@ class PersonaSupervisor:
                                         continue
                                     _slim_st[_k_st] = str(_v_st)
                                 _st_slim.append({"content": (_fc_st or "")[:_doc_chars_st_sv], "metadata": _slim_st})
+                            # Cross-sheet completeness (2026-09): see
+                            # _merge_cross_chapter_docs_for_nonreg docstring — a different,
+                            # more directly relevant chapter may live in another sheet.
+                            if (not _use_op_topic_filter) and _st_data_type in ("marketing", "business_guide") and _st_parent_mt:
+                                _st_slim = self._merge_cross_chapter_docs_for_nonreg(_st_slim, _st_parent_mt, q)
                             state.current_docs = _st_slim
                             state.last_retrieval_query = _anchored_q if _anchored_q else q
                             state.context["last_user_legal_query"] = q
                             state.context["last_topic"] = _target_st_sv
                             state.context["_subtopic_chapter_used"] = True
                             if _use_op_topic_filter:
+                                # Entity variety: same check as the Step 0 op_topic path —
+                                # inject entity_type slot when docs cover both บุคคลธรรมดา
+                                # and นิติบุคคล and entity not yet known. Without this, setting
+                                # _direct_topic_match below silently disables persona_practical.py's
+                                # own entity-variety check with no replacement (2026-09 audit finding).
+                                _st_et_injected = False
+                                _st_session_et = str(
+                                    (state.context.get("collected_slots") or {}).get("entity_type") or ""
+                                ).strip()
+                                if not _st_session_et and self._entity_slot_needed(q):
+                                    _et_in_st = {
+                                        str(d.get("metadata", {}).get("entity_type_normalized") or "").strip()
+                                        for d in _st_slim
+                                    } - {"", "nan", "None"}
+                                    _st_combined_content = any(
+                                        re.search(r"บุคคลธรรมดา\s*\d+\.", str((raw_m or {}).get("identification_documents") or ""))
+                                        and re.search(r"นิติบุคคล\s*\d+\.", str((raw_m or {}).get("identification_documents") or ""))
+                                        for _fc_st2, raw_m in _st_docs_raw
+                                    )
+                                    _st_et_mixed = (
+                                        ("นิติบุคคล" in _et_in_st and "บุคคลธรรมดา" in _et_in_st)
+                                        or _st_combined_content
+                                    )
+                                    if _st_et_mixed:
+                                        _sq_st = list((state.context or {}).get("topic_slot_queue") or [])
+                                        # Also true for an explicit decline, not just an actual answer —
+                                        # see the _et_already_known_ot sibling site above for the real
+                                        # case this was found in (QR Payment kept re-asking forever).
+                                        _et_already_known_st = bool(
+                                            (state.get_collected_slots() if hasattr(state, "get_collected_slots") else {}).get("entity_type")
+                                        ) or "entity_type" in (state.context.get(self._SKIPPED_SLOT_KEYS_CTX_KEY) or [])
+                                        if not _et_already_known_st and not any(s.get("key") == "entity_type" for s in _sq_st):
+                                            _et_sorted_st = sorted(_et_in_st) if len(_et_in_st) >= 2 else ["นิติบุคคล", "บุคคลธรรมดา"]
+                                            state.context["topic_slot_queue"] = [{
+                                                "key": "entity_type",
+                                                "options": _et_sorted_st,
+                                                "display_options": _et_sorted_st,
+                                                "question": "ร้านของคุณดำเนินการในรูปแบบใดครับ",
+                                            }] + _sq_st
+                                            _st_et_injected = True
+                                            _LOG.info(
+                                                "[Supervisor] sub_topic(operation_topic) %r has mixed entity types %s"
+                                                " — asking entity_type first",
+                                                _target_st_sv, _et_sorted_st,
+                                            )
                                 # Exact operation_topic match → entity-neutral direct answer
                                 state.context["_direct_topic_match"] = True
                                 _is_def_q_st = bool(self._DEFINITION_Q_RE.search(q))
@@ -4357,8 +4747,14 @@ class PersonaSupervisor:
                                             _is_def_q_st = True
                                 if _is_def_q_st:
                                     state.context["_informational_query"] = True
-                                    state.context.pop("topic_slot_queue", None)
-                                    state.context.pop("pending_slot", None)
+                                    # Don't clear a topic_slot_queue we JUST injected above for
+                                    # this exact entity-mixed match (2026-09: identical ordering
+                                    # bug live-reproduced and fixed in the Step 0 op_topic path —
+                                    # see that block's comment) — a definition-style query with
+                                    # entity-variant docs should still ask before answering.
+                                    if not _st_et_injected:
+                                        state.context.pop("topic_slot_queue", None)
+                                        state.context.pop("pending_slot", None)
                             _st_filter_used = True
                             _LOG.info(
                                 "[Supervisor] %s chapter retrieval: %r → %d docs",
@@ -4392,6 +4788,7 @@ class PersonaSupervisor:
 
         _sv_hybrid = getattr(conf, "HYBRID_SEARCH_ENABLED", False)
         _sv_rrf_k = int(getattr(conf, "HYBRID_RRF_K", 60))
+        _sv_bm25_ratio = float(getattr(conf, "BM25_BYPASS_MIN_RATIO", 0.35))
         _sv_vstore = getattr(self.retriever, "vectorstore", None)
 
         def _sv_search(q: str, k: int, metadata_filter: Optional[dict] = None) -> list:
@@ -4400,6 +4797,7 @@ class PersonaSupervisor:
                 from utils.hybrid_retriever import hybrid_scored_search
                 return [d for d, _ in hybrid_scored_search(
                     _sv_vstore, q, k=k, rrf_k=_sv_rrf_k, metadata_filter=metadata_filter,
+                    bm25_bypass_min_ratio=_sv_bm25_ratio,
                 )]
             if metadata_filter and _sv_vstore is not None:
                 try:
@@ -4514,10 +4912,21 @@ class PersonaSupervisor:
                         # Filter to actual government-issued permits/licenses only.
                         # ^ใบ covers ใบอนุญาต/ใบทะเบียน/ใบวุฒิบัตร/ใบรับรอง/ใบภาษี.
                         # ^แบบแสดง covers แบบแสดงรายการภาษีป้าย.
+                        # ภาษี (2026-09, live-verified gap): catches the 2 remaining tax-law
+                        # entries that aren't shaped like a "ใบ..." permit but are still a real,
+                        # universally-applicable compliance obligation for any new business owner
+                        # — ประมวลรัษฎากร (income tax code) and รวมกฎหมายที่ดิน...ภาษีที่ดิน (land/
+                        # building tax). A user asked "จะเปิดร้านอาหารต้องขอใบอนุญาตอะไรบ้าง...
+                        # เพิ่งเริ่มทำเป็นบุคคลธรรมดาคนเดียว" and the answer covered VAT/signboard
+                        # tax (already matched ^ใบ/^แบบแสดง) but silently dropped these two —
+                        # confirmed via a full scan of all 76 regulatory license_types that these
+                        # are the ONLY 2 "ภาษี"-containing entries this pattern was missing; every
+                        # other excluded entry (labor court procedure, criminal code, the
+                        # constitution, etc.) is correctly out of scope for this sweep.
                         # Excludes: ทะเบียนนายจ้าง/ผู้ประกันตน (employee registrations,
                         # not permits), and all operational tools (payment, banking, staffing).
                         _PERMIT_LT_RE = re.compile(
-                            r"^ใบ|^แบบแสดง|ภพ\.|ภ\.ป|สณ\.|ภส\.", re.UNICODE
+                            r"^ใบ|^แบบแสดง|ภพ\.|ภ\.ป|สณ\.|ภส\.|ภาษี", re.UNICODE
                         )
                         _missing_lts = {lt for lt in _missing_lts if _PERMIT_LT_RE.search(lt)}
                         # Re-include license types explicitly named in the user's query
@@ -4545,6 +4954,11 @@ class PersonaSupervisor:
                             )
                             _missing_lts_sorted = sorted(_missing_lts)
 
+                            # Positive signal for a genuine "new registration" OBD value —
+                            # this naming convention ("การจด.../การขอ.../การสมัคร...") holds
+                            # consistently across this dataset's license types.
+                            _NEW_REG_OBD_RE = re.compile(r"^(การจด|การขอ|การสมัคร)")
+
                             def _fetch_sweep_docs_for_lt(lt_miss: str) -> list:
                                 try:
                                     _hits = _sv_vstore.similarity_search(
@@ -4559,28 +4973,62 @@ class PersonaSupervisor:
                                             )
                                         )
                                     ]
-                                    if not _good:
-                                        # similarity_search returned only edit-type docs for this
-                                        # license_type (e.g. VAT: 22/25 Chroma docs are edit-type,
-                                        # similarity always surfaces those). Fall back to a direct
-                                        # metadata scan so we find the new-reg doc reliably.
+                                    # 2026-09: `_good` being non-empty does NOT guarantee it's
+                                    # actually the new-registration doc — _SWEEP_EDIT_RE is a
+                                    # blocklist of lifecycle-change keywords, and an obscure edge
+                                    # case can slip past it while still not being what a "new
+                                    # registration" question needs. Live-reproduced: VAT's
+                                    # similarity_search top-2 were "ย้ายสถานประกอบการ" (correctly
+                                    # excluded) and "ผู้ประกอบการจดทะเบียนซึ่งเป็นบุคคลธรรมดาถึงแก่
+                                    # ความตาย" (VAT registration transfer on the owner's death —
+                                    # not excluded by the blocklist, but not a new-registration
+                                    # doc either), so `_good` looked non-empty and the fallback
+                                    # below never ran — VAT silently vanished from "which licenses
+                                    # do I need to open a restaurant" answers (qa_12case case 10).
+                                    # Only trust `_good` as-is when something in it actually LOOKS
+                                    # like new registration; otherwise still attempt the fallback
+                                    # scan below and prefer whatever it finds.
+                                    _good_confirmed = any(
+                                        _NEW_REG_OBD_RE.search(
+                                            (getattr(d, "metadata", {}) or {}).get("operation_by_department", "")
+                                        )
+                                        for d in _good
+                                    )
+                                    if not _good or not _good_confirmed:
+                                        # similarity_search returned only edit-type (or otherwise
+                                        # unconfirmed) docs for this license_type (e.g. VAT: 22/25
+                                        # Chroma docs are edit-type, similarity always surfaces
+                                        # those). Fall back to a direct metadata scan, preferring a
+                                        # confirmed new-reg OBD match, so we find the new-reg doc
+                                        # reliably instead of settling for a weak/atypical survivor.
                                         _fb_raw = _coll_sw.get(
                                             where={"license_type": lt_miss},
                                             include=["documents", "metadatas"],
                                         )
                                         from langchain_core.documents import Document as _LCDoc
+                                        _fb_confirmed: Optional["_LCDoc"] = None
+                                        _fb_unconfirmed: Optional["_LCDoc"] = None
                                         for _fb_doc, _fb_meta in zip(
                                             _fb_raw.get("documents") or [],
                                             _fb_raw.get("metadatas") or [],
                                         ):
                                             _op = (_fb_meta.get("operation_by_department") or "").strip()
-                                            if not _SWEEP_EDIT_RE.search(_op):
-                                                _good = [_LCDoc(page_content=_fb_doc, metadata=_fb_meta)]
-                                                _LOG.debug(
-                                                    "[Supervisor] sweep fallback coll.get %r: new-reg doc found (op=%r)",
-                                                    lt_miss, _op[:60],
-                                                )
+                                            if _SWEEP_EDIT_RE.search(_op):
+                                                continue
+                                            _cand = _LCDoc(page_content=_fb_doc, metadata=_fb_meta)
+                                            if _NEW_REG_OBD_RE.search(_op):
+                                                _fb_confirmed = _cand
                                                 break
+                                            if _fb_unconfirmed is None:
+                                                _fb_unconfirmed = _cand
+                                        _fb_pick = _fb_confirmed or _fb_unconfirmed
+                                        if _fb_pick is not None:
+                                            _good = [_fb_pick]
+                                            _LOG.debug(
+                                                "[Supervisor] sweep fallback coll.get %r: new-reg doc found (op=%r, confirmed=%s)",
+                                                lt_miss, (_fb_pick.metadata or {}).get("operation_by_department", "")[:60],
+                                                _fb_confirmed is not None,
+                                            )
                                     return _good[:2]
                                 except Exception as _lt_e:
                                     _LOG.debug("[Supervisor] sweep skip %r: %s", lt_miss, _lt_e)
@@ -4672,8 +5120,21 @@ class PersonaSupervisor:
             # marketing / business_guide content fields
             "answer_guideline": 1500, "main_topic": 120, "sub_topic": 150,
         }
+        # PDF book content (2026-09 bug fix): this whole slimming block is an independent
+        # DUPLICATE of persona_practical.py's _retrieve_docs() capping logic — that one was
+        # already fixed to give ingested_via="pdf_auto" business_guide docs a much higher
+        # answer_guideline cap (PDF_KNOWHOW_CHUNK_MAX_CHARS-sized chunks, up to 24000 chars),
+        # but this copy was missed. Live-reproduced: a query whose fallback retrieval routed
+        # through THIS function (not _retrieve_docs()) got its correct PDF-book answer
+        # silently re-truncated to 1500 chars — the same fixed content (a full page_content
+        # chunk building a real tax-rate table) was cut off mid-way, and the LLM correctly
+        # reported no usable answer for the truncated fragment it was actually shown.
+        _SUPERVISOR_PDF_BOOK_AG_CAP = int(getattr(conf, "LLM_DOC_CHARS_PDF_BOOK", 24000))
         for d in (docs or [])[:top_k]:
             raw_md = getattr(d, "metadata", {}) or {}
+            _sv_lt_val = str(raw_md.get("license_type") or "").strip().lower()
+            _sv_is_bg = _sv_lt_val in ("", "nan", "none")
+            _sv_is_pdf_book = str(raw_md.get("ingested_via") or "").strip().lower() == "pdf_auto"
             slim_md = {}
             for k, v in raw_md.items():
                 if k not in _SUPERVISOR_META_WHITELIST:
@@ -4681,7 +5142,10 @@ class PersonaSupervisor:
                 if v in (None, "", "nan", "None"):
                     continue
                 v_str = str(v)
-                cap = _SUPERVISOR_FIELD_CAPS.get(k)
+                if k == "answer_guideline" and _sv_is_bg and _sv_is_pdf_book:
+                    cap = _SUPERVISOR_PDF_BOOK_AG_CAP
+                else:
+                    cap = _SUPERVISOR_FIELD_CAPS.get(k)
                 slim_md[k] = v_str[:cap] if cap and len(v_str) > cap else v_str
             results.append({"content": (getattr(d, "page_content", "") or "")[:_doc_chars], "metadata": slim_md})
 
@@ -4719,23 +5183,10 @@ class PersonaSupervisor:
     )
     # Action patterns — user wants to perform a registration/application step.
     # Overrides _INFO_Q_RE: even if query looks informational, treat as action.
-    _ACTION_Q_RE = re.compile(
-        r"(อยากจด|อยากสมัคร|อยากขอ|อยากยื่น|อยากลงทะเบียน|"
-        r"ต้องการจด|ต้องการสมัคร|ต้องการขอ|ต้องการยื่น|ต้องการลงทะเบียน|"
-        r"จะจด|จะสมัคร|จะขอใบ|จะยื่น|จะลงทะเบียน|"
-        r"วิธีจด|วิธีสมัคร|วิธีลงทะเบียน|วิธีการลงทะเบียน|"
-        r"ขั้นตอนการจด|ขั้นตอนการสมัคร|ขั้นตอนการขอ|ขั้นตอนการลงทะเบียน|"
-        r"ต้องการแก้ไข|ต้องการเปลี่ยนแปลง|ต้องการยกเลิก|ต้องการต่ออายุ|"
-        r"อยากแก้ไข|อยากเปลี่ยนแปลง|อยากยกเลิก|อยากต่ออายุ|"
-        r"จะแก้ไข|จะเปลี่ยนแปลง|จะยกเลิก|จะต่ออายุ|"
-        r"วิธีแก้ไข|วิธีเปลี่ยนแปลง|วิธียกเลิก|วิธีต่ออายุ|"
-        r"ขั้นตอนการแก้ไข|ขั้นตอนการเปลี่ยนแปลง|ขั้นตอนการยกเลิก|ขั้นตอนการต่ออายุ|"
-        r"จะเปิด|จะทำร้าน|จะทำธุรกิจ|อยากเปิด|อยากทำร้าน|อยากทำธุรกิจ|"
-        # Bare "ขอใบ(อนุญาต)" / "ยื่นขอใบ" without modal prefix — implies action, not info.
-        # Negative lookahead: exclude renewal context (ต่ออายุ/หมดอายุ within 20 chars).
-        r"(?:ขอ|ยื่น(?:\s*ขอ)?)\s*ใบ(?:อนุญาต)?(?!.{0,20}(?:ต่ออายุ|ต่อ\s*อายุ|หมดอายุ|สิ้นอายุ)))",
-        re.IGNORECASE,
-    )
+    # Promoted to utils.text_patterns.ACTION_INTENT_RE (2026-09) as the single
+    # shared definition — see that module for why (a narrower drifted copy of
+    # this exact pattern was found in persona_practical.py's fee-info gate).
+    _ACTION_Q_RE = _SHARED_ACTION_INTENT_RE
     # Document/requirement question — "เอกสารอะไรบ้าง", "ต้องใช้เอกสารอะไรบ้าง" etc. These
     # always have an entity/registration-type-dependent answer (the required-documents list
     # is exactly the field that splits by entity_type in the source data), so they must never
@@ -5318,12 +5769,56 @@ class PersonaSupervisor:
                             _LOG.warning("[Supervisor] info-query fee doc supplement failed: %s", _e_fee)
             # Fix A: if query clearly implies one operation, infer operation_group and
             # re-retrieve focused docs so practical answers only that operation.
-            _lt_infoq = next(
-                (((d.get("metadata") or {}).get("license_type") or "").strip()
-                 for d in docs if isinstance(d, dict)
-                 if ((d.get("metadata") or {}).get("license_type") or "").strip()),
-                "",
-            )
+            # Determine the dominant license_type among retrieved docs — NOT just the first
+            # one seen (2026-10, live-reproduced: "ร้านจด VAT แล้วใช้ POS ออกใบกำกับภาษี
+            # ต้องขออนุมัติเครื่องกับสรรพากรก่อนไหมคะ" retrieved both VAT and POS ID docs, but
+            # the old code took whichever doc happened to be first in the list — VAT, since it's
+            # the first word of the query — and silently filtered out POS ID for the rest of
+            # this turn, even though POS ID was the actual regulatory process being asked
+            # about). Count distinct license_types first; only invoke the LLM tie-breaker when
+            # counts don't already make one dominant (≥60% of docs or ≥2× the runner-up — same
+            # dominance threshold already used for entity disambiguation elsewhere in this
+            # file) — EXCEPT raw doc count turned out to be an unreliable dominance signal for
+            # license_type specifically (unlike for entity_type, where it transfers fine):
+            # live-reproduced with the VAT+POS ID case, VAT retrieved 10 docs vs POS ID's 5,
+            # clearing a 60%-dominance bar easily — but that 2:1 ratio just reflects VAT having
+            # more sub-topic rows indexed in the corpus overall, not that the QUESTION is twice
+            # as much about VAT. Doc count answers "how much does this corpus have on each
+            # license", not "which one is this question about" — so for license_type the LLM
+            # tie-breaker is invoked whenever 2+ distinct license_types appear at all, skipping
+            # only when the second-place license has just a single stray doc (likely noise/
+            # keyword-overlap, not a real second topic).
+            _lt_counts_iq: Dict[str, int] = {}
+            for _d_iq in docs:
+                if not isinstance(_d_iq, dict):
+                    continue
+                _lt_iq = ((_d_iq.get("metadata") or {}).get("license_type") or "").strip()
+                if _lt_iq:
+                    _lt_counts_iq[_lt_iq] = _lt_counts_iq.get(_lt_iq, 0) + 1
+            _lt_infoq = ""
+            if len(_lt_counts_iq) == 1:
+                _lt_infoq = next(iter(_lt_counts_iq))
+            elif len(_lt_counts_iq) >= 2:
+                _sorted_lts_iq = sorted(_lt_counts_iq, key=_lt_counts_iq.get, reverse=True)
+                _top_lt_iq, _second_lt_iq = _sorted_lts_iq[0], _sorted_lts_iq[1]
+                _second_n_iq = _lt_counts_iq[_second_lt_iq]
+                if _second_n_iq < 2:
+                    _lt_infoq = _top_lt_iq
+                else:
+                    _dominant_iq = self._classify_license_dominance(query, _top_lt_iq, _second_lt_iq, state=state)
+                    if _dominant_iq:
+                        _lt_infoq = _dominant_iq
+                        _LOG.info(
+                            "[Supervisor] info-query multi-license: classifier picked dominant=%r (candidates=%s)",
+                            _dominant_iq, _sorted_lts_iq[:2],
+                        )
+                    else:
+                        _LOG.info(
+                            "[Supervisor] info-query multi-license: classifier says genuinely both — merging %s",
+                            _sorted_lts_iq[:2],
+                        )
+                        self._merge_multi_license_docs(state, query, _sorted_lts_iq[:2])
+                        docs = state.current_docs or docs
             if _lt_infoq:
                 try:
                     _og_res_iq = self._get_operation_groups_for_entity(_lt_infoq, "", state=state)
@@ -6051,7 +6546,30 @@ class PersonaSupervisor:
                     except Exception as _e_ot_7:
                         _LOG.warning("[Supervisor] Step7 op_topic re-retrieve failed: %s", _e_ot_7)
 
-        remaining = [s for s in all_slots if s["key"] not in collected_keys]
+        # Also exclude slot keys the user already explicitly declined to single-select
+        # (e.g. "ทั้งสองแบบครับ") — see _SKIPPED_SLOT_KEYS_CTX_KEY's docstring. Without this,
+        # a skip only removes the one pending_slot instance; this same discovery step would
+        # otherwise re-add the identical key moments later from the next unfiltered retrieval
+        # (docs still span multiple values for it) and re-ask it in rephrased wording forever.
+        _skipped_keys_lq = set(state.context.get(self._SKIPPED_SLOT_KEYS_CTX_KEY) or [])
+        remaining = [
+            s for s in all_slots
+            if s["key"] not in collected_keys and s["key"] not in _skipped_keys_lq
+        ]
+
+        # Guarantee comprehensive coverage for THIS topic too (2026-10): entity_type was
+        # just filtered out of `remaining` above purely because the user declined it on some
+        # EARLIER, possibly unrelated topic this session (see _SKIPPED_SLOT_KEYS_CTX_KEY and
+        # _merge_both_entity_docs_after_skip's docstrings) — not because it's already known.
+        # Without this, THIS topic silently never gets asked AND never gets the compensating
+        # both-entity merge either, leaving it to luck (an unrelated sibling-completion
+        # mechanism) whether the final answer actually covers both entity types.
+        if (
+            "entity_type" in _skipped_keys_lq
+            and "entity_type" not in collected_keys
+            and any(s["key"] == "entity_type" for s in all_slots)
+        ):
+            self._merge_both_entity_docs_after_skip(state, query, license_type_hint=license_type)
 
         if not remaining:
             return
@@ -6108,6 +6626,7 @@ class PersonaSupervisor:
                         _broad_lq = [d for d, _ in hybrid_scored_search(
                             _vstore_lq, _lq_query, k=5,
                             rrf_k=int(getattr(conf, "HYBRID_RRF_K", 60)),
+                            bm25_bypass_min_ratio=float(getattr(conf, "BM25_BYPASS_MIN_RATIO", 0.35)),
                         )]
                     else:
                         _tmp_broad_lq = _vstore_lq.as_retriever(search_kwargs={"k": 5})
@@ -6812,7 +7331,7 @@ class PersonaSupervisor:
         # detection, greeting detection, or legal-question guards.
         _ps = ctx.get("pending_slot")
         pending_key = str((_ps.get("key") if isinstance(_ps, dict) else None) or "")
-        _SLOT_REPLY_ALWAYS = {"topic", "operation_group", "operation_sub_type", "operation_topic", "registration_type", "department", "entity_type", "location", "shop_area_type", "area_size", "choice"}
+        _SLOT_REPLY_ALWAYS = self._SLOT_REPLY_ALWAYS_KEYS
 
         # Switch/persona guards: exempt _SLOT_REPLY_ALWAYS slots so that e.g. typing a bank name
         # ("kasikorn") while answering the department slot is never mis-classified as a persona
@@ -7064,12 +7583,143 @@ class PersonaSupervisor:
         except Exception:
             _LOG.warning("[Supervisor] startup: license type validation failed", exc_info=True)
 
+    # Thin wrapper around utils.text_patterns' shared constant (moved there 2026-10 so
+    # persona_academic.py can share the same guard — see that module's docstring for
+    # the full history/rationale, same precedent as _filter_by_specific_topic_conflict).
+    _NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE = _SHARED_NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE
+
+    def _nonreg_chapter_semantic_check(self, q: str) -> Tuple[str, float, str]:
+        """Thin wrapper around utils.text_patterns.nonreg_chapter_semantic_check
+        (moved there 2026-10 so persona_academic.py can share the same guard —
+        see that function's docstring for the full history/rationale)."""
+        return _shared_nonreg_chapter_semantic_check(self.retriever, q, log_prefix="[Supervisor] ")
+
+    def _filter_by_specific_topic_conflict(
+        self, q: str, candidates: List[str], label: str = "candidate",
+    ) -> List[str]:
+        """Thin wrapper around utils.text_patterns.filter_by_specific_topic_conflict
+        (moved there 2026-09 so persona_academic.py can share the same guard —
+        see that function's docstring for the full history/rationale)."""
+        return _shared_filter_by_specific_topic_conflict(q, candidates, label=label, log_prefix="[Supervisor] ")
+
     def _get_chroma_collection(self):
         """Return the raw Chroma collection object from the practical retriever, or None."""
         vectorstore = getattr(self._practical.retriever, "vectorstore", None)
         if vectorstore is None:
             return None
         return getattr(vectorstore, "_collection", None)
+
+    def _merge_cross_chapter_docs_for_nonreg(
+        self, existing_docs: List[Dict], existing_main_topic: str, q: str, max_add: int = 5,
+    ) -> List[Dict]:
+        """2026-09: for non-regulatory (marketing/business_guide) chapter-fetch results,
+        additionally pull in docs from OTHER main_topics via the normal hybrid retrieval
+        path.
+
+        Chapter-fetch guarantees completeness of whichever chapter it exact-matched — but
+        the marketing/business_guide know-how content sometimes has the SAME concept
+        covered in two different sheets under two different main_topic labels (e.g. a
+        query naming "กลยุทธ์การตั้งราคา" exact-matches the thinner "เพิ่มยอดขายง่ายๆ" chapter
+        from one book, while "กลยุทธ์ด้านราคา" — a different sheet's much more comprehensive
+        26-item chapter — is what the question actually needs). Live-verified that plain
+        semantic/hybrid retrieval (bypassing chapter-fetch) already finds that other chapter
+        correctly on its own; chapter-fetch just never gives it a chance to run. This only
+        ADDS docs on top of what chapter-fetch found — never removes or reorders anything —
+        so a clean single-chapter match for OTHER non-reg questions is unaffected beyond a
+        few extra candidate docs the LLM is free to ignore if not relevant (Evidence-First
+        rule already constrains it to cite only genuinely relevant DOCUMENTS).
+        Scoped to non-regulatory data_type only, both here and at each call site.
+
+        REVISED 2026-09 (qa_12case case 12 follow-up): originally only added the top
+        `max_add` semantically-ranked individual docs from the other main_topic — capped
+        low to avoid ballooning doc count for the common case, but for a genuinely
+        comprehensive sibling chapter that cap silently excludes real categories the LLM
+        never gets a chance to cite. Live-reproduced: case 12's query ("ตั้งราคาเมนู...
+        มีหลักคิดยังไงบ้าง") exact-matched the WRONG primary chapter ("การเข้าใจพื้นฐานการ
+        ขายสินค้า" — a generic sales-basics chapter whose sub_topic happens to be literally
+        named "การตั้งราคา") while the actually-relevant "กลยุทธ์ด้านราคา" chapter only rode
+        along as a secondary merge capped at 5 of its 26 items — missing the "คู่แข่ง
+        เปลี่ยนแปลงราคา" category entirely, and the answer fell back on ungrounded general
+        pricing knowledge to fill the gap instead. Fixed: once a sibling main_topic is
+        identified as relevant via the semantic top-hit, fetch its FULL chapter (same
+        `where={"main_topic": ...}` pattern the primary chapter already gets) instead of
+        a capped sample — the same "guarantee completeness of whichever chapter is
+        relevant" principle already applied to the primary match, now applied consistently
+        to the secondary one too. Still bounded: only the single most relevant OTHER
+        main_topic gets the full-chapter treatment, not every semantic hit's chapter —
+        this isn't a general "fetch everything" widening. Falls back to the original
+        capped-sample behavior if the full fetch fails or no other main_topic stands out.
+        """
+        try:
+            _sem_docs = self._practical._retrieve_docs(q)
+        except Exception as e:
+            _LOG.warning("[Supervisor] cross-chapter merge retrieval failed: %s", e)
+            return existing_docs
+
+        _seen_hashes = {hash((d.get("content") or "")[:200]) for d in existing_docs}
+        _added: List[Dict] = []
+
+        # Single most relevant OTHER main_topic among the top semantic hits (already
+        # ranked, so the first qualifying one is the best candidate for a full fetch).
+        _other_mt = ""
+        for d in _sem_docs:
+            md = d.get("metadata") or {}
+            if str(md.get("data_type") or "").strip().lower() not in ("marketing", "business_guide"):
+                continue
+            _mt = str(md.get("main_topic") or "").strip()
+            if _mt and _mt != existing_main_topic:
+                _other_mt = _mt
+                break
+
+        if _other_mt:
+            try:
+                _cc_coll = self._get_chroma_collection()
+                _cc_res = _cc_coll.get(where={"main_topic": _other_mt}, include=["documents", "metadatas"])
+                for c, m in zip(_cc_res.get("documents") or [], _cc_res.get("metadatas") or []):
+                    _h = hash((c or "")[:200])
+                    if _h in _seen_hashes:
+                        continue
+                    _seen_hashes.add(_h)
+                    _added.append({"content": c or "", "metadata": m or {}})
+            except Exception as e:
+                _LOG.warning(
+                    "[Supervisor] cross-chapter full-fetch failed for %r, falling back to capped sample: %s",
+                    _other_mt, e,
+                )
+
+        if not _added:
+            # Fallback: original capped top-K sample — covers the full-fetch failure
+            # case above, and the case where no single OTHER main_topic stood out
+            # clearly enough among the top hits to justify a full-chapter fetch.
+            for d in _sem_docs:
+                md = d.get("metadata") or {}
+                if str(md.get("data_type") or "").strip().lower() not in ("marketing", "business_guide"):
+                    continue
+                _mt = str(md.get("main_topic") or "").strip()
+                if not _mt or _mt == existing_main_topic:
+                    continue
+                _h = hash((d.get("content") or "")[:200])
+                if _h in _seen_hashes:
+                    continue
+                _seen_hashes.add(_h)
+                _added.append(d)
+                if len(_added) >= max_add:
+                    break
+        if _added:
+            _LOG.info(
+                "[Supervisor] cross-chapter merge (non-reg): +%d doc(s) from other main_topic(s) "
+                "for chapter %r", len(_added), existing_main_topic,
+            )
+        # Merged docs go FIRST, not appended at the end: persona_practical.py's
+        # "_direct_topic_match" informational-overview cap does a plain [:N] slice on
+        # whatever chapter-fetch returned, so appending at the end meant the merged
+        # docs were silently sliced off entirely whenever the primary chapter alone
+        # already had ≥N docs (live-verified: cap kept 5/17, all 5 from the primary
+        # chapter, 0 from the merge). Putting the semantically-ranked cross-chapter
+        # hits first ensures they survive that cap — reasonable given the primary
+        # chapter is, by construction of this whole code path, the one whose exact
+        # text match didn't fully satisfy the query in the first place.
+        return _added + existing_docs
 
     def _discover_slots_for_license(self, license_type: str, known_entity_type: Optional[str] = None) -> List[Dict]:
         """
@@ -9323,6 +9973,297 @@ class PersonaSupervisor:
         )
         return _fb_opts, _fb_map
 
+    def _merge_both_entity_docs_after_skip(
+        self, state: ConversationState, query: str, license_type_hint: str = "",
+    ) -> None:
+        """Called whenever entity_type is being silently withheld from a slot_queue because
+        the user already explicitly declined ("ทั้งสองแบบครับ") to pick one — SOMEWHERE in
+        this session, not necessarily for the CURRENT topic (see _SKIPPED_SLOT_KEYS_CTX_KEY's
+        docstring: deliberately session-scoped, same lifetime as collected_slots, matching how
+        an actual stated entity_type answer already persists across unrelated later topics —
+        2026-10 design discussion: a decline is as durable a fact about this user as an answer
+        is, so it should be remembered the same way; what must NOT vary by topic is whether the
+        resulting answer is actually comprehensive).
+
+        2026-10 follow-up fix: originally only called from the slot_skip branch for the EXACT
+        topic that triggered the skip. Live-tested that this left later, unrelated topics that
+        ALSO have an entity split (e.g. asking about a liquor license after declining
+        entity_type for a commercial-registration question) silently unprotected — they
+        happened to still get a reasonable answer via an unrelated sibling-completion
+        mechanism in persona_practical.py, but nothing guaranteed that for every topic. Now
+        called from BOTH the slot_skip branch (license_type_hint="", derived from
+        state.current_docs) AND _maybe_build_slot_queue_from_docs's own discover-slots step
+        (license_type_hint=<that function's own license_type>) so every topic where entity_type
+        would have been asked, had it not been pre-emptively skipped, gets the same guarantee.
+
+        Fetches each real entity_type_normalized value's own best-matching docs for `query`
+        independently (same per-entity-scored-search shape used elsewhere in this file for
+        analogous "don't let one category starve another out of a shared top-K" situations)
+        and prepends them onto state.current_docs. Prepending, not appending, because
+        multiple downstream caps in persona_practical.py take a first-N slice of
+        state.current_docs — appending here would let this exact fix get silently truncated
+        back out, the same failure mode already fixed once this session for the QR Payment
+        cross-reference (see that fix's own comment in persona_practical.py for the precedent).
+        """
+        try:
+            _lt_for_merge = (license_type_hint or "").strip()
+            if not _lt_for_merge:
+                for _d in (state.current_docs or []):
+                    if not isinstance(_d, dict):
+                        continue
+                    _lt_for_merge = str((_d.get("metadata") or {}).get("license_type") or "").strip()
+                    if _lt_for_merge:
+                        break
+            if not _lt_for_merge:
+                return
+            _coll_for_merge = self._get_chroma_collection()
+            if _coll_for_merge is None:
+                return
+            _res_for_merge = _coll_for_merge.get(where={"license_type": _lt_for_merge}, include=["metadatas"])
+            _entity_vals = sorted({
+                str((_m or {}).get("entity_type_normalized") or "").strip()
+                for _m in (_res_for_merge.get("metadatas") or [])
+            } - {"", "nan", "None"})
+            if len(_entity_vals) < 2:
+                # No real entity split for this license_type — nothing to merge; the
+                # normal retrieval already covers it correctly on its own.
+                return
+            _per_entity_cap = 3
+            # Hard total ceiling independent of how many entity values exist (2026-10,
+            # defensive): today's real data only ever has 2 (นิติบุคคล/บุคคลธรรมดา), so
+            # _per_entity_cap alone already bounds this at 6 docs in practice — but nothing
+            # upstream guarantees a future license_type/corpus update can't introduce 3+
+            # entity_type_normalized values (e.g. a third "ห้างหุ้นส่วนสามัญ"-style bucket
+            # some sheet row uses inconsistently). Capping the TOTAL merged count, not just
+            # the per-entity count, keeps prompt size/cost bounded regardless of how the
+            # underlying data shape evolves, without relying on that shape staying as-is.
+            _total_merge_cap = 8
+            _seen_content_hashes: set = set()
+
+            # Per-entity semantic search (unchanged shape) — collected into a dict first
+            # instead of appended straight into one flat list, so the interleave step below
+            # can control ordering across entities (see why, further down).
+            _entity_doc_lists: Dict[str, List[Dict[str, Any]]] = {}
+            for _ev in _entity_vals:
+                try:
+                    _entity_doc_lists[_ev] = self._practical._retrieve_docs(
+                        query,
+                        metadata_filter={"license_type": _lt_for_merge, "entity_type_normalized": _ev},
+                        max_docs=_per_entity_cap,
+                    )
+                except Exception as _e_ev:
+                    _LOG.warning("[Supervisor] merge_both_entity_docs: per-entity retrieve failed for %r: %s", _ev, _e_ev)
+                    _entity_doc_lists[_ev] = []
+
+            # Guaranteed inclusion of a legal/penalty-bearing doc per entity (2026-10,
+            # live-reproduced, 2 iterations): a real case needed the
+            # "ป้ายชื่อต้องตรงกับชื่อที่จดทะเบียน" signage/legal text, which lives in a
+            # general "about this entity" row that's SEPARATE from the operation-specific
+            # sub-case rows (e.g. นิติบุคคล's name-change has 4 sub-case variants:
+            # จองชื่อแล้ว/ยังไม่จองชื่อ/ชื่อพิเศษ/ไม่มีตราประทับ) — raising the per-entity cap
+            # from 3 to 5 didn't reliably surface it (ranking against an operation-specific
+            # query structurally favors operation-specific rows every time, not a close call
+            # a bigger cap fixes). First attempt tried identifying "the general profile doc"
+            # by an operation_topic naming pattern ("รูปแบบ<entity>", whitespace-collapsed)
+            # — this BROKE on real data: นิติบุคคล's profile row really is "รูปแบบนิติบุคคล"
+            # (no internal space) but the sub-case rows are labelled "รูปแบบ นิติบุคคล" (WITH
+            # a space) — collapsing whitespace made the matcher treat them as the same row,
+            # the same two-near-identical-labels trap already hit once this session (the
+            # op-intent filter bug). บุคคลธรรมดา's equivalent row is named completely
+            # differently again ("บุคคลธรรมดา กิจการเจ้าของคนเดียว") — confirming topic-name
+            # pattern-matching can't generalize here at all. Match on the FIELD actually
+            # needed instead: any doc for this entity with a non-empty legal_regulatory,
+            # picking the longest if several exist — direct metadata lookup, zero reliance
+            # on embedding similarity, so this can never lose a ranking competition again.
+            for _ev in _entity_vals:
+                _docs_for_ev = _entity_doc_lists.get(_ev) or []
+                _already_has_legal = any(
+                    str((_d.get("metadata") or {}).get("legal_regulatory") or "").strip()
+                    for _d in _docs_for_ev
+                )
+                if _already_has_legal:
+                    continue
+                try:
+                    _res_legal = _coll_for_merge.get(
+                        where={"$and": [{"license_type": _lt_for_merge}, {"entity_type_normalized": _ev}]},
+                        include=["metadatas", "documents"],
+                    )
+                except Exception as _e_legal:
+                    _LOG.warning("[Supervisor] merge_both_entity_docs: legal-doc lookup failed for %r: %s", _ev, _e_legal)
+                    continue
+                _best_legal_doc: Optional[Dict[str, Any]] = None
+                _best_legal_len = 0
+                for _lmd, _ldoc in zip(_res_legal.get("metadatas") or [], _res_legal.get("documents") or []):
+                    _legal_text = str((_lmd or {}).get("legal_regulatory") or "").strip()
+                    if len(_legal_text) > _best_legal_len:
+                        _best_legal_len = len(_legal_text)
+                        _best_legal_doc = {"content": _ldoc or "", "metadata": _lmd or {}}
+                if _best_legal_doc is not None:
+                    _entity_doc_lists.setdefault(_ev, []).append(_best_legal_doc)
+                    _LOG.info(
+                        "[Supervisor] merge_both_entity_docs: guaranteed legal_regulatory doc for %r (topic=%r, not in top-%d)",
+                        _ev, (_best_legal_doc["metadata"] or {}).get("operation_topic"), _per_entity_cap,
+                    )
+
+            # Interleave round-robin across entities instead of block-concatenating one
+            # entity's docs before the other (2026-10, live-reproduced): _entity_vals is
+            # alphabetically sorted, and in Thai that puts "นิติบุคคล" (ขึ้นต้น น, U+0E19)
+            # before "บุคคลธรรมดา" (ขึ้นต้น บ, U+0E1A) EVERY time, for EVERY license_type
+            # this split exists for — not a coincidence of this one case. Block-concatenating
+            # meant นิติบุคคล's docs always landed at the very front of the prompt and
+
+            # บุคคลธรรมดา's always came after — confirmed via direct, deterministic
+            # reproduction (no embedding ranking involved) that this ordering is 100%
+            # fixed, call after call. A real case showed the downstream effect: the
+            # LLM consistently wrote a complete, detailed section for whichever entity's
+            # docs it saw first (นิติบุคคล) and a shortchanged one for whichever it saw
+            # later (บุคคลธรรมดา) — an LLM attention/position effect, not random
+            # variance, so no prompt-wording fix could have closed it; only removing the
+            # structural position advantage can. Round-robin (doc 1 of every entity, then
+            # doc 2 of every entity, ...) means neither entity structurally owns the
+            # front of the prompt.
+            _merged_docs: List[Dict[str, Any]] = []
+            _max_len = max((len(v) for v in _entity_doc_lists.values()), default=0)
+            for _i in range(_max_len):
+                if len(_merged_docs) >= _total_merge_cap:
+                    break
+                for _ev in _entity_vals:
+                    if len(_merged_docs) >= _total_merge_cap:
+                        break
+                    _docs_for_ev = _entity_doc_lists.get(_ev) or []
+                    if _i >= len(_docs_for_ev):
+                        continue
+                    _d_ev = _docs_for_ev[_i]
+                    _h = hash((_d_ev.get("content") or "")[:120])
+                    if _h not in _seen_content_hashes:
+                        _seen_content_hashes.add(_h)
+                        _merged_docs.append(_d_ev)
+            if _merged_docs:
+                _existing = [
+                    d for d in (state.current_docs or [])
+                    if hash((d.get("content") or "")[:120]) not in _seen_content_hashes
+                ]
+                state.current_docs = _merged_docs + _existing
+                _LOG.info(
+                    "[Supervisor] merge_both_entity_docs: license=%r entities=%s → +%d doc(s) prepended (total=%d)",
+                    _lt_for_merge, _entity_vals, len(_merged_docs), len(state.current_docs),
+                )
+        except Exception as _e_merge:
+            _LOG.warning("[Supervisor] merge_both_entity_docs failed: %s", _e_merge)
+
+    def _classify_license_dominance(
+        self, query: str, license_a: str, license_b: str, state: ConversationState = None,
+    ) -> str:
+        """Cheap LLM tie-breaker for when retrieved docs span 2 distinct license_types with
+        neither clearly dominant by doc count (2026-10, live-reproduced — see
+        _merge_multi_license_docs's docstring for the real case this was built for).
+
+        Returns license_a, license_b, or "" (meaning genuinely about both — caller should
+        merge rather than pick one). Deliberately NOT a regex/keyword heuristic: the earlier
+        attempt at this (checking _SUPERVISOR_KW_OVERRIDE / _MULTI_TOPIC_LICENSE_KEYWORDS for
+        a "which keyword appears" answer) can't actually tell "A is just context, B is the
+        real ask" from "both are equally the real ask" — that's a judgment about what the
+        SENTENCE is doing, not what words appear in it, and hand-coding detection for every
+        future context-vs-ask phrasing pattern doesn't scale (same reasoning already applied
+        to the EDC case's "ติดต่อใคร" scope decision — see [[edc_department_vs_service_channel_2026-10]]).
+        """
+        try:
+            prompt = build_license_dominance_detect_prompt(query, license_a, license_b)
+            model = getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL)
+            timeout = int(getattr(conf, "LLM_TOPIC_PICKER_TIMEOUT", 8))
+            llm = ChatOpenAI(
+                model=model,
+                openai_api_key=conf.OPENROUTER_API_KEY,
+                openai_api_base=conf.OPENROUTER_BASE_URL,
+                http_client=get_shared_http_client(),
+                temperature=0.0,
+                max_tokens=300,
+                request_timeout=timeout,
+                model_kwargs={"response_format": {"type": "json_object"}},
+            )
+            text = extract_llm_text(
+                llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/license_dominance", state=state)
+            ).strip()
+            text = self._strip_code_fences(text)
+            obj = json.loads(text)
+            choice = str(obj.get("dominant") or "").strip().upper()
+            if choice == "A":
+                return license_a
+            if choice == "B":
+                return license_b
+            return ""  # "both" or anything unparseable → treat as genuinely multi, safer default
+        except Exception as _e_dom:
+            _LOG.warning("[Supervisor] license_dominance classify failed: %s — defaulting to first-seen license", _e_dom)
+            return license_a
+
+    def _merge_multi_license_docs(
+        self, state: ConversationState, query: str, license_types: List[str],
+    ) -> None:
+        """Called when a query's retrieved docs span 2+ distinct license_types and
+        _classify_license_dominance decided none is dominant — the query is genuinely about
+        more than one license at once (2026-10, live-reproduced: "ร้านจด VAT แล้วใช้ POS
+        ออกใบกำกับภาษี ต้องขออนุมัติเครื่องกับสรรพากรก่อนไหมคะ" mentions VAT only as an
+        already-true precondition, but a near-identical-shaped question COULD genuinely ask
+        about 2 licenses as co-equal asks — this fix covers that case too, not just the one
+        that happened to be tested).
+
+        Fetches each license_type's own best-matching docs independently (same per-category
+        search shape as _merge_both_entity_docs_after_skip, generalized from entity_type to
+        license_type) and interleaves them into state.current_docs round-robin — NOT
+        block-concatenated by license, for the same reason _merge_both_entity_docs_after_skip
+        stopped block-concatenating by entity: whichever license's docs land first in the
+        prompt gets more complete treatment from the LLM, a positional effect confirmed live
+        in [[name_change_entity_order_bias_2026-10]].
+
+        Relies on prompts_practical.py's existing "No cross-license_type overgeneralization"
+        rule (one section per license_type actually present in DOCUMENTS) to format the
+        resulting answer — not yet verified live whether that rule's completeness holds up
+        for a genuine 2-license answer the way the analogous entity_type rule needed an
+        explicit completeness mandate added; check this before assuming it just works.
+        """
+        try:
+            _per_license_cap = 3
+            _total_cap = 8
+            _license_doc_lists: Dict[str, List[Dict[str, Any]]] = {}
+            for _lt in license_types:
+                try:
+                    _license_doc_lists[_lt] = self._practical._retrieve_docs(
+                        query, metadata_filter={"license_type": _lt}, max_docs=_per_license_cap,
+                    )
+                except Exception as _e_lt:
+                    _LOG.warning("[Supervisor] merge_multi_license: retrieve failed for %r: %s", _lt, _e_lt)
+                    _license_doc_lists[_lt] = []
+
+            _merged_docs: List[Dict[str, Any]] = []
+            _seen_hashes: set = set()
+            _max_len = max((len(v) for v in _license_doc_lists.values()), default=0)
+            for _i in range(_max_len):
+                if len(_merged_docs) >= _total_cap:
+                    break
+                for _lt in license_types:
+                    if len(_merged_docs) >= _total_cap:
+                        break
+                    _docs_for_lt = _license_doc_lists.get(_lt) or []
+                    if _i >= len(_docs_for_lt):
+                        continue
+                    _d = _docs_for_lt[_i]
+                    _h = hash((_d.get("content") or "")[:120])
+                    if _h not in _seen_hashes:
+                        _seen_hashes.add(_h)
+                        _merged_docs.append(_d)
+            if _merged_docs:
+                _existing = [
+                    d for d in (state.current_docs or [])
+                    if hash((d.get("content") or "")[:120]) not in _seen_hashes
+                ]
+                state.current_docs = _merged_docs + _existing
+                _LOG.info(
+                    "[Supervisor] merge_multi_license: licenses=%s → +%d doc(s) prepended (total=%d)",
+                    license_types, len(_merged_docs), len(state.current_docs),
+                )
+        except Exception as _e_merge_lt:
+            _LOG.warning("[Supervisor] merge_multi_license failed: %s", _e_merge_lt)
+
     def _route_pending_slot_to_persona(self, state: ConversationState, user_input: str) -> Tuple[ConversationState, str]:
         _raw_pending = (state.context or {}).get("pending_slot")
         pending = _raw_pending if isinstance(_raw_pending, dict) else {}
@@ -9340,6 +10281,28 @@ class PersonaSupervisor:
             _LOG.info("[Supervisor] slot_skip detected for slot=%r input=%r", pending.get("key"), _raw_ui[:50])
             state.context = state.context or {}
             state.context.pop("pending_slot", None)
+            # Record this key as explicitly declined (2026-10, live-reproduced): without this,
+            # a skip only removes the CURRENT pending_slot instance — _maybe_build_slot_queue_from_docs
+            # re-discovers slot dimensions from the next unfiltered retrieval and, finding the
+            # same key still ambiguous (e.g. docs still span both entity_type values because the
+            # user never actually picked one), re-adds and re-asks the SAME key in newly-rephrased
+            # wording. A real customer answering "ทั้งสองแบบครับ" to an entity_type question hit
+            # exactly this: skip → re-ask → skip → re-ask, never converging to an answer covering
+            # both. Tracked keys are checked at every `remaining = [s for s in all_slots if ...]`
+            # site (see _SKIPPED_SLOT_KEYS_CTX_KEY's other usages) so a key the user has already
+            # declined once is never re-asked again this session, on this topic.
+            _skipped_key = str(pending.get("key") or "").strip()
+            if _skipped_key:
+                _skipped_set = set(state.context.get(self._SKIPPED_SLOT_KEYS_CTX_KEY) or [])
+                _skipped_set.add(_skipped_key)
+                state.context[self._SKIPPED_SLOT_KEYS_CTX_KEY] = list(_skipped_set)
+                if _skipped_key == "entity_type":
+                    # See clarification_flags.py's ENTITY_INJECTION_SKIP_FLAGS /
+                    # DYNAMIC_CLARIFICATION_SKIP_FLAGS entries for why this flag exists:
+                    # persona_practical.py's own independent entity-injection check (and
+                    # _maybe_dynamic_clarification below) must not re-ask the identical
+                    # question through their own separate mechanisms.
+                    state.context["_entity_type_explicitly_skipped"] = True
             _next_queue = list(state.context.get("topic_slot_queue") or [])
             if _next_queue:
                 # Advance to next slot in queue
@@ -9361,6 +10324,23 @@ class PersonaSupervisor:
                 _last_q = (state.context.get("last_user_legal_query") or state.context.get("last_topic") or "").strip()
                 if _last_q and not _last_q.startswith("__"):
                     self._ensure_practical_retrieval_for_legal(state, _last_q)
+                    # entity_type explicitly declined, not just "unknown" (2026-10, live-
+                    # reproduced): the retrieval _ensure_practical_retrieval_for_legal just ran
+                    # filters for entity_type_normalized=="" (entity-neutral docs only) when no
+                    # entity is known — correct for a genuinely universal fact, but when the
+                    # user explicitly said "ทั้งสองแบบครับ" the entity-SPECIFIC docs for BOTH
+                    # values are exactly what's needed, and this filter silently excludes both.
+                    # Real corpus shape confirmed: the cancellation procedure for ใบทะเบียนพาณิชย์
+                    # lives inside each entity's own general "รูปแบบ [entity]" row, not a row
+                    # named after the operation — plain semantic search on the user's "ยกเลิก..."
+                    # phrasing ranked unrelated rows (lost-certificate, apply-on-behalf-of, etc.)
+                    # above it, so the final answer was INFO_GAP even though the real answer was
+                    # retrievable. Fetch each entity value's own best-matching docs directly
+                    # (same per-entity-scored-search pattern, so neither entity's content can
+                    # starve the other out of a shared top-K) and merge, instead of trusting one
+                    # blended semantic search to rank both fairly.
+                    if "entity_type" in (state.context.get(self._SKIPPED_SLOT_KEYS_CTX_KEY) or []):
+                        self._merge_both_entity_docs_after_skip(state, _last_q)
                     st2, reply = self._practical.handle(state, _last_q, _internal=False)
                     reply = self._normalize_male(reply)
                     self._add_assistant(st2, reply)
@@ -9574,6 +10554,9 @@ class PersonaSupervisor:
                     mt for mt in _fb_mt_candidates
                     if mt.lower() in _fb_q_lower and len(mt) >= 5
                 ]
+                _fb_matched_mts = self._filter_by_specific_topic_conflict(
+                    str(mapped), _fb_matched_mts, label="fallback main_topic"
+                )
                 if _fb_matched_mts:
                     _fb_target_mt = max(_fb_matched_mts, key=len)
                     try:
@@ -9620,6 +10603,9 @@ class PersonaSupervisor:
                                 or ot.lower() in _fb_raw_lower
                             )
                         ]
+                        _fb_matched_ots = self._filter_by_specific_topic_conflict(
+                            _fb_raw_lower, _fb_matched_ots, label="fallback operation_topic"
+                        )
                         if _fb_matched_ots:
                             _fb_target_ot = max(_fb_matched_ots, key=len)
                             _fb_ot_coll = self._get_chroma_collection()
@@ -9641,6 +10627,51 @@ class PersonaSupervisor:
                                     state.last_retrieval_query = str(mapped)
                                     state.context["last_topic"] = _fb_target_ot
                                     state.context["last_user_legal_query"] = str(mapped)
+                                    # Entity variety: same check as the primary retrieval path's
+                                    # op_topic/sub_topic sites — inject entity_type slot when docs
+                                    # cover both บุคคลธรรมดา and นิติบุคคล and entity not yet known.
+                                    # Without this, _direct_topic_match below silently disables
+                                    # persona_practical.py's own entity-variety check with no
+                                    # replacement (2026-09 audit finding — this duplicated fallback
+                                    # path had zero entity-injection logic of its own).
+                                    _fb_session_et = str(
+                                        (state.context.get("collected_slots") or {}).get("entity_type") or ""
+                                    ).strip()
+                                    if not _fb_session_et and self._entity_slot_needed(str(mapped)):
+                                        _et_in_fb = {
+                                            str(d.get("metadata", {}).get("entity_type_normalized") or "").strip()
+                                            for d in _fb_ot_docs
+                                        } - {"", "nan", "None"}
+                                        _fb_combined_content = any(
+                                            re.search(r"บุคคลธรรมดา\s*\d+\.", str((m or {}).get("identification_documents") or ""))
+                                            and re.search(r"นิติบุคคล\s*\d+\.", str((m or {}).get("identification_documents") or ""))
+                                            for m in (_fb_ot_res.get("metadatas") or [])
+                                        )
+                                        _fb_et_mixed = (
+                                            ("นิติบุคคล" in _et_in_fb and "บุคคลธรรมดา" in _et_in_fb)
+                                            or _fb_combined_content
+                                        )
+                                        if _fb_et_mixed:
+                                            _sq_fb = list((state.context or {}).get("topic_slot_queue") or [])
+                                            # Also true for an explicit decline, not just an actual answer —
+                                            # see the _et_already_known_ot sibling site above for the real
+                                            # case this was found in (QR Payment kept re-asking forever).
+                                            _et_already_known_fb = bool(
+                                                (state.get_collected_slots() if hasattr(state, "get_collected_slots") else {}).get("entity_type")
+                                            ) or "entity_type" in (state.context.get(self._SKIPPED_SLOT_KEYS_CTX_KEY) or [])
+                                            if not _et_already_known_fb and not any(s.get("key") == "entity_type" for s in _sq_fb):
+                                                _et_sorted_fb = sorted(_et_in_fb) if len(_et_in_fb) >= 2 else ["นิติบุคคล", "บุคคลธรรมดา"]
+                                                state.context["topic_slot_queue"] = [{
+                                                    "key": "entity_type",
+                                                    "options": _et_sorted_fb,
+                                                    "display_options": _et_sorted_fb,
+                                                    "question": "ร้านของคุณดำเนินการในรูปแบบใดครับ",
+                                                }] + _sq_fb
+                                                _LOG.info(
+                                                    "[Supervisor] topic-slot op_topic %r has mixed entity types %s"
+                                                    " — asking entity_type first",
+                                                    _fb_target_ot, _et_sorted_fb,
+                                                )
                                     state.context["_direct_topic_match"] = True
                                     _LOG.info(
                                         "[Supervisor] topic-slot op_topic retrieval: %r → %d docs",
@@ -11410,7 +12441,11 @@ class PersonaSupervisor:
                             _collected_keys = set(_cs_area.keys()) | set(_ctx_slots_area.keys())
                         except Exception:
                             _collected_keys = set()
-                        _remaining = [s for s in _all_slots if s["key"] not in _collected_keys]
+                        _skipped_keys_area = set(state.context.get(self._SKIPPED_SLOT_KEYS_CTX_KEY) or [])
+                        _remaining = [
+                            s for s in _all_slots
+                            if s["key"] not in _collected_keys and s["key"] not in _skipped_keys_area
+                        ]
                         # Also remove entity_type itself (just answered)
                         _remaining = [s for s in _remaining if s["key"] != "entity_type"]
 
@@ -12463,6 +13498,14 @@ class PersonaSupervisor:
                 and not self._LEGAL_SIGNAL_RE.search(_remainder)
                 and not self._looks_like_legal_question(_remainder, state)
                 and not self._LIKELY_SELECTION_RE.match(_remainder)
+                # Defense-in-depth (2026-09): _handle_deflect's own docstring lists this
+                # "greeting+personal-question" site as one of 3 callers sharing the same
+                # off-topic-guardrail intent — the other 2 (2.2c, unknown_intent) already got
+                # this marketing bypass when a real "เทคนิคในการทำให้ยอดขายขึ้น"-style query was
+                # found deflecting instead of answering. This site had the identical gap and
+                # is reachable independently of _looks_like_greeting_or_thanks' own fix above
+                # (e.g. via the self-intro/greeting_llm_check routes into _handle_greeting).
+                and not self._MARKETING_NOT_ELAB_RE.search(_remainder)
             ):
                 # Noise check: very short OR mostly-repeated-char remainder (e.g. "yyyyyyd", "d") = greeting extension
                 _NOISE_REMAINDER_RE = re.compile(r"^[a-zA-Z]{1,3}$|^[a-zA-Z]*(.)\1{3,}[a-zA-Z]*$", re.IGNORECASE)
@@ -13027,6 +14070,19 @@ class PersonaSupervisor:
         # BYPASS: skip entirely when pending_slot is active — user is answering a slot question,
         # not asking a new topic (e.g. "นิติ" as answer to entity_type question).
         _pending_slot_active = bool((state.context or {}).get("pending_slot"))
+        # Whether the CURRENT pending_slot (if any) is one of the "always treat as a slot
+        # reply" keys — computed once here, reused by sections 2.3/2.4/2.5 below (each of
+        # which can return early via _silent_switch_to_academic) so none of them hijack an
+        # answer to one of these slots before _should_route_pending_slot_now/2.6 ever gets
+        # a chance to apply the SAME exemption. See _SLOT_REPLY_ALWAYS_KEYS's docstring for
+        # the live-reproduced bug this closes ("ทั้งสองแบบเลยครับ" answering a
+        # registration_type question silently switched personas instead of being treated
+        # as a slot reply/skip).
+        _pending_slot_key_for_ps = str(
+            (((state.context or {}).get("pending_slot") or {}).get("key")
+             if isinstance((state.context or {}).get("pending_slot"), dict) else None) or ""
+        )
+        _pending_slot_is_reply_always = _pending_slot_key_for_ps in self._SLOT_REPLY_ALWAYS_KEYS
         # Also bypass 2.2c when there is an active legal conversation — short follow-ups
         # like "แล้วถ้าเป็นนิติบุคคลอ่ะ" lack standalone keywords but are clearly in-domain.
         _has_active_legal_ctx = bool(
@@ -13038,6 +14094,14 @@ class PersonaSupervisor:
         elif (
             raw_stripped
             and not self._LEGAL_SIGNAL_RE.search(raw_stripped)
+            # Marketing/sales-technique signal (live-verified 2026-09): LEGAL_SIGNAL_RE has zero
+            # marketing vocabulary, so a query like "เทคนิคในการทำให้ยอดขายขึ้น" fell all the way
+            # to this guardrail's Chroma fallback below -- which only checks plain dense
+            # similarity_search_with_relevance_scores (k=1, threshold 0.72). That query's real
+            # top dense score against the actual matching "เพิ่มยอดขายง่าย ๆ..." chapter was only
+            # 0.408 (confirmed live), so the fallback missed it too and every such question got
+            # deflected with a generic clarifying question instead of ever reaching retrieval.
+            and not self._MARKETING_NOT_ELAB_RE.search(raw_stripped)
             and not self._LIKELY_SELECTION_RE.match(raw_stripped)
             and not self._ANY_NUMBER_RE.search(raw_stripped)
             and not self._QUESTION_MARKERS_RE.search(raw_stripped)
@@ -13115,10 +14179,27 @@ class PersonaSupervisor:
         # "ละเอียดกว่านี้" — these are style requests even if they contain a legal keyword.
         # Heuristic: wants_long + short input (≤10 words) + explicit depth modifier present.
         _raw_is_legal = self._looks_like_legal_question(raw_stripped, state)
+        # Computed BEFORE the (potentially expensive) style classifier call below so that
+        # call can be skipped entirely during a protected pending_slot (2026-10 efficiency
+        # fix — see _pending_slot_is_reply_always's docstring for the correctness side of
+        # this same gate). "ทั้ง..." excluded on purpose: it's the exact word family
+        # ("ทั้งสองแบบ", "ทั้งหมดเลย") that is ALSO this slot's own skip-decline vocabulary
+        # (_SLOT_SKIP_RE / build_slot_skip_detect_prompt) — live-reproduced that trusting
+        # the depth-keyword regex on "ทั้งหมดเลยค่ะ" during a pending slot would silently
+        # reopen the exact academic-mode-hijack bug this whole chain exists to close,
+        # because the skip-interpretation can only be confirmed later (LLM fallback,
+        # inside _route_pending_slot_to_persona) — never trust this regex alone on a "ทั้ง..."
+        # phrase while a slot is pending; let it fall through to slot-skip handling instead.
+        _has_explicit_depth = bool(self._DEPTH_DETAIL_RE.search(raw_stripped))
+        _explicit_depth_safe_during_slot = _has_explicit_depth and "ทั้ง" not in raw_stripped
+        _skip_style_classifier_for_slot = _pending_slot_is_reply_always and not _explicit_depth_safe_during_slot
         # _last_q_for_style pre-computed above before pre-warm block.
         _style_pw_key = (raw_stripped[:80], (_last_q_for_style or "")[:80])
         _style_pw_hit = (state.context or {}).get("_style_pw_cache", {}).get(_style_pw_key)
-        style = _style_pw_hit if _style_pw_hit is not None else self._infer_user_style_request_hybrid(raw_stripped, _last_q_for_style, state=state)
+        if _skip_style_classifier_for_slot:
+            style: Dict[str, Any] = {}
+        else:
+            style = _style_pw_hit if _style_pw_hit is not None else self._infer_user_style_request_hybrid(raw_stripped, _last_q_for_style, state=state)
         # _is_short_depth_followup: allows academic switch even when input has legal keywords.
         # Two paths:
         # A) Regex path: explicit depth keyword (e.g. เจาะลึก, ละเอียด) — always accepted.
@@ -13132,7 +14213,6 @@ class PersonaSupervisor:
         # asking about a specific item from the PREVIOUS answer, not requesting a new academic
         # deep-dive.  Practical LLM can handle this via conversation history.
         _is_numbered_item_ref = bool(re.search(r'ช่องทางที่\s*\d+|วิธีที่\s*\d+', raw_stripped))
-        _has_explicit_depth = bool(self._DEPTH_DETAIL_RE.search(raw_stripped))
         _is_short_depth_followup = (
             style.get("wants_long")
             and _raw_is_legal
@@ -13150,19 +14230,36 @@ class PersonaSupervisor:
                 )
             )
         )
-        if style.get("wants_long") and (not _raw_is_legal or _is_short_depth_followup):
+        # Pending-slot exemption (2026-10, live-reproduced — see _SLOT_REPLY_ALWAYS_KEYS):
+        # an answer to one of these slots (e.g. registration_type's "ทั้งสองแบบเลยครับ")
+        # must never be hijacked into a persona switch here, before 2.6/
+        # _should_route_pending_slot_now ever gets a chance to apply the identical
+        # exemption — that later check is useless if this earlier one already returned.
+        # Narrow carve-out: an UNAMBIGUOUS explicit depth request ("...แบบละเอียดเจาะลึก...")
+        # unrelated to "ทั้ง..." wording is still honored even mid-slot (see
+        # _explicit_depth_safe_during_slot above) — a genuine "switch me to deep mode"
+        # request shouldn't be silently swallowed just because a slot happens to be pending.
+        if (
+            (not _pending_slot_is_reply_always or _explicit_depth_safe_during_slot)
+            and style.get("wants_long")
+            and (not _raw_is_legal or _is_short_depth_followup)
+        ):
             return self._silent_switch_to_academic(state, raw_stripped)
         # wants_short or legal question: continue to practical routing below
 
         # 2.4) explicit target in text + switch verb -> silent switch
         explicit_target = self._infer_target_persona_from_text(raw_stripped)
-        if explicit_target in {"academic", "practical"} and any(v in self._normalize_for_intent(raw_stripped) for v in self._SWITCH_VERBS):
+        if (
+            not _pending_slot_is_reply_always
+            and explicit_target in {"academic", "practical"}
+            and any(v in self._normalize_for_intent(raw_stripped) for v in self._SWITCH_VERBS)
+        ):
             if explicit_target == "academic":
                 return self._silent_switch_to_academic(state, raw_stripped)
             # explicit_target == "practical": already in practical, continue routing
 
         # 2.5) switch without target -> silent switch to academic (toggle)
-        if self._looks_like_switch_without_target(raw_stripped, state):
+        if not _pending_slot_is_reply_always and self._looks_like_switch_without_target(raw_stripped, state):
             cur = normalize_persona_id(state.persona_id)
             if cur != "academic":
                 return self._silent_switch_to_academic(state, raw_stripped)

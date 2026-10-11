@@ -56,29 +56,67 @@ OPENROUTER_MODEL_TOPIC_PICKER = os.getenv("OPENROUTER_MODEL_TOPIC_PICKER", OPENR
 # cheapest if revisiting later, OpenRouter's lineup changes often.
 OPENROUTER_MODEL_PDF_MATCHING = os.getenv("OPENROUTER_MODEL_PDF_MATCHING", "qwen/qwen3.7-flash")
 
-# PDF review queue: classification/boundary-finding tasks (content-shape
-# routing, license/know-how topic-splitting) — added 2026-08-25 after
-# realizing these 3 functions had been silently reusing
-# OPENROUTER_MODEL_PRACTICAL (the main chat persona's model, claude-sonnet-
-# 4-5) purely because that constant already existed, not from any deliberate
-# quality decision for THIS task.
+# PDF review queue: classify_content_shape ONLY (content-shape routing —
+# structured_license vs know_how) — added 2026-08-25 after realizing this
+# function had been silently reusing OPENROUTER_MODEL_PRACTICAL (the main
+# chat persona's model, claude-sonnet-4-5) purely because that constant
+# already existed, not from any deliberate quality decision for THIS task.
 #
 # DECISION 2026-08-25: live-tested 6 cheaper alternatives (qwen3.7-flash,
 # qwen3-30b-a3b, deepseek-v4-flash, deepseek-v4-pro, gemini-2.5-flash-lite,
-# claude-haiku-4-5) across all 3 functions, 5-15 synthetic cases x 3 runs
-# each. deepseek-v4-flash/-pro came closest but still fell short on
-# classify_content_shape's secondary_pages field (73-87% vs sonnet-4-5's
-# 100%) — this is the field that catches mixed-shape documents (e.g. a
-# license procedure buried inside an otherwise-know_how PDF), and a miss
-# there means that buried license never gets candidate-matched against the
-# regulatory Sheet at all (caught by a human reviewer eventually, but not
-# automatically). Given this function decides which drafting pipeline a
-# real document runs through, the user chose to keep it on the proven
-# claude-sonnet-4-5 rather than trade accuracy for cost here — same model
-# OPENROUTER_MODEL_PRACTICAL already uses, kept as its own constant so this
-# task's model can still be changed independently later without touching
-# the main chat persona.
+# claude-haiku-4-5), 5-15 synthetic cases x 3 runs each. deepseek-v4-flash/
+# -pro came closest but still fell short on classify_content_shape's
+# secondary_pages field (73-87% vs sonnet-4-5's 100%) — this is the field
+# that catches mixed-shape documents (e.g. a license procedure buried
+# inside an otherwise-know_how PDF), and a miss there means that buried
+# license never gets candidate-matched against the regulatory Sheet at all
+# (caught by a human reviewer eventually, but not automatically). Given
+# this function decides which drafting pipeline a real document runs
+# through, the user chose to keep it on the proven claude-sonnet-4-5 rather
+# than trade accuracy for cost here.
+#
+# REVISED 2026-09: this constant used to ALSO back identify_knowhow_topics
+# and identify_license_topics (the 2 topic-splitting functions) — they'd
+# been switched here alongside classify_content_shape in the same 2026-08-25
+# change, sharing this constant purely because it was introduced at the same
+# time, not because topic-splitting was itself tested and found to need
+# sonnet's accuracy. Split out to their own OPENROUTER_MODEL_PDF_TOPIC_SPLIT
+# below once real-document testing showed they have a very different
+# cost/accuracy profile than classification does — see that constant's
+# comment for what changed and why.
 OPENROUTER_MODEL_PDF_CLASSIFICATION = os.getenv("OPENROUTER_MODEL_PDF_CLASSIFICATION", "anthropic/claude-sonnet-4-5")
+
+# PDF review queue: identify_knowhow_topics + identify_license_topics (topic-
+# BOUNDARY splitting, not classification or content drafting) — split out
+# from OPENROUTER_MODEL_PDF_CLASSIFICATION 2026-09 after real-document
+# testing (not the synthetic cases the 2026-08-25 decision above used) found
+# this task has a much lower accuracy bar to clear than classification does:
+# the actual topic TEXT is always sliced verbatim from the source pages by
+# the caller afterward (see pdf_knowhow_drafting.py's docstring) — an LLM
+# here only ever decides where a boundary falls, never writes content a user
+# would read, so a slightly-off boundary costs a reviewer a re-split, not a
+# wrong fact reaching a real answer.
+#
+# DECISION 2026-09: live-tested against 2 real (not synthetic) documents —
+# a 242-page know-how book and a 250-page page sample of a real regulatory
+# compilation — comparing sonnet-4-5 (previous default) against qwen3.7-
+# flash, claude-haiku-4-5, and gemini-2.5-flash-lite on BOTH topic-splitting
+# functions. qwen3.7-flash was cheapest but badly unreliable at real batch
+# sizes (85-100+ page batches): inconsistent topic counts across identical
+# repeated runs, 51% of pages dropped entirely on the 242-page test, and
+# occasional stray non-Thai characters in Thai output. claude-haiku-4-5 was
+# both worse AND more expensive than gemini at this scale (45/242 pages
+# dropped, $0.33 vs gemini's $0.018 for the same document) — not worth
+# considering further. gemini-2.5-flash-lite won clearly on both real
+# documents: MORE complete than sonnet-4-5 itself (12/242 vs sonnet's 14/242
+# missing pages on the know-how book; 14/250 missing vs sonnet's much larger
+# gaps on the regulatory compilation, correctly split into 15 distinct real
+# statutes/regulations), no stray-language artifacts observed, at roughly
+# 1/90 to 1/150 of sonnet's cost on these two documents. Kept as its own
+# constant (not reusing OPENROUTER_MODEL_PDF_CLASSIFICATION) precisely so
+# this task's model can keep moving independently of classify_content_shape,
+# which has a proven, different, higher accuracy bar to clear.
+OPENROUTER_MODEL_PDF_TOPIC_SPLIT = os.getenv("OPENROUTER_MODEL_PDF_TOPIC_SPLIT", "google/gemini-2.5-flash-lite")
 
 # PDF review queue: draft_fields_from_pages — writes the actual regulatory
 # content (department, license type, fees, steps, legal basis, etc.) that
@@ -132,6 +170,20 @@ OPENROUTER_MODEL_PDF_DRAFTING = os.getenv("OPENROUTER_MODEL_PDF_DRAFTING", "anth
 # quality complaints on documents that went through this path.
 OPENROUTER_MODEL_PDF_VISION = os.getenv("OPENROUTER_MODEL_PDF_VISION", "google/gemini-2.5-flash-lite")
 
+# Native-text-layer image-detection check (2026-09) — see utils/pdf_text_layer.py's
+# _page_needs_ocr_for_visual_content(). Separate constant from
+# OPENROUTER_MODEL_PDF_VISION above on purpose even though they default to the
+# same model today: that one re-verifies OCR TEXT accuracy on already-OCR'd
+# pages; this one answers a completely different question ("does this
+# NATIVE-text page have a meaningful image get_text() can't see") on pages
+# that would otherwise skip OCR entirely. Kept independently tunable so a
+# future change to one doesn't silently retune the other, the same lesson
+# already learned once this session with OPENROUTER_MODEL_PDF_CLASSIFICATION
+# vs OPENROUTER_MODEL_PDF_TOPIC_SPLIT sharing a constant by accident.
+# Real-measured cost: $0.0001355/page (2026-09 live test) — ~8.6 cents for a
+# 634-page document even if every qualifying page needed the check.
+OPENROUTER_MODEL_PDF_IMAGE_CHECK = os.getenv("OPENROUTER_MODEL_PDF_IMAGE_CHECK", "google/gemini-2.5-flash-lite")
+
 # FIX: wrap conversions in try/except so bad env vars give clear error instead of crashing silently
 def _safe_float(name: str, default: float) -> float:
     raw = os.getenv(name, str(default))
@@ -181,18 +233,85 @@ LLM_DOCS_MAX_ACADEMIC = _safe_int("LLM_DOCS_MAX_ACADEMIC", 12)    # raised: 5 �
 
 LLM_DOC_CHARS_PRACTICAL = _safe_int("LLM_DOC_CHARS_PRACTICAL", 700)   # reduced 1200→700: metadata fields carry key info
 LLM_DOC_CHARS_ACADEMIC = _safe_int("LLM_DOC_CHARS_ACADEMIC", 700)    # raised: 500 → 700 (need full metadata fields)
-LLM_DOC_CHARS_BUSINESS_GUIDE = _safe_int("LLM_DOC_CHARS_BUSINESS_GUIDE", 3500)  # business_guide: answer_guideline is sole content field — needs full coverage
-LLM_DOC_CHARS_KNOWHOW = _safe_int("LLM_DOC_CHARS_KNOWHOW", 4000)  # know_how (feature/pdf-ingestion): full_text is sole content field, same reasoning as above
-PAGE_CONTENT_MAX_CHARS = _safe_int("PAGE_CONTENT_MAX_CHARS", 2500)    # raised 1800→2500: fit legal_regulatory into embedding
+LLM_DOC_CHARS_BUSINESS_GUIDE = _safe_int("LLM_DOC_CHARS_BUSINESS_GUIDE", 5500)  # business_guide: answer_guideline is sole content field — needs full coverage. Raised 3500→5500 (2026-09 cost-reduction audit): real corpus max is 4901 chars, 2 docs were silently truncated at 3500; matches data_loader.py's embedding-time cap (also 5500) so metadata is never less complete than content.
+# Raised 1800→2500 (fit legal_regulatory), 2500→7500 (2026-09, fit terms_and_conditions —
+# a card-payment settlement-time table went silently missing from search because it sat near
+# the end of _build_page_content's field ordering with no cap of its own), 7500→12000 (same
+# session: auditing every field's cap against the REAL corpus length distribution — not just
+# reacting to the one reported case — found operation_steps, legal_regulatory, terms_and_
+# conditions, identification_documents, and service_channel were ALL under-sized, silently
+# truncating 18-56% of the docs that have each field), then 12000→18000 (same session again:
+# an alcohol-license EDC requirement was STILL truncated at the p95+ caps because it sat past
+# even those — caps now cover each field's real CURRENT MAX + ~25% headroom instead of just
+# p95, per user request to genuinely stop losing content rather than just reduce how often it
+# happens). New worst case: 1800+2000+2300+2100+900+300+600+5500+300=15800 + head (~500) +
+# labels/separators (~150) ≈ 16450 if EVERY field hit its own cap simultaneously on one row —
+# 18000 leaves margin above that. Confirmed safe: feature/pdf-ingestion's own testing (direct
+# OpenRouter embeddings calls, bypassing langchain, see code/utils/pdf_text_chunking.py's
+# module docstring) already empirically proved baai/bge-m3 embeds up to ~42,300 Thai
+# characters with NO silent truncation — 18000 stays well under that with real margin to
+# spare, so this is not a guess about model capacity, just reusing an already-verified fact.
+PAGE_CONTENT_MAX_CHARS = _safe_int("PAGE_CONTENT_MAX_CHARS", 18000)
+LLM_DOC_CHARS_KNOWHOW = _safe_int("LLM_DOC_CHARS_KNOWHOW", 4000)  # know_how (feature/pdf-ingestion): full_text is sole content field, same reasoning as LLM_DOC_CHARS_BUSINESS_GUIDE above
+
+# PDF book know-how content (feature/pdf-ingestion, 2026-09 sub-chunking fix):
+# real topics measured up to 19,056 chars (a whole book chapter) were being
+# silently cut to ~1,800-2,500 chars by the generic caps above, making
+# everything past that point invisible to both embedding-based retrieval and
+# the LLM's answer context — the model itself was never the constraint
+# (direct OpenRouter API test confirmed baai/bge-m3 honors its full
+# 8192-token / ~42,300-Thai-char window with zero silent truncation below
+# that; going over it is a hard 400 error, not a quiet truncation). Both
+# constants below are kept intentionally equal so a chunk built at the
+# embedding-side cap never gets re-truncated at the LLM-context stage.
+PDF_KNOWHOW_CHUNK_MAX_CHARS = _safe_int("PDF_KNOWHOW_CHUNK_MAX_CHARS", 24000)  # per-chunk cap when splitting a topic's full_text — comfortably fits the largest real chapter seen (19,056 chars) as ONE chunk, safety margin below the ~40k-42k measured hard wall
+LLM_DOC_CHARS_PDF_BOOK = _safe_int("LLM_DOC_CHARS_PDF_BOOK", 24000)  # matches PDF_KNOWHOW_CHUNK_MAX_CHARS above — only applies to ingested_via="pdf_auto" docs, NOT the legacy Sheet-based business_guide content (LLM_DOC_CHARS_BUSINESS_GUIDE, still 5500), to avoid ballooning token cost for content that was never affected by this bug
 
 # RAG Quality: Minimum similarity threshold
 RETRIEVAL_MIN_SIMILARITY = _safe_float("RETRIEVAL_MIN_SIMILARITY", 0.6)
+
+# PDF book content (2026-09, evidence-based): RETRIEVAL_MIN_SIMILARITY above was
+# calibrated for short, structured regulatory/marketing Sheet rows — it silently
+# drops genuinely-correct PDF-book narrative content, which scores systematically
+# lower on bge-m3 cosine similarity even for the single best-matching chunk.
+# Measured directly against this branch's real test PDF ("เจ๊ง! ในกระดาษ") on
+# 2026-09-16: 5 independently-verified correct query/doc pairs (regression suite
+# categories 1, 3, 4, plus the Top Line/Bottom Line case) scored 0.487-0.577 —
+# ALL below the 0.6 floor, not a one-off near-miss. A 3-query negative-control
+# check (regulatory-only queries with zero relation to the PDF book) found the
+# highest ANY pdf_auto doc scored was 0.3998 — comfortably below every genuine
+# positive match. 0.45 sits in the middle of that gap with margin on both sides.
+# Scoped to ingested_via="pdf_auto" only (same pattern as LLM_DOC_CHARS_PDF_BOOK)
+# — zero effect on regulatory/legacy Sheet-based content, which was never
+# measured to have this problem and whose current 0.6 floor is left untouched.
+RETRIEVAL_MIN_SIMILARITY_PDF_BOOK = _safe_float("RETRIEVAL_MIN_SIMILARITY_PDF_BOOK", 0.45)
 
 # Hybrid RAG: BM25 (sparse) + Dense (embedding) fused with RRF.
 # Set HYBRID_SEARCH_ENABLED=true to activate. Requires pythainlp + rank_bm25.
 # HYBRID_RRF_K: RRF smoothing constant (higher = less rank-sensitive, default 60).
 HYBRID_SEARCH_ENABLED = os.getenv("HYBRID_SEARCH_ENABLED", "false").lower() == "true"
 HYBRID_RRF_K = _safe_int("HYBRID_RRF_K", 60)
+
+# BM25-only bypass ratio (2026-09, evidence-based — follow-up to the
+# RETRIEVAL_MIN_SIMILARITY_PDF_BOOK investigation above). A doc found ONLY by
+# BM25 (missing from Dense results entirely) used to get an UNCONDITIONAL pass
+# through every similarity floor — its actual BM25 relevance score was computed
+# then discarded (utils/hybrid_retriever.py's _rrf_fuse). That let a purely
+# coincidental keyword match (e.g. a bare conjunction appearing in an unrelated
+# document by chance) outrank a genuinely-relevant top candidate that merely
+# scored a hair under the Dense floor — the exact live-reproduced mechanism
+# behind one of the Academic-mode retrieval bugs above.
+#
+# An ABSOLUTE BM25 score threshold doesn't work — raw BM25Okapi scores vary
+# wildly by query (measured top-scores of 12.7, 19.2, 22.8, 27.4, 103.3 across
+# different real queries, no shared scale). A RELATIVE threshold does:
+# measured across 7 real query/doc pairs, every CONFIRMED-relevant BM25 match
+# scored at least 0.556 of its own query's top BM25 score (several genuinely
+# on-topic secondary rows scored 0.556-0.933, not just the literal #1 result —
+# multiple valid docs for one topic naturally differ in length/wording). The
+# one confirmed coincidental false-positive scored only 0.227 of its query's
+# top score. 0.35 sits in that gap with margin on both sides.
+BM25_BYPASS_MIN_RATIO = _safe_float("BM25_BYPASS_MIN_RATIO", 0.35)
 
 # Cross-encoder reranker (Level 3 RAG quality improvement)
 # Set RERANKER_ENABLED=true in env.properties to activate.
@@ -303,6 +422,17 @@ DEBUG_LATENCY = os.getenv("DEBUG_LATENCY", "true").lower() == "true"
 # 1) OpenRouter provider routing — route to the fastest-throughput provider for a given
 #    model. Same model/weights/output, just a different serving path. "" disables it.
 PROVIDER_ROUTING_SORT = os.getenv("PROVIDER_ROUTING_SORT", "throughput").strip().lower()
+# 1b) Pin Anthropic-model calls to OpenRouter's "anthropic" backend specifically
+#    (provider.order=["anthropic"], allow_fallbacks left at OpenRouter's default/true).
+#    Root-caused 2026-09: without this, OpenRouter is free to serve the same model via
+#    Anthropic direct, AWS Bedrock, or GCP Vertex on every call, and prompt-cache state
+#    (cache_control) does not carry over between those backends — so cache_read_tokens
+#    was 0 on effectively every real production call despite the caching mechanism
+#    itself (build_cached_system_message) being independently verified correct in
+#    isolation. Pinning to one backend is what makes repeated cache hits possible at
+#    all; allow_fallbacks stays true so a genuine Anthropic-side outage still fails
+#    over instead of erroring out (only loses the cache benefit during that window).
+PROVIDER_PIN_ANTHROPIC = os.getenv("PROVIDER_PIN_ANTHROPIC", "true").lower() == "true"
 # 2) Anthropic top-level prompt caching for the (large, static) system prompt prefix.
 #    No-op for non-Anthropic models (e.g. GPT-5.1 already gets implicit OpenAI-side
 #    caching with no request change needed). Applied only to the main answer-generation
@@ -383,6 +513,25 @@ AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
 AWS_REGION = os.getenv("AWS_REGION", "")
 PDF_INGESTION_S3_BUCKET = os.getenv("PDF_INGESTION_S3_BUCKET", "")
+# Cross-process Typhoon OCR rate-limit coordination (2026-09) — see
+# utils/pdf_rate_limiter.py's GlobalTyphoonRateLimiter. Shared by every
+# concurrent Lambda invocation AND the EC2 consumer, so they all coordinate
+# against Typhoon's real 2/sec + 20/min ceiling instead of each pacing
+# itself with no idea how many others are calling at the same time. Table
+# must be created manually (see that module's docstring for schema) —
+# empty/missing-table failures fail OPEN to local-only throttling, never
+# block the pipeline.
+PDF_RATE_LIMIT_DYNAMODB_TABLE = os.getenv("PDF_RATE_LIMIT_DYNAMODB_TABLE", "restbiz-pdf-rate-limiter")
+# Deliberately a SEPARATE var from AWS_REGION above, not a reuse of it — the
+# Lambda side of this same feature cannot use AWS_REGION for this purpose at
+# all: AWS_REGION is a Lambda-RESERVED environment variable name (Lambda sets
+# it automatically to the function's own deployed region and blocks any
+# attempt to override it via custom env vars in the console), so a Lambda
+# function deployed in one region can never point this specific lookup at a
+# DynamoDB table living in a different region without a distinct variable
+# name. Falls back to AWS_REGION here on the EC2 side only for convenience
+# when the table happens to live in the same region as everything else.
+PDF_RATE_LIMIT_DYNAMODB_REGION = os.getenv("PDF_RATE_LIMIT_DYNAMODB_REGION", "") or AWS_REGION
 # Keeps dev/test uploads scoped under a clearly-labeled sub-prefix, separate from
 # wherever a real production Lambda might eventually watch within this bucket.
 PDF_INGESTION_S3_PREFIX = os.getenv("PDF_INGESTION_S3_PREFIX", "")
@@ -414,6 +563,10 @@ PDF_SQS_QUEUE_URL = os.getenv("PDF_SQS_QUEUE_URL", "https://sqs.ap-southeast-2.a
 # code/router/monitoring.py). Required header: X-Admin-Key.
 # Unset = those endpoints fail closed (401) rather than being left open.
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
+# Explicit opt-in escape hatch for the admin auth check above — see
+# utils/admin_auth.py's module docstring for why this exists and its scope.
+# Defaults to False (secure) on every deployment unless deliberately set.
+ADMIN_AUTH_DISABLED = os.getenv("ADMIN_AUTH_DISABLED", "false").strip().lower() == "true"
 
 # Hard cap on POST/PUT/PATCH request body size (utils/middleware.py's
 # BodySizeLimitMiddleware) — the largest legitimate payload is a /chat

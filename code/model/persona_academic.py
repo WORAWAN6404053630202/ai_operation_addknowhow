@@ -27,6 +27,11 @@ from utils.text_patterns import (
     detect_entity_type_with_negation as _detect_entity_type_with_negation,
     is_bare_generic_followup as _shared_is_bare_generic_followup,
     extract_info_gap_tag as _shared_extract_info_gap_tag,
+    filter_by_specific_topic_conflict as _shared_filter_by_specific_topic_conflict,
+    effective_min_similarity as _shared_effective_min_similarity,
+    extract_thai_keywords as _shared_extract_thai_keywords,
+    nonreg_chapter_semantic_check as _shared_nonreg_chapter_semantic_check,
+    NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE as _SHARED_NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE,
 )
 
 _LOG = logging.getLogger("restbiz.academic")
@@ -52,6 +57,20 @@ def _aggregate_non_reg_docs(
 
     Groups by sub_topic (fallback: main_topic).  Sub_topics with only 1 doc are
     returned as-is.
+
+    2026-09 bug fix: a group of docs sharing one sub_topic can mean two
+    UNRELATED things — (a) the original case this function was built for,
+    several independent Sheet rows/content_types under one marketing
+    sub_topic, where a "N ประเภท" numbered-snippet overview is the right
+    answer, or (b) sequential CHUNKS of ONE long PDF-book topic that had to
+    be split at ingest time (utils/pdf_text_chunking.py) purely because it
+    exceeded the embedding-size cap — these are NOT "different types", they
+    are one continuous narrative, and collapsing them into 200-char-per-item
+    snippets both mislabels them (a fabricated "types" framing) and re-loses
+    the exact content fix #1 in this session's investigation restored.
+    chunk_total is an unambiguous signal here: only PDF ingestion ever sets
+    it, so its presence (>1) safely distinguishes case (b) from (a) without
+    touching the original Sheet-based behavior at all.
     """
     from collections import OrderedDict as _OD
     groups: "dict[str, list]" = _OD()
@@ -64,6 +83,33 @@ def _aggregate_non_reg_docs(
     for st_key, st_docs in groups.items():
         if len(st_docs) == 1:
             result.append(st_docs[0])
+            continue
+
+        # PDF multi-chunk case: reassemble in chunk_index order instead of
+        # building a lossy "N types" snippet summary — see docstring above.
+        try:
+            _chunk_totals = {int((sd.get("metadata") or {}).get("chunk_total") or 0) for sd in st_docs}
+        except (TypeError, ValueError):
+            _chunk_totals = set()
+        if len(_chunk_totals) == 1 and next(iter(_chunk_totals)) > 1:
+            _ordered = sorted(
+                st_docs,
+                key=lambda sd: int((sd.get("metadata") or {}).get("chunk_index") or 0),
+            )
+            _pdf_book_cap = int(getattr(conf, "LLM_DOC_CHARS_PDF_BOOK", 24000))
+            _full_ag = "\n\n".join(
+                str((sd.get("metadata") or {}).get("answer_guideline") or "").strip()
+                for sd in _ordered
+            ).strip()[:_pdf_book_cap]
+            _md0_chunks = _ordered[0].get("metadata") or {}
+            _combined_md_chunks = {
+                k: v for k, v in _md0_chunks.items()
+                if v not in (None, "", "nan", "None") and str(v) not in ("nan", "None", "")
+            }
+            _combined_md_chunks["answer_guideline"] = _full_ag
+            _combined_md_chunks.pop("chunk_index", None)
+            _combined_md_chunks.pop("chunk_total", None)
+            result.append({"content": _full_ag[:3000], "metadata": _combined_md_chunks})
             continue
 
         md0 = st_docs[0].get("metadata") or {}
@@ -568,7 +614,8 @@ class AcademicPersonaService:
             elif getattr(conf, "HYBRID_SEARCH_ENABLED", False):
                 from utils.hybrid_retriever import hybrid_scored_search
                 _rrf_k_tg = int(getattr(conf, "HYBRID_RRF_K", 60))
-                docs_broad = [d for d, _ in hybrid_scored_search(vectorstore, _q, k=k, rrf_k=_rrf_k_tg)]
+                _bm25_ratio_tg = float(getattr(conf, "BM25_BYPASS_MIN_RATIO", 0.35))
+                docs_broad = [d for d, _ in hybrid_scored_search(vectorstore, _q, k=k, rrf_k=_rrf_k_tg, bm25_bypass_min_ratio=_bm25_ratio_tg)]
             else:
                 tmp_broad = vectorstore.as_retriever(search_kwargs={"k": k})
                 docs_broad = tmp_broad.invoke(_q)
@@ -662,8 +709,40 @@ class AcademicPersonaService:
                         )
                     _q_lower_ac_ch = query.lower()
                     _matched_mts_ac = [mt for mt in self._cached_main_topics if mt.lower() in _q_lower_ac_ch]
+                    _matched_mts_ac = _shared_filter_by_specific_topic_conflict(
+                        query, _matched_mts_ac, label="main_topic", log_prefix="[Academic] "
+                    )
                     if _matched_mts_ac:
                         _target_mt_ac = max(_matched_mts_ac, key=len)
+                        # Regulatory-dominance guard (2026-10, live-reproduced): this is an
+                        # independent copy of persona_supervisor.py's main_topic chapter-fetch
+                        # exact-match (same substring-match shape, written separately for
+                        # Academic mode) — confirmed to have the EXACT same bug, reproduced
+                        # with the same real query: "การจดทะเบียนและขอใบอนุญาตร้านอาหารต้องทำยังไง"
+                        # exact-matches this main_topic's shallow 4-row business_guide chapter
+                        # (just a "2 ประเภท" definition + a VAT-registration stub) while plain
+                        # semantic retrieval ranks a regulatory food-permit document at 0.73 —
+                        # well above the dominance threshold. See
+                        # utils.text_patterns.nonreg_chapter_semantic_check's docstring for the
+                        # full pattern and calibration data (shared with persona_supervisor.py
+                        # so the two copies can't drift onto different thresholds).
+                        _mt_sem_top_dt_ac, _mt_sem_top_score_ac, _ = _shared_nonreg_chapter_semantic_check(
+                            self.retriever, query, log_prefix="[Academic] "
+                        )
+                        _mt_rejected_ac = (
+                            _mt_sem_top_dt_ac == "regulatory"
+                            and _mt_sem_top_score_ac >= _SHARED_NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE
+                        )
+                        if _mt_rejected_ac:
+                            _LOG.info(
+                                "[Academic] main_topic exact-match %r rejected — overall semantic top "
+                                "hit is a confident regulatory match (score=%.3f); falling through to "
+                                "sub_topic/semantic retrieval",
+                                _target_mt_ac, _mt_sem_top_score_ac,
+                            )
+                    else:
+                        _mt_rejected_ac = False
+                    if _matched_mts_ac and not _mt_rejected_ac:
                         _ch_res = _coll_ac.get(
                             where={"main_topic": _target_mt_ac},
                             include=["documents", "metadatas"],
@@ -689,6 +768,9 @@ class AcademicPersonaService:
                         _matched_sts_ac = [
                             st for st in self._cached_sub_topics if st.lower() in _q_lower_ac_ch
                         ]
+                        _matched_sts_ac = _shared_filter_by_specific_topic_conflict(
+                            query, _matched_sts_ac, label="sub_topic", log_prefix="[Academic] "
+                        )
                         if _matched_sts_ac:
                             _target_st_ac = max(_matched_sts_ac, key=len)
                             _st_ch_res = _coll_ac.get(
@@ -726,13 +808,14 @@ class AcademicPersonaService:
 
         _hybrid_ac = getattr(conf, "HYBRID_SEARCH_ENABLED", False)
         _rrf_k_ac = int(getattr(conf, "HYBRID_RRF_K", 60))
+        _bm25_ratio_ac = float(getattr(conf, "BM25_BYPASS_MIN_RATIO", 0.35))
 
         def _ac_search(q: str, k: int, flt=None) -> list:
             """Hybrid or Dense retrieval for Academic — attaches _sim to metadata."""
             vectorstore = getattr(self.retriever, "vectorstore", None)
             if vectorstore is not None and _hybrid_ac:
                 from utils.hybrid_retriever import hybrid_scored_search
-                pairs = hybrid_scored_search(vectorstore, q, k=k, metadata_filter=flt, rrf_k=_rrf_k_ac)
+                pairs = hybrid_scored_search(vectorstore, q, k=k, metadata_filter=flt, rrf_k=_rrf_k_ac, bm25_bypass_min_ratio=_bm25_ratio_ac)
                 result = []
                 for _d, _s in pairs:
                     if _s is not None:
@@ -819,7 +902,19 @@ class AcademicPersonaService:
         # Mirror practical's sim_filter: drop docs below RETRIEVAL_MIN_SIMILARITY.
         # BM25-only docs (_bm25_hit=True) bypass the threshold — same as practical.
         # Fallback: if filter is too aggressive (< 2 docs pass), use top-N by blend.
+        #
+        # PDF book content (2026-09 bug fix, evidence-based — see conf.py's
+        # RETRIEVAL_MIN_SIMILARITY_PDF_BOOK comment for the full measurement):
+        # the global 0.6 floor was silently dropping genuinely-correct PDF-book
+        # narrative content (measured 0.487-0.577 for 5 confirmed-correct real
+        # queries, ALL below 0.6) — live-reproduced as a Top Line/Bottom Line
+        # question landing on an unrelated factory-layout-planning doc instead,
+        # because the correct doc never survived this filter to even become a
+        # topic-menu candidate. Scoped strictly to ingested_via="pdf_auto" so
+        # regulatory/legacy Sheet content keeps the original, unmeasured-as-broken
+        # 0.6 floor exactly as before.
         _min_sim_ac = getattr(conf, "RETRIEVAL_MIN_SIMILARITY", 0.6)
+        _min_sim_pdf_ac = getattr(conf, "RETRIEVAL_MIN_SIMILARITY_PDF_BOOK", 0.45)
         _filtered_ac: list = []
         _low_ac: list = []
         for _d_f in docs:
@@ -827,8 +922,9 @@ class AcademicPersonaService:
             if _md_f_ac.get("_bm25_hit"):
                 _filtered_ac.append(_d_f)
                 continue
+            _eff_min_sim_ac = _shared_effective_min_similarity(_md_f_ac, _min_sim_ac, _min_sim_pdf_ac)
             _score_ac = _md_f_ac.get("_sim")
-            if _score_ac is not None and float(_score_ac) >= _min_sim_ac:
+            if _score_ac is not None and float(_score_ac) >= _eff_min_sim_ac:
                 _filtered_ac.append(_d_f)
             elif _score_ac is not None:
                 _low_ac.append((_d_f, float(_score_ac)))
@@ -1639,6 +1735,9 @@ class AcademicPersonaService:
                 if _mt_val and _mt_val.lower() not in ("nan", "none", ""):
                     _candidate_mts[_mt_val] = _candidate_mts.get(_mt_val, 0) + 1
             _query_matched_mts = [mt for mt in _candidate_mts if mt.lower() in _q_lower_mt]
+            _query_matched_mts = _shared_filter_by_specific_topic_conflict(
+                query, _query_matched_mts, label="topic-menu main_topic pre-filter", log_prefix="[Academic] "
+            )
             if len(_query_matched_mts) == 1:
                 _target_mt = _query_matched_mts[0]
                 _docs_filtered = [
@@ -1654,11 +1753,12 @@ class AcademicPersonaService:
 
         # Map: topic_key → {"label": str, "score": int, "title_score": int, "main_topic": str}
         seen: Dict[str, Dict] = {}
-        if query:
-            _q_clean = re.sub(r'[^\u0E00-\u0E7Fa-zA-Z0-9]', ' ', query.lower())
-            _q_words = [w for w in _q_clean.split() if len(w) >= 3]
-        else:
-            _q_words = []
+        # 2026-09 bug fix: was plain whitespace-split (`re.sub(...).split()`), which
+        # does nothing useful for Thai (no spaces between words) \u2014 see
+        # utils.text_patterns.extract_thai_keywords's docstring for the live-reproduced
+        # failure this caused (a real keyword trapped in an unsplittable blob, a bare
+        # conjunction surviving as a "keyword" and winning by pure coincidence).
+        _q_words = _shared_extract_thai_keywords(query) if query else []
 
         for d in (docs or []):
             md = d.get("metadata") or {}
@@ -1884,10 +1984,14 @@ class AcademicPersonaService:
         # "ประโยชน์ของการตลาดออนไลน์ต่อผู้ขาย" without showing menu.
         _aq_direct = (state.context.get("academic_question") or "").strip().lower()
         if _aq_direct:
-            _direct_matches = [
-                t for t in topics
+            _direct_match_keys = [
+                t["key"] for t in topics
                 if len(t["key"]) >= 6 and t["key"].lower() in _aq_direct
             ]
+            _direct_match_keys = _shared_filter_by_specific_topic_conflict(
+                _aq_direct, _direct_match_keys, label="topic-menu auto-select", log_prefix="[Academic] "
+            )
+            _direct_matches = [t for t in topics if t["key"] in _direct_match_keys]
             if len(_direct_matches) == 1:
                 _auto_key = _direct_matches[0]["key"]
                 _LOG.info("[Academic] Topic auto-selected (direct name in query): %r", _auto_key)
@@ -2060,6 +2164,7 @@ class AcademicPersonaService:
         _has_matched_filtered = any(
             str((d.get("metadata") or {}).get("license_type") or "").strip() == selected_key
             or str((d.get("metadata") or {}).get("main_topic") or "").strip() == selected_key
+            or str((d.get("metadata") or {}).get("sub_topic") or "").strip() == selected_key
             for d in (fresh_docs or [])
         )
         _used_sv_hint = False
@@ -2093,11 +2198,25 @@ class AcademicPersonaService:
                         )
                 except Exception as _e_sv:
                     _LOG.warning("[Academic] supervisor hint retrieval failed (%s)", _e_sv)
-        if not fresh_docs:
+        if not _used_sv_hint and not _has_matched_filtered:
             # Intermediate fallback: try Chroma get() by sub_topic — for marketing/business-guide
             # docs where the menu key is stored as sub_topic not license_type.
             # Using get() (not search) ensures ALL docs for this sub_topic are returned,
             # not just the top-k from semantic ranking (which may miss lower-ranked benefits).
+            #
+            # BUG FIX (2026-09): this used to be gated on `if not fresh_docs:`, but the
+            # comment two blocks up already explains why that's always false — _retrieve_docs
+            # silently substitutes unfiltered semantic results when its metadata filter matches
+            # 0 docs, so fresh_docs is *never* empty here even when the license_type/main_topic
+            # filters both failed (which is the normal case for a sub_topic-keyed topic, since
+            # sub_topic-keyed topics have no license_type/main_topic value equal to selected_key
+            # at all). That made this entire sub_topic get() fallback unreachable dead code —
+            # PDF-book/business_guide topic selections silently kept whatever wrong-topic docs
+            # the earlier unfiltered fallback happened to rank highest (reproduced live: a
+            # Top Line/Bottom Line financial-analysis question landed on an unrelated factory
+            # layout-planning sub_topic and stayed there on every retry). Gating on
+            # `_has_matched_filtered` (same signal already used for the license_type/main_topic
+            # retries above) makes this fallback actually run for sub_topic-keyed topics.
             try:
                 _vstore_ac_st = getattr(self.retriever, "vectorstore", None)
                 _coll_ac_st = getattr(_vstore_ac_st, "_collection", None) if _vstore_ac_st else None
@@ -2792,13 +2911,15 @@ class AcademicPersonaService:
         # academic_question is safe: entity enrichment is already skipped in the contradiction
         # case, so it never carries the stale entity when the user switches entity.
         _original_user_q = user_q or (state.context or {}).get("last_user_legal_query") or ""
-        _NATURAL_STALE_RE = re.compile(r"บุคคลธรรมดา", re.IGNORECASE)
-        _JURISTIC_STALE_RE = re.compile(r"นิติบุคคล|บริษัท|ห้างหุ้นส่วน", re.IGNORECASE)
-        _orig_says_natural = bool(_NATURAL_STALE_RE.search(_original_user_q))
-        _orig_says_juristic = bool(_JURISTIC_STALE_RE.search(_original_user_q))
+        # Uses the canonical shared regexes (utils/text_patterns.py) rather than a local
+        # ad hoc pair — 2026-09 audit found this spot had drifted to a narrower copy that
+        # missed colloquial/typo phrasing (e.g. "เจ้าของคนเดียว", "บุคคลทั่วไป") the shared
+        # version already catches, exactly the drift class text_patterns.py exists to prevent.
+        _orig_says_natural = bool(self._ENTITY_NATURAL_RE.search(_original_user_q))
+        _orig_says_juristic = bool(self._ENTITY_NITI_RE.search(_original_user_q))
         _known_entity = known_slots.get("entity_type", "") or known_slots.get("entity_type_normalized", "")
         if _known_entity:
-            _ke_is_juristic = bool(_JURISTIC_STALE_RE.search(_known_entity))
+            _ke_is_juristic = bool(self._ENTITY_NITI_RE.search(_known_entity))
             _ke_is_natural = _known_entity == "บุคคลธรรมดา"
             if (_ke_is_juristic and _orig_says_natural and not _orig_says_juristic) or \
                (_ke_is_natural and _orig_says_juristic and not _orig_says_natural):
@@ -4288,6 +4409,19 @@ class AcademicPersonaService:
             "identification_documents": 4000,
             "answer_guideline": 1500, "main_topic": 500, "sub_topic": 500,
         }
+        # PDF book content (2026-09 bug fix, ported from persona_practical.py/
+        # persona_supervisor.py — see pdf_chunking_truncation_and_retrieval_fixes
+        # memory for the full chain this belongs to): this file has its OWN
+        # independent copy of the answer_guideline=1500 cap, never audited
+        # alongside the other two. Academic mode explicitly aggregates and
+        # answers from business_guide/marketing docs with no license_type
+        # (_ac_is_non_reg below) — the exact shape PDF book chunks take — so a
+        # user in Academic (deep-dive) mode asking the same question that was
+        # already fixed for Practical mode would hit the identical truncation
+        # here, silently, with no error. Same fix: PDF-book chunks (chunk_max
+        # already bounded to PDF_KNOWHOW_CHUNK_MAX_CHARS at ingest) get the
+        # matching LLM-side cap instead of the generic short-row cap.
+        _ACADEMIC_PDF_BOOK_AG_CAP = int(getattr(conf, "LLM_DOC_CHARS_PDF_BOOK", 24000))
         # Long fields: deduplicate by content hash — send each UNIQUE value once to avoid ×N repetition.
         # identification_documents is intentionally excluded — it varies by entity_type and must
         # come from every matching doc so the complete list reaches the LLM.
@@ -4323,6 +4457,9 @@ class AcademicPersonaService:
         docs_json = []
         for d in _docs_for_ac_llm[:_MAX_DOCS_ACADEMIC]:
             md = d.get("metadata", {}) or {}
+            _ac_lt_val = str(md.get("license_type") or "").strip().lower()
+            _ac_is_bg_doc = _ac_lt_val in ("", "nan", "none")
+            _ac_is_pdf_book = str(md.get("ingested_via") or "").strip().lower() == "pdf_auto"
             filtered_md = {}
             for k, v in md.items():
                 if k not in _ACADEMIC_META_WHITELIST and k not in _ACADEMIC_LONG_FIELDS:
@@ -4340,7 +4477,10 @@ class AcademicPersonaService:
                     v_str = re.sub(r"(https?://)", r"\n\1", v_str).strip()
                 if k in _ACADEMIC_LONG_FIELDS:
                     _academic_long_sent_hashes.add(f"{k}:{v_str[:200]}")
-                cap = _ACADEMIC_FIELD_CAPS.get(k)
+                if k == "answer_guideline" and _ac_is_bg_doc and _ac_is_pdf_book:
+                    cap = _ACADEMIC_PDF_BOOK_AG_CAP
+                else:
+                    cap = _ACADEMIC_FIELD_CAPS.get(k)
                 filtered_md[k] = v_str[:cap] if cap and len(v_str) > cap else v_str
             _ac_content = d.get("content", "") or ""
             if _ac_is_non_reg:
@@ -4980,6 +5120,9 @@ Return JSON:
                                     return True
                             return False
                         _matched_lts = [lt for lt in _lts_in_docs if len(lt) >= 5 and _lt_matches_query(lt)]
+                        _matched_lts = _shared_filter_by_specific_topic_conflict(
+                            _aq_q_lc, _matched_lts, label="post-collapse license_type filter", log_prefix="[Academic] "
+                        )
                         if len(_matched_lts) == 1:
                             _LOG.info(
                                 "[Academic] Post-collapse lt-filter: query names %r → filtering %d → focused docs",

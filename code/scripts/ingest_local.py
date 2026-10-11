@@ -121,6 +121,18 @@ def _normalize_metadata(md: Dict[str, Any]) -> Dict[str, Any]:
 _VALID_DATA_TYPES = {"regulatory", "marketing", "business_guide", "know_how"}
 _VALID_ENTITY_TYPES = {"นิติบุคคล", "บุคคลธรรมดา", ""}
 
+# Every field data_loader.py's _build_page_content folds into the embedded text.
+# Keep this list in sync with that function — it's how _validate_documents (below)
+# catches the "field has real content but never made it into page_content" bug
+# class (e.g. a settlement-time table that was silently unsearchable for months
+# because it sat behind other fields with no cap of its own). If a new field gets
+# added to _build_page_content, add it here too so it's covered by the same check.
+_PAGE_CONTENT_BODY_FIELDS = [
+    "operation_steps", "legal_regulatory", "terms_and_conditions",
+    "identification_documents", "fees", "operation_duration",
+    "service_channel", "answer_guideline", "restaurant_ai_document",
+]
+
 
 def _validate_documents(docs: List[Document]) -> int:
     """
@@ -162,6 +174,31 @@ def _validate_documents(docs: List[Document]) -> int:
             issues.append(
                 f"page_content too short ({len(content)} chars) — embedding quality will be poor"
             )
+
+        # Field-coverage check — catches a populated field that is completely absent
+        # from page_content (silently unsearchable, even though the LLM would still
+        # see the full value via metadata on a lucky retrieval hit). Checks only a
+        # short prefix of each field's value, not the whole thing, so a field that
+        # was legitimately truncated by ITS OWN cap inside _build_page_content
+        # (expected, not a bug) doesn't false-positive here — only TOTAL absence is
+        # flagged. See PAGE_CONTENT_MAX_CHARS in conf.py for the history of this
+        # exact bug class (terms_and_conditions, 2026-09; legal_regulatory before it).
+        #
+        # Both `md` and `content` have already been through normalize_documents by
+        # the time this runs, so they're normally in sync — but a prefix compared
+        # pre-normalization can occasionally land on a duplicate-token boundary that
+        # _normalize_text collapses (e.g. a source typo like "X X เป็น..." dedup'd
+        # to "X เป็น..."), shifting where the prefix starts. Re-normalizing val
+        # before the prefix check removes that class of false positive without
+        # weakening the check — it still only tolerates a normalization artifact,
+        # never a field that's genuinely absent.
+        for field in _PAGE_CONTENT_BODY_FIELDS:
+            val = str(md.get(field) or "").strip()
+            if val and val[:30] not in content and _normalize_text(val)[:30] not in content:
+                issues.append(
+                    f"{field} has content but is completely missing from page_content "
+                    "— will never be found by similarity/BM25 search"
+                )
 
         # Non-regulatory docs must have operation_topic for supervisor topic routing.
         if dt in ("marketing", "business_guide"):
@@ -258,6 +295,32 @@ def main():
     else:
         print("\n[Ingest] Sheet D — Know-how: SHEET_URL_KNOWHOW not set, skipping.")
 
+    # ── Source E: PDF-auto-ingested content (feature/pdf-ingestion, 2026-09) ──
+    # This rebuild (reset=True below) wipes and recreates the ENTIRE collection
+    # from Sheet sources only — anything the PDF direct-ingest path (see
+    # service/pdf_direct_ingest.py) added incrementally between rebuilds would
+    # be silently destroyed the next time anyone runs this script, since it's
+    # not one of the 4 sources above. Snapshot those docs out of the LIVE
+    # collection first (before it gets wiped) and carry them forward into the
+    # new one — a routine Sheet refresh should never need anyone to remember
+    # "don't forget the PDF data", it should just always survive.
+    print("\n[Ingest] Source E — PDF-auto-ingested content (carrying forward across rebuild)...")
+    try:
+        from service.local_vector_store import get_vs_manager
+        _mgr = get_vs_manager()
+        _mgr.connect_to_existing(fail_if_empty=False)
+        _raw = _mgr.vectorstore._collection.get(
+            where={"ingested_via": "pdf_auto"}, include=["documents", "metadatas"],
+        )
+        _pdf_docs = [
+            Document(page_content=c or "", metadata=m or {})
+            for c, m in zip(_raw.get("documents") or [], _raw.get("metadatas") or [])
+        ]
+        all_docs.extend(_pdf_docs)
+        print(f"[Ingest]   → {len(_pdf_docs)} PDF-auto-ingested docs carried forward")
+    except Exception as e:
+        print(f"[Ingest]   ⚠️  Could not read existing PDF-auto-ingested docs, none carried forward: {e}")
+
     # ── Normalize all docs ───────────────────────────────────────────────────
     docs = all_docs
     normalize_documents(docs)
@@ -287,6 +350,25 @@ def main():
     print(f"[Ingest]   know_how docs   : {len(kh_docs)}")
     print(f"[Ingest]   location populated: {len(locs)}/{len(docs)}")
     print(f"[Ingest]   entity_type populated: {len(entities)}/{len(docs)}")
+
+    # Release the read connection opened above (Source E's snapshot) before
+    # reset=True opens a fresh one — live-reproduced 2026-09: keeping both
+    # alive in the same process throws "attempt to write a readonly
+    # database" from chromadb's rust client the moment the new one tries to
+    # write, even though the two point at different paths (old collection
+    # vs. the reset path's temp dir) — chromadb's SharedSystemClient caches
+    # client state per-process regardless. clear_system_cache() is
+    # chromadb's own documented way to drop that cache; without it this
+    # exact snapshot-then-rebuild sequence cannot work in one script run.
+    try:
+        from service.local_vector_store import get_vs_manager
+        from chromadb.api.client import SharedSystemClient
+        _mgr = get_vs_manager()
+        _mgr.vectorstore = None
+        _mgr.retriever = None
+        SharedSystemClient.clear_system_cache()
+    except Exception as e:
+        print(f"[Ingest]   ⚠️  Could not release prior Chroma connection cleanly: {e}")
 
     ingest_documents(docs, reset=True)  # wipe old local chroma before rebuild
 

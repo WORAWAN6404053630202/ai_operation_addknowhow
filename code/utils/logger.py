@@ -4,6 +4,7 @@ Provides structured logging with request tracking, performance metrics, and debu
 """
 
 import logging
+import logging.handlers
 import sys
 import time
 import json
@@ -120,40 +121,68 @@ class HumanReadableFormatter(logging.Formatter):
 def setup_logging(
     level: str = "INFO",
     log_format: str = "human",  # "human" or "json"
-    log_file: Optional[str] = None
+    log_file: Optional[str] = None,
+    log_file_level: str = "WARNING",
+    log_file_max_bytes: int = 5_000_000,
+    log_file_backup_count: int = 5,
 ):
     """
     Setup application logging
-    
+
     Args:
         level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
         log_format: "human" for development, "json" for production
         log_file: Optional file path to write logs
+        log_file_level: Level threshold for the FILE handler specifically —
+            independent of `level` above, which still governs the console
+            handler. 2026-09: this file is meant to survive container
+            recreation on redeploy (see docker run's volume mount) purely for
+            post-incident investigation, not as a full request trace — so it
+            defaults to WARNING (captures every real error/failure, including
+            the many "[X] LLM call failed: %s" sites throughout
+            persona_practical.py/persona_supervisor.py) rather than DEBUG,
+            which would fill the rotation window with routine noise and push
+            out the very history an incident investigation needs. Console
+            output is unaffected and still follows `level` (DEBUG in
+            production today).
+        log_file_max_bytes: Rotate once the active file reaches this size.
+        log_file_backup_count: Old rotated files to keep before deleting the
+            oldest. Default 5MB x 5 backups = ~30MB ceiling total, deliberately
+            small — this is a small EC2 instance and disk costs money; the
+            WARNING-level threshold above means this ceiling should span weeks
+            of real incident history, not hours, despite the small size.
     """
     # Remove existing handlers
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
-    
+
     # Set level
     root_logger.setLevel(getattr(logging, level.upper()))
-    
+
     # Choose formatter
     if log_format == "json":
         formatter = StructuredFormatter()
     else:
         formatter = HumanReadableFormatter()
-    
+
     # Console handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
     root_logger.addHandler(console_handler)
-    
-    # File handler (optional)
+
+    # File handler (optional) — size-based rotation, see log_file_level's
+    # docstring above for why this stays small and WARNING-only by default.
     if log_file:
-        file_handler = logging.FileHandler(log_file)
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_file,
+            maxBytes=log_file_max_bytes,
+            backupCount=log_file_backup_count,
+            encoding="utf-8",
+        )
         file_handler.setFormatter(formatter)
+        file_handler.setLevel(getattr(logging, log_file_level.upper()))
         root_logger.addHandler(file_handler)
-    
+
     # Silence noisy libraries
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)

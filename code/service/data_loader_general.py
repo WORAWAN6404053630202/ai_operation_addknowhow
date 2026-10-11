@@ -24,6 +24,8 @@ from urllib.parse import parse_qs, urlparse
 import pandas as pd
 from langchain_core.documents import Document
 
+import conf
+
 
 class GeneralDataLoader:
     """
@@ -70,14 +72,23 @@ class GeneralDataLoader:
         ),
     }
 
-    def __init__(self, data_type: str, page_content_max_chars: int = 1800):
+    def __init__(self, data_type: str, page_content_max_chars: Optional[int] = None):
         """
         data_type: "marketing" | "business_guide" (stored in doc metadata)
         """
         assert data_type in ("marketing", "business_guide"), \
             f"data_type must be 'marketing' or 'business_guide', got {data_type!r}"
         self.data_type = data_type
-        self.page_content_max_chars = page_content_max_chars
+        # Live-verified (2026-09): both real call sites (scripts/ingest_local.py) construct
+        # this class without passing page_content_max_chars at all, so the old hardcoded
+        # default of 1800 silently ignored conf.PAGE_CONTENT_MAX_CHARS entirely — same bug
+        # class as DataLoader's config={} issue (see that class's __init__ for the other
+        # half of this fix). Default to the real conf value unless a caller explicitly
+        # overrides it.
+        self.page_content_max_chars = (
+            page_content_max_chars if page_content_max_chars is not None
+            else int(getattr(conf, "PAGE_CONTENT_MAX_CHARS", 1800) or 1800)
+        )
         self.documents: List[Document] = []
 
     # ------------------------------------------------------------------
@@ -175,30 +186,33 @@ class GeneralDataLoader:
         research_reference: Optional[str],
     ) -> str:
         """
-        Build embedding text optimised for multilingual-e5-large.
+        Build embedding text for baai/bge-m3 (docstring previously said
+        "multilingual-e5-large" — stale, that model isn't used anymore; see
+        project memory embedding_model_correction.md).
 
-        Lead with category signals (หัวข้อหลัก, sub_topic) so similarity search
-        surfaces the right doc when user asks about the same topic.
-        Body is the answer guideline — primary retrieval payload.
+        2026-09 fix: the old version labeled every field ("หัวข้อหลัก: X
+        หัวข้อย่อย: Y ประเภท: Z แหล่งข้อมูล: W แนวคำตอบ: ... อ้างอิง: ...") —
+        live-reproduced this repeated label boilerplate dominates the
+        embedding vector so completely that two TOTALLY UNRELATED documents
+        came out 0.867 cosine-similar to each other (vs. 0.243 for a
+        genuinely relevant document against a real query — indistinguishable
+        from noise: query-to-corpus similarity across 200 random docs had a
+        std of just 0.014). Confirmed empirically that dropping the labels
+        and the low-value content_type/source_book/research_reference fields
+        (all still preserved verbatim in metadata for any downstream use)
+        nearly tripled the discrimination spread (std 0.022 → 0.055,
+        mean 0.240 → 0.430) on a real sample. BM25/reranker read
+        page_content directly too and are unaffected by this change since
+        they already downweight repeated boilerplate tokens via IDF.
         """
         parts = []
 
-        # Header: topic signals
         if main_topic:
-            parts.append(f"หัวข้อหลัก: {main_topic}")
+            parts.append(main_topic)
         if sub_topic:
-            parts.append(f"หัวข้อย่อย: {sub_topic}")
-        if content_type:
-            parts.append(f"ประเภท: {content_type}")
-        if source_book:
-            parts.append(f"แหล่งข้อมูล: {source_book}")
-
-        # Body: the actual answer content
+            parts.append(sub_topic)
         if answer_guideline:
-            parts.append(f"แนวคำตอบ:\n{answer_guideline}")
-
-        if research_reference:
-            parts.append(f"อ้างอิง: {research_reference}")
+            parts.append(answer_guideline)
 
         text = "\n".join(p.strip() for p in parts if p.strip())
 
@@ -210,7 +224,21 @@ class GeneralDataLoader:
 
     def _process_dataframe(self, df: pd.DataFrame, colmap: dict, source: str) -> int:
         added = 0
+        # 2026-09: same fix as data_loader.py's DataLoader._process_dataframe —
+        # sheet_write_back.py's decision_type="update" flow marks the OLD row
+        # superseded via a note in this column, but nothing on the read side
+        # ever respected it until now (Sheet itself stays additive-only/never-
+        # edited on purpose — see sheet_write_back.py — so the fix belongs at
+        # ingest time, not by mutating the Sheet). Must match
+        # sheet_write_back.py's _SUPERSEDED_NOTE_HEADER exactly.
+        _has_superseded_col = "superseded_note" in df.columns
+
         for idx, row in df.iterrows():
+            if _has_superseded_col:
+                _superseded_note = self._to_val(row.get("superseded_note"))
+                if _superseded_note and str(_superseded_note).strip() not in ("", "nan", "None"):
+                    print(f"[GeneralDataLoader] Skipping superseded row {idx}: {_superseded_note!r}")
+                    continue
             source_book = self._get(row, colmap, "source_book")
             main_topic = self._get(row, colmap, "main_topic")
             sub_topic = self._get(row, colmap, "sub_topic")

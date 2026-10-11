@@ -81,6 +81,15 @@ class LocalVectorStoreManager:
             http_client=get_shared_http_client(),
             request_timeout=conf.EMBEDDING_REQUEST_TIMEOUT,
             max_retries=3,
+            # Live-verified (2026-09): langchain's default chunk_size (1000) sends up to
+            # 1000 documents' text in ONE request during bulk ingest — OpenRouter's backend
+            # has a hard 60s worker timeout regardless of client-side request_timeout, and a
+            # batch that size reliably exceeds it (confirmed via repeated 504 "Worker
+            # upstream fetch timed out after 60000ms" errors, not transient flakiness).
+            # Only affects embed_documents (bulk ingest); embed_query (per-message runtime
+            # embedding) always sends a single text regardless of this setting, so normal
+            # chat traffic is unaffected.
+            chunk_size=25,
         )
         print("[Embedding] Loaded successfully")
 
@@ -216,6 +225,90 @@ class LocalVectorStoreManager:
 
         return self._build_retriever()
 
+    def add_documents(self, documents: List[Document]) -> int:
+        """Incremental add — appends to the LIVE collection without touching
+        anything already in it (unlike create_vectorstore(reset=True), which
+        wipes and rebuilds from scratch). Added 2026-09 for the PDF direct-
+        ingest path (see service/pdf_direct_ingest.py): a PDF upload must be
+        able to add its chunks to the bot's searchable corpus without waiting
+        for — or disturbing — the next full Sheet-based rebuild.
+
+        Connects to the existing collection first if this process hasn't
+        already (mirrors connect_to_existing's setup) — safe to call from a
+        fresh process (e.g. the SQS consumer) that never ran a query first."""
+        if self.vectorstore is None:
+            self.connect_to_existing(fail_if_empty=False)
+
+        docs = [
+            Document(
+                page_content=d.page_content,
+                metadata=_stringify_metadata(getattr(d, "metadata", {}) or {}),
+            )
+            for d in (documents or [])
+        ]
+        if not docs:
+            return 0
+
+        self.vectorstore.add_documents(docs)
+        try:
+            self.vectorstore.persist()
+        except Exception:
+            pass
+
+        count = self._collection_count()
+        print(f"[VectorStore] Added {len(docs)} doc(s) incrementally | collection count now={count}")
+        return len(docs)
+
+    def list_pdf_ingested_files(self) -> Dict[str, int]:
+        """Audit helper for the no-human-review PDF direct-ingest path (see
+        service/pdf_direct_ingest.py) — the only "review" available is
+        looking at what's in the collection, so this must be cheap and
+        always available. Returns {source_file: doc_count} for every PDF
+        that has ever written into this collection via ingested_via=pdf_auto,
+        letting someone spot a bad ingest (e.g. a document that came out with
+        far fewer docs than its page count would suggest) before deciding
+        whether to delete_by_source_file() it."""
+        if self.vectorstore is None:
+            self.connect_to_existing(fail_if_empty=False)
+        raw = self.vectorstore._collection.get(
+            where={"ingested_via": "pdf_auto"}, include=["metadatas"],
+        )
+        counts: Dict[str, int] = {}
+        for m in raw.get("metadatas") or []:
+            src = (m or {}).get("source_file") or "(unknown)"
+            counts[src] = counts.get(src, 0) + 1
+        return counts
+
+    def delete_by_source_file(self, source_file: str) -> int:
+        """Removes every doc ingested from one PDF file, and ONLY that file —
+        the recovery path for a bad PDF ingest (e.g. missing pages, wrong
+        chunking) now that there's no human review gate before content
+        reaches the bot. Scoped with ingested_via=pdf_auto in the same filter
+        (not just source_file) so this can never touch a Sheet-sourced doc,
+        even in the hypothetical case a Sheet row's own metadata happened to
+        contain a same-named field — matches the project's standing rule that
+        PDF-derived and Sheet-derived content must stay strictly separate.
+
+        Returns the number of docs deleted (0 if source_file was never
+        ingested — not an error, just a no-op)."""
+        if not source_file:
+            return 0
+        if self.vectorstore is None:
+            self.connect_to_existing(fail_if_empty=False)
+        where = {"$and": [{"ingested_via": "pdf_auto"}, {"source_file": source_file}]}
+        existing = self.vectorstore._collection.get(where=where, include=[])
+        ids = existing.get("ids") or []
+        if not ids:
+            print(f"[VectorStore] delete_by_source_file({source_file!r}): nothing found, no-op")
+            return 0
+        self.vectorstore._collection.delete(where=where)
+        try:
+            self.vectorstore.persist()
+        except Exception:
+            pass
+        print(f"[VectorStore] Deleted {len(ids)} doc(s) for source_file={source_file!r} | collection count now={self._collection_count()}")
+        return len(ids)
+
     # Retrieval helpers (infra-only)
     def retrieve_raw_docs(self, query: str, k: Optional[int] = None) -> List[Document]:
         if not query or not str(query).strip():
@@ -302,3 +395,19 @@ def retrieve_docs(query: str, k: int = 0, clip_chars: int = 600, fail_if_empty: 
 def ingest_documents(documents: List[Document], reset: bool = True):
     """Public API for ingestion."""
     return _MANAGER.create_vectorstore(documents, reset=reset)
+
+
+def add_documents(documents: List[Document]) -> int:
+    """Public API for incremental (non-destructive) ingestion — see
+    LocalVectorStoreManager.add_documents. Returns the number of docs added."""
+    return _MANAGER.add_documents(documents)
+
+
+def list_pdf_ingested_files() -> Dict[str, int]:
+    """Public API — see LocalVectorStoreManager.list_pdf_ingested_files."""
+    return _MANAGER.list_pdf_ingested_files()
+
+
+def delete_by_source_file(source_file: str) -> int:
+    """Public API — see LocalVectorStoreManager.delete_by_source_file."""
+    return _MANAGER.delete_by_source_file(source_file)

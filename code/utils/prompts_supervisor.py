@@ -538,19 +538,58 @@ def build_broad_question_detect_prompt(user_text: str) -> str:
     Called when _BROAD_Q_RE regex misses; catches variant phrasing like
     "อยากทราบว่าต้องจัดการอะไรบ้าง", "ต้องดูแลเรื่องอะไรบ้างสำหรับร้านอาหาร".
     Confidence threshold: 0.75.
+
+    2026-09 bug fix: live-reproduced this over-firing is_broad=true (conf=0.95) on
+    "การหาพื้นที่ฐานลูกค้าทำได้กี่วิธี อะไรบ้าง" — a narrow question about ONE
+    business_guide topic (methods for finding a customer catchment area), not a
+    multi-license/multi-dimension overview. Root cause: every original is_broad=true
+    example ends in "...อะไรบ้าง" ("what are they"), so the model appears to have
+    generalized that ENDING alone as the signal, rather than the actual thing that
+    makes those examples broad — that they span MULTIPLE regulatory/business
+    dimensions (licenses+tax+registration), not that they're phrased as a list.
+    "อะไรบ้าง" is exceedingly common in ordinary Thai questions asking to enumerate
+    sub-items WITHIN one already-narrow topic (factors, methods, types, steps) —
+    that phrasing alone carries no breadth signal. Added an explicit rule plus
+    counter-examples naming this exact failure shape so the distinction is
+    unambiguous: count DISTINCT dimensions being asked about, not "อะไรบ้าง".
+    Consequence when this misfires: triggers the expensive two-pass regulatory
+    sweep, merging in unrelated docs that can blow the session token budget and
+    produce a broken info-gap answer for what should have been a simple question.
+
+    NOTE on "broad" terminology (2026-09, cross-file audit): this prompt's
+    is_broad=true controls RETRIEVAL SCOPE only (fetch docs across multiple
+    license/tax/registration dimensions). It is a DIFFERENT axis from Practical's
+    own prompts_practical.py "TARGETED-CATEGORY GATE", which controls ANSWER
+    FORMAT (whether to show only a license list vs. a full multi-section
+    overview) and uses the same example phrase ("ต้องขอใบอนุญาตอะไรบ้าง") with
+    opposite-sounding terminology. This is intentional, not a bug: a query can
+    correctly be is_broad=true HERE (needs wide retrieval to cover licenses+tax+
+    registration) while ALSO being a "targeted category" question THERE (the
+    answer itself should stay a clean license list, not sprout unrelated
+    kitchen-hygiene/marketing sections). Do not "fix" one file's definition of
+    "broad" to match the other's — they answer different questions at different
+    pipeline stages. If editing either, re-check this note first.
     """
     return (
-        "คุณคือ classifier ตรวจว่า user ถาม 'ภาพรวม' (ต้องการรายการหลายอย่างพร้อมกัน) หรือ 'เฉพาะเจาะจง' (ถามเรื่องเดียว)\n"
+        "คุณคือ classifier ตรวจว่า user ถาม 'ภาพรวม' (ครอบคลุมหลายมิติ/หลายใบอนุญาต/หลายหัวข้อพร้อมกัน)"
+        " หรือ 'เฉพาะเจาะจง' (ถามเรื่องเดียว แม้จะขอให้แจกแจงเป็นรายการย่อยภายในเรื่องนั้นก็ตาม)\n"
         f"user_text: {user_text}\n\n"
-        "is_broad=true — user ถามแบบภาพรวม เช่น:\n"
+        "กฎสำคัญ: คำว่า 'อะไรบ้าง'/'มีอะไรบ้าง' เพียงอย่างเดียว **ไม่ใช่สัญญาณว่าเป็นคำถามภาพรวม** —\n"
+        "คำนี้ใช้ได้ทั้งกับคำถามภาพรวมจริง (หลายมิติ) และคำถามเฉพาะเจาะจงที่แค่ขอให้แจกแจงรายการย่อย\n"
+        "ภายในหัวข้อเดียว (เช่น ปัจจัย/วิธีการ/ประเภท/ขั้นตอนของเรื่องเดียว) ให้นับว่า user ถามกี่ 'มิติ'\n"
+        "(ใบอนุญาตประเภทต่างๆ / ภาษีประเภทต่างๆ / การจดทะเบียนหลายแบบ) ไม่ใช่ดูแค่รูปประโยค\n\n"
+        "is_broad=true — ครอบคลุมหลายมิติจริง เช่น:\n"
         "- 'เปิดร้านอาหารต้องทำอะไรบ้าง' → ครอบคลุมหลายด้าน (ใบอนุญาต+ภาษี+จดทะเบียน)\n"
-        "- 'ต้องจ่ายภาษีอะไรบ้าง' → ขอรายการ ไม่ใช่ถามภาษีใดภาษีหนึ่ง\n"
-        "- 'ต้องขอใบอนุญาตอะไรบ้าง' → ขอรายการ\n"
+        "- 'ต้องจ่ายภาษีอะไรบ้าง' → ขอรายการภาษีหลายประเภท ไม่ใช่ถามภาษีใดภาษีหนึ่ง\n"
+        "- 'ต้องขอใบอนุญาตอะไรบ้าง' → ขอรายการใบอนุญาตหลายประเภท\n"
         "- 'ต้องจดทะเบียนอะไรบ้าง' / 'ต้องดูแลอะไรบ้าง'\n\n"
-        "is_broad=false — user ถามเฉพาะเจาะจง เช่น:\n"
+        "is_broad=false — เรื่องเดียว แม้จะลงท้ายด้วย 'อะไรบ้าง' ก็ตาม เช่น:\n"
         "- 'VAT ต้องจดยังไง' → ถาม VAT อย่างเดียว\n"
         "- 'ใบอนุญาตจัดตั้งต้องใช้เอกสารอะไร' → ถามใบอนุญาตเดียว\n"
-        "- 'ขั้นตอนจดทะเบียนพาณิชย์' → เรื่องเดียว\n\n"
+        "- 'ขั้นตอนจดทะเบียนพาณิชย์' → เรื่องเดียว\n"
+        "- 'การหาพื้นที่ฐานลูกค้าทำได้กี่วิธี อะไรบ้าง' → เรื่องเดียว (วิธีหาทำเลลูกค้า) แค่ขอแจกแจง\n"
+        "  วิธีการภายในหัวข้อนั้น ไม่ได้ถามหลายมิติของธุรกิจ\n"
+        "- 'ปัจจัยสำคัญในการเลือกทำเลมีอะไรบ้าง' → เรื่องเดียว (ปัจจัยเลือกทำเล) ไม่ใช่ภาพรวมธุรกิจ\n\n"
         'ตอบ JSON เท่านั้น: {"is_broad": true/false, "confidence": 0.0}\n'
         "confidence < 0.75 → is_broad=false"
     )
@@ -705,6 +744,34 @@ def build_info_action_q_detect_prompt(user_text: str) -> str:
     )
 
 
+def build_license_dominance_detect_prompt(user_text: str, license_a: str, license_b: str) -> str:
+    """
+    Classify whether a query touching 2 different license_types is dominantly about ONE of
+    them (the other just mentioned as context/precondition, e.g. "จด VAT แล้ว...") or
+    genuinely asks about BOTH as co-equal questions.
+    Called when retrieved docs for a query span 2 distinct license_type values with neither
+    clearly dominant by doc count (2026-10, live-reproduced — a query mentioning VAT
+    registration status as context while actually asking about POS device approval got
+    silently locked onto VAT alone, because the code previously just took the first
+    retrieved doc's license_type with no check for this).
+    Returns: {"dominant": "A" | "B" | "both"}
+    """
+    return (
+        "คุณคือระบบวิเคราะห์ว่าคำถามของลูกค้าร้านอาหารถามเกี่ยวกับ license/ใบอนุญาตใดเป็นหลัก\n"
+        "เอกสารที่ค้นเจอมี 2 license_type ปนกัน ต้องวิเคราะห์ว่าคำถามถามเรื่องไหนจริงๆ\n\n"
+        f'คำถาม: "{user_text}"\n\n'
+        f"A) {license_a}\n"
+        f"B) {license_b}\n\n"
+        "วิเคราะห์ 3 แบบ:\n"
+        '- "A": คำถามถามเรื่อง A เป็นหลัก ส่วน B แค่ถูกเอ่ยถึงเป็นบริบท/เงื่อนไขที่มีอยู่แล้ว ไม่ใช่สิ่งที่ถามจริง\n'
+        '  ตัวอย่าง: "ร้านจด VAT แล้ว ใช้ POS ต้องขออนุมัติเครื่องกับสรรพากรไหม" — จด VAT เป็นบริบท (มีอยู่แล้ว) คำถามจริงคือเรื่องขออนุมัติเครื่อง POS → ตอบ B ถ้า A=VAT, B=POS\n'
+        '- "B": กลับกัน B เป็นบริบท A เป็นคำถามจริง\n'
+        '- "both": คำถามถามทั้ง A และ B เท่าเทียมกันจริงๆ ทั้งคู่เป็นสิ่งที่ต้องตอบ ไม่ใช่แค่ฝั่งใดฝั่งหนึ่งเป็นบริบท\n'
+        '  ตัวอย่าง: "ต้องขอทั้ง VAT และ POS ID เลยไหม ขั้นตอนแต่ละอย่างเป็นยังไง" → both\n\n'
+        'ตอบเป็น JSON เท่านั้น: {"dominant": "A"} หรือ {"dominant": "B"} หรือ {"dominant": "both"}'
+    )
+
+
 def build_smalltalk_detect_prompt(user_text: str) -> str:
     """
     Detect whether user is making small talk / asking personal off-topic questions to the bot
@@ -790,9 +857,11 @@ def build_slot_skip_detect_prompt(user_text: str) -> str:
         "is_skip=true เมื่อ user:\n"
         "- บอกว่าไม่รู้/ไม่แน่ใจ/ยังหาข้อมูลอยู่ (เช่น 'ยังตัดสินใจไม่ได้', 'ไม่ค่อยแน่ใจ', 'ยังไม่รู้เลย')\n"
         "- ขอข้ามหรือผ่านไปก่อน (เช่น 'ขอผ่านไปก่อน', 'ข้ามก่อนได้ไหม', 'ไม่ต้องถามก็ได้')\n"
-        "- ไม่ทราบข้อมูล (เช่น 'ไม่ทราบครับ', 'ไม่มีข้อมูล')\n\n"
+        "- ไม่ทราบข้อมูล (เช่น 'ไม่ทราบครับ', 'ไม่มีข้อมูล')\n"
+        "- ตอบว่าใช่/มีทั้งหมดทุกตัวเลือก ทั้งที่คำถามให้เลือกแค่ 1 อย่าง (เช่น 'ทั้งสองแบบครับ',"
+        " 'มีทั้งคู่', 'ทั้งหมดเลยค่ะ' — ไม่ใช่การเลือกตัวเลือกเดียวที่ถูกถามจริงๆ)\n\n"
         "is_skip=false เมื่อ user:\n"
-        "- ตอบคำถามโดยตรง (เลือกตัวเลือก, บอกประเภท, บอกที่ตั้ง)\n"
+        "- ตอบคำถามโดยตรง เลือกตัวเลือกเดียวจากที่ถาม (บอกประเภท, บอกที่ตั้ง)\n"
         "- ถามคำถามใหม่\n"
         "- ทักทาย/ขอบคุณ\n\n"
         'ตอบ JSON เท่านั้น: {"is_skip": true/false, "confidence": 0.0}\n'

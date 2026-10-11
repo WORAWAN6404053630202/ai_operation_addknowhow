@@ -275,10 +275,22 @@ except ImportError:
 
 
 def build_speed_extra_body(model_name: str) -> dict:
-    """Extra OpenRouter request-body fields that reduce latency without changing what
-    the model produces: provider routing (`provider.sort`) — send the request to
-    whichever OpenRouter provider currently has the best throughput/latency for this
-    model. Same model weights, same output; only the serving path changes.
+    """Extra OpenRouter request-body fields that reduce latency/cost without changing
+    what the model produces — same model weights, same output, only the serving path
+    changes.
+
+    For Anthropic models, pin `provider.order=["anthropic"]` (PROVIDER_PIN_ANTHROPIC)
+    rather than just `provider.sort`. Root-caused 2026-09: `sort` alone is a soft
+    preference — OpenRouter can still serve the same model via Anthropic direct, AWS
+    Bedrock, or GCP Vertex interchangeably call-to-call, and prompt-cache state
+    (cache_control) does not carry over between those backends. That's why
+    cache_read_tokens was 0 on effectively every real production call despite the
+    caching mechanism itself (build_cached_system_message) being independently
+    verified correct in isolation — pinning to one backend is a prerequisite for
+    cache hits, not just a latency tweak. allow_fallbacks is left at OpenRouter's
+    default (true), so a genuine Anthropic-side outage still fails over to another
+    backend instead of erroring out; it only loses the cache benefit during that
+    window.
 
     Prompt caching is NOT set here — a top-level `cache_control` in extra_body was
     tried and measured (see conversation notes): it never produced a single cache
@@ -291,6 +303,9 @@ def build_speed_extra_body(model_name: str) -> dict:
     """
     extra: dict = {}
     if not _CONF_AVAILABLE:
+        return extra
+    if getattr(conf, "PROVIDER_PIN_ANTHROPIC", True) and "anthropic/" in (model_name or ""):
+        extra["provider"] = {"order": ["anthropic"]}
         return extra
     _sort = getattr(conf, "PROVIDER_ROUTING_SORT", "")
     if _sort:
@@ -373,12 +388,14 @@ def _check_token_budget(total: int, model: str) -> None:
         )
 
 
-# Cost Estimation — pricing/cache-multiplier tables live in utils/model_pricing.py,
-# shared with utils/llm_cost_logging.py (PDF pipeline) and router/admin.py (dashboard)
-# so all 3 can't silently drift out of sync with each other again (they had, before
-# this consolidation — see model_pricing.py's module docstring for specifics).
-from utils.model_pricing import MODEL_PRICING as PRICING_USD_PER_MILLION_TOKENS
-from utils.model_pricing import cache_multipliers as _cache_multipliers
+# Cost estimation — pricing table and cache-discount multipliers now live in
+# utils/model_pricing.py (single source of truth, shared across the bot and the
+# admin dashboard) instead of being duplicated here.
+from utils.model_pricing import (
+    get_pricing as _get_pricing,
+    cache_multipliers as _cache_multipliers,
+    MODEL_PRICING as PRICING_USD_PER_MILLION_TOKENS,
+)
 
 _COST_LOG = logging.getLogger(__name__)
 
@@ -396,7 +413,7 @@ def estimate_cost(
     additional) — pass 0/0 (the default) for calls where caching doesn't apply or
     wasn't measured, which reduces to the original flat-rate calculation exactly.
     """
-    pricing = PRICING_USD_PER_MILLION_TOKENS.get(model)
+    pricing = _get_pricing(model)
     if pricing is None:
         _COST_LOG.warning("[Cost] Model %r not in pricing table — cost logged as $0. Add it to utils/model_pricing.py's MODEL_PRICING.", model)
         return 0.0

@@ -16,6 +16,8 @@ from langchain_core.documents import Document
 from typing import List, Optional, Dict
 from urllib.parse import urlparse, parse_qs
 
+import conf
+
 
 class DataLoader:
     """
@@ -43,9 +45,16 @@ class DataLoader:
         self.departments_found = set()
 
         # RAG content tuning knobs (safe defaults)
-        self.page_content_max_chars = int(getattr(config, "PAGE_CONTENT_MAX_CHARS", 1800) or 1800)
+        # Live-verified (2026-09): the only call site (scripts/ingest_local.py) constructs
+        # this class with config={} (a plain dict), and getattr(a_dict, "SOME_NAME", default)
+        # can never find "SOME_NAME" as a dict ATTRIBUTE (dicts hold data via keys, not
+        # attributes) — so this silently fell back to the hardcoded default below on every
+        # single ingest, regardless of what conf.PAGE_CONTENT_MAX_CHARS was actually set to.
+        # A prior fix (1800→2500, see conf.py's comment on that constant) never actually
+        # took effect for this exact reason — read from the real conf module directly instead.
+        self.page_content_max_chars = int(getattr(conf, "PAGE_CONTENT_MAX_CHARS", 1800) or 1800)
         self.include_research_reference_in_content = bool(
-            getattr(config, "INCLUDE_RESEARCH_REF_IN_CONTENT", False)
+            getattr(conf, "INCLUDE_RESEARCH_REF_IN_CONTENT", False)
         )
 
     @staticmethod
@@ -501,29 +510,62 @@ class DataLoader:
         # Answer body: all actionable fields
         # NOTE: legal_regulatory is placed early (position 2) to ensure penalty/law keywords
         # are always embedded in the vector — they are short but critical for retrieval.
+        # terms_and_conditions is placed early too (position 3, right after legal_regulatory)
+        # for the same reason — live-verified (2026-09) it can hold actionable facts (e.g. a
+        # card-payment settlement-cutoff-time table) that similarity/BM25 search must be able
+        # to find, not just boilerplate. It used to sit near the END of this list with no cap
+        # of its own, so for any doc whose earlier fields (operation_steps, identification_
+        # documents) were already near their own caps, it silently never made it into the
+        # final `text[:max_chars]` clamp at all — the doc embedded fine, just with zero trace
+        # of its terms_and_conditions content, so no query could ever surface it via retrieval
+        # even though the full text was sitting right there in metadata the whole time.
         # identification_documents is long and can tolerate being partially truncated.
         body_parts = []
-        # NOTE: All three long fields are capped for embedding budget only.
-        # Full values are always available in metadata for the LLM to read.
-        # Caps ensure every field's keywords appear in the vector regardless of doc length.
+        # NOTE: every field below is capped for embedding budget only — full values are
+        # always available in metadata for the LLM to read regardless of this cap. Every
+        # field having its OWN cap (not just relying on the final overall clamp) is what
+        # guarantees each one's keywords have a chance to appear in the vector regardless
+        # of how much content precedes it — the terms_and_conditions bug above happened
+        # precisely because it was the one field that didn't follow this rule yet.
+        # Caps below (2026-09) sized to fully cover the real corpus's current max
+        # length per field, not just p95+ — live-verified case: a special-business
+        # EDC requirement ("ร้านขายเหล้าต้องแนบใบอนุญาตจำหน่ายสุรา") sat at character
+        # 798 of a 1456-char operation_steps value, past the old 600-char cap, so it
+        # silently never reached the vector even though this field WAS present and
+        # NOT flagged by the field-coverage check (that check only catches a field
+        # being completely absent, not a real fact buried past its own cap — a
+        # narrower, harder-to-detect version of the same bug class). Auditing every
+        # field's real corpus distribution found this was not a one-off: identification_
+        # documents was truncating 56% of docs that have it, service_channel 45%,
+        # legal_regulatory 35%, terms_and_conditions 27%, operation_steps 18%. Each
+        # cap below is the field's real current max + ~25% headroom for growth — safe
+        # to be this generous because feature/pdf-ingestion's own testing already
+        # empirically confirmed (direct OpenRouter embeddings calls, bypassing
+        # langchain) that baai/bge-m3 embeds up to ~42,300 Thai characters with NO
+        # silent truncation; a hard error only past that, never a quiet drop. See
+        # code/utils/pdf_text_chunking.py's module docstring for that finding.
         if md.get("operation_steps"):
-            body_parts.append(f"ขั้นตอนการดำเนินการ:\n{md['operation_steps'][:600]}")
+            body_parts.append(f"ขั้นตอนการดำเนินการ:\n{md['operation_steps'][:1800]}")
         if md.get("legal_regulatory"):
-            body_parts.append(f"ข้อกำหนดกฎหมาย/บทลงโทษ:\n{md['legal_regulatory'][:300]}")
-        if md.get("identification_documents"):
-            body_parts.append(f"เอกสารที่ต้องใช้:\n{md['identification_documents'][:500]}")
-        if md.get("fees"):
-            body_parts.append(f"ค่าธรรมเนียม:\n{md['fees']}")
-        if md.get("operation_duration"):
-            body_parts.append(f"ระยะเวลาดำเนินการ: {md['operation_duration']}")
-        if md.get("service_channel"):
-            body_parts.append(f"ช่องทางยื่นคำขอ/ติดต่อ:\n{md['service_channel'][:150]}")
+            body_parts.append(f"ข้อกำหนดกฎหมาย/บทลงโทษ:\n{md['legal_regulatory'][:2000]}")
         if md.get("terms_and_conditions"):
-            body_parts.append(f"เงื่อนไขและหลักเกณฑ์:\n{md['terms_and_conditions']}")
+            body_parts.append(f"เงื่อนไขและหลักเกณฑ์:\n{md['terms_and_conditions'][:2300]}")
+        if md.get("identification_documents"):
+            body_parts.append(f"เอกสารที่ต้องใช้:\n{md['identification_documents'][:2100]}")
+        if md.get("fees"):
+            body_parts.append(f"ค่าธรรมเนียม:\n{md['fees'][:900]}")
+        if md.get("operation_duration"):
+            body_parts.append(f"ระยะเวลาดำเนินการ: {md['operation_duration'][:300]}")
+        if md.get("service_channel"):
+            body_parts.append(f"ช่องทางยื่นคำขอ/ติดต่อ:\n{md['service_channel'][:600]}")
         if md.get("answer_guideline"):
-            body_parts.append(f"แนวคำตอบ:\n{md['answer_guideline']}")
+            # Sole content field for business_guide/marketing rows (no license_type
+            # fields to compete with), and one of the last fields for regulatory
+            # rows, so it was the last of the 9 body fields still relying on the
+            # blunt overall clamp instead of its own cap.
+            body_parts.append(f"แนวคำตอบ:\n{md['answer_guideline'][:5500]}")
         if md.get("restaurant_ai_document"):
-            body_parts.append(f"เอกสาร/ฟอร์ม: {md['restaurant_ai_document']}")
+            body_parts.append(f"เอกสาร/ฟอร์ม: {md['restaurant_ai_document'][:300]}")
 
         body = self._join_nonempty(body_parts)
 
@@ -544,8 +586,24 @@ class DataLoader:
         docs_before = len(self.documents)
 
         colmap = self._build_column_map(df)
+        # 2026-09: sheet_write_back.py's decision_type="update" flow writes a
+        # note into this column on the OLD row it's superseding — but until now
+        # nothing on the READ side ever checked it, so the old (stale/wrong) row
+        # kept getting ingested into Chroma right alongside the new one every
+        # single rebuild. The Sheet itself stays additive-only/never-edited (an
+        # intentional safety property — see sheet_write_back.py's docstring),
+        # so the fix belongs here: skip a row at ingest time if a later row has
+        # marked it superseded, rather than mutating/deleting anything in the
+        # Sheet. See sheet_write_back.py's _SUPERSEDED_NOTE_HEADER — must match
+        # exactly.
+        _has_superseded_col = "superseded_note" in df.columns
 
         for idx, row in df.iterrows():
+            if _has_superseded_col:
+                _superseded_note = self._get_row_value(row, "superseded_note")
+                if _superseded_note and str(_superseded_note).strip() not in ("", "nan", "None"):
+                    print(f"[DataLoader] Skipping superseded row {idx}: {_superseded_note!r}")
+                    continue
             dept = self._get_row_value(row, colmap.get("department"))
             if dept:
                 self.departments_found.add(dept)

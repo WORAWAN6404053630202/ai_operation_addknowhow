@@ -122,17 +122,17 @@ class RateLimiter:
             cutoff_time = current_time - self.window_seconds
             while timestamps and timestamps[0] < cutoff_time:
                 timestamps.popleft()
-
+            
             # Check if under limit
             if len(timestamps) < self.max_requests:
                 timestamps.append(current_time)
-
+                
                 # Calculate reset time (when oldest request expires)
                 reset_in = 0
                 if timestamps:
                     oldest = timestamps[0]
                     reset_in = int(self.window_seconds - (current_time - oldest))
-
+                
                 return True, {
                     "allowed": True,
                     "remaining": self.max_requests - len(timestamps),
@@ -142,11 +142,11 @@ class RateLimiter:
                 }
             else:
                 self.blocked_requests += 1
-
+                
                 # Calculate when oldest request will expire
                 oldest = timestamps[0]
                 reset_in = int(self.window_seconds - (current_time - oldest) + 1)
-
+                
                 return False, {
                     "allowed": False,
                     "remaining": 0,
@@ -155,7 +155,7 @@ class RateLimiter:
                     "window": self.window_seconds,
                     "retry_after": max(1, reset_in)
                 }
-
+    
     def record_token_usage(self, identifier: str, tokens: int) -> None:
         """
         Record LLM token usage for the current window.

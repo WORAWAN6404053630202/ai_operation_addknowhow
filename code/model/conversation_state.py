@@ -86,9 +86,9 @@ class ConversationState(BaseModel):
         default=0.0,
         description=(
             "Cumulative real cost (USD) across all LLM calls in this session. Renamed from "
-            "total_cost_usd (2026-09) to match the PDF review pipeline's ReviewItem.total_cost "
-            "field so the admin dashboard and the PDF review UI expose the same field name for "
-            "the same concept. Accumulated per-call at the call site (llm_call.py), where the "
+            "total_cost_usd (2026-09) so the field name matches what the admin dashboard "
+            "exposes, and also matches the PDF review pipeline's ReviewItem.total_cost field "
+            "— one name for the same concept in both UIs. Accumulated per-call at the call site (llm_call.py), where the "
             "correct model/pricing for THAT specific call is known — a turn often mixes one "
             "main-persona call (Sonnet/GPT-5.1) with several cheap Haiku classifier calls, so "
             "this must NOT be reconstructed later from a single blended token delta priced at "

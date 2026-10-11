@@ -33,8 +33,22 @@ from utils.logger import setup_logging, get_logger
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_FORMAT = os.getenv("LOG_FORMAT", "human")  # "human" or "json"
 LOG_FILE = os.getenv("LOG_FILE", None)
+# 2026-09: file handler defaults are separate from LOG_LEVEL (console) — see
+# setup_logging's docstring in utils/logger.py for why WARNING + a small
+# rotation ceiling is the deliberate default (survive container recreation
+# on redeploy for post-incident investigation, without growing disk usage).
+LOG_FILE_LEVEL = os.getenv("LOG_FILE_LEVEL", "WARNING")
+LOG_FILE_MAX_BYTES = int(os.getenv("LOG_FILE_MAX_BYTES", "5000000"))
+LOG_FILE_BACKUP_COUNT = int(os.getenv("LOG_FILE_BACKUP_COUNT", "5"))
 
-setup_logging(level=LOG_LEVEL, log_format=LOG_FORMAT, log_file=LOG_FILE)
+setup_logging(
+    level=LOG_LEVEL,
+    log_format=LOG_FORMAT,
+    log_file=LOG_FILE,
+    log_file_level=LOG_FILE_LEVEL,
+    log_file_max_bytes=LOG_FILE_MAX_BYTES,
+    log_file_backup_count=LOG_FILE_BACKUP_COUNT,
+)
 logger = get_logger(__name__)
 
 logger.info(f"Starting application with LOG_LEVEL={LOG_LEVEL}, LOG_FORMAT={LOG_FORMAT}")

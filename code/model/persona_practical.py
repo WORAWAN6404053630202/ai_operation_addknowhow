@@ -28,6 +28,9 @@ from utils.text_patterns import (
     ENTITY_NATURAL_RE as _SHARED_ENTITY_NATURAL_RE,
     is_bare_generic_followup as _shared_is_bare_generic_followup,
     extract_info_gap_tag as _shared_extract_info_gap_tag,
+    topic_label_matches_query as _shared_topic_label_matches_query,
+    is_fee_or_duration_info_query as _shared_is_fee_or_duration_info_query,
+    effective_min_similarity as _shared_effective_min_similarity,
 )
 
 # Import professional logging
@@ -339,6 +342,41 @@ _LLM_METADATA_WHITELIST = frozenset({
     "restaurant_ai_document",  # เอกสาร/ฟอร์ม AI ร้านอาหาร (bypasses content truncation via metadata track)
 })
 
+
+def _build_head_only_content(md: Dict[str, Any]) -> str:
+    """Short disambiguator line built directly from metadata fields — replaces the
+    full page_content string (which duplicates every _LLM_METADATA_WHITELIST field
+    as labeled prose, ~75-85% the size of metadata itself, verified against real
+    corpus data during the 2026-09 cost-reduction audit) in docs_json sent to the
+    LLM. Mirrors data_loader.py's _build_page_content() head section exactly, since
+    that's the one part carrying info NOT otherwise in metadata: location, area_size,
+    and operation_by_department are deliberately excluded from
+    _LLM_METADATA_WHITELIST (see its own comments) and only ever reached the LLM via
+    this head line — preserved here, everything else (steps/fees/documents/etc.) is
+    already sent in full via metadata so is safe to drop from content entirely.
+    NOT used for the sub_topic-completeness aggregated doc (_comb_content_pr) — that
+    one's content is a genuine synthesis, not a metadata-duplicate; see its
+    "_keep_full_content" marker in the docs_json build loop below."""
+    parts = []
+    if md.get("license_type"):
+        parts.append(f"ใบอนุญาต/ทะเบียน: {md['license_type']}")
+    if md.get("operation_by_department"):
+        parts.append(f"การดำเนินการ: {md['operation_by_department']}")
+    if md.get("location"):
+        parts.append(f"พื้นที่: {md['location']}")
+    if md.get("area_size"):
+        parts.append(f"ขนาดพื้นที่ร้าน: {md['area_size']}")
+    if md.get("entity_type_normalized"):
+        parts.append(f"ประเภทผู้ประกอบการ: {md['entity_type_normalized']}")
+    elif md.get("registration_type"):
+        parts.append(f"ประเภทการจดทะเบียน: {md['registration_type']}")
+    if md.get("operation_topic"):
+        parts.append(f"หัวข้อ: {md['operation_topic']}")
+    if md.get("department"):
+        parts.append(f"หน่วยงาน: {md['department']}")
+    return "\n".join(parts)
+
+
 # P0: practical policy "last gate"
 try:
     from utils.practical_lint import enforce_practical_policy  # type: ignore
@@ -443,6 +481,112 @@ class PracticalPersonaService:
 
     _DONT_KNOW_RE = re.compile(r"^\s*(ไม่รู้|ไม่แน่ใจ|ไม่ทราบ|งง|แล้วแต่|อะไรก็ได้)\s*$")
     _ASK_TYPES_RE = re.compile(r"(มีประเภทอะไรบ้าง|ประเภทอะไรบ้าง|มีแบบไหนบ้าง|มีอะไรบ้าง)\s*$")
+
+    # Entity-type re-invite closer (2026-10, live-reproduced): prompts_practical.py's
+    # "IMPORTANT distinction" rule tells the model not to close an answer by inviting
+    # the user to state บุคคลธรรมดา/นิติบุคคล again after they already explicitly
+    # declined to single-select — but like the action="ask" case above, this is an
+    # advisory instruction the model still drifts from at a real, non-trivial rate.
+    # Phrasing varies too much to anchor one regex to it, AND the invite sometimes
+    # spans multiple ครับ-delimited clauses (confirmed across 15 real calls):
+    # "ถ้าคุณบอกว่าเป็นบุคคลธรรมดา หรือ นิติบุคคล...ได้เลยครับ" (one clause),
+    # "...บอกรูปแบบธุรกิจของคุณได้เลยครับ" (entity+tell+offer all one clause),
+    # "...ลองบอกผมว่าคุณจดทะเบียนเป็นแบบไหนครับ เพื่อให้ผมอธิบาย...ชัดเจนยิ่งขึ้นครับ"
+    # (the tell-verb and the detail-offer land in two SEPARATE clauses). So detection
+    # scans clauses after the entity-type mention for the first one containing a
+    # tell-verb, then checks whether a detail-offer word appears anywhere in the
+    # REST of the paragraph from there — if so, that clause and everything after it
+    # is dropped, keeping the informative clause(s) before it intact.
+    _ENTITY_REINVITE_TELL_VERB_RE = re.compile(r"บอก|แจ้ง|ระบุ")
+    _ENTITY_REINVITE_ENTITY_RE = re.compile(r"รูปแบบ|บุคคลธรรมดา|นิติบุคคล")
+    _ENTITY_REINVITE_DETAIL_OFFER_RE = re.compile(r"ได้เลย|ละเอียด|ชัดเจน|อธิบาย")
+
+    # Phone-number detection for the hallucination-prevention whitelist (Layers 2+3
+    # below). Live-reproduced bug (2026-09): the original design required a specific
+    # keyword immediately before a number (โทร/สายด่วน/Tel/Fax/...) to recognize it as
+    # a phone number — real data labels its numbers with "Merchant Call Center" /
+    # "Customer Service 24 Hours" (English department-name conventions never
+    # anticipated), so a genuinely real, correctly-cited phone number never made it
+    # into the whitelist, and the LLM's correct output was then stripped as
+    # "hallucinated". Patching in more keywords is the same whack-a-mole that caused
+    # the bug — any FUTURE label wording the team adds would break it again the same
+    # way. Durable fix: 9-11 digit numbers (landline/mobile, with or without +66,
+    # with any mix of dashes/dots/spaces/parens) are matched by SHAPE alone, no
+    # keyword required — the shape itself is specific enough that it essentially
+    # never collides with fee amounts, dates, or reference numbers in this data
+    # (verified against the full real corpus, zero false positives). Only the much
+    # shorter 4-digit hotline codes (e.g. "1506") stay keyword-gated, since a bare
+    # 4-digit number IS genuinely ambiguous with a baht amount ("ค่าธรรมเนียม 1500 บาท").
+    _PHONE_CANDIDATE_RE = re.compile(r'\+?\d[\d\-\.\s]{6,15}\d')
+    _HOTLINE_WITH_CTX_RE = re.compile(
+        r'(?:📞|โทร(?:ศัพท์|สาร)?|สายด่วน|Tel\.?|Fax\.?|แฟกซ์|Call Center|Customer Service|Hotline|ติดต่อ)'
+        r'.{0,15}?(?<!\d)(1\d{3})(?!\d)',
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _extract_thai_phone_numbers(cls, text: str) -> set:
+        """Shared by both the doc-side whitelist builder and the answer-side strip
+        check below, so the two can never again drift apart the way the original
+        keyword-only version did. Returns numbers normalized to local form (leading
+        "0", no separators) so "+66 2 123 4567" and "02-123-4567" compare equal."""
+        text = (text or "").replace("(", " ").replace(")", " ")
+        found: set = set()
+        for _m in cls._PHONE_CANDIDATE_RE.finditer(text):
+            _has_plus = _m.group(0).strip().startswith("+")
+            _digits = re.sub(r"\D", "", _m.group(0))
+            if _has_plus and _digits.startswith("66") and len(_digits) in (10, 11):
+                found.add("0" + _digits[2:])
+            elif _digits.startswith("0") and len(_digits) in (9, 10):
+                found.add(_digits)
+        for _m in cls._HOTLINE_WITH_CTX_RE.finditer(text):
+            found.add(_m.group(1))
+        return found
+
+    @classmethod
+    def _extract_inline_service_urls(cls, line: str) -> List[Tuple[str, str]]:
+        """Extract (label, url) pairs from a single service_channel/operation_steps
+        line — pulled out of the Pass 1b link-scanning loop in handle() so this
+        parsing logic is unit-testable on its own (mirrors why
+        _extract_thai_phone_numbers above is a separate method).
+
+        2026-09 bug fix, live-reproduced: service_channel often packs multiple
+        contact entries with URLs onto ONE undelimited line (no newline between
+        them), e.g. "แผนก A 24 ชม. https://... แผนก B จันทร์-ศุกร์ 09.00-18.00 น.
+        https://...". Two compounding bugs here:
+        1. Each URL's label used to be computed from the WHOLE line prefix, not
+           the segment since the previous URL — for the 2nd+ URL this pulled the
+           FIRST entry's own text (and URL) in too, pushing the segment well past
+           the 50-char "extract last item" fallback below even when each real
+           entry was individually short.
+        2. That fallback's own numbered-list-marker regex (`\\d+[.)]\\s*`) matched
+           "09.00-18.00 น." (a time-of-day, not a list) at both "09." and "18."
+           (digit+dot each), splitting the text into garbage fragments and
+           leaving a bare "น." as the final label. Fixed by requiring the marker
+           NOT be immediately followed by another digit — a genuine list marker
+           ("2.ทำสิ่งนี้") is followed by a word character, never another digit,
+           which is exactly what distinguishes it from a decimal/time value.
+
+        Does NOT dedup against a global _link_seen set or filter .pdf URLs —
+        callers still own that cross-line/cross-doc bookkeeping.
+        """
+        results: List[Tuple[str, str]] = []
+        prev_end = 0
+        for _m in cls._INLINE_URL_RE.finditer(line):
+            _raw_url = _m.group(1).rstrip(".,;)")
+            if _raw_url.lower().startswith("www."):
+                _raw_url = "https://" + _raw_url
+            _before = line[prev_end:_m.start()].strip().rstrip(':：-').strip()
+            prev_end = _m.end()
+            _before = re.sub(r'^[\d\.\-\*•]+\.?\s*', '', _before).strip()
+            if len(_before) > 50:
+                _segs = re.split(r'\d+[.)]\s*(?!\d)', _before)
+                if len(_segs) > 1:
+                    _before = re.sub(r'^[\d\.\-\*•]+\.?\s*', '', _segs[-1]).strip()
+                else:
+                    _before = _before[-50:].lstrip(' .,').strip()
+            results.append((_before, _raw_url))
+        return results
 
     _NUM_OPTION_LINE_RE = re.compile(r"^\s*(\d{1,2})\)\s*(.+?)\s*$")
     # Shared with persona_supervisor.py — see utils/text_patterns.py. Reconciled to
@@ -1245,6 +1389,124 @@ class PracticalPersonaService:
                 t = t.rstrip(" .") + "ครับ"
         return t
 
+    def _strip_entity_reinvite_closer(self, text: str) -> str:
+        """Drop any closing paragraph that re-invites the user to state their
+        entity_type (บุคคลธรรมดา/นิติบุคคล) after they already explicitly declined
+        to single-select. See _ENTITY_REINVITE_*_RE's docstring for why this exists
+        as a deterministic fallback alongside the prompt rule. Only call this when
+        state.context["_entity_type_explicitly_skipped"] is True — the keyword
+        combination (ถ้า...บอก + entity-type word + ได้เลย) is narrow but not
+        impossible in an unrelated context, so it's gated to the one situation
+        where that combination can only mean the re-invite pattern.
+        """
+        t = text or ""
+        out_paragraphs = []
+        for p in re.split(r"\n\s*\n", t):
+            if not self._ENTITY_REINVITE_ENTITY_RE.search(p):
+                out_paragraphs.append(p)
+                continue
+            # Mark clause boundaries: after a sentence-final polite particle, or
+            # right before a "ถ้า"/"ลอง" that opens a new clause. (Variable-width
+            # alternation can't sit inside a lookbehind in Python's re, hence the
+            # two-step mark-then-split instead of a single split regex.)
+            marked = re.sub(r"(ครับ|ค่ะ|คะ)\s+", "\\1\x01", p)
+            marked = re.sub(r"\s+(ถ้า|ลอง)", "\x01\\1", marked)
+            clauses = marked.split("\x01")
+            entity_idx = next(
+                (i for i, c in enumerate(clauses) if self._ENTITY_REINVITE_ENTITY_RE.search(c)),
+                None,
+            )
+            cut_idx = None
+            if entity_idx is not None:
+                for i in range(entity_idx, len(clauses)):
+                    if self._ENTITY_REINVITE_TELL_VERB_RE.search(clauses[i]):
+                        tail = " ".join(clauses[i:])
+                        if self._ENTITY_REINVITE_DETAIL_OFFER_RE.search(tail):
+                            cut_idx = i
+                            break
+            kept_clauses = clauses[:cut_idx] if cut_idx is not None else clauses
+            joined = " ".join(c.strip() for c in kept_clauses if c.strip())
+            if joined.strip():
+                out_paragraphs.append(joined)
+        result = "\n\n".join(out_paragraphs).strip()
+        return result or t
+
+    def _retry_if_entity_coverage_incomplete(self, ans: str, prompt: str, state: ConversationState) -> str:
+        """Deterministic safety net (2026-10, live-reproduced — same retry-once shape as
+        the action="ask" net elsewhere in this file, for a more severe variant of the same
+        failure class): confirmed via a live 4-run batch that retrieval and doc-merging for
+        the real case this was built from were 100% deterministic every time (5 standalone
+        re-checks of the per-entity semantic search, 3 of the department-scope exact-match
+        fetch — zero variance in either) — so when one entity's whole section goes missing
+        from the final answer, it is provably the generation step dropping it, not a hidden
+        retrieval bug. Call this only when state.context["_entity_type_explicitly_skipped"]
+        is True (caller's responsibility — mirrors _strip_entity_reinvite_closer's own
+        calling convention).
+
+        Scoped narrowly to when it matters most: only fires if BOTH entity values are
+        genuinely present in the DOCUMENTS actually used (not just the flag being set — a
+        license with no real entity split wouldn't have 2+ distinct
+        entity_type_normalized values in current_docs at all) AND the answer text never
+        names one of them even once.
+        """
+        _entities_in_docs_ans = {
+            str((d.get("metadata") or {}).get("entity_type_normalized") or "").strip()
+            for d in (state.current_docs or [])
+            if isinstance(d, dict)
+        } - {"", "nan", "None"}
+        if len(_entities_in_docs_ans) < 2:
+            return ans
+        _missing_entities_ans = [ev for ev in _entities_in_docs_ans if ev not in ans]
+        if not _missing_entities_ans:
+            return ans
+        _LOG.warning(
+            "[Practical] answer missing entity section(s) %s despite "
+            "_entity_type_explicitly_skipped and both present in DOCUMENTS "
+            "— retrying once with a corrective reminder",
+            _missing_entities_ans,
+        )
+        _entity_coverage_retry_prompt = (
+            prompt
+            + "\n\n[SYSTEM REMINDER] Your previous answer completely omitted "
+            f"the section(s) for: {', '.join(_missing_entities_ans)}. DOCUMENTS "
+            "contain full content for EVERY entity_type_normalized value present "
+            "— write one clearly-labeled, complete section per entity type, "
+            "omitting none of them."
+        )
+        try:
+            _retry_decision_ans = self._call_llm_json_with_truncation_retry(
+                _entity_coverage_retry_prompt, state=state
+            )
+            _retry_exec_raw_ans = _retry_decision_ans.get("execution", {})
+            if isinstance(_retry_exec_raw_ans, str):
+                try:
+                    _retry_exec_raw_ans = json.loads(_retry_exec_raw_ans)
+                except Exception:
+                    _retry_exec_raw_ans = {}
+            _retry_exec_ans = _retry_exec_raw_ans if isinstance(_retry_exec_raw_ans, dict) else {}
+            _retry_ans = (_retry_exec_ans.get("answer") or "").strip()
+            if _retry_ans:
+                _retry_ans, _ = _shared_extract_info_gap_tag(_retry_ans)
+                _retry_ans = self._strip_entity_reinvite_closer(_retry_ans)
+                _still_missing = [ev for ev in _entities_in_docs_ans if ev not in _retry_ans]
+                if len(_still_missing) < len(_missing_entities_ans):
+                    _LOG.info(
+                        "[Practical] entity coverage retry improved answer — still missing=%s",
+                        _still_missing,
+                    )
+                    return _retry_ans
+                _LOG.warning(
+                    "[Practical] entity coverage retry did not help (still missing=%s) "
+                    "— keeping original answer",
+                    _still_missing,
+                )
+        except Exception as _e_coverage_retry:
+            _LOG.warning(
+                "[Practical] entity coverage retry failed: %s — keeping original answer",
+                _e_coverage_retry,
+            )
+        return ans
+
     def _apply_practical_lint(self, text: str, kind: str) -> str:
         t = (text or "").strip()
         if not t:
@@ -1489,6 +1751,20 @@ class PracticalPersonaService:
         re.IGNORECASE,
     )
     _LQS_SIGN_TAX_RE = re.compile(r"ภาษีป้าย|ป้ายร้านอาหาร", re.IGNORECASE)
+    # ใบอนุญาตอาหาร (casual phrasing) → "ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร". 2026-09: this
+    # license_type had NO dedicated keyword rule here (unlike VAT/liquor/SAN/etc. above), so a
+    # casual "ขอใบอนุญาตอาหาร" query — which shares no 8-char contiguous substring with the
+    # official name (the real name has "จัดตั้งสถานที่จำหน่าย" between "ใบอนุญาต" and "อาหาร",
+    # a casual query has neither) — scored 0 on both the food-permit AND every other license,
+    # falling through to the LLM fallback classifier, which was live-reproduced picking the
+    # wrong license ("ใบทะเบียนพาณิชย์") for a query that also mentioned entity-type comparison
+    # terms ("ห้างหุ้นส่วนจำกัด", "บุคคลธรรมดา") strongly associated with DBD/commerce
+    # registration content elsewhere in the corpus, discarding all the actual food-permit docs
+    # via FOCUS FILTER before the answer was ever generated.
+    _LQS_FOOD_PERMIT_RE = re.compile(
+        r"ใบอนุญาต.*อาหาร|อาหาร.*ใบอนุญาต|จัดตั้ง.*(?:ร้านอาหาร|จำหน่ายอาหาร)|สถานที่จำหน่ายอาหาร|bma\s*oss",
+        re.IGNORECASE,
+    )
     _LQS_QR_PAYMENT_RE = re.compile(
         r"qr|คิวอาร์|คิวอาเพ|คิวอาเอพีไอ|payment|biller.?id|merchant.?id|"
         r"สมัคร.*ชำระ|ชำระ.*ออนไลน์|ลงทะเบียน.*ชำระ",
@@ -1496,6 +1772,10 @@ class PracticalPersonaService:
     )
 
     # ── Inline handle() patterns compiled once here ──────────────────────────────
+    _INLINE_URL_RE = re.compile(
+        r"(https?://[^\s฀-๿]{8,}|www\.[a-zA-Z0-9][\w.\-]+(?:/[^\s฀-๿]*)?)",
+        re.IGNORECASE,
+    )
     _TC_QUERY_RE = re.compile(r"ตัดรอบ|cut.?off|เงื่อนไขและหลักเกณฑ์|หลักเกณฑ์การให้บริการ")
     _TC_TIME_RE = re.compile(r"\d{1,2}[.:]\d{2}\s*น\.?")
     _NO_FORMS_Q_RE = re.compile(
@@ -1540,8 +1820,16 @@ class PracticalPersonaService:
             model_kwargs={"response_format": {"type": "json_object"}},
             extra_body=_extra_body,
         )
-
-    # Normalization / detectors
+        # Root cause (2026-09-24) of a total prompt-caching outage: the call site
+        # that builds the cached system message used to read the model name via
+        # getattr(self.llm, "model", ""), but langchain_openai (as pinned in this
+        # project's requirements.txt, 0.3.35) stores it under `.model_name`, not
+        # `.model` — that getattr always silently returned "", so the "anthropic/"
+        # in model_name check in build_cached_system_message was always False and
+        # cache_control was never attached on any real call, ever. Storing the
+        # already-known-correct value here avoids depending on the installed
+        # library's internal attribute name at all.
+        self._model_name = model_name
     def _normalize_for_intent(self, s: str) -> str:
         t = (s or "").strip().lower()
         t = re.sub(r"[!！?？。,，]+", " ", t)
@@ -2162,7 +2450,7 @@ class PracticalPersonaService:
         last_err = None
         for _ in range(max_retries):
             try:
-                _sys_msg = build_cached_system_message(SYSTEM_PROMPT_PRACTICAL, getattr(self.llm, "model", ""))
+                _sys_msg = build_cached_system_message(SYSTEM_PROMPT_PRACTICAL, self._model_name)
                 resp = llm_invoke(_llm, [_sys_msg, HumanMessage(content=prompt)], logger=_LOG, label="Practical/json", state=state)
                 text = extract_llm_text(resp).strip()
 
@@ -2354,6 +2642,41 @@ class PracticalPersonaService:
             _LOG.info("[Practical] LQS LLM fallback: %r → %r (conf=%.2f, min=%.2f)", query[:50], matched, conf_val, min_confidence)
         return matched
 
+    # Live-verified (2026-09) against the real corpus: structural/section labels like
+    # "กฎหมาย", "บทสรุป", "เบ็ดเตล็ด", "บทกำหนดโทษ", "บทเฉพาะกาล" top out at 10 Thai
+    # characters and are too generic to substring-match safely (a user query merely
+    # mentioning "กฎหมาย" would false-positive-trigger a sweep). Every genuine,
+    # specific chapter topic in the corpus is ≥12 chars (e.g. "กฎหมายแรงงาน",
+    # "กลยุทธ์ด้านราคา") — this threshold sits in that natural gap.
+    _NONREG_TOPIC_MIN_LEN = 12
+
+    def _get_nonreg_main_topics(self, vectorstore) -> List[str]:
+        """Distinct main_topic values for non-regulatory (marketing/business_guide)
+        rows, fetched live from Chroma and cached per-process (invalidated by
+        redeploy/re-ingest, which restarts the process). Sorted longest-first so a
+        substring check never matches a short topic name that's itself a substring
+        of a longer, more specific one. Zero hardcoded topic names — any topic
+        added to the data shows up here automatically.
+        """
+        _cached = getattr(self, "_nonreg_main_topics_cache", None)
+        if _cached is not None:
+            return _cached
+        _topics: set = set()
+        if vectorstore is not None:
+            _coll = getattr(vectorstore, "_collection", None)
+            if _coll is not None:
+                try:
+                    _result = _coll.get(where={"data_type": {"$in": ["marketing", "business_guide"]}}, include=["metadatas"])
+                    for _md in (_result.get("metadatas") or []):
+                        _mt = str((_md or {}).get("main_topic") or "").strip()
+                        if _mt and len(_mt) >= self._NONREG_TOPIC_MIN_LEN:
+                            _topics.add(_mt)
+                except Exception as _mt_lookup_e:
+                    _LOG.debug("[Practical] nonreg main_topic fetch failed: %s", _mt_lookup_e)
+        _sorted = sorted(_topics, key=len, reverse=True)
+        self._nonreg_main_topics_cache = _sorted
+        return _sorted
+
     def _retrieve_docs(
         self, query: str, metadata_filter: Optional[Dict[str, Any]] = None, max_docs: Optional[int] = None,
         slot_context: Optional[Dict[str, Any]] = None, state=None,
@@ -2396,6 +2719,7 @@ class PracticalPersonaService:
 
         _hybrid_enabled = getattr(conf, "HYBRID_SEARCH_ENABLED", False)
         _rrf_k = int(getattr(conf, "HYBRID_RRF_K", 60))
+        _bm25_ratio = float(getattr(conf, "BM25_BYPASS_MIN_RATIO", 0.35))
 
         def _scored_search(q: str, k: int, flt: Optional[dict] = None) -> list:
             """Dense search (+ BM25 via RRF when HYBRID_SEARCH_ENABLED=true). Attaches _sim to metadata."""
@@ -2415,7 +2739,7 @@ class PracticalPersonaService:
             try:
                 if _hybrid_enabled:
                     from utils.hybrid_retriever import hybrid_scored_search
-                    pairs = hybrid_scored_search(vectorstore, q, k=k, metadata_filter=flt, rrf_k=_rrf_k)
+                    pairs = hybrid_scored_search(vectorstore, q, k=k, metadata_filter=flt, rrf_k=_rrf_k, bm25_bypass_min_ratio=_bm25_ratio)
                 else:
                     kwargs: dict = {"k": k}
                     if flt:
@@ -2566,22 +2890,147 @@ class PracticalPersonaService:
                         _r3_added, _missing_terms, len(docs),
                     )
 
+        # ── Round 4: chapter-completeness sweep (business_guide/marketing) ──────
+        # Mirrors persona_supervisor.py's regulatory coverage-sweep guarantee (its
+        # broad-question path deterministically fetches every missing license_type
+        # instead of trusting similarity search to find them all) — but for
+        # non-regulatory "chapter" content, keyed on main_topic instead of
+        # license_type.
+        #
+        # Anchor detection has TWO independent paths, tried in order:
+        #   (a) Round 2's majority-vote anchor, when it happened to land on
+        #       main_topic (cheap, no extra query).
+        #   (b) Direct containment check: does expanded_query literally contain
+        #       one of the corpus's actual main_topic values? This path exists
+        #       because (a) requires ≥2 of the top-5 Round-1 docs to already
+        #       share a main_topic — but live-verified (2026-09) case
+        #       "อยากได้คำแนะนำเรื่องการตั้งราคาเมนูให้เหมาะสม มีหลักคิดยังไงบ้าง"
+        #       scored a best dense rank of 215th/942 (~0 similarity) against the
+        #       correct "กลยุทธ์ด้านราคา" chapter, so Round 1's top-5 was scattered
+        #       across unrelated topics and (a) never found a majority. Casual
+        #       phrasing just doesn't share vocabulary with the formal chapter
+        #       text at the embedding level. Path (b) instead leans on
+        #       query_synonyms.py, which already exists to bridge exactly this
+        #       gap — its expansion for "ตั้งราคา" appends the literal string
+        #       "กลยุทธ์ด้านราคา" into expanded_query, so a substring check
+        #       against the corpus's live main_topic list finds it deterministically
+        #       even when similarity search alone can't. The main_topic list itself
+        #       is fetched from Chroma (cached per-process), not hardcoded — so any
+        #       FUTURE main_topic is covered automatically the moment a synonym
+        #       pattern (or the query text itself) mentions it by name.
+        if docs and not metadata_filter:
+            _r4_anchor: str = _r2_anchor if (_r2_field == "main_topic" and _r2_anchor) else ""
+            if not _r4_anchor:
+                try:
+                    for _mt_cand in self._get_nonreg_main_topics(vectorstore):
+                        if _mt_cand and _mt_cand in expanded_query:
+                            _r4_anchor = _mt_cand
+                            break
+                except Exception as _mt_e:
+                    _LOG.debug("[Practical] nonreg main_topic lookup failed: %s", _mt_e)
+            if _r4_anchor:
+                try:
+                    _chapter_is_nonreg = _r4_anchor in self._get_nonreg_main_topics(vectorstore)
+                    if _chapter_is_nonreg and vectorstore is not None:
+                        _coll_ch = getattr(vectorstore, "_collection", None)
+                        if _coll_ch is not None:
+                            _ch_result = _coll_ch.get(where={"main_topic": _r4_anchor}, include=["documents", "metadatas"])
+                            _seen_ch = {hash((getattr(d, "page_content", "") or "")[:120]) for d in docs}
+                            # Group by sub_topic (fallback operation_topic) and round-robin
+                            # pick across groups, capped at max_docs — same "bounded fetch,
+                            # not the whole chapter" shape as persona_supervisor.py's
+                            # regulatory sweep (k=2 per missing license_type, not unlimited).
+                            # This guarantees every distinct sub-category within the chapter
+                            # gets a representative doc BEFORE any one category gets a second,
+                            # which is what actually fixes "missing 2 of 4 categories" — just
+                            # adding all 26 docs to the candidate pool and hoping the reranker
+                            # sorts them diversely into the final max_docs slots was not a
+                            # guarantee, only a hope.
+                            _ch_groups: Dict[str, list] = {}
+                            for _ch_content, _ch_meta in zip(
+                                _ch_result.get("documents") or [], _ch_result.get("metadatas") or []
+                            ):
+                                _ch_h = hash((_ch_content or "")[:120])
+                                if _ch_h in _seen_ch:
+                                    continue
+                                _seen_ch.add(_ch_h)
+                                _grp_key = str((_ch_meta or {}).get("sub_topic") or (_ch_meta or {}).get("operation_topic") or "").strip() or "_"
+                                _ch_groups.setdefault(_grp_key, []).append((_ch_content, _ch_meta))
+
+                            # A full-chapter question genuinely needs more than the terse
+                            # default doc budget to cover every distinct sub-topic — same
+                            # reasoning as the existing max_docs=8/15 overrides elsewhere in
+                            # this file for other broad-retrieval call sites. Bounded so a
+                            # chapter with e.g. 80 sub-topics can't blow up token cost.
+                            _n_groups_total = len(_ch_groups)
+                            _sweep_cap_ceiling = int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL_CHAPTER_SWEEP", 12))
+                            if _n_groups_total > max_docs:
+                                max_docs = min(_n_groups_total, _sweep_cap_ceiling)
+
+                            from langchain_core.documents import Document as _ChDoc
+                            _pinned: list = []
+                            _cap = max(1, max_docs)
+                            while _ch_groups and len(_pinned) < _cap:
+                                for _grp_key in list(_ch_groups.keys()):
+                                    if len(_pinned) >= _cap:
+                                        break
+                                    _content, _meta = _ch_groups[_grp_key].pop(0)
+                                    # _bm25_hit bypasses the min_similarity filter below — these docs
+                                    # are trusted by construction (exact main_topic metadata match),
+                                    # not by a similarity score, same reasoning as real BM25 hits.
+                                    # _chapter_sweep_pin additionally protects them from being DROPPED
+                                    # (not just reordered) by the reranker's own top_k cutoff further
+                                    # below — discovered live (2026-09): prepending to `docs` only
+                                    # guarantees survival through the FINAL docs[:max_docs] slice, but
+                                    # the reranker runs before that and re-sorts+truncates to its own
+                                    # RERANKER_TOP_K purely by cross-encoder score, with no notion of
+                                    # "pinned" — so a real test with 9 pinned sub-topics only saw 7
+                                    # survive to the final answer, silently dropped mid-pipeline.
+                                    _pinned.append(_ChDoc(page_content=_content or "", metadata={**(_meta or {}), "_bm25_hit": True, "_chapter_sweep_pin": True}))
+                                    if not _ch_groups[_grp_key]:
+                                        del _ch_groups[_grp_key]
+                            if _pinned:
+                                # Pin at the front (not appended) so this chapter's coverage
+                                # survives the final docs[:max_docs] truncation regardless of
+                                # how the reranker/metadata-boost stages later score them.
+                                docs = _pinned + docs
+                                _n_groups = len({str((p.metadata or {}).get("sub_topic") or (p.metadata or {}).get("operation_topic") or "") for p in _pinned})
+                                _LOG.info(
+                                    "[Practical] Round 4 chapter sweep +%d docs (%d sub-topics, main_topic=%r) total=%d",
+                                    len(_pinned), _n_groups, _r4_anchor[:40], len(docs),
+                                )
+                except Exception as _ch_e:
+                    _LOG.debug("[Practical] chapter sweep failed: %s", _ch_e)
+
         retrieval_ms = (time.time() - start) * 1000
 
         # Token Optimization: Filter by similarity score
         # เลือกเฉพาะเอกสารที่มี similarity > threshold
+        # PDF book content (2026-09 bug fix, evidence-based — see conf.py's
+        # RETRIEVAL_MIN_SIMILARITY_PDF_BOOK comment for the full measurement):
+        # the global 0.6 floor silently drops genuinely-correct PDF-book narrative
+        # content (measured 0.487-0.577 across 5 confirmed-correct real queries,
+        # ALL below 0.6) — this file's own _retrieve_docs() has the identical gap
+        # to persona_academic.py's, confirmed by direct testing; it just rarely
+        # bites in practice because most live Practical traffic is actually
+        # retrieved by persona_supervisor.py's _ensure_practical_retrieval_for_legal
+        # (which applies no similarity floor at all), not this function. Scoped
+        # strictly to ingested_via="pdf_auto" so regulatory/legacy Sheet content
+        # keeps the original 0.6 floor exactly as before.
         min_similarity = getattr(conf, 'RETRIEVAL_MIN_SIMILARITY', 0.6)
+        min_similarity_pdf = getattr(conf, 'RETRIEVAL_MIN_SIMILARITY_PDF_BOOK', 0.45)
         filtered_docs = []
         low_quality_docs = []
-        
+
         for d in docs:
             _md_f = (getattr(d, "metadata", {}) or {})
             # BM25-only docs (no Dense score) are trusted by RRF — bypass min_similarity
             if _md_f.get("_bm25_hit"):
                 filtered_docs.append(d)
                 continue
+            _eff_min_similarity = _shared_effective_min_similarity(_md_f, min_similarity, min_similarity_pdf)
             score = _md_f.get("_sim") or getattr(d, 'score', None)
-            if score is not None and score >= min_similarity:
+            if score is not None and score >= _eff_min_similarity:
                 filtered_docs.append(d)
             elif score is not None:
                 low_quality_docs.append((d, score))
@@ -2633,6 +3082,14 @@ class PracticalPersonaService:
         # a tiebreaker on near-equal scores rather than overriding the reranker.
         if getattr(conf, "RERANKER_ENABLED", False) and len(docs) >= 3:
             try:
+                # Chapter-sweep pins (Round 4) must survive reranking, not just be
+                # reordered by it — the reranker truncates to its own RERANKER_TOP_K
+                # purely by cross-encoder score, with no notion of "pinned", so a doc
+                # added specifically to guarantee sub-topic coverage can still be
+                # silently dropped here even though it survived the min_similarity
+                # filter above. Live-verified (2026-09): 9 pinned sub-topics went in,
+                # only 7 came out the other side of this exact step.
+                _pin_before = [d for d in docs if (getattr(d, "metadata", {}) or {}).get("_chapter_sweep_pin")]
                 from utils.reranker import rerank as _do_rerank
                 _rr_model = getattr(conf, "RERANKER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
                 _rr_top_k = int(getattr(conf, "RERANKER_TOP_K", len(docs)))
@@ -2641,6 +3098,12 @@ class PracticalPersonaService:
                 _rr_min_score = getattr(conf, "RERANKER_MIN_SCORE", None)
                 # Use original query (Thai only) not expanded_query which may contain English synonyms
                 docs = _do_rerank(query, docs, model_name=_rr_model, top_k=_rr_top_k, backend=_rr_backend, onnx_file=_rr_onnx_file, min_score=_rr_min_score)
+                if _pin_before:
+                    _seen_after = {hash((getattr(d, "page_content", "") or "")[:120]) for d in docs}
+                    _re_add = [p for p in _pin_before if hash((getattr(p, "page_content", "") or "")[:120]) not in _seen_after]
+                    if _re_add:
+                        docs = _re_add + docs
+                        _LOG.info("[Practical] reranker dropped %d chapter-sweep pin(s) — re-admitted", len(_re_add))
                 _LOG.debug("[Practical] reranker applied — %d docs kept", len(docs))
             except Exception as _rr_exc:
                 _LOG.warning("[Practical] reranker failed (%s) — continuing without rerank", _rr_exc)
@@ -2693,6 +3156,22 @@ class PracticalPersonaService:
         # Sort descending by blend score; preserve original order on ties (stable sort)
         _boosted.sort(key=lambda x: x[1], reverse=True)
         docs = [_d for _d, _ in _boosted]
+
+        # Re-assert chapter-sweep pins ahead of everything else, right before the
+        # final docs[:max_docs] truncation. Reordering by relevance (this boost step,
+        # and the reranker before it) is fine and expected for both groups — but a
+        # pinned doc must never lose its slot in the final cut just because its blend
+        # score landed lower than a non-pinned doc's. Doing this only once (earlier,
+        # right after Round 4) wasn't enough: both the reranker and this boost step
+        # independently re-sort `docs` by their own score afterward, silently undoing
+        # a front-position guarantee set upstream — live-verified (2026-09), pins
+        # still lost slots here even after being re-admitted post-reranker. Sorting
+        # within each group is preserved; only the pinned-vs-not grouping is forced.
+        if any((getattr(d, "metadata", {}) or {}).get("_chapter_sweep_pin") for d in docs):
+            _pin_group = [d for d in docs if (getattr(d, "metadata", {}) or {}).get("_chapter_sweep_pin")]
+            _rest_group = [d for d in docs if not (getattr(d, "metadata", {}) or {}).get("_chapter_sweep_pin")]
+            docs = _pin_group + _rest_group
+
         # Log when boost changed the ranking
         _boost_changed = any(
             _boosted[i][1] != _boosted[i][0].metadata.get("_sim", _boosted[i][1])
@@ -2731,6 +3210,13 @@ class PracticalPersonaService:
             "legal_regulatory",     # บทลงโทษ ค่าปรับ ข้อกำหนดทางกฎหมาย
             "terms_and_conditions", # หน้าที่และเงื่อนไขของผู้ประกอบการ
             "restaurant_ai_document",  # เอกสาร/ฟอร์ม AI ร้านอาหาร
+            # location/area_size (2026-09 cost-reduction audit): needed so the new
+            # head-only content line (_build_head_only_content) can still show them —
+            # neither is in _LLM_METADATA_WHITELIST (never sent as a separate metadata
+            # key), they only ever reached the LLM via content's head line, which this
+            # whitelist must not silently drop now that content is built from md here
+            # instead of from the ingest-time page_content string.
+            "location", "area_size",
             # know_how docs (feature/pdf-ingestion) — separate lightweight schema,
             # see data_loader.py's load_from_knowhow_sheet(). full_text is absent
             # from metadata entirely (not just capped) when knowhow_write_back.py
@@ -2740,9 +3226,12 @@ class PracticalPersonaService:
         _STORE_FIELD_CAPS = {
             # Must be >= the per-field caps used in the handle() prompt loop below,
             # otherwise the storage cut dominates and the prompt cap has no effect.
+            # terms_and_conditions/service_channel raised 1800/500→2300/600 (2026-09
+            # cost-reduction audit): matches data_loader.py's embedding-time cap —
+            # real corpus had 1/2 docs respectively exceeding the old, tighter values.
             "operation_steps": 2000, "identification_documents": 4000,
-            "research_reference": 3100, "fees": 900, "service_channel": 500,
-            "legal_regulatory": 2000, "terms_and_conditions": 1800,
+            "research_reference": 3100, "fees": 900, "service_channel": 600,
+            "legal_regulatory": 2000, "terms_and_conditions": 2300,
             "restaurant_ai_document": 800,
             # marketing / business_guide content fields
             "answer_guideline": 1500, "main_topic": 120, "sub_topic": 150,
@@ -2758,12 +3247,23 @@ class PracticalPersonaService:
         # truncates it, causing downstream LLM to miss later steps/sections.
         # Use a higher cap for business_guide docs so the full content reaches the LLM.
         _BG_ANSWER_GUIDELINE_CAP = int(getattr(conf, "LLM_DOC_CHARS_BUSINESS_GUIDE", 3500))
+        # PDF book content (feature/pdf-ingestion, 2026-09 sub-chunking fix):
+        # service/pdf_direct_ingest.py's build_knowhow_documents() now emits
+        # sub-chunks up to conf.PDF_KNOWHOW_CHUNK_MAX_CHARS (24000) so a whole
+        # book chapter's content survives embedding untruncated — but without
+        # a matching cap here, _BG_ANSWER_GUIDELINE_CAP (3500) would just
+        # re-truncate it at this later stage, undoing that fix. Gated behind
+        # ingested_via="pdf_auto" (stamped on every doc that module creates)
+        # so pre-existing, legacy Sheet-based business_guide content is
+        # completely unaffected — it was never long enough to hit 3500 anyway.
+        _PDF_BOOK_ANSWER_GUIDELINE_CAP = int(getattr(conf, "LLM_DOC_CHARS_PDF_BOOK", 24000))
         results: List[Dict[str, Any]] = []
         for d in docs[:max_docs]:
             raw_md = getattr(d, "metadata", {}) or {}
             # Detect business_guide doc: no license_type → answer_guideline is the sole content
             _lt_val = (raw_md.get("license_type") or "").strip().lower()
             _is_bg = _lt_val in ("", "nan", "none")
+            _is_pdf_book = str(raw_md.get("ingested_via") or "").strip().lower() == "pdf_auto"
             slim_md = {}
             for k, v in raw_md.items():
                 if k not in _STORE_META_WHITELIST:
@@ -2771,7 +3271,9 @@ class PracticalPersonaService:
                 if v in (None, "", "nan", "None"):
                     continue
                 v_str = str(v)
-                if k == "answer_guideline" and _is_bg:
+                if k == "answer_guideline" and _is_bg and _is_pdf_book:
+                    cap = _PDF_BOOK_ANSWER_GUIDELINE_CAP
+                elif k == "answer_guideline" and _is_bg:
                     cap = _BG_ANSWER_GUIDELINE_CAP
                 else:
                     cap = _STORE_FIELD_CAPS.get(k)
@@ -2850,6 +3352,34 @@ class PracticalPersonaService:
             state.context.pop(auto_internal_guard_key, None)
         elif user_text == "__auto_post_retrieve__":
             state.context[auto_internal_guard_key] = int(state.context.get(auto_internal_guard_key, 0) or 0) + 1
+
+        # Hard cap on internal retrieve→re-retrieve recursion (2026-09 incident fix,
+        # ported from main — see commit 1bf59b8). This counter was being incremented
+        # right above on every "__auto_post_retrieve__" recursive call but was never
+        # READ anywhere in this file — a dead tripwire. When retrieval genuinely
+        # returns 0 docs every time (e.g. a broken/empty vectorstore connection), the
+        # action=="retrieve" guard further down only blocks re-retrieval when
+        # `state.current_docs` is truthy — with docs empty, that guard is skipped
+        # entirely, so the LLM keeps returning action="retrieve" with a freshly-
+        # reworded query forever and handle() keeps recursing with no limit.
+        # Reproduced live: one single question recursed for 2h22m, accumulated 5.4M+
+        # tokens, before being killed manually — this closes that gap. MAX_ROUNDS
+        # (conf) is a DIFFERENT, higher-level per-session turn limit enforced in
+        # persona_supervisor.py — it never sees this loop since handle() never
+        # returns control back up while recursing, so it can't help here.
+        _apg_count = int(state.context.get(auto_internal_guard_key, 0) or 0)
+        _max_auto_retrieve_loops = int(getattr(conf, "MAX_AUTO_RETRIEVE_LOOPS", 5) or 5)
+        if _apg_count > _max_auto_retrieve_loops:
+            _LOG.error(
+                "[Practical] auto-retrieve loop exceeded cap (%d > %d) — aborting with fallback "
+                "instead of recursing further (query=%r)",
+                _apg_count, _max_auto_retrieve_loops, user_text[:80],
+            )
+            state.context[auto_internal_guard_key] = 0
+            state.context["_info_gap_detected"] = True
+            _fb = "ขอโทษครับ ไม่พบข้อมูลที่ตรงกับคำถามนี้ในฐานข้อมูลของเรา กรุณาลองถามใหม่หรือระบุรายละเอียดเพิ่มเติมครับ"
+            state.add_assistant_message(_fb)
+            return state, _fb
 
         # recovery only in non-internal, owner-gated (already inside the function)
         if not _internal:
@@ -3032,10 +3562,19 @@ class PracticalPersonaService:
             "operation_steps": 2000,  # raised 900→2000: multi-phase online channels (e.g. 3-phase ภาษีป้าย) need ~1500 chars
             "identification_documents": 4000,  # must never truncate — missing items = legal error; current max in data is 3156 chars
             "fees": 900,
-            "operation_duration": 200,
-            "service_channel": 400,
-            "legal_regulatory": 1250,
-            "terms_and_conditions": 1800,
+            # operation_duration/service_channel/legal_regulatory/terms_and_conditions
+            # raised (2026-09 cost-reduction audit): these were tighter than data_loader.
+            # py's embedding-time cap for the same field, so a handful of real docs
+            # (1-2 each) had MORE text in the old duplicated "content" field than in
+            # metadata — an asymmetry that made content non-redundant for those few
+            # docs. Matching (or exceeding) the embedding cap here closes that gap so
+            # metadata is never less complete than content, which is what makes it
+            # safe to stop sending full duplicated content at all (see
+            # _build_head_only_content below).
+            "operation_duration": 300,
+            "service_channel": 600,
+            "legal_regulatory": 2000,
+            "terms_and_conditions": 2300,
             "restaurant_ai_document": 650,
         }
         _LONG_FIELDS_DEDUP = {"operation_steps", "legal_regulatory", "identification_documents"}  # deduped per (license_type, entity_type_normalized, service_channel); terms_and_conditions excluded (cut-off time rows differ per doc)
@@ -3043,6 +3582,13 @@ class PracticalPersonaService:
         # Cap docs sent to LLM: _prompt_max_docs per license_type to control token usage.
         # For multi-license, each license still gets its own metadata via dedup logic below.
         _all_docs = state.current_docs or []
+        # Pristine snapshot for the multi-entity established-topic guarantee fallback further
+        # below (2026-09) — by the time that block runs, op-intent filtering + sibling-completion
+        # may have already replaced _docs_to_process's license_type composition entirely (see
+        # that block's own comment for the live-reproduced scenario), so deriving a fallback
+        # license from _docs_to_process at that point can pick up a completely unrelated,
+        # already-narrowed pool instead of what was actually retrieved for the query.
+        _all_docs_snapshot_ig = list(_all_docs)
         _lt_order: list = []  # license_types in order of first appearance
         _lt_doc_count: dict = {}
         _mt_order: list = []  # main_topics from non-regulatory docs (no license_type)
@@ -3317,13 +3863,53 @@ class PracticalPersonaService:
                 _base, _prompt_max_docs,
             )
 
+        # Broad/generic tax question (2026-09, live-reproduced): "ปีนี้เราต้องเสียภาษีปะ
+        # ต้องเสียเท่าไหร่" names no specific tax sub-type (not "ภาษีป้าย", not "VAT"/
+        # "ภาษีมูลค่าเพิ่ม") — it's inherently asking about ALL taxes a restaurant owes, which
+        # legitimately spans 2 regulatory license_types (signboard tax + VAT) AND business_guide
+        # rows with no license_type at all (income tax has no regulatory doc, only a
+        # business_guide overview row). The regex license-scorer below correctly scores every
+        # candidate 0 for a query this generic, which then falls through to an LLM fallback
+        # that is FORCED to pick exactly one license_type (its prompt has no "multiple/none of
+        # these specifically" option) — it picked "ภาษีป้าย" alone, and the subsequent
+        # dominant-license narrowing dropped the VAT docs AND every business_guide tax row
+        # (license_type="" never matches a non-empty dominant_lt), leaving an answer about
+        # signboard tax only. Detected here, BEFORE the regex/LLM scoring below ever runs, so
+        # neither can mis-fire on this query; narrowed to a tax-topic allowlist on _all_docs
+        # directly (drops only unrelated marketing/business_guide noise — e.g. "กลยุทธ์ด้านราคา",
+        # "สำรวจร้านคู่แข่ง" — that unfiltered retrieval also happened to pull in), then routed
+        # through the SAME "broad query" skip as the "บอกทุกอย่าง" case below so FOCUS FILTER's
+        # single-dominant-license narrowing never runs on it at all.
+        _TAX_TOPIC_LABEL_RE = re.compile(r"ภาษี", re.IGNORECASE)
+        _is_broad_tax_query = bool(
+            _TAX_TOPIC_LABEL_RE.search(user_text or "")
+            and not self._LQS_SIGN_TAX_RE.search(user_text or "")
+            and not self._LQS_VAT_RE.search(user_text or "")
+        )
+        if _is_broad_tax_query:
+            _tax_lts = {lt for lt in _lt_order if _TAX_TOPIC_LABEL_RE.search(lt)}
+            _tax_relevant_docs = [
+                d for d in _all_docs
+                if (d.get("metadata") or {}).get("license_type", "").strip() in _tax_lts
+                or _TAX_TOPIC_LABEL_RE.search(
+                    " ".join(str((d.get("metadata") or {}).get(k) or "") for k in ("main_topic", "sub_topic", "operation_topic"))
+                )
+            ]
+            if _tax_relevant_docs:
+                _LOG.info(
+                    "[Practical] broad tax query: keeping %d tax-relevant doc(s) across %s (dropped %d unrelated noise doc(s))",
+                    len(_tax_relevant_docs), sorted(_tax_lts) or ["(business_guide only)"], len(_all_docs) - len(_tax_relevant_docs),
+                )
+                _all_docs = _tax_relevant_docs
+                state.current_docs = _all_docs
+
         # FOCUS FILTER: when docs span multiple license_types AND this is a single-topic query
         # (not an explicit "broad overview" request like "บอกทุกอย่าง"), keep only docs from the
         # dominant license_type — the one with the most docs and highest similarity to the query.
         # This prevents stale docs from the previous topic bleeding into the current answer.
         # Exception: if the multi-license set was intentionally built for a multi-topic query
         # (_multi_topic_retrieval flag), skip this filter.
-        _is_broad_query = bool(
+        _is_broad_query = _is_broad_tax_query or bool(
             re.search(r"บอกทุกอย่าง|รายละเอียดทั้งหมด|อยากรู้ครบ|ทุกอย่างที่|ทุกด้าน|ทุกเรื่อง", user_text or "")
         )
         _is_multi_topic_flag = bool((state.context or {}).get("_multi_topic_retrieval"))
@@ -3431,6 +4017,9 @@ class PracticalPersonaService:
                     s += 8.0
                 # QR Payment / online payment → "ระบบชำระเงินออนไลน์"
                 if self._LQS_QR_PAYMENT_RE.search(q) and re.search(r"ระบบชำระเงิน", lt, re.IGNORECASE):
+                    s += 8.0
+                # ใบอนุญาตอาหาร (casual phrasing) → "ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร"
+                if self._LQS_FOOD_PERMIT_RE.search(q) and re.search(r"จัดตั้งสถานที่จำหน่ายอาหาร", lt, re.IGNORECASE):
                     s += 8.0
                 return s
 
@@ -3580,7 +4169,19 @@ class PracticalPersonaService:
                                             if _s > _best_ot_sc_ff:
                                                 _best_ot_sc_ff = _s
                                                 _best_ot_ff = _ot_cand
-                                        if _best_ot_ff:
+                                        # Require a genuinely POSITIVE score (real Latin-token
+                                        # evidence, e.g. "SAN" matching "SAN PLUS") before
+                                        # overriding — not just "less negative than before".
+                                        # Bug found live (case 7, qa_12case rerun): when the
+                                        # current candidate pool's only non-empty operation_topic
+                                        # scored negative (e.g. "Wechat Pay" vs a query asking
+                                        # about "EDC" fees), this accepted ANY pure-Thai-label
+                                        # operation_topic elsewhere under the same license
+                                        # (scoring a neutral 0 — no Latin tokens at all, so zero
+                                        # actual relevance) and threw away the correctly-matching
+                                        # doc, which has operation_topic=None/empty and was never
+                                        # a candidate in this comparison to begin with.
+                                        if _best_ot_ff and _best_ot_sc_ff > 0:
                                             _ot_fresh = self._retrieve_docs(
                                                 user_text,
                                                 metadata_filter={"$and": [
@@ -3599,6 +4200,62 @@ class PracticalPersonaService:
                                                 state.current_docs = _ot_fresh
                                 except Exception as _ff_ot_err:
                                     _LOG.debug("[Practical] op-topic Latin correction failed: %s", _ff_ot_err)
+
+        # QR Payment account-name cross-reference (2026-09, live-reproduced): a customer
+        # asking about updating their bank account's OWNER NAME (e.g. after marriage) has
+        # their retrieval correctly include the QR-Payment-specific "name cannot be edited,
+        # must cancel and re-apply" docs (license_type="ระบบชำระเงินออนไลน์",
+        # registration_type="เจ้าของเดิม ชื่อบัญชีเดิม") ALONGSIDE the general
+        # license_type="บัญชีธนาคารรับเงิน" process doc at first — but the FOCUS FILTER just
+        # above (keeps only the single dominant license_type by keyword score, since the
+        # query never says "QR Payment") strips them back out, silently omitting the single
+        # most consequential fact for any restaurant that happens to accept QR Payment. This
+        # runs AFTER the focus filter (including its op-topic Latin-correction sub-step)
+        # fully resolves, specifically so it can't just get stripped straight back out by
+        # the same mechanism. Deliberately a narrow, hard-coded cross-reference (not a
+        # general "always re-add every filtered-out license_type" mechanism, which would
+        # defeat the focus filter's whole purpose) — scoped to the exact operation_topic
+        # that names this specific scenario, so it can't fire for unrelated bank-account
+        # questions (phone number change, etc.).
+        if any(
+            ((_d.get("metadata") or {}).get("operation_topic") or "").strip() == "การแก้ไข ชื่อเจ้าของบัญชี"
+            for _d in _all_docs
+        ) and not any(
+            ((_d.get("metadata") or {}).get("license_type") or "").strip() == "ระบบชำระเงินออนไลน์"
+            and ((_d.get("metadata") or {}).get("registration_type") or "").strip() == "เจ้าของเดิม ชื่อบัญชีเดิม"
+            for _d in _all_docs
+        ):
+            try:
+                _qr_vs = getattr(self.retriever, "vectorstore", None)
+                _qr_coll = getattr(_qr_vs, "_collection", None) if _qr_vs else None
+                if _qr_coll is not None:
+                    _qr_res = _qr_coll.get(
+                        where={"$and": [
+                            {"license_type": "ระบบชำระเงินออนไลน์"},
+                            {"registration_type": "เจ้าของเดิม ชื่อบัญชีเดิม"},
+                        ]},
+                        include=["documents", "metadatas"],
+                    )
+                    _qr_added = [
+                        {"content": c or "", "metadata": m or {}}
+                        for c, m in zip(_qr_res.get("documents") or [], _qr_res.get("metadatas") or [])
+                    ]
+                    if _qr_added:
+                        # Prepend, not append: several downstream cap paths (e.g. the
+                        # final "else: _docs_to_process = _all_docs[:_prompt_max_docs]"
+                        # fallback) just take a first-N slice — live-reproduced that
+                        # appending here let this exact fix get silently truncated back
+                        # out by that later slice, since the added docs landed past
+                        # position N. Prepending guarantees they survive any such cap.
+                        _all_docs = _qr_added + _all_docs
+                        state.current_docs = _all_docs
+                        _LOG.info(
+                            "[Practical] QR Payment account-name cross-reference: +%d doc(s) (banks: %s)",
+                            len(_qr_added),
+                            [((_d.get("metadata") or {}).get("department") or "") for _d in _qr_added],
+                        )
+            except Exception as _qr_xref_e:
+                _LOG.warning("[Practical] QR Payment account-name cross-reference failed: %s", _qr_xref_e)
 
         # Terms-and-conditions miss check: if query asks about cut-off times / conditions
         # but NO current doc has non-empty terms_and_conditions → stale state, force fresh
@@ -3689,7 +4346,54 @@ class PracticalPersonaService:
                             _st_pr_res.get("documents") or [],
                             _st_pr_res.get("metadatas") or [],
                         ))
-                        if len(_st_pr_pairs) > len(_all_docs):
+                        # PDF multi-chunk case (2026-09 bug fix): docs sharing one sub_topic
+                        # can mean independent Sheet content_type variants (the case this
+                        # aggregation was built for — "N ประเภท" framing is correct) OR
+                        # sequential CHUNKS of ONE long PDF-book topic split at ingest time
+                        # (utils/pdf_text_chunking.py) purely for embedding-size reasons —
+                        # those are NOT "different types", collapsing them into 200-char
+                        # snippets both mislabels them and re-loses the content fix #1 in
+                        # this session restored. chunk_total is set ONLY by PDF ingestion,
+                        # so its presence (>1, consistent across all pairs) unambiguously
+                        # signals case (b) without touching the original Sheet behavior.
+                        try:
+                            _pr_chunk_totals = {int((fm or {}).get("chunk_total") or 0) for _fc, fm in _st_pr_pairs}
+                        except (TypeError, ValueError):
+                            _pr_chunk_totals = set()
+                        if len(_pr_chunk_totals) == 1 and next(iter(_pr_chunk_totals)) > 1:
+                            _st_pr_ordered = sorted(
+                                _st_pr_pairs,
+                                key=lambda pair: int((pair[1] or {}).get("chunk_index") or 0),
+                            )
+                            _pdf_book_cap_pr = int(getattr(conf, "LLM_DOC_CHARS_PDF_BOOK", 24000))
+                            _full_ag_pr = "\n\n".join(
+                                str((fm or {}).get("answer_guideline") or "").strip()
+                                for _fc, fm in _st_pr_ordered
+                            ).strip()[:_pdf_book_cap_pr]
+                            _md0_chunks_pr = _st_pr_ordered[0][1] or {}
+                            _comb_md_chunks_pr = {
+                                k: v for k, v in _md0_chunks_pr.items()
+                                if v not in (None, "", "nan", "None") and str(v) not in ("nan", "None", "")
+                            }
+                            _comb_md_chunks_pr["answer_guideline"] = _full_ag_pr
+                            _comb_md_chunks_pr.pop("chunk_index", None)
+                            _comb_md_chunks_pr.pop("chunk_total", None)
+                            # _keep_full_content: same reasoning as the Sheet-variant
+                            # aggregation's own marker below — this doc's content IS the
+                            # reassembled full chapter text, not a metadata-duplicate the
+                            # docs_json build loop's head-only-content trim should touch.
+                            _aggregated_chunks_pr = [{
+                                "content": _full_ag_pr[:3000],
+                                "metadata": _comb_md_chunks_pr,
+                                "_keep_full_content": True,
+                            }]
+                            state.current_docs = _aggregated_chunks_pr
+                            _all_docs = _aggregated_chunks_pr
+                            _LOG.info(
+                                "[Practical] PDF multi-chunk reassembly: %d chunks → 1 combined doc for %r",
+                                len(_st_pr_pairs), _target_pr_st,
+                            )
+                        elif len(_st_pr_pairs) > len(_all_docs):
                             # Build supplemented list (add rows not already present)
                             _mc_pr = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700) or 700)
                             _ag_cap_pr = 400  # per-item cap for aggregated answer_guideline
@@ -3737,7 +4441,13 @@ class PracticalPersonaService:
                             )[:1500]
                             if _refs_pr:
                                 _comb_md_pr["research_reference"] = "\n".join(_refs_pr[:5])
-                            _aggregated_pr = [{"content": _comb_content_pr, "metadata": _comb_md_pr}]
+                            # _keep_full_content: this doc's "content" is a genuine synthesis
+                            # (per-item answer_guideline snippets) with no equivalent in
+                            # _comb_md_pr's own collapsed answer_guideline (just a type-name
+                            # list) — the docs_json build loop's head-only-content trim must
+                            # skip this one doc and keep its content as-is. See
+                            # _build_head_only_content's docstring for the general case.
+                            _aggregated_pr = [{"content": _comb_content_pr, "metadata": _comb_md_pr, "_keep_full_content": True}]
                             state.current_docs = _aggregated_pr
                             _all_docs = _aggregated_pr
                             _LOG.info(
@@ -3747,29 +4457,56 @@ class PracticalPersonaService:
                 except Exception as _pr_st_e:
                     _LOG.warning("[Practical] Sub_topic supplement failed: %s", _pr_st_e)
 
-        # Chapter overview detection: when ALL docs share the same main_topic AND
-        # data_type is marketing/business_guide → bypass the per-license cap so the LLM
-        # sees ALL chapter docs and can cover every sub_topic. Without this, the cap of
+        # Chapter overview detection: when the dominant main_topic AND data_type is
+        # marketing/business_guide → bypass the per-license cap so the LLM sees ALL
+        # chapter docs and can cover every sub_topic. Without this, the cap of
         # LLM_DOCS_MAX_PRACTICAL=6 would silently drop docs 7-N, causing subtopics to go missing.
         _is_chapter_overview = False
         if _all_docs and not _is_multi_license_docs:
-            _co_mts = {
-                ((_d.get("metadata") or {}).get("main_topic") or "").strip()
-                for _d in _all_docs
-            }
-            _co_dts = {
-                ((_d.get("metadata") or {}).get("data_type") or "").strip().lower()
-                for _d in _all_docs
-            }
+            _co_mt_counts: dict = {}
+            for _d in _all_docs:
+                _mt = ((_d.get("metadata") or {}).get("main_topic") or "").strip()
+                if _mt:
+                    _co_mt_counts[_mt] = _co_mt_counts.get(_mt, 0) + 1
             _subtopic_chapter_used = bool((state.context or {}).get("_subtopic_chapter_used"))
-            if (
-                len(_co_mts) == 1
-                and next(iter(_co_mts))
-                and _co_dts <= {"marketing", "business_guide", ""}
-                and not _subtopic_chapter_used
-            ):
-                _is_chapter_overview = True
-                _LOG.info("[Practical] Chapter overview detected — bypassing doc cap (main_topic=%r, %d docs)", next(iter(_co_mts)), len(_all_docs))
+            if _co_mt_counts:
+                # Dominant main_topic (2026-09 robustness fix, mirrors the analogous fix a
+                # few dozen lines below for _informational_but_nonreg_chapter — see that
+                # comment for the live-reproduced precedent). Requiring ALL docs to share
+                # exactly one main_topic breaks when even a few stray cross-chapter docs get
+                # pulled in alongside a real chapter expansion (live-reproduced: 23 real
+                # chapter docs + 5 unrelated-main_topic docs → 2 distinct main_topic values →
+                # never triggered, so the "cover every sub_topic" mandate never applied even
+                # though 82% of retrieved docs were genuinely one chapter). Use whichever
+                # main_topic dominates instead, and check data_type purity only within that
+                # dominant chapter's own docs (a stray doc's data_type shouldn't veto it).
+                _co_mt_dominant, _co_mt_dominant_n = max(_co_mt_counts.items(), key=lambda kv: kv[1])
+                _co_dominant_docs = [
+                    _d for _d in _all_docs
+                    if ((_d.get("metadata") or {}).get("main_topic") or "").strip() == _co_mt_dominant
+                ]
+                _co_dts = {
+                    ((_d.get("metadata") or {}).get("data_type") or "").strip().lower()
+                    for _d in _co_dominant_docs
+                }
+                if (
+                    _co_mt_dominant_n >= len(_all_docs) / 2
+                    and _co_dts <= {"marketing", "business_guide", ""}
+                    and not _subtopic_chapter_used
+                ):
+                    # NOTE: detection only — deliberately does NOT mutate _all_docs/
+                    # state.current_docs here. This flag is read by an earlier elif
+                    # branch too (_direct_topic_match's _informational_but_nonreg_chapter,
+                    # a few dozen lines below), which intentionally KEEPS cross-chapter
+                    # docs added by _merge_cross_chapter_docs_for_nonreg (see its
+                    # docstring's qa_12case case 12 — a deliberate full second-chapter
+                    # merge, not noise). Dropping strays unconditionally here would strip
+                    # those before that branch ever runs. The actual drop (when wanted)
+                    # happens only inside the "elif _is_chapter_overview:" branch itself,
+                    # which is mutually exclusive with _direct_topic_match.
+                    _is_chapter_overview = True
+                    _co_mts = {_co_mt_dominant}
+                    _LOG.info("[Practical] Chapter overview detected — bypassing doc cap (main_topic=%r, %d/%d docs)", _co_mt_dominant, _co_mt_dominant_n, len(_all_docs))
 
         # Topic Focus Filter: when the query contains English tokens that uniquely identify
         # one topic among several in _all_docs (e.g. "WeChat Pay" in a set that also includes
@@ -3832,20 +4569,69 @@ class PracticalPersonaService:
             # would produce an incomplete answer (e.g. 4 of 5 authority-restriction scenarios).
             # Exception: informational (bare topic) queries only need a brief overview — cap to
             # _prompt_max_docs so LLM produces a concise answer rather than a full guide.
-            if bool((state.context or {}).get("_informational_query")):
+            # Non-reg chapter guard (2026-09): _informational_query can be True even when
+            # _all_docs is NOT "one narrow definition doc" but a full non-regulatory
+            # (marketing/business_guide) CHAPTER that persona_supervisor.py's Step 0/sub_topic
+            # exact-match already deliberately expanded to (e.g. a single-topic query like
+            # "การสื่อสารการตลาด" matched a 1-row definition, then expanded to the full 23-row
+            # "กลยุทธ์ด้านการสื่อสาร" chapter it belongs to — see that expansion's own comment,
+            # "qa_12case case 3"). The informational-query classifier only judges the QUERY's
+            # phrasing, not what _all_docs actually contains, so it has no way to know the
+            # difference — capping to _prompt_max_docs here silently throws away 20+ of the
+            # very sub_topics that expansion existed to surface, live-reproduced as this same
+            # case's answer covering only 2-3 of 6+ distinct sub_topics. Detect the same
+            # "single shared non-reg main_topic" shape _is_chapter_overview checks below (that
+            # check runs too late in this function to reuse directly) and skip the cap then.
+            _informational_but_nonreg_chapter = False
+            if bool((state.context or {}).get("_informational_query")) and len(_all_docs) > _prompt_max_docs:
+                # Don't require a single shared main_topic — the "cross-chapter merge (non-reg)"
+                # step (see _merge_cross_chapter_docs_for_nonreg in persona_supervisor.py) can
+                # legitimately add a couple of docs from ANOTHER main_topic on top of the
+                # primary chapter expansion, which made this check require exactly one
+                # main_topic value fail here even though the docs are still genuinely a non-reg
+                # chapter overview (live-reproduced: 23 chapter docs + 2 cross-chapter docs = 2
+                # distinct main_topic values, so the stricter check never triggered and this fix
+                # silently did nothing on its first attempt). data_type + doc count alone is a
+                # sufficient and more robust signal of "this is chapter breadth, not one doc".
+                _dtm_dts = {str((_d.get("metadata") or {}).get("data_type") or "").strip().lower() for _d in _all_docs}
+                if _dtm_dts and _dtm_dts <= {"marketing", "business_guide", ""}:
+                    _informational_but_nonreg_chapter = True
+            if bool((state.context or {}).get("_informational_query")) and not _informational_but_nonreg_chapter:
                 _docs_to_process = _all_docs[:_prompt_max_docs]
                 _LOG.info(
                     "[Practical] Direct topic match (informational overview) — capped %d/%d docs",
                     len(_docs_to_process), len(_all_docs),
                 )
             else:
+                if _informational_but_nonreg_chapter:
+                    _LOG.info(
+                        "[Practical] Direct topic match (informational, but non-reg chapter) — "
+                        "sending all %d docs (cap would have discarded the chapter expansion)",
+                        len(_all_docs),
+                    )
                 _docs_to_process = _all_docs
                 _LOG.info("[Practical] Direct topic match — sending all %d docs (no cap)", len(_all_docs))
         elif _is_chapter_overview:
+            _co_mt = next(iter(_co_mts))
+            # Drop any minority stray docs from OTHER main_topics before building the
+            # sub_topic list below (2026-09) — scoped to THIS branch only (unlike the
+            # detection above, which deliberately left _all_docs untouched so the
+            # _direct_topic_match branch's cross-chapter merge could stay intact). Here,
+            # keeping them would leak unrelated sub_topics into the "Required sections"
+            # mandate (_chapter_overview_instruction below enumerates every sub_topic
+            # found in _docs_to_process), forcing the LLM to write sections for a
+            # different chapter's content it was never asked about.
+            _co_strays = [
+                _d for _d in _all_docs
+                if ((_d.get("metadata") or {}).get("main_topic") or "").strip() != _co_mt
+            ]
+            if _co_strays:
+                _all_docs = [_d for _d in _all_docs if _d not in _co_strays]
+                state.current_docs = _all_docs
+                _LOG.info("[Practical] Chapter overview: dropped %d stray docs from other main_topics", len(_co_strays))
             # Supplement: the reranker cap inside _retrieve_docs may have silently dropped
             # sub_topic docs that ranked lower than LLM_DOCS_MAX_PRACTICAL.
             # Re-retrieve with a main_topic metadata filter to recover any missing sub_topics.
-            _co_mt = next(iter(_co_mts))
             try:
                 _suppl = self._retrieve_docs(
                     _co_mt,
@@ -3995,6 +4781,22 @@ class PracticalPersonaService:
                         _op_include_re,
                         str((d.get("metadata") or {}).get("registration_type") or ""),
                     )
+                ) or (
+                    # Rescue: keep doc if the operation label ITSELF is dual-purpose and
+                    # matches the user's intent keyword too (2026-10, live-reproduced).
+                    # Example: ใบทะเบียนพาณิชย์'s cancellation row for บุคคลธรรมดา is labeled
+                    # operation_by_department="ยกเลิก เปลี่ยนแปลง" (one combined portal menu
+                    # entry covering both ops) — _eff_op(d) matches _op_exclude_re on
+                    # "เปลี่ยนแปลง" and gets dropped for a ยกเลิก-intent query, even though its
+                    # own label also matches _op_include_re on "ยกเลิก" and its operation_steps
+                    # ("1.การยกเลิก ภายใน 30 วัน...") genuinely IS the cancellation procedure —
+                    # confirmed via direct retrieval test: this doc ranked #1 for the exact
+                    # real query that hit this bug, then got silently filtered out here.
+                    # Without this, that's the ONLY op-filter case that removes the single doc
+                    # that actually answers the question, not just a wrong-entity/wrong-license
+                    # doc — so the rescue checks _eff_op(d) itself, not just registration_type.
+                    _op_include_re
+                    and re.search(_op_include_re, _eff_op(d))
                 ) or not (
                     # Check operation_by_department first (holds the actual operation label e.g. "ยกเลิก",
                     # "ต่ออายุหนังสือรับรองการแจ้ง"); fall back to operation_topic then topic for licenses
@@ -4106,13 +4908,29 @@ class PracticalPersonaService:
                             # Department filter: when primary doc belongs to a specific bank/authority,
                             # restrict siblings to the same department so cross-bank docs (e.g. กสิกรไทย
                             # siblings included in a ไทยพาณิชย์ answer) don't inflate token count or
-                            # pollute links/content with wrong-bank data.
+                            # pollute links/content with wrong-bank data. This restriction only makes
+                            # sense once that department is actually ESTABLISHED — already collected
+                            # from a prior turn, or explicitly named in the user's CURRENT message.
+                            # 2026-09: found live that it was applying unconditionally, even when no
+                            # bank was named at all (e.g. "ต้องสมัคร QR กับธนาคารไหน") — sibling
+                            # completion then silently locked onto whichever bank the initial ranking
+                            # happened to rank first (always กสิกรไทย, live-verified 3/3 runs) and
+                            # permanently hid ไทยพาณิชย์, even though both banks offer the identical
+                            # service and share the same operation_by_department value ("QR PAYMENT").
+                            # Only skip the restriction in that genuinely-ambiguous case — every
+                            # existing established-department/named-bank path is unchanged.
                             _sib_dept = str(_sm.get("department") or "").strip()
-                            _dept_clauses = (
-                                [{"department": _sib_dept}]
-                                if _sib_dept and _sib_dept.lower() not in ("nan", "none")
-                                else []
-                            )
+                            _dept_established = False
+                            if _sib_dept and _sib_dept.lower() not in ("nan", "none"):
+                                _collected_dept = (
+                                    str(state.get_collected_slot("department") or "").strip()
+                                    if hasattr(state, "get_collected_slot") else ""
+                                )
+                                if _collected_dept and _collected_dept == _sib_dept:
+                                    _dept_established = True
+                                elif _sib_dept.lower() in (user_text or "").lower():
+                                    _dept_established = True
+                            _dept_clauses = [{"department": _sib_dept}] if _dept_established else []
                             # Entity-type filter: include entity-neutral docs (entity_type_normalized='')
                             # but exclude docs belonging to the competing entity type.
                             # Without this, sibling-completion fetches ALL entity variants and floods
@@ -4326,7 +5144,44 @@ class PracticalPersonaService:
                     for _d in _docs_to_process
                 }
                 _et_in_docs.discard("")
-                if len(_et_pre_sibling) >= 2 and not state.get_collected_slot("entity_type") and not has_any_flag(state.context, ENTITY_INJECTION_SKIP_FLAGS):
+                # Field-awareness guard (2026-09): only ask when the field the user is
+                # actually asking about varies by entity — mirrors the prompt's own "Judge
+                # this by the SPECIFIC thing the user asked about" rule (Core rules above),
+                # but enforced here too since the LLM never gets a chance to apply that
+                # judgment when this slot-queue injection fires first and blocks the answer.
+                # Live-reproduced: a pure "ขั้นตอน...เรียงลำดับ" (steps) question, where
+                # operation_steps is IDENTICAL across entity variants (only
+                # identification_documents differs), asked entity_type unnecessarily —
+                # and non-deterministically so, depending on which docs survived op-intent
+                # filtering into _docs_to_process for that particular run.
+                _et_inject_asks_docs = bool(re.search(r"เอกสาร|หลักฐาน", user_text or ""))
+                _et_inject_skip_identical_steps = False
+                if not _et_inject_asks_docs:
+                    # Use _op_pass_docs (the same pre-sibling snapshot _et_pre_sibling itself
+                    # was derived from), not _docs_to_process — sibling-completion can narrow
+                    # or reshape the latter, so comparing against it caused this guard to miss
+                    # cases where _et_pre_sibling still had ≥2 entity types but _docs_to_process
+                    # no longer did (live-reproduced: 1 of 4 repeated identical queries still
+                    # asked unnecessarily before this correction).
+                    _steps_by_entity_ig = {
+                        str((_d.get("metadata") or {}).get("entity_type_normalized") or "").strip():
+                            str((_d.get("metadata") or {}).get("operation_steps") or "").strip()
+                        for _d in _op_pass_docs
+                        if str((_d.get("metadata") or {}).get("entity_type_normalized") or "").strip()
+                    }
+                    _steps_vals_ig = {v for v in _steps_by_entity_ig.values() if v}
+                    if len(_steps_by_entity_ig) >= 2 and len(_steps_vals_ig) == 1:
+                        _et_inject_skip_identical_steps = True
+                        _LOG.info(
+                            "[Practical] entity_type injection skipped — operation_steps identical "
+                            "across entity types %s and query doesn't ask about documents",
+                            sorted(_steps_by_entity_ig.keys()),
+                        )
+                if (
+                    len(_et_pre_sibling) >= 2 and not state.get_collected_slot("entity_type")
+                    and not has_any_flag(state.context, ENTITY_INJECTION_SKIP_FLAGS)
+                    and not _et_inject_skip_identical_steps
+                ):
                     _sq_now = list((state.context or {}).get("topic_slot_queue") or [])
                     if not any(s.get("key") == "entity_type" for s in _sq_now):
                         _et_display = {"บุคคลธรรมดา": "บุคคลธรรมดา", "นิติบุคคล": "นิติบุคคล"}
@@ -4526,16 +5381,99 @@ class PracticalPersonaService:
             ).strip()
             _established_license = str((state.context or {}).get("last_topic") or "").strip()
             _multi_entities_mentioned = list((state.context or {}).get("_multi_entity_mentioned") or [])
+            # Fallback when there's no established topic yet (2026-09): "last_topic" is only
+            # set once a prior turn (or an earlier exact-match step this same turn) has locked
+            # onto a topic — a genuine multi-entity comparison asked as the FIRST message in a
+            # session has neither, so this guarantee silently never ran for exactly that case.
+            # Live-reproduced: "ร้านเราเป็นห้างหุ้นส่วนจำกัด กับร้านที่เป็นบุคคลธรรมดา เอกสาร...
+            # ต่างกันไหม" as an opening message retrieved มาตรฐาน SAN + regulatory docs whose
+            # license_type was overwhelmingly "ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร", but only ONE
+            # entity variant happened to survive into _docs_to_process — with no established
+            # license to anchor to, the missing entity's docs were never guaranteed-fetched, and
+            # the LLM fell back to a blanket [[INFO_GAP]] instead of the comparison it had enough
+            # data to attempt. Derive the anchor from the dominant license_type already present
+            # in _docs_to_process instead of requiring it to pre-exist.
+            if not _established_license:
+                _lt_counts_ig: Dict[str, int] = {}
+                for _d_ig in _all_docs_snapshot_ig:
+                    _lt_ig = str((_d_ig.get("metadata") or {}).get("license_type") or "").strip()
+                    if _lt_ig and _lt_ig not in ("nan", "None"):
+                        _lt_counts_ig[_lt_ig] = _lt_counts_ig.get(_lt_ig, 0) + 1
+                if _lt_counts_ig:
+                    # Prefer keyword overlap with the query over raw doc count — a noisy
+                    # retrieval pool can have far MORE docs of an unrelated license_type than
+                    # of the one actually being asked about (live-reproduced: "ขอใบอนุญาตอาหาร"
+                    # pulled in many more "ใบทะเบียนพาณิชย์" rows than the correct "ใบอนุญาตจัดตั้ง
+                    # สถานที่จำหน่ายอาหาร" ones, so a pure max(count) pick anchored to the wrong
+                    # license — harmless that one time only because other correct docs happened
+                    # to already be present, but not reliable). Thai has no spaces between
+                    # words, so a plain word-split overlap check doesn't work — use character
+                    # trigram overlap instead (standard technique for un-segmented Thai text).
+                    # Fall back to count only when nothing overlaps at all.
+                    _q_lower_ig = (user_text or "").lower()
+                    _q_trigrams_ig = {_q_lower_ig[i:i + 3] for i in range(len(_q_lower_ig) - 2)}
+                    def _lt_overlap_score(_lt: str) -> int:
+                        _lt_l = _lt.lower()
+                        _lt_trigrams = {_lt_l[i:i + 3] for i in range(len(_lt_l) - 2)}
+                        return len(_lt_trigrams & _q_trigrams_ig)
+                    _best_overlap = max((_lt_overlap_score(k) for k in _lt_counts_ig), default=0)
+                    if _best_overlap > 0:
+                        _established_license = max(
+                            (k for k in _lt_counts_ig if _lt_overlap_score(k) == _best_overlap),
+                            key=lambda k: _lt_counts_ig[k],
+                        )
+                    else:
+                        _established_license = max(_lt_counts_ig, key=lambda k: _lt_counts_ig[k])
             _target_entities = list(dict.fromkeys(
                 ([_cs_established_entity] if _cs_established_entity else []) + _multi_entities_mentioned
             ))
             if _target_entities and _established_license:
+                _vs_guarantee_ent = getattr(self.retriever, "vectorstore", None)
+                _coll_guarantee_ent = getattr(_vs_guarantee_ent, "_collection", None) if _vs_guarantee_ent else None
+                # Blanket license-level guarantee (2026-09): some licenses (e.g. the food-permit
+                # BMA OSS/self-file channel doc) embed the entity comparison as running text
+                # WITHIN a single row's identification_documents (e.g. "...เอกสารเหมือนกันทั้ง
+                # บุคคลธรรมดาและห้างหุ้นส่วนจำกัด... กรณีนิติบุคคลเพิ่ม หนังสือรับรองนิติบุคคล")
+                # rather than splitting into separate entity_type_normalized rows — for those,
+                # the per-entity guarantee below (which filters by entity_type_normalized) finds
+                # nothing to fetch even though the actual comparison content exists. Also covers
+                # the case live-reproduced for this exact query: op-intent filtering discarded
+                # every retrieved row of the target license (they were all renewal/edit/cancel
+                # variants of the SAME license, correctly excluded on their own terms) leaving
+                # NONE of that license's rows in _docs_to_process at all — not just missing one
+                # entity's rows. Runs BEFORE the per-entity guarantee so a license that DOES
+                # split by entity_type_normalized still gets that finer-grained treatment too.
+                if _coll_guarantee_ent is not None and not any(
+                    str((d.get("metadata") or {}).get("license_type") or "").strip() == _established_license
+                    for d in _docs_to_process
+                ):
+                    try:
+                        _guar_res_lt = _coll_guarantee_ent.get(
+                            where={"license_type": _established_license},
+                            include=["documents", "metadatas"],
+                        )
+                        _guar_max_chars_lt = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700))
+                        _guar_docs_lt = [
+                            {"content": (c or "")[:_guar_max_chars_lt], "metadata": m or {}}
+                            for c, m in zip(
+                                _guar_res_lt.get("documents") or [],
+                                _guar_res_lt.get("metadatas") or [],
+                            )
+                        ]
+                        if _guar_docs_lt:
+                            _docs_to_process = _guar_docs_lt + _docs_to_process
+                            state.current_docs = _docs_to_process
+                            _LOG.info(
+                                "[Practical] established-topic guarantee (license, blanket): license=%r → "
+                                "+%d doc(s) (none of that license_type survived op-intent filtering)",
+                                _established_license, len(_guar_docs_lt),
+                            )
+                    except Exception as _e_guarantee_lt:
+                        _LOG.warning("[Practical] established-topic guarantee (license, blanket) failed: %s", _e_guarantee_lt)
                 _entities_present = {
                     str((d.get("metadata") or {}).get("entity_type_normalized") or "").strip()
                     for d in _docs_to_process
                 }
-                _vs_guarantee_ent = getattr(self.retriever, "vectorstore", None)
-                _coll_guarantee_ent = getattr(_vs_guarantee_ent, "_collection", None) if _vs_guarantee_ent else None
                 if _coll_guarantee_ent is not None:
                     _guar_max_chars_ent = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700))
                     for _target_entity in _target_entities:
@@ -4745,10 +5683,10 @@ class PracticalPersonaService:
         # Pass 1b: extract inline URLs from non-reference metadata fields (service_channel,
         # operation_steps). The prompt instructs the LLM to omit these URLs from the body text,
         # but we surface them here so they appear in the 🌐 links section via the safety net.
-        _INLINE_URL_RE = re.compile(
-            r"(https?://[^\s฀-๿]{8,}|www\.[a-zA-Z0-9][\w.\-]+(?:/[^\s฀-๿]*)?)",
-            re.IGNORECASE,
-        )
+        # Per-line (desc, url) parsing lives in _extract_inline_service_urls (see its docstring
+        # for the 2026-09 bug history) — this loop owns the cross-line/cross-doc bookkeeping
+        # (fallback label carry-over, global dedup, .pdf filtering) that method deliberately
+        # doesn't.
         _INLINE_SCAN_FIELDS = ("service_channel", "operation_steps")
         for _di in (_docs_for_links if _docs_for_links is not None else _docs_to_process):
             for _isf in _INLINE_SCAN_FIELDS:
@@ -4762,33 +5700,19 @@ class PracticalPersonaService:
                     _isf_line_s = _isf_line.strip()
                     if not _isf_line_s:
                         continue
-                    _line_url_ms = list(_INLINE_URL_RE.finditer(_isf_line_s))
-                    if not _line_url_ms:
+                    _line_pairs = self._extract_inline_service_urls(_isf_line_s)
+                    if not _line_pairs:
                         _clean_desc = re.sub(r'^[\d\.\-\*•]+\.?\s*', '', _isf_line_s).rstrip(':：').strip()
                         if _clean_desc:
                             _prev_desc_isf = _clean_desc
                         continue
-                    for _m in _line_url_ms:
-                        _raw_url = _m.group(1).rstrip(".,;)")
-                        if _raw_url.lower().startswith("www."):
-                            _raw_url = "https://" + _raw_url
+                    for _desc_isf, _raw_url in _line_pairs:
                         if _raw_url in _link_seen:
                             continue
                         if _raw_url.lower().endswith(".pdf"):
                             continue
                         _link_seen.add(_raw_url)
-                        _before_url = _isf_line_s[:_m.start()].strip().rstrip(':：-').strip()
-                        _before_url = re.sub(r'^[\d\.\-\*•]+\.?\s*', '', _before_url).strip()
-                        # service_channel is often one long line: all text before the URL is
-                        # a huge preamble. Extract only the last numbered-item label so the
-                        # desc stays short (e.g. "เว็บไซต์" instead of the full channel text).
-                        if len(_before_url) > 50:
-                            _isf_segs = re.split(r'\d+[.)]\s*', _before_url)
-                            if len(_isf_segs) > 1:
-                                _before_url = re.sub(r'^[\d\.\-\*•]+\.?\s*', '', _isf_segs[-1]).strip()
-                            else:
-                                _before_url = _before_url[-50:].lstrip(' .,').strip()
-                        _desc_isf = _before_url if _before_url else _prev_desc_isf
+                        _desc_isf = _desc_isf if _desc_isf else _prev_desc_isf
                         _link_service.append((_desc_isf, _raw_url))
                         # Sentinel -2: inline service_channel URL — always keep through narrow_answer filter.
                         # service_channel represents "where to submit" for the license type, not a
@@ -4885,28 +5809,56 @@ class PracticalPersonaService:
                 filtered_md[k] = v_str
             if any(k in filtered_md for k in _LONG_FIELDS_DEDUP):
                 _long_fields_sent_by_lt[_lt_et_key] = True
-            # Chapter overview: trim content to 300 chars per doc — LLM only needs enough to
-            # write 2-4 bullet points per sub_topic. Full 700-char content across 15+ docs
-            # causes prompt > 35K tokens → JSON malformation risk on long Thai responses.
-            _raw_content = (d.get("content", "") or "")
-            # Strip "อ้างอิง: Website...\nhttps://..." from non-regulatory doc content.
-            # Marketing/bakery docs have this appended at ingest; links shown only on explicit ask.
-            if (md.get("data_type") or "").strip() in ("marketing", "business_guide"):
-                _raw_content = re.sub(r'\nอ้างอิง:.*', '', _raw_content, flags=re.DOTALL).strip()
-            # Chapter overview: clip to 300 chars per doc to control token budget across many docs.
-            # Exception: a single aggregated doc (sub_topic completeness path) must NOT be clipped
-            # — its content is the numbered list of ALL items and truncation would hide most entries.
-            _content_for_llm = (
-                _raw_content[:300]
-                if _is_chapter_overview and len(_docs_to_process) > 1
-                else _raw_content
-            )
+            # Head-only content (2026-09 cost-reduction audit): the old full page_content
+            # duplicated every _LLM_METADATA_WHITELIST field as labeled prose (~75-85% the
+            # size of metadata itself, verified against real corpus data) — metadata above
+            # already carries the complete version of every one of those fields (caps raised
+            # to match/exceed data_loader.py's embedding-time caps, see _FIELD_CAPS above),
+            # so sending the full body again here was pure duplication. _build_head_only_
+            # content keeps just the short disambiguator line (license/department/location/
+            # area_size/entity/topic) — the one part that carried info NOT in metadata
+            # (location, area_size, operation_by_department are deliberately excluded from
+            # _LLM_METADATA_WHITELIST).
+            # EXCEPTION — _keep_full_content: the sub_topic-completeness aggregated doc's
+            # content is a genuine synthesis (per-item answer_guideline snippets) with no
+            # metadata equivalent — must keep its real content, not just a head line.
+            if d.get("_keep_full_content"):
+                _raw_content = (d.get("content", "") or "")
+                # Strip "อ้างอิง: Website...\nhttps://..." from non-regulatory doc content.
+                # Marketing/bakery docs have this appended at ingest; links shown only on explicit ask.
+                if (md.get("data_type") or "").strip() in ("marketing", "business_guide"):
+                    _raw_content = re.sub(r'\nอ้างอิง:.*', '', _raw_content, flags=re.DOTALL).strip()
+                # Chapter overview: clip to 300 chars per doc to control token budget across many docs.
+                # The aggregated doc itself is always the sole entry in _docs_to_process when this
+                # marker is set, so len(_docs_to_process) > 1 is false and it's never clipped here.
+                _content_for_llm = (
+                    _raw_content[:300]
+                    if _is_chapter_overview and len(_docs_to_process) > 1
+                    else _raw_content
+                )
+            else:
+                _content_for_llm = _build_head_only_content(md)
             docs_json.append(
                 {
                     "metadata": filtered_md,
                     "content": _content_for_llm,
                 }
             )
+
+        # Diagnostic-only (2026-09, added while investigating a real but
+        # non-reproducible info-gap: on ~1 real query the LLM answered
+        # "ยังไม่พบข้อมูลในเอกสารครับ" despite the correct doc having ranked
+        # #1 in retrieval (0.777 similarity) — 4/4 isolated retries answered
+        # correctly, so the doc/retrieval path itself is not at fault. This
+        # never fired again to pin down further. Pure logging, no behavior
+        # change — if it recurs, this line shows exactly what docs_json
+        # actually contained for the failing call, so the paired log line
+        # after the LLM call (below) can be compared against it.
+        _LOG.info(
+            "[Practical] docs_json finalized: %d doc(s) → %s",
+            len(docs_json),
+            [((dj.get("metadata") or {}).get("license_type") or (dj.get("metadata") or {}).get("operation_topic") or "?")[:40] for dj in docs_json],
+        )
 
         # Build labeled link sections — LLM copies these directly, no URL pattern matching needed
         # When docs come from multiple licenses, tag each link with [license_type] so LLM
@@ -5086,12 +6038,31 @@ class PracticalPersonaService:
         # Soft multi-license hint: when docs span 2+ license types that the user explicitly
         # requested, remind LLM to cover ALL of them in its answer. Unlike multi_license_topics
         # (which forces action='answer'), this is advisory only — LLM can still ask slots first.
+        #
+        # 2026-09 bug fix: this used to trust `_is_multi_license_docs` alone (just counting
+        # distinct license_type values among whatever got RETRIEVED) despite this very
+        # docstring saying "that the user explicitly requested" — those are NOT the same
+        # thing. Live-reproduced: a query about corporate income tax rate ("...เสียภาษีเงินได้
+        # นิติบุคคลอัตราเท่าไหร่") got noisy retrieval hits for 3 totally unrelated licenses
+        # (liquor, signboard tax, VAT — all sharing the word "ภาษี") purely by keyword overlap.
+        # This hint then told the LLM the user asked about all 3 "together", forcing it to
+        # frame its whole answer around licenses the user never mentioned — the actual
+        # relevant business_guide document (which DID have the answer) was never even
+        # referenced in the instruction, and the LLM answered [[INFO_GAP]] instead. Fixed by
+        # requiring each license_type name to actually appear in the user's own query text
+        # (same substring/ASCII-token check already used for main_topic/sub_topic chapter-fetch
+        # matching elsewhere in this codebase) before trusting it as "explicitly requested".
         if _is_multi_license_docs:
-            _hint_lts = list(dict.fromkeys(
+            _hint_lts_raw = list(dict.fromkeys(
                 (d.get("metadata") or {}).get("license_type", "").strip()
                 for d in _all_docs
                 if (d.get("metadata") or {}).get("license_type", "")
             ))
+            _user_text_lower_mlh = user_text.lower()
+            _hint_lts = [
+                lt for lt in _hint_lts_raw
+                if _shared_topic_label_matches_query(lt, _user_text_lower_mlh)
+            ]
             if len(_hint_lts) >= 2:
                 _topic_hint += (
                     f"\n\n💡 MULTI-LICENSE: user ถามเรื่อง {', '.join(_hint_lts)} พร้อมกัน"
@@ -5148,25 +6119,32 @@ Rules:
         # Injected when user asks about fees (ค่าธรรมเนียม/เท่าไหร่/กี่วัน) but has NOT asked
         # to actually register/apply (no action intent). Forces action="answer" with all fee
         # tiers combined — avoids unnecessary entity_type/operation_group asking.
-        _is_fee_info_q = bool(re.search(
-            r"ค่าธรรมเนียม|เท่าไหร่|กี่บาท|กี่วัน|กี่เดือน|กี่ปี|ค่าใช้จ่าย|ระยะเวลา",
-            _intent_text, re.IGNORECASE,
-        )) and not bool(re.search(
-            r"อยากจด|ต้องการจด|จะจด|จะสมัคร|อยากสมัคร|ต้องการสมัคร|วิธีจด|ขั้นตอนการจด",
-            _intent_text, re.IGNORECASE,
-        ))
+        _is_fee_info_q = _shared_is_fee_or_duration_info_query(_intent_text)
         _fee_info_instruction = ""
         if _is_fee_info_q:
             _fee_info_instruction = """
 
 ⚠️ FEE / DURATION INFORMATIONAL QUERY — MANDATORY RULES:
-- action MUST be "answer". DO NOT set action="ask".
-- DO NOT ask for entity_type, registration_type, or operation_group.
-- Scan ALL DOCUMENTS for ค่าธรรมเนียม (fees) or ระยะเวลา (duration) fields.
-- If values differ by entity or sub-type: list ALL tiers together in one concise answer
+- DO NOT ask for entity_type, registration_type, or operation_group — this query has no
+  registration/application intent, so asking those feels presumptuous. If the fee/duration
+  differs by entity_type/registration_type/operation_group specifically, action MUST be
+  "answer" with all those variants listed together in one concise answer
   (e.g. "ตั้งใหม่ 50 บาท ทุกประเภท กรณีบริษัทจำกัดมีค่าบริคณห์สนธิเพิ่ม 500 บาท").
-- Keep the answer SHORT — just the fee/duration and one brief contextual note if relevant.
-- Do NOT list full registration steps or document requirements unless explicitly asked.
+- 2026-09 update: this does NOT override the Multi-tier rule / Decision policy 2b above for
+  OTHER differentiating conditions (e.g. shop area, location). If the fee/duration genuinely
+  differs by one of those and it is NOT already in collected_slots, action should be "ask" for
+  that ONE condition instead — do not list every tier as a substitute for asking. Only
+  entity_type/registration_type/operation_group are exempt from asking here.
+- Scan ALL DOCUMENTS for the relevant number(s) — for regulatory DOCUMENTS this is usually a
+  structured ค่าธรรมเนียม (fees) or ระยะเวลา (duration) field; for business_guide/marketing
+  DOCUMENTS (no license_type, content lives in answer_guideline) the number/rate/table may be
+  embedded in that narrative content instead (e.g. a tax-bracket table, a cost percentage) —
+  read the FULL document content, don't limit the scan to fields literally named "fees"/
+  "ระยะเวลา", or you will miss a correct answer that's really there.
+- When action="answer": keep it SHORT — just the fee/duration/rate and one brief contextual
+  note if relevant (a short tiered table, e.g. 3 tax brackets, still counts as "short" — don't
+  drop tiers to force brevity). Do NOT list full registration steps or document requirements
+  unless explicitly asked.
 """
 
         # General informational/definitional query instruction:
@@ -5395,14 +6373,35 @@ Rules:
         # knows exactly which sub_topics to present as separate named sections.
         _chapter_overview_instruction = ""
         if _is_chapter_overview:
+            # Scope the subtopic mandate to the dominant chapter only (2026-09) —
+            # regardless of which upstream branch actually built _docs_to_process.
+            # _is_chapter_overview can be True even when it was the _direct_topic_match
+            # branch (not the "elif _is_chapter_overview" one) that supplied
+            # _docs_to_process — that branch intentionally leaves a few genuinely-relevant
+            # cross-chapter docs unfiltered (see _merge_cross_chapter_docs_for_nonreg /
+            # _informational_but_nonreg_chapter), so _docs_to_process itself is NOT pruned
+            # there. Without this scoping, a mixed doc set leaks an unrelated chapter's
+            # sub_topics into "Required sections", forcing the LLM to write sections for
+            # content the user never asked about (live-reproduced: a promotion-strategy
+            # chapter's 6 sub_topics got listed alongside the actually-asked-about
+            # communication chapter's 10, because _direct_topic_match had fired instead of
+            # the dedicated chapter-overview branch that drops strays). This filter is
+            # display/mandate-only — it does NOT touch _docs_to_process/docs_json, so any
+            # extra cross-chapter docs the other branch chose to keep are still visible to
+            # the LLM, just not forced into the required-sections list.
+            _co_mt_disp = next(iter(_co_mts)) if _co_mts else ""
+            _chapter_docs_disp = (
+                [_d for _d in _docs_to_process if ((_d.get("metadata") or {}).get("main_topic") or "").strip() == _co_mt_disp]
+                if _co_mt_disp else _docs_to_process
+            )
             _chapter_subtopics: list = []
-            for _d in _docs_to_process:
+            for _d in _chapter_docs_disp:
                 _st = ((_d.get("metadata") or {}).get("sub_topic") or "").strip()
                 if _st and _st not in _chapter_subtopics:
                     _chapter_subtopics.append(_st)
             if len(_chapter_subtopics) >= 2:
                 _st_list_str = "\n".join(f"  {i+1}. {st}" for i, st in enumerate(_chapter_subtopics))
-                _chapter_mt = next(
+                _chapter_mt = _co_mt_disp or next(
                     ((_d.get("metadata") or {}).get("main_topic") or "").strip()
                     for _d in _docs_to_process
                     if (_d.get("metadata") or {}).get("main_topic")
@@ -5419,18 +6418,12 @@ Rules:
         # Layer 2 of hallucination prevention: build a phone-number whitelist from retrieved docs
         # and inject it into the human message so the LLM has an explicit, per-query boundary.
         # Layer 1 = system prompt constraint. Layer 3 = post-processing strip (below, near URL validation).
-        _DOC_PHONE_CTX_RE = re.compile(
-            r'(?:📞|โทร(?:ศัพท์|สาร)?|สายด่วน|Tel\.?|Fax\.?|แฟกซ์)'
-            r'\s*[:\s]*(\d[\d\s\-\.]{3,13})',
-            re.IGNORECASE,
-        )
+        # See _extract_thai_phone_numbers's docstring for why this is shape-based, not
+        # keyword-based (2026-09 live-reproduced bug fix).
         _doc_phones: set = set()
         for _dp in _all_docs:
             _dp_text = json.dumps(_dp, ensure_ascii=False)
-            for _pm in _DOC_PHONE_CTX_RE.finditer(_dp_text):
-                _norm_p = re.sub(r'[\s\-\.]', '', _pm.group(1))
-                if 4 <= len(_norm_p) <= 12 and _norm_p.isdigit():
-                    _doc_phones.add(_norm_p)
+            _doc_phones |= self._extract_thai_phone_numbers(_dp_text)
         if _doc_phones:
             _phones_display = ", ".join(sorted(_doc_phones))
             _phone_guard_instruction = (
@@ -5539,15 +6532,98 @@ Your JSON response:
                 _exec_raw = {}
         exec_ = _exec_raw if isinstance(_exec_raw, dict) else {}
 
+        # Deterministic safety net (2026-10, live-reproduced — same retry-once shape as
+        # _call_llm_json_with_truncation_retry above, for a DIFFERENT failure mode): the
+        # prompt now tells the model not to action="ask" about entity_type when the user
+        # already explicitly declined to single-select and DOCUMENTS were deliberately
+        # assembled with both entity types' content (see prompts_practical.py's Multi-tier
+        # rule exception + persona_supervisor.py's _entity_type_explicitly_skipped flag) —
+        # but a prompt instruction is advisory, not a guarantee, and this exact mistake was
+        # observed recurring at a real, non-trivial rate even after that fix (~1 in 5 real
+        # calls, temperature=0.2). Catching it here, deterministically, after the fact, is
+        # the only way to actually close the gap rather than just reduce its odds. Scoped
+        # narrowly: only retries when action="ask" AND the question is unmistakably the
+        # entity_type question (both option words present) AND Supervisor already recorded
+        # this exact decline — never fires for a genuine first-time entity_type ask.
+        if (
+            action == "ask"
+            and bool((state.context or {}).get("_entity_type_explicitly_skipped"))
+            and "บุคคลธรรมดา" in str(exec_.get("question") or "")
+            and "นิติบุคคล" in str(exec_.get("question") or "")
+        ):
+            _LOG.warning(
+                "[Practical] action='ask' re-asked entity_type despite _entity_type_explicitly_skipped "
+                "— retrying once with a corrective reminder instead of surfacing this question: %r",
+                exec_.get("question"),
+            )
+            _entity_retry_prompt = (
+                prompt
+                + "\n\n[SYSTEM REMINDER] The user already explicitly declined to pick one "
+                "entity_type (บุคคลธรรมดา vs นิติบุคคล) earlier in this conversation. DOCUMENTS "
+                "were deliberately assembled to include BOTH entity types' content for exactly "
+                "this reason. Do NOT action=\"ask\" about entity_type — action=\"answer\" using "
+                "one labeled section per entity_type_normalized present in DOCUMENTS instead."
+            )
+            try:
+                _retry_decision = self._call_llm_json_with_truncation_retry(_entity_retry_prompt, state=state)
+                _retry_action = (_retry_decision.get("action") or "ask").strip()
+                if _retry_action != "ask":
+                    decision = _retry_decision
+                    action = _retry_action
+                    _retry_exec_raw = decision.get("execution", {})
+                    if isinstance(_retry_exec_raw, str):
+                        try:
+                            _retry_exec_raw = json.loads(_retry_exec_raw)
+                        except Exception:
+                            _retry_exec_raw = {}
+                    exec_ = _retry_exec_raw if isinstance(_retry_exec_raw, dict) else {}
+                    _LOG.info("[Practical] entity_type re-ask retry succeeded — action=%r", action)
+                else:
+                    _LOG.warning("[Practical] entity_type re-ask retry STILL action='ask' — keeping original question")
+            except Exception as _e_entity_retry:
+                _LOG.warning("[Practical] entity_type re-ask retry failed: %s — keeping original decision", _e_entity_retry)
+
+        # Diagnostic-only (2026-09, paired with the docs_json log above) —
+        # catches the exact failing moment if this info-gap pattern recurs:
+        # logs docs actually sent to the LLM alongside its "not found" answer,
+        # so a future occurrence in production leaves enough evidence to
+        # actually root-cause it (unlike this session's attempt, which could
+        # not reproduce it in 4/4 isolated retries with identical query+data).
+        # No behavior change — decision/action/exec_ are used exactly as before.
+        if action == "answer":
+            _diag_answer = str(exec_.get("answer") or "")
+            if re.search(r"ไม่พบข้อมูล|ยังไม่พบ", _diag_answer):
+                _LOG.warning(
+                    "[Practical] INFO-GAP ANSWER despite %d doc(s) in prompt (query=%r): "
+                    "docs sent=%s | answer_snippet=%r",
+                    len(docs_json),
+                    user_input[:120],
+                    [((dj.get("metadata") or {}).get("license_type") or (dj.get("metadata") or {}).get("operation_topic") or "?")[:40] for dj in docs_json],
+                    _diag_answer[:200],
+                )
+
         if action == "retrieve":
             # Guard: block LLM re-retrieval when docs are already loaded.
-            # Two conditions — either is sufficient to block:
+            # Three conditions — any one is sufficient to block:
             #   1) topic_slot_queue non-empty AND docs exist (original guard — slot ask phase)
             #   2) _internal=True AND docs exist — supervisor already set the right docs
             #      (covers the case where queue was JUST cleared after last slot filled,
             #       but LLM ignores rule 2 and returns action='retrieve' anyway)
+            #   3) _entity_type_explicitly_skipped AND docs exist (2026-10, live-reproduced):
+            #      this call shape hits NEITHER of the above two — topic_slot_queue was just
+            #      popped empty and persona_supervisor.py deliberately calls with _internal=False
+            #      (see its own "No more slots" branch) — yet state.current_docs at this point
+            #      was hand-assembled by _merge_both_entity_docs_after_skip specifically because
+            #      plain semantic search for this query is unreliable (confirmed: it can rank a
+            #      same-named-but-different row higher — a "รูปแบบ นิติบุคคล" EDIT-form doc
+            #      outranked the real "รูปแบบนิติบุคคล" entity-profile doc for a cancellation
+            #      query in one live run). Letting the LLM's own action="retrieve" silently
+            #      overwrite that merged set with a fresh ungated search reintroduces exactly
+            #      the failure merge was built to prevent — observed live as a complete
+            #      INFO_GAP on docs that were correct one step earlier.
             _pending_queue = (state.context or {}).get("topic_slot_queue") or []
-            if state.current_docs and (_pending_queue or _internal):
+            _entity_merge_active = bool((state.context or {}).get("_entity_type_explicitly_skipped"))
+            if state.current_docs and (_pending_queue or _internal or _entity_merge_active):
                 # Track how many consecutive times retrieve has been blocked.
                 # If LLM keeps returning 'retrieve' despite blocked (e.g. sees wrong-entity docs
                 # and refuses to answer), force action='answer' after 2 blocks to break the loop.
@@ -5868,6 +6944,9 @@ Your JSON response:
                 ans, _info_gap_tagged = _shared_extract_info_gap_tag(ans)
                 if _info_gap_tagged:
                     state.context["_info_gap_detected"] = True
+                if bool((state.context or {}).get("_entity_type_explicitly_skipped")):
+                    ans = self._strip_entity_reinvite_closer(ans)
+                    ans = self._retry_if_entity_coverage_incomplete(ans, prompt, state)
             else:
                 # Empty LLM output — Python-decided fallback, not LLM output, so it can
                 # never carry the tag; flag the gap directly (see text_patterns.py).
@@ -6088,27 +7167,22 @@ Your JSON response:
                 ans = '\n'.join(_pp_out2)
 
             # Layer 3 of hallucination prevention: strip phone/hotline numbers not found in docs.
-            # Uses the same _doc_phones whitelist built during prompt construction above.
-            # Only strips numbers appearing in a phone-keyword context (📞, สายด่วน, โทร, etc.)
-            # to avoid false positives on fee amounts, years, and form reference numbers.
-            _ANS_PHONE_CTX_RE = re.compile(
-                r'(?:📞|โทร(?:ศัพท์|สาร)?|สายด่วน|Tel\.?|Fax\.?|แฟกซ์)'
-                r'\s*[:\s]*(\d[\d\s\-\.]{3,13})',
-                re.IGNORECASE,
-            )
+            # Uses the same _doc_phones whitelist AND the same shape-based extraction as
+            # Layer 2 above (_extract_thai_phone_numbers) — kept as one shared implementation
+            # so the two layers can never again drift apart the way the original keyword-only
+            # version did (see that method's docstring for the live-reproduced bug this fixes).
             _phone_out: list = []
             _phone_stripped = False
             for _pl in ans.split('\n'):
-                _pm_ans = _ANS_PHONE_CTX_RE.search(_pl)
-                if _pm_ans:
-                    _norm_ans = re.sub(r'[\s\-\.]', '', _pm_ans.group(1))
-                    if _norm_ans.isdigit() and 4 <= len(_norm_ans) <= 12 and _norm_ans not in _doc_phones:
-                        _LOG.warning(
-                            "[Practical] hallucinated phone number stripped: %r from: %r",
-                            _norm_ans, _pl[:80],
-                        )
-                        _phone_stripped = True
-                        continue
+                _line_phones = self._extract_thai_phone_numbers(_pl)
+                _bad_phones = _line_phones - _doc_phones
+                if _bad_phones:
+                    _LOG.warning(
+                        "[Practical] hallucinated phone number stripped: %r from: %r",
+                        _bad_phones, _pl[:80],
+                    )
+                    _phone_stripped = True
+                    continue
                 _phone_out.append(_pl)
             if _phone_stripped:
                 ans = '\n'.join(_phone_out)
