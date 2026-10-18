@@ -552,6 +552,14 @@ PDF_RATE_LIMIT_DYNAMODB_TABLE = os.getenv("PDF_RATE_LIMIT_DYNAMODB_TABLE", "rest
 # name. Falls back to AWS_REGION here on the EC2 side only for convenience
 # when the table happens to live in the same region as everything else.
 PDF_RATE_LIMIT_DYNAMODB_REGION = os.getenv("PDF_RATE_LIMIT_DYNAMODB_REGION", "") or AWS_REGION
+
+# Content-hash-keyed cache for PDF topic-splitting/field-drafting LLM output
+# (2026-10) — see utils/pdf_draft_cache.py. Same table-must-be-created-
+# manually, fail-open-on-any-DynamoDB-error philosophy as the rate limiter
+# above, deliberately a separate table (a cache and a rate-limit claim have
+# very different access patterns/lifetimes, no reason to share one table).
+PDF_DRAFT_CACHE_DYNAMODB_TABLE = os.getenv("PDF_DRAFT_CACHE_DYNAMODB_TABLE", "restbiz-pdf-draft-cache")
+PDF_DRAFT_CACHE_DYNAMODB_REGION = os.getenv("PDF_DRAFT_CACHE_DYNAMODB_REGION", "") or AWS_REGION
 # Keeps dev/test uploads scoped under a clearly-labeled sub-prefix, separate from
 # wherever a real production Lambda might eventually watch within this bucket.
 PDF_INGESTION_S3_PREFIX = os.getenv("PDF_INGESTION_S3_PREFIX", "")

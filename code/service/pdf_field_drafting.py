@@ -72,6 +72,14 @@ DRAFTABLE_FIELDS: dict[str, list[str]] = {
 # than by the LLM here.
 NOT_DRAFTED_FIELDS = ["restaurant_ai_document", "combined_links"]
 
+# Bump this whenever _PROMPT_TEMPLATE below changes — it's the cache-
+# invalidation key for utils/pdf_draft_cache.py's content-hash cache
+# (service/sqs_consumer.py includes it in the cache key it builds), so an
+# old cached draft from before a prompt improvement never gets silently
+# served after the improvement ships. Declared here, next to the prompt it
+# versions, specifically so editing one naturally prompts editing the other.
+DRAFT_FIELDS_PROMPT_VERSION = "v1"
+
 _PROMPT_TEMPLATE = """ต่อไปนี้คือข้อความที่สกัดได้จากเอกสารราชการ (PDF) ทุกหน้า
 
 """ + INJECTION_GUARD + """
@@ -143,6 +151,10 @@ class LicenseTopicBounds(TypedDict):
     license_type: str
     page_ranges: list[tuple[int, int]]
 
+
+# Same purpose as DRAFT_FIELDS_PROMPT_VERSION above, for _TOPIC_SPLIT_PROMPT
+# specifically — bump when that prompt changes.
+TOPIC_SPLIT_PROMPT_VERSION = "v1"
 
 _TOPIC_SPLIT_PROMPT = """เอกสารต่อไปนี้ (มีทั้งหมด {num_pages} หน้า) ถูกจัดว่าเป็นเอกสารเกี่ยวกับใบอนุญาต/
 ขั้นตอนราชการ ซึ่งอาจพูดถึงใบอนุญาตหรือขั้นตอนมากกว่า 1 เรื่องปนกันอยู่ในไฟล์เดียวก็ได้ (เช่น เอกสารรวม

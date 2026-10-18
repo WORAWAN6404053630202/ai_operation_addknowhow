@@ -53,6 +53,12 @@ class KnowhowTopicBounds(TypedDict):
     page_ranges: list[tuple[int, int]]
 
 
+# Bump whenever _PROMPT_TEMPLATE below changes — cache-invalidation key for
+# utils/pdf_draft_cache.py's content-hash cache (see
+# pdf_field_drafting.py's DRAFT_FIELDS_PROMPT_VERSION for the full
+# rationale; same pattern here).
+KNOWHOW_TOPIC_SPLIT_PROMPT_VERSION = "v1"
+
 _PROMPT_TEMPLATE = """เอกสารต่อไปนี้ (มีทั้งหมด {num_pages} หน้า) ถูกจัดว่าเป็นเนื้อหา know-how/ให้ความรู้
 สำหรับฐานความรู้ของ Restbiz (ผู้ช่วย AI ด้านธุรกิจร้านอาหารในไทย) ซึ่งอาจมีหลายหัวข้อปนกันอยู่ในไฟล์เดียว
 

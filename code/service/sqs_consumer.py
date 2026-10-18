@@ -34,9 +34,12 @@ from service import pdf_supersede_resolver
 from service.pdf_candidate_matching import check_category_fit, find_candidate_matches
 from service.pdf_content_shape import classify_content_shape
 from service.pdf_extraction_validation import validate_extraction
-from service.pdf_field_drafting import draft_fields_from_pages, identify_license_topics
+from service.pdf_field_drafting import (
+    draft_fields_from_pages, identify_license_topics,
+    DRAFT_FIELDS_PROMPT_VERSION, TOPIC_SPLIT_PROMPT_VERSION,
+)
 from service.pdf_knowhow_candidate_matching import find_knowhow_candidate_matches
-from service.pdf_knowhow_drafting import identify_knowhow_topics
+from service.pdf_knowhow_drafting import identify_knowhow_topics, KNOWHOW_TOPIC_SPLIT_PROMPT_VERSION
 from service.pdf_large_extraction import extract_full_document
 from service.local_vector_store import add_documents as _add_documents_to_vectorstore
 from service.local_vector_store import archive_and_remove as _archive_and_remove_in_vectorstore
@@ -44,6 +47,7 @@ from service import pdf_status_tracker
 from utils.llm_cost_logging import CostAccumulator
 from utils.logger import get_logger
 from utils.page_ranges import format_page_ranges, group_into_ranges
+from utils.pdf_draft_cache import content_hash, get_draft_cache
 
 logger = get_logger(__name__)
 
@@ -321,11 +325,22 @@ def _build_knowhow_items_direct(
     processing raised an exception, never inspects the returned list's
     length or contents, so an empty return is safe (confirmed by reading
     that function before this was written)."""
-    try:
-        topic_bounds = identify_knowhow_topics(page_markdowns, cost_accumulator=cost_accumulator)
-    except Exception as e:
-        logger.error(f"[SQSConsumer] Know-how topic-splitting failed for {filename}, nothing written for this slice: {e}")
-        return []
+    # Content-hash cache check (2026-10) — see utils/pdf_draft_cache.py. An
+    # exact re-upload of a document whose pages extract to the identical
+    # text skips this LLM call entirely; a cache miss behaves exactly as
+    # before. Never blocks the pipeline — any cache error falls through to
+    # the real call below.
+    _topic_split_cache_key = f"knowhow_topics:{KNOWHOW_TOPIC_SPLIT_PROMPT_VERSION}:{content_hash(chr(10).join(page_markdowns))}"
+    topic_bounds = get_draft_cache().get(_topic_split_cache_key)
+    if topic_bounds is not None:
+        logger.info(f"[SQSConsumer] {filename}: know-how topic-split cache HIT — skipped LLM call")
+    else:
+        try:
+            topic_bounds = identify_knowhow_topics(page_markdowns, cost_accumulator=cost_accumulator)
+        except Exception as e:
+            logger.error(f"[SQSConsumer] Know-how topic-splitting failed for {filename}, nothing written for this slice: {e}")
+            return []
+        get_draft_cache().put(_topic_split_cache_key, topic_bounds)
 
     knowhow_topics = []
     retire_doc_ids: list[str] = []
@@ -438,11 +453,19 @@ def _build_license_items_direct(
     because entity-injection/2-pass retrieval/exact-match chapter-fetch in
     persona_supervisor.py key off these exact 13 fields + topic_group +
     entity_type_normalized directly, not just semantic similarity."""
-    try:
-        topic_bounds = identify_license_topics(page_markdowns, cost_accumulator=cost_accumulator)
-    except Exception as e:
-        logger.error(f"[SQSConsumer] License topic-splitting failed for {filename}, nothing written for this slice: {e}")
-        return []
+    # Content-hash cache check — see the identical pattern/rationale in
+    # _build_knowhow_items_direct above.
+    _topic_split_cache_key = f"license_topics:{TOPIC_SPLIT_PROMPT_VERSION}:{content_hash(chr(10).join(page_markdowns))}"
+    topic_bounds = get_draft_cache().get(_topic_split_cache_key)
+    if topic_bounds is not None:
+        logger.info(f"[SQSConsumer] {filename}: license topic-split cache HIT — skipped LLM call")
+    else:
+        try:
+            topic_bounds = identify_license_topics(page_markdowns, cost_accumulator=cost_accumulator)
+        except Exception as e:
+            logger.error(f"[SQSConsumer] License topic-splitting failed for {filename}, nothing written for this slice: {e}")
+            return []
+        get_draft_cache().put(_topic_split_cache_key, topic_bounds)
 
     if not topic_bounds:
         logger.info(f"[SQSConsumer] {filename}: no license topics identified in this slice, nothing written")
@@ -455,11 +478,17 @@ def _build_license_items_direct(
         topic_pages, topic_markdowns = _slice_by_ranges(pages, page_markdowns, topic["page_ranges"])
         for s, e in topic["page_ranges"]:
             covered_local.update(range(s, e + 1))
-        try:
-            drafted = draft_fields_from_pages(topic_markdowns, cost_accumulator=cost_accumulator)
-        except Exception as e:
-            logger.error(f"[SQSConsumer] Field drafting failed for {filename} ({topic['department']!r}/{topic['license_type']!r}), nothing written for this topic: {e}")
-            continue
+        _draft_cache_key = f"license_draft:{DRAFT_FIELDS_PROMPT_VERSION}:{content_hash(chr(10).join(topic_markdowns))}"
+        drafted = get_draft_cache().get(_draft_cache_key)
+        if drafted is not None:
+            logger.info(f"[SQSConsumer] {filename} topic ({topic['department']!r}/{topic['license_type']!r}): field-draft cache HIT — skipped LLM call")
+        else:
+            try:
+                drafted = draft_fields_from_pages(topic_markdowns, cost_accumulator=cost_accumulator)
+            except Exception as e:
+                logger.error(f"[SQSConsumer] Field drafting failed for {filename} ({topic['department']!r}/{topic['license_type']!r}), nothing written for this topic: {e}")
+                continue
+            get_draft_cache().put(_draft_cache_key, drafted)
         merged = pdf_direct_ingest.merge_drafted_fields(topic, drafted)
         merged["page_range"] = format_page_ranges([p.page_num for p in topic_pages])
         merged["_raw_text"] = "\n\n".join(topic_markdowns)
