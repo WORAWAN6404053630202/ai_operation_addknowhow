@@ -744,7 +744,10 @@ def build_info_action_q_detect_prompt(user_text: str) -> str:
     )
 
 
-def build_license_dominance_detect_prompt(user_text: str, license_a: str, license_b: str) -> str:
+def build_license_dominance_detect_prompt(
+    user_text: str, license_a: str, license_b: str,
+    content_a: str = "", content_b: str = "",
+) -> str:
     """
     Classify whether a query touching 2 different license_types is dominantly about ONE of
     them (the other just mentioned as context/precondition, e.g. "จด VAT แล้ว...") or
@@ -754,20 +757,42 @@ def build_license_dominance_detect_prompt(user_text: str, license_a: str, licens
     registration status as context while actually asking about POS device approval got
     silently locked onto VAT alone, because the code previously just took the first
     retrieved doc's license_type with no check for this).
+
+    content_a/content_b (optional, 2026-10, live-reproduced): short excerpts (e.g.
+    terms_and_conditions/legal_regulatory) from each license's own retrieved doc. Added for a
+    DIFFERENT failure mode than the original context-vs-real-ask one above: a query can
+    explicitly name ONLY one license while the SITUATION described genuinely requires an
+    unstated prerequisite license too (e.g. "จ้างพนักงานคนแรกของร้าน ต้องขึ้นทะเบียนผู้ประกันตน
+    ยังไงคะ" never mentions ทะเบียนนายจ้าง at all, but hiring your first employee mandatorily
+    requires it first) — query-text-only scoring has no phrasing cue to catch this, so callers
+    with cheap content excerpts on hand should pass them. Left blank ("") by callers that
+    don't — the original query-text-only behavior is unchanged when both are "".
     Returns: {"dominant": "A" | "B" | "both"}
     """
+    _content_block = ""
+    if content_a or content_b:
+        _content_block = (
+            f"\nเนื้อหาบางส่วนของ A ({license_a}): {content_a[:400] or '(ไม่มีข้อมูล)'}\n"
+            f"เนื้อหาบางส่วนของ B ({license_b}): {content_b[:400] or '(ไม่มีข้อมูล)'}\n"
+        )
     return (
         "คุณคือระบบวิเคราะห์ว่าคำถามของลูกค้าร้านอาหารถามเกี่ยวกับ license/ใบอนุญาตใดเป็นหลัก\n"
         "เอกสารที่ค้นเจอมี 2 license_type ปนกัน ต้องวิเคราะห์ว่าคำถามถามเรื่องไหนจริงๆ\n\n"
         f'คำถาม: "{user_text}"\n\n'
         f"A) {license_a}\n"
-        f"B) {license_b}\n\n"
-        "วิเคราะห์ 3 แบบ:\n"
+        f"B) {license_b}\n"
+        f"{_content_block}\n"
+        "วิเคราะห์ 4 แบบ:\n"
         '- "A": คำถามถามเรื่อง A เป็นหลัก ส่วน B แค่ถูกเอ่ยถึงเป็นบริบท/เงื่อนไขที่มีอยู่แล้ว ไม่ใช่สิ่งที่ถามจริง\n'
         '  ตัวอย่าง: "ร้านจด VAT แล้ว ใช้ POS ต้องขออนุมัติเครื่องกับสรรพากรไหม" — จด VAT เป็นบริบท (มีอยู่แล้ว) คำถามจริงคือเรื่องขออนุมัติเครื่อง POS → ตอบ B ถ้า A=VAT, B=POS\n'
         '- "B": กลับกัน B เป็นบริบท A เป็นคำถามจริง\n'
-        '- "both": คำถามถามทั้ง A และ B เท่าเทียมกันจริงๆ ทั้งคู่เป็นสิ่งที่ต้องตอบ ไม่ใช่แค่ฝั่งใดฝั่งหนึ่งเป็นบริบท\n'
-        '  ตัวอย่าง: "ต้องขอทั้ง VAT และ POS ID เลยไหม ขั้นตอนแต่ละอย่างเป็นยังไง" → both\n\n'
+        '- "both" (คำถามเอ่ยทั้งคู่): คำถามถามทั้ง A และ B เท่าเทียมกันจริงๆ ทั้งคู่เป็นสิ่งที่ต้องตอบ ไม่ใช่แค่ฝั่งใดฝั่งหนึ่งเป็นบริบท\n'
+        '  ตัวอย่าง: "ต้องขอทั้ง VAT และ POS ID เลยไหม ขั้นตอนแต่ละอย่างเป็นยังไง" → both\n'
+        '- "both" (เนื้อหาเผยว่าต้องทำคู่กัน แม้คำถามเอ่ยถึงแค่ตัวเดียว): ดูเนื้อหาของฝั่งที่ไม่ได้ถูกเอ่ยถึง — '
+        'ถ้าเนื้อหาบอกชัดว่าต้องทำคู่กับอีกตัวเสมอ/เป็นเงื่อนไขบังคับก่อน ไม่ใช่แค่หัวข้อที่เกี่ยวข้องกันทั่วไป ให้ตอบ both ด้วย\n'
+        '  ตัวอย่าง: คำถามถามแค่ "ขึ้นทะเบียนผู้ประกันตนยังไง" (ไม่เอ่ยถึงทะเบียนนายจ้างเลย) '
+        'แต่เนื้อหาของทะเบียนนายจ้างบอกว่า "นายจ้างต้องขึ้นทะเบียนพร้อมกับลูกจ้าง ภายใน 30 วัน" '
+        '— นี่คือเงื่อนไขบังคับคู่กัน ไม่ใช่แค่บริบททั่วไป → ตอบ both\n\n'
         'ตอบเป็น JSON เท่านั้น: {"dominant": "A"} หรือ {"dominant": "B"} หรือ {"dominant": "both"}'
     )
 

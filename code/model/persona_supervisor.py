@@ -6104,6 +6104,94 @@ class PersonaSupervisor:
                         )
                         break
             if _explicit_lt:
+                # Sequential-prerequisite guard (2026-10, live-reproduced): "explicit mention"
+                # assumes naming ONE license always means ONLY that license matters — correct
+                # for the case it was built for (POS ID: "ร้านจด VAT แล้ว ใช้ POS..." names POS,
+                # VAT is just context) but wrong when the discarded license is actually a
+                # required CO-STEP the user doesn't know exists yet (e.g. "จ้างพนักงานคนแรก...
+                # ต้องขึ้นทะเบียนผู้ประกันตนยังไงคะ" names only ทะเบียนผู้ประกันตน, but hiring your
+                # first employee also mandatorily requires ทะเบียนนายจ้าง first — the query has
+                # zero phrasing cue pointing at the missing license at all). Reuses the same
+                # content-aware classifier built for the POS case (now extended with doc-content
+                # excerpts) rather than a keyword list, so it generalizes to future, not-yet-seen
+                # prerequisite pairs instead of needing a new hand-coded rule each time.
+                _other_lts_em = [lt for lt in license_types_seen if lt != _explicit_lt]
+                _merged_as_both_em = False
+                _dept_explicit_em = next(
+                    (
+                        ((_d3.get("metadata") or {}).get("department") or "").strip()
+                        for _d3 in docs
+                        if isinstance(_d3, dict)
+                        and ((_d3.get("metadata") or {}).get("license_type") or "").strip() == _explicit_lt
+                    ),
+                    "",
+                )
+                # Filter candidates to the SAME department BEFORE counting — a query can
+                # retrieve several unrelated license_types that merely share a keyword
+                # (e.g. "พนักงาน" also matches "การจัดหาพนักงาน", a totally different
+                # department) — counting "how many others remain" BEFORE this filter wrongly
+                # blocks the check below from ever running when 2+ unrelated others exist.
+                _other_lts_em_same_dept = [
+                    lt for lt in _other_lts_em
+                    if _dept_explicit_em
+                    and _dept_explicit_em == next(
+                        (
+                            ((_d3.get("metadata") or {}).get("department") or "").strip()
+                            for _d3 in docs
+                            if isinstance(_d3, dict)
+                            and ((_d3.get("metadata") or {}).get("license_type") or "").strip() == lt
+                        ),
+                        "",
+                    )
+                ]
+                if len(_other_lts_em_same_dept) == 1:
+                    _lt_other_em = _other_lts_em_same_dept[0]
+                    def _content_excerpt_em(_lt_target: str) -> str:
+                        for _d4 in docs:
+                            if not isinstance(_d4, dict):
+                                continue
+                            _md4 = _d4.get("metadata") or {}
+                            if (_md4.get("license_type") or "").strip() != _lt_target:
+                                continue
+                            _tc4 = str(_md4.get("terms_and_conditions") or "").strip()
+                            if _tc4:
+                                return _tc4
+                            _lr4 = str(_md4.get("legal_regulatory") or "").strip()
+                            if _lr4:
+                                return _lr4
+                        return ""
+                    try:
+                        _dominant_em = self._classify_license_dominance(
+                            query, _explicit_lt, _lt_other_em, state=state,
+                            content_a=_content_excerpt_em(_explicit_lt),
+                            content_b=_content_excerpt_em(_lt_other_em),
+                        )
+                    except Exception as _e_dom_em:
+                        _LOG.warning(
+                            "[Supervisor] multi-license explicit-mention dominance check failed: %s", _e_dom_em
+                        )
+                        _dominant_em = _explicit_lt
+                    if not _dominant_em:
+                        _LOG.info(
+                            "[Supervisor] multi-license: explicit mention %r but same-department "
+                            "sibling %r classified as genuinely-both — merging instead of narrowing",
+                            _explicit_lt, _lt_other_em,
+                        )
+                        self._merge_multi_license_docs(state, query, [_explicit_lt, _lt_other_em])
+                        # Dedicated, narrowly-scoped key — deliberately NOT the pre-existing
+                        # multi_license_topics flag (2026-10, live-reproduced): reusing that
+                        # flag was tried first and caused a worse regression — it activated a
+                        # broader, separately-triggered re-detection mechanism that pulled in a
+                        # 3rd, wrong license and caused turn 1 itself to skip the entity_type
+                        # question. This key is checked only by code that directly knows what
+                        # it means.
+                        state.context["_explicit_mention_merged_pair"] = [_explicit_lt, _lt_other_em]
+                        _merged_as_both_em = True
+                if _merged_as_both_em:
+                    # Same pattern as the "multi-license substring match" branch above: don't
+                    # force a single-license topic selection, let practical answer from the
+                    # merged doc set covering both registrations.
+                    return
                 _LOG.info(
                     "[Supervisor] multi-license: explicit mention %r in query → use as dominant (overrides doc-count)",
                     _explicit_lt,
@@ -10153,6 +10241,7 @@ class PersonaSupervisor:
 
     def _classify_license_dominance(
         self, query: str, license_a: str, license_b: str, state: ConversationState = None,
+        content_a: str = "", content_b: str = "",
     ) -> str:
         """Cheap LLM tie-breaker for when retrieved docs span 2 distinct license_types with
         neither clearly dominant by doc count (2026-10, live-reproduced — see
@@ -10166,9 +10255,15 @@ class PersonaSupervisor:
         SENTENCE is doing, not what words appear in it, and hand-coding detection for every
         future context-vs-ask phrasing pattern doesn't scale (same reasoning already applied
         to the EDC case's "ติดต่อใคร" scope decision — see [[edc_department_vs_service_channel_2026-10]]).
+
+        content_a/content_b (optional, 2026-10): short doc-content excerpts, forwarded as-is
+        to build_license_dominance_detect_prompt — see that function's docstring for the
+        unstated-prerequisite case this was added for. Left blank by callers that don't have
+        cheap excerpts on hand; the original query-text-only behavior is unchanged when both
+        are "".
         """
         try:
-            prompt = build_license_dominance_detect_prompt(query, license_a, license_b)
+            prompt = build_license_dominance_detect_prompt(query, license_a, license_b, content_a, content_b)
             model = getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL)
             timeout = int(getattr(conf, "LLM_TOPIC_PICKER_TIMEOUT", 8))
             llm = ChatOpenAI(
@@ -10252,9 +10347,20 @@ class PersonaSupervisor:
                         _seen_hashes.add(_h)
                         _merged_docs.append(_d)
             if _merged_docs:
+                # Only keep pre-existing docs that ALSO belong to one of the target licenses
+                # (2026-10, live-reproduced): the old unconditional keep-everything-not-already-
+                # merged let a THIRD, unrelated license_type that happened to be in the broader
+                # candidate pool scanned before this merge ran (e.g. "การจัดหาพนักงาน", a
+                # different department, pulled in only because it shares the keyword "พนักงาน")
+                # survive into the final merged set — contaminating the answer with wrong
+                # content from a license nobody asked about. This merge is specifically about
+                # license_types (the caller's own parameter), so the keep-filter should say so
+                # explicitly rather than "whatever wasn't already captured."
+                _target_lts_set = set(license_types)
                 _existing = [
                     d for d in (state.current_docs or [])
                     if hash((d.get("content") or "")[:120]) not in _seen_hashes
+                    and ((d.get("metadata") or {}).get("license_type") or "").strip() in _target_lts_set
                 ]
                 state.current_docs = _merged_docs + _existing
                 _LOG.info(
@@ -11423,15 +11529,32 @@ class PersonaSupervisor:
                 # Recover license_type — prefer current_docs (set by entity-enriched retrieval)
                 # over last_topic which may be stale (e.g. set to the user's raw query text
                 # when free text was typed while a topic-menu slot was pending).
+                # Collects EVERY distinct license_type present, not just the first (2026-10,
+                # live-reproduced): when _merge_multi_license_docs merged 2 genuinely-both
+                # licenses earlier this same turn-chain (e.g. "จ้างพนักงานคนแรก" needing both
+                # ทะเบียนนายจ้าง + ทะเบียนผู้ประกันตน), taking only the first doc's license_type
+                # here silently narrowed the NEXT retrieval (after entity_type/operation_group
+                # is answered) back down to one license — the merge upstream was real, this
+                # "take first" read of it just threw half of it away on the very next turn.
                 _saved_license = ""
+                _saved_licenses_multi: List[str] = []
+                _seen_lts_op: set = set()
                 for _d_op in (state.current_docs or []):
                     if isinstance(_d_op, dict):
                         _lt_op = ((_d_op.get("metadata") or {}).get("license_type") or "").strip()
-                        if _lt_op:
-                            _saved_license = _lt_op
-                            break
+                        if _lt_op and _lt_op not in _seen_lts_op:
+                            _seen_lts_op.add(_lt_op)
+                            _saved_licenses_multi.append(_lt_op)
+                if _saved_licenses_multi:
+                    _saved_license = _saved_licenses_multi[0]
                 if not _saved_license:
                     _saved_license = (state.context or {}).get("last_topic") or ""
+                # Filter VALUE to use at retrieval call sites below — a single string in the
+                # common (single-license) case, unchanged from before; {"$in": [...]} only
+                # when the merge above genuinely left 2+ distinct licenses in play.
+                _license_filter_val = (
+                    {"$in": _saved_licenses_multi} if len(_saved_licenses_multi) > 1 else _saved_license
+                )
 
                 if _saved_entity:
                     # Filter by BOTH entity_type AND license_type so docs from other license types
@@ -11459,7 +11582,7 @@ class PersonaSupervisor:
                         # Build combined filter: entity_type + license_type + department (if known)
                         _op_meta_filter: dict = {"entity_type_normalized": _saved_entity}
                         if _saved_license:
-                            _op_meta_filter["license_type"] = _saved_license
+                            _op_meta_filter["license_type"] = _license_filter_val
                         if _saved_dept_op:
                             _op_meta_filter["department"] = _saved_dept_op
                         state.current_docs = self._practical._retrieve_docs(
@@ -11472,7 +11595,7 @@ class PersonaSupervisor:
                             _LOG.info("[Supervisor] op-group dept+license 0 docs → relax to entity+license only")
                             state.current_docs = self._practical._retrieve_docs(
                                 enriched_q,
-                                metadata_filter={"entity_type_normalized": _saved_entity, "license_type": _saved_license},
+                                metadata_filter={"entity_type_normalized": _saved_entity, "license_type": _license_filter_val},
                                 max_docs=_k_for_op,
                             )
                         # Fallback 2: relax to entity-only
@@ -12074,14 +12197,27 @@ class PersonaSupervisor:
                 # Generic docs (entity_type_normalized='') hold operation_steps, fees, channels —
                 # they are excluded by the entity filter but needed for a complete LLM answer.
                 _prior_license = None
+                _prior_licenses_set: set = set()
                 _prior_generic_docs: List[Dict] = []
                 for _pd in (state.current_docs or []):
                     _plt = ((_pd.get("metadata") or {}).get("license_type") or "").strip()
                     if _plt and not _prior_license:
                         _prior_license = _plt
+                    if _plt:
+                        _prior_licenses_set.add(_plt)
                     _pet = ((_pd.get("metadata") or {}).get("entity_type_normalized") or "").strip()
                     if _pet == "" and _plt:
                         _prior_generic_docs.append(_pd)
+                # Post-filter below used to compare against _prior_license (singular) only —
+                # when current_docs genuinely spans 2+ licenses (2026-10, live-reproduced: the
+                # explicit-mention-override merge for "จ้างพนักงานคนแรก" leaves both ทะเบียนนายจ้าง
+                # + ทะเบียนผู้ประกันตน in current_docs), that silently dropped every doc from
+                # whichever license didn't happen to be first. _prior_licenses_set captures the
+                # full set so the post-filter can keep both — _prior_license itself is left
+                # unchanged for the OTHER consumers below (registration_type/area_size handling,
+                # bank-mismatch guard) that were not part of this case and are not touched here.
+                if not _prior_licenses_set and _prior_license:
+                    _prior_licenses_set = {_prior_license}
 
                 # Bank mismatch guard: if the legal query names a bank that differs from
                 # the department in current_docs, the cached docs are from the wrong bank.
@@ -12122,6 +12258,7 @@ class PersonaSupervisor:
                             _qbank, _doc_banks,
                         )
                         _prior_license = None
+                        _prior_licenses_set = set()
                         _prior_generic_docs = []
 
                 # If department was already collected (e.g. user chose ธนาคารไทยพาณิชย์ before
@@ -12142,35 +12279,85 @@ class PersonaSupervisor:
                     if len(_dept_counts) == 1:
                         _known_dept = next(iter(_dept_counts))
 
+                # Base filter parts WITHOUT any license_type constraint — shared by both the
+                # default single-license path (bare similarity search, relying on the
+                # post-filter below) and the multi-license round-robin path further down.
                 if _known_dept:
                     # Include entity-neutral ("") docs alongside entity-specific ones so that
                     # shared procedure/fee/channel docs aren't excluded when department is known.
-                    _ef_parts: List[Dict] = [
+                    _ef_base_parts: List[Dict] = [
                         {"$or": [
                             {"entity_type_normalized": _entity_val},
                             {"entity_type_normalized": ""},
                         ]},
                         {"department": _known_dept},
                     ]
-                    if _known_loc_et:
-                        # {"$in": [loc, ""]} keeps location-specific AND no-location generic docs
-                        _ef_parts.append({"location": {"$in": [_known_loc_et, ""]}})
-                    entity_filter: dict = {"$and": _ef_parts}
                 else:
-                    if _known_loc_et:
-                        entity_filter = {"$and": [
-                            {"entity_type_normalized": _entity_val},
-                            {"location": {"$in": [_known_loc_et, ""]}},
-                        ]}
-                    else:
-                        entity_filter = {"entity_type_normalized": _entity_val}
+                    _ef_base_parts = [{"entity_type_normalized": _entity_val}]
+                if _known_loc_et:
+                    # {"$in": [loc, ""]} keeps location-specific AND no-location generic docs
+                    _ef_base_parts.append({"location": {"$in": [_known_loc_et, ""]}})
+
+                def _build_entity_filter(extra: Optional[Dict] = None) -> dict:
+                    _parts = list(_ef_base_parts)
+                    if extra:
+                        _parts.append(extra)
+                    return {"$and": _parts} if len(_parts) > 1 else _parts[0]
+
                 try:
-                    _entity_docs = self._practical._retrieve_docs(enriched_q, metadata_filter=entity_filter)
-                    # Post-filter: keep only docs for the original license_type
+                    if len(_prior_licenses_set) > 1:
+                        # Round-robin per-license retrieval (2026-10, live-reproduced): a single
+                        # combined similarity search — even WITH a license_type $in constraint
+                        # added as one more $and clause — still let one license's
+                        # stronger-matching wording crowd the other entirely out of the top-k
+                        # (confirmed live: adding $in alone still returned 5/5 docs from only
+                        # ทะเบียนผู้ประกันตน, none from ทะเบียนนายจ้าง, for "จ้างพนักงานคนแรก...
+                        # ผู้ประกันตน" — the query's own wording dominates ranking regardless of
+                        # which licenses are eligible). Retrieving each license separately with
+                        # its own capped k — the same technique _merge_multi_license_docs already
+                        # uses for the turn-1 merge — guarantees both get a fair slice regardless
+                        # of embedding score skew.
+                        _per_lt_cap = max(2, int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 6)) // len(_prior_licenses_set))
+                        _per_lt_docs: Dict[str, List[Dict]] = {}
+                        for _plt in sorted(_prior_licenses_set):
+                            try:
+                                _per_lt_docs[_plt] = self._practical._retrieve_docs(
+                                    enriched_q,
+                                    metadata_filter=_build_entity_filter({"license_type": _plt}),
+                                    max_docs=_per_lt_cap,
+                                )
+                            except Exception as _e_plt:
+                                _LOG.warning(
+                                    "[Supervisor] entity-enriched per-license retrieve failed for %r: %s",
+                                    _plt, _e_plt,
+                                )
+                                _per_lt_docs[_plt] = []
+                        _entity_docs = []
+                        _seen_ed_hashes: set = set()
+                        _max_plt_len = max((len(v) for v in _per_lt_docs.values()), default=0)
+                        for _i in range(_max_plt_len):
+                            for _plt in sorted(_prior_licenses_set):
+                                _docs_i = _per_lt_docs.get(_plt) or []
+                                if _i >= len(_docs_i):
+                                    continue
+                                _d = _docs_i[_i]
+                                _h = hash((_d.get("content") or "")[:120])
+                                if _h not in _seen_ed_hashes:
+                                    _seen_ed_hashes.add(_h)
+                                    _entity_docs.append(_d)
+                        _LOG.info(
+                            "[Supervisor] entity-enriched retrieval (multi-license round-robin): "
+                            "licenses=%s docs=%d",
+                            sorted(_prior_licenses_set), len(_entity_docs),
+                        )
+                    else:
+                        _entity_docs = self._practical._retrieve_docs(enriched_q, metadata_filter=_build_entity_filter())
+                    # Post-filter: keep only docs for the original license_type(s) — plural-aware,
+                    # see _prior_licenses_set's comment above for why.
                     if _prior_license and _entity_docs:
                         _license_filtered = [
                             d for d in _entity_docs
-                            if ((_d_md := (d.get("metadata") or {})).get("license_type") or "").strip() == _prior_license
+                            if ((_d_md := (d.get("metadata") or {})).get("license_type") or "").strip() in _prior_licenses_set
                         ]
                         if _license_filtered:
                             state.current_docs = _license_filtered
@@ -12209,7 +12396,7 @@ class PersonaSupervisor:
                         _new_generic = [
                             d for d in _prior_generic_docs
                             if _doc_dedup_key(d) not in _entity_content_keys
-                            and ((_d_md2 := d.get("metadata") or {}).get("license_type") or "").strip() == (_prior_license or "")
+                            and ((_d_md2 := d.get("metadata") or {}).get("license_type") or "").strip() in _prior_licenses_set
                         ]
                         if _new_generic:
                             state.current_docs = list(state.current_docs) + _new_generic
@@ -12620,35 +12807,84 @@ class PersonaSupervisor:
                                                 _meta_parts_og = [{k: v} for k, v in _meta_et.items()]
                                                 _meta_parts_og.append(_loc_flt_og)
                                                 _meta_et = {"$and": _meta_parts_og}
-                                        _redocs_et = self._practical._retrieve_docs(
-                                            _enrich_q_et,
-                                            metadata_filter=_meta_et,
-                                            max_docs=int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 4)),
-                                        )
-                                        # If registration_type filter returned 0 docs:
-                                        # - If targeted retrieval already set rt-specific docs in current_docs, skip overwrite
-                                        # - Otherwise relax to entity+license
-                                        if not _redocs_et and "$and" in _meta_et:
-                                            _top_rt = ((state.current_docs[0] if state.current_docs else {}).get("metadata") or {}).get("registration_type") or ""
-                                            _targeted_ok = _known_rt_et and _top_rt and _known_rt_et in _top_rt
-                                            if _targeted_ok:
-                                                _LOG.info(
-                                                    "[Supervisor] auto-infer: rt Chroma filter returned 0, "
-                                                    "but targeted retrieval already set rt-specific docs — skipping overwrite",
-                                                )
-                                            else:
-                                                _meta_et_fb: dict = {"entity_type_normalized": {"$in": [_entity_val, ""]}}
-                                                if _license_type_for_og:
-                                                    _meta_et_fb["license_type"] = _license_type_for_og
-                                                if _known_loc_og:
-                                                    _fb_parts = [{k: v} for k, v in _meta_et_fb.items()]
-                                                    _fb_parts.append({"location": {"$in": [_known_loc_og, ""]}})
-                                                    _meta_et_fb = {"$and": _fb_parts}
-                                                _redocs_et = self._practical._retrieve_docs(
-                                                    _enrich_q_et,
-                                                    metadata_filter=_meta_et_fb,
-                                                    max_docs=int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 4)),
-                                                )
+                                        if len(_prior_licenses_set) > 1:
+                                            # Round-robin per-license retrieval (2026-10, live-reproduced):
+                                            # _license_type_for_og is only the first-seen license
+                                            # (_prior_license) — a single retrieval filtered to just that
+                                            # one would silently throw away the OTHER merged license right
+                                            # here, undoing supervisor's own earlier content-aware merge
+                                            # this same turn-chain. A combined $in filter isn't enough either
+                                            # (confirmed live elsewhere in this fix: embedding similarity still
+                                            # lets one license's stronger wording-match starve the other out
+                                            # of the top-k) — retrieve each license separately instead, same
+                                            # technique as the entity-filtered retrieval above.
+                                            _base_parts_og = (
+                                                [p for p in _meta_et["$and"] if "license_type" not in p]
+                                                if isinstance(_meta_et.get("$and"), list)
+                                                else [{k: v} for k, v in _meta_et.items() if k != "license_type"]
+                                            )
+                                            _per_lt_cap_og = max(2, int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 4)) // len(_prior_licenses_set))
+                                            _per_lt_docs_og: Dict[str, List[Dict]] = {}
+                                            for _plt_og in sorted(_prior_licenses_set):
+                                                _parts_og = _base_parts_og + [{"license_type": _plt_og}]
+                                                _filter_og = {"$and": _parts_og} if len(_parts_og) > 1 else _parts_og[0]
+                                                try:
+                                                    _per_lt_docs_og[_plt_og] = self._practical._retrieve_docs(
+                                                        _enrich_q_et, metadata_filter=_filter_og, max_docs=_per_lt_cap_og,
+                                                    )
+                                                except Exception as _e_plt_og:
+                                                    _LOG.warning(
+                                                        "[Supervisor] auto-infer op_group per-license retrieve failed for %r: %s",
+                                                        _plt_og, _e_plt_og,
+                                                    )
+                                                    _per_lt_docs_og[_plt_og] = []
+                                            _redocs_et = []
+                                            _seen_og_hashes: set = set()
+                                            _max_og_len = max((len(v) for v in _per_lt_docs_og.values()), default=0)
+                                            for _i_og in range(_max_og_len):
+                                                for _plt_og in sorted(_prior_licenses_set):
+                                                    _docs_i_og = _per_lt_docs_og.get(_plt_og) or []
+                                                    if _i_og >= len(_docs_i_og):
+                                                        continue
+                                                    _d_og = _docs_i_og[_i_og]
+                                                    _h_og = hash((_d_og.get("content") or "")[:120])
+                                                    if _h_og not in _seen_og_hashes:
+                                                        _seen_og_hashes.add(_h_og)
+                                                        _redocs_et.append(_d_og)
+                                            _LOG.info(
+                                                "[Supervisor] auto-infer op_group round-robin retrieval: licenses=%s docs=%d",
+                                                sorted(_prior_licenses_set), len(_redocs_et),
+                                            )
+                                        else:
+                                            _redocs_et = self._practical._retrieve_docs(
+                                                _enrich_q_et,
+                                                metadata_filter=_meta_et,
+                                                max_docs=int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 4)),
+                                            )
+                                            # If registration_type filter returned 0 docs:
+                                            # - If targeted retrieval already set rt-specific docs in current_docs, skip overwrite
+                                            # - Otherwise relax to entity+license
+                                            if not _redocs_et and "$and" in _meta_et:
+                                                _top_rt = ((state.current_docs[0] if state.current_docs else {}).get("metadata") or {}).get("registration_type") or ""
+                                                _targeted_ok = _known_rt_et and _top_rt and _known_rt_et in _top_rt
+                                                if _targeted_ok:
+                                                    _LOG.info(
+                                                        "[Supervisor] auto-infer: rt Chroma filter returned 0, "
+                                                        "but targeted retrieval already set rt-specific docs — skipping overwrite",
+                                                    )
+                                                else:
+                                                    _meta_et_fb: dict = {"entity_type_normalized": {"$in": [_entity_val, ""]}}
+                                                    if _license_type_for_og:
+                                                        _meta_et_fb["license_type"] = _license_type_for_og
+                                                    if _known_loc_og:
+                                                        _fb_parts = [{k: v} for k, v in _meta_et_fb.items()]
+                                                        _fb_parts.append({"location": {"$in": [_known_loc_og, ""]}})
+                                                        _meta_et_fb = {"$and": _fb_parts}
+                                                    _redocs_et = self._practical._retrieve_docs(
+                                                        _enrich_q_et,
+                                                        metadata_filter=_meta_et_fb,
+                                                        max_docs=int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 4)),
+                                                    )
                                         if _redocs_et:
                                             state.current_docs = _redocs_et
                                             state.last_retrieval_query = _enrich_q_et

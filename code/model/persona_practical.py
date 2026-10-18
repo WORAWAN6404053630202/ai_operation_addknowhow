@@ -3914,12 +3914,33 @@ class PracticalPersonaService:
         )
         _is_multi_topic_flag = bool((state.context or {}).get("_multi_topic_retrieval"))
         _is_broad_q_flag = bool((state.context or {}).get("_broad_question"))
+        # Explicit-mention-merged-pair guard (2026-10, live-reproduced): FOCUS FILTER's own
+        # dominance scoring below is PURELY keyword-based (query substring/keyword-table
+        # matches) — it has no visibility into supervisor's _ensure_practical_retrieval_for_legal,
+        # which already ran a CONTENT-aware classifier (_classify_license_dominance) to decide
+        # this exact pair of license_types is genuinely-both and merged them into
+        # state.current_docs. For "จ้างพนักงานคนแรกของร้าน ต้องขึ้นทะเบียนผู้ประกันตนยังไงคะ":
+        # the keyword table scores "ทะเบียนผู้ประกันตน"=8 (query says "ผู้ประกันตน") but
+        # "ทะเบียนนายจ้าง"=0 (no keyword rule fires — the query never says "ทะเบียนนายจ้าง" or
+        # "ประกันสังคม" literally), so FOCUS FILTER's own logic below would silently re-discard
+        # the very license supervisor just fought to keep. Checked via subset (not equality)
+        # since _is_multi_license_docs already guarantees len(_lt_order) > 1, so a match here
+        # only ever means _lt_order == the merged pair in practice.
+        _explicit_merged_pair = set((state.context or {}).get("_explicit_mention_merged_pair") or [])
+        _is_explicit_merged_pair_flag = bool(_explicit_merged_pair) and set(_lt_order) <= _explicit_merged_pair
         # Tracks whether FOCUS FILTER's multi-requested path kept ≥2 license types.
         # Set to True inside the multi-requested block; used to skip sibling-completion
         # (sibling-completion adds 4+ docs for each surviving license → prompt explosion
         # when 3 license types are all kept by multi-requested).
         _multi_requested_kept = False
-        if _is_multi_license_docs and not _is_broad_query and not _is_multi_topic_flag and not _is_broad_q_flag and _lt_order:
+        if _is_explicit_merged_pair_flag and _is_multi_license_docs and not _is_broad_query:
+            _multi_requested_kept = True
+            _LOG.info(
+                "[Practical] FOCUS FILTER: skipped — %s already merged by supervisor's "
+                "content-aware classifier (_explicit_mention_merged_pair)",
+                sorted(_explicit_merged_pair),
+            )
+        elif _is_multi_license_docs and not _is_broad_query and not _is_multi_topic_flag and not _is_broad_q_flag and _lt_order:
             # Pick dominant license_type by relevance to the CURRENT user query (not doc count alone).
             # Algorithm:
             #   1. Score each license_type against user_text using:
@@ -6582,6 +6603,68 @@ Your JSON response:
                     _LOG.warning("[Practical] entity_type re-ask retry STILL action='ask' — keeping original question")
             except Exception as _e_entity_retry:
                 _LOG.warning("[Practical] entity_type re-ask retry failed: %s — keeping original decision", _e_entity_retry)
+
+        # Deterministic safety net for multi-license completeness (2026-10, live-reproduced,
+        # same retry-once shape as the entity_type safety net above, for a different failure
+        # mode): prompts_practical.py's "COMPLETENESS, non-negotiable" rule for license_type
+        # tells the model to give each merged license_type its own full section instead of
+        # deferring one to a closing offer ("ถ้าอยากรู้เพิ่มเติมเรื่อง X ถามได้เลย") — but that's
+        # advisory, observed live to still happen roughly half the time even with the rule in
+        # place (model wrote a complete ทะเบียนนายจ้าง section, then only NAMED ทะเบียนผู้ประกันตน
+        # in the closing line instead of giving its steps/documents). Catching it here,
+        # deterministically, is the only way to actually close the gap. Scoped narrowly: only
+        # fires when this turn's docs were genuinely merged across 2 license_types by the
+        # explicit-mention-override classifier (_explicit_mention_merged_pair) and the model
+        # chose to answer — never fires for an ordinary single-license turn.
+        if action == "answer" and len(_explicit_merged_pair) > 1:
+            def _answer_body_excl_closing(_txt: str) -> str:
+                # Closing offers live in the final paragraph — exclude it so a license_type
+                # merely NAMED there (without real content) doesn't count as "covered".
+                _cut = _txt.rfind("\n\n")
+                return _txt[:_cut] if _cut > 0 else _txt
+
+            _answer_text_cs = str(exec_.get("answer") or "")
+            _answer_body_cs = _answer_body_excl_closing(_answer_text_cs)
+            _missing_lts_cs = [lt for lt in sorted(_explicit_merged_pair) if lt not in _answer_body_cs]
+            if _missing_lts_cs:
+                _LOG.warning(
+                    "[Practical] multi-license completeness gap: answer body missing %s "
+                    "despite both being genuinely required — retrying once with a corrective reminder",
+                    _missing_lts_cs,
+                )
+                _completeness_retry_prompt = (
+                    prompt
+                    + "\n\n[SYSTEM REMINDER] DOCUMENTS were deliberately assembled to cover "
+                    + " AND ".join(sorted(_explicit_merged_pair))
+                    + " because BOTH are genuinely required for this user's situation. Your "
+                    "previous answer only gave full detail for one of them. Rewrite the answer "
+                    "so EACH license_type gets its own complete section (ขั้นตอน, เอกสารที่ต้องใช้, "
+                    "ค่าธรรมเนียม, ระยะเวลา) in THIS answer — do not defer either one to a closing "
+                    "offer to explain more later."
+                )
+                try:
+                    _retry_decision_cs = self._call_llm_json_with_truncation_retry(_completeness_retry_prompt, state=state)
+                    _retry_exec_raw_cs = _retry_decision_cs.get("execution", {})
+                    if isinstance(_retry_exec_raw_cs, str):
+                        try:
+                            _retry_exec_raw_cs = json.loads(_retry_exec_raw_cs)
+                        except Exception:
+                            _retry_exec_raw_cs = {}
+                    _retry_exec_cs = _retry_exec_raw_cs if isinstance(_retry_exec_raw_cs, dict) else {}
+                    _retry_answer_cs = str(_retry_exec_cs.get("answer") or "")
+                    _retry_body_cs = _answer_body_excl_closing(_retry_answer_cs)
+                    _still_missing_cs = [lt for lt in _missing_lts_cs if lt not in _retry_body_cs]
+                    if _retry_answer_cs and not _still_missing_cs:
+                        decision = _retry_decision_cs
+                        exec_ = _retry_exec_cs
+                        _LOG.info("[Practical] multi-license completeness retry succeeded — both sections now present")
+                    else:
+                        _LOG.warning(
+                            "[Practical] multi-license completeness retry still missing %s — keeping first attempt",
+                            _still_missing_cs or _missing_lts_cs,
+                        )
+                except Exception as _e_cs_retry:
+                    _LOG.warning("[Practical] multi-license completeness retry failed: %s", _e_cs_retry)
 
         # Diagnostic-only (2026-09, paired with the docs_json log above) —
         # catches the exact failing moment if this info-gap pattern recurs:
