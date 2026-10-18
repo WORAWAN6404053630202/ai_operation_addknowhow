@@ -47,6 +47,7 @@ from typing import Any, Optional
 import conf
 from utils.llm_cost_logging import CostAccumulator, log_llm_cost
 from utils.logger import get_logger
+from utils.prompt_safety import INJECTION_GUARD
 
 logger = get_logger(__name__)
 
@@ -228,7 +229,16 @@ def compare_extractions(markdown_a: str, markdown_b: str, label_a: str = "model_
     return flags
 
 
+# 2026-10 security fix: embeds raw OCR extraction text from an
+# attacker-influenceable PDF upload, same class of gap already fixed
+# elsewhere in the PDF pipeline (see utils/prompt_safety.py's docstring).
+# Lower severity than the two overlap-resolution sites — this function's
+# output is informational ValidationFlags only, never auto-applied — but
+# closing it keeps the "every PDF-text-embedding prompt has the guard"
+# invariant actually true project-wide, not just mostly true.
 _LLM_COMPARISON_PROMPT = """ต่อไปนี้คือผลลัพธ์การสกัดข้อความจากเอกสารหน้าเดียวกัน โดยเครื่องมือ 2 ตัวที่ทำงานอิสระจากกัน (ตัว A และตัว B)
+
+""" + INJECTION_GUARD + """
 
 อ่านทั้งสองฉบับ แล้วหาจุดที่ทั้งสองฉบับ "ขัดแย้งกันในข้อเท็จจริง" (ตัวเลข, ชื่อ, วันที่, รหัส, หรือข้อความสำคัญอื่นๆ ที่ควรจะตรงกัน แต่กลับไม่ตรงกัน)
 

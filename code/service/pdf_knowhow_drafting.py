@@ -108,8 +108,14 @@ _PROMPT_TEMPLATE = """เอกสารต่อไปนี้ (มีทั�
 """
 
 
+# 2026-10 security fix: same gap/fix as pdf_field_drafting.py's identical
+# function — see that file's comment for the full rationale. This prompt
+# embeds raw OCR page text and was missing INJECTION_GUARD despite every
+# other PDF-text-embedding prompt in this file having it.
 _OVERLAP_RESOLUTION_PROMPT = """หน้าต่อไปนี้ถูกระบบแบ่งหัวข้อจัดให้อยู่ใน 2 หัวข้อพร้อมกันโดยผิดพลาด (ห้ามเกิดขึ้น
 แต่เกิดขึ้นจริง) ต้องเลือกว่าเนื้อหาหน้านี้ควรอยู่หัวข้อไหนมากกว่ากัน — เลือกแค่ 1 หัวข้อ
+
+""" + INJECTION_GUARD + """
 
 หัวข้อ A: "{topic_a}" — {sub_a}
 หัวข้อ B: "{topic_b}" — {sub_b}
@@ -190,7 +196,12 @@ def _resolve_page_overlaps(
             log_llm_cost(logger, "KnowhowDrafting/ResolveOverlap", conf.OPENROUTER_MODEL_PDF_TOPIC_SPLIT, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
             raw = resp.choices[0].message.content or "{}"
             winner = parse_leading_json(raw).get("winner", "A")
-            winner_idx, loser_idx = (idx_a, idx_b) if winner == "A" else (idx_b, idx_a)
+            # Fail-closed (2026-10 security fix) — see pdf_field_drafting.py's
+            # identical fix for the full rationale: only an explicit "B"
+            # flips the pre-set safe default; "A" and anything else
+            # (malformed, unexpected, injected) both keep it.
+            if winner == "B":
+                winner_idx, loser_idx = idx_b, idx_a
         except Exception as e:
             logger.warning(f"[KnowhowDrafting] Overlap resolution call failed for pages {pages}, defaulting to first-topic-wins: {e}")
 

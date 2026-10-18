@@ -92,11 +92,36 @@ def _embedding_candidates(comparison_text: str, data_type_filter: dict) -> dict[
     if not comparison_text.strip():
         return {}
     floor = float(getattr(conf, "PDF_SUPERSEDE_EMBEDDING_FLOOR", 0.70))
+    min_gap = float(getattr(conf, "PDF_SUPERSEDE_EMBEDDING_MIN_GAP", 0.05))
     max_candidates = int(getattr(conf, "PDF_SUPERSEDE_EMBEDDING_MAX_CANDIDATES", 10))
     hits = get_vs_manager().query_live_with_ids(
         comparison_text, k=max_candidates * 2, filter=data_type_filter,
     )
-    return {h["id"]: h for h in hits if h["score"] >= floor}
+    # 2026-10 bug fix: this previously kept EVERY hit above the floor (up to
+    # 2x max_candidates, since that's only used to size the Chroma query k=)
+    # — the "_MAX_CANDIDATES" name was aspirational, not enforced. Now
+    # actually capped via the same dynamic-gap-cutoff logic already proven
+    # in pdf_candidate_matching.py's _dynamic_cutoff_count (a real gap in
+    # the sorted score distribution, not a blind top-N cut).
+    hits_sorted = sorted(hits, key=lambda h: h["score"], reverse=True)
+    keep_count = _dynamic_cutoff_count([h["score"] for h in hits_sorted], floor, min_gap, max_candidates)
+    return {h["id"]: h for h in hits_sorted[:keep_count]}
+
+
+def _dynamic_cutoff_count(sorted_scores: list[float], floor: float, min_gap: float, max_candidates: int) -> int:
+    """How many of the descending-sorted scores to keep — the largest gap
+    between consecutive scores above the floor, not a fixed top-K. Ported
+    from pdf_candidate_matching.py's proven implementation (same reasoning:
+    a document with 7 genuinely-similar candidates should show 7, one with
+    none should show none)."""
+    above_floor = [s for s in sorted_scores if s >= floor]
+    if len(above_floor) <= 1:
+        return len(above_floor)
+    gaps = [(above_floor[i] - above_floor[i + 1], i) for i in range(len(above_floor) - 1)]
+    best_gap, best_idx = max(gaps)
+    if best_gap >= min_gap:
+        return min(best_idx + 1, max_candidates)
+    return min(len(above_floor), max_candidates)
 
 
 def _identity_fuzzy_candidates(
@@ -213,7 +238,14 @@ def _resolve(
     try:
         pool: dict[str, dict] = {}
         pool.update(_embedding_candidates(comparison_text, data_type_filter))
-        pool.update(_identity_fuzzy_candidates(new_values, data_type_filter, identity_keys))
+        # Merge identity-fuzzy hits WITHOUT clobbering an embedding hit's
+        # real score (2026-10 bug fix — plain dict.update() applied here
+        # second used to silently overwrite a doc's real embedding score
+        # with None whenever both signals matched the same doc; cosmetic
+        # only, never affected the decision, but fixed alongside the
+        # truncation bug below since it's the same block).
+        for doc_id, info in _identity_fuzzy_candidates(new_values, data_type_filter, identity_keys).items():
+            pool.setdefault(doc_id, info)
     except Exception as e:
         logger.error(f"[SupersedeResolver] Candidate pool fetch failed for {source_file!r}, defaulting to new: {e}")
         return SupersedeDecision("new", reasoning=f"candidate fetch failed: {e}")
@@ -221,21 +253,38 @@ def _resolve(
     if not pool:
         return SupersedeDecision("new", reasoning="no live candidates found")
 
+    # 2026-10 bug fix: this used to silently slice the pool to the first
+    # `batch_size` candidates (dict insertion order — embedding hits always
+    # first) and send ONLY those to the LLM judge. Any remaining candidates,
+    # including identity-fuzzy matches specifically designed to catch what
+    # embeddings under-score, were silently dropped — never judged, never
+    # logged as dropped — so the resolver could default to "new" even when
+    # a genuine duplicate/update existed in the pool. Fixed by batching
+    # through the WHOLE pool (every candidate gets judged, across as many
+    # LLM calls as needed), mirroring pdf_candidate_matching.py's proven
+    # _llm_scan_candidates pattern.
     batch_size = int(getattr(conf, "PDF_SUPERSEDE_LLM_BATCH_SIZE", 15))
-    candidate_items = list(pool.items())[:batch_size]
-    candidates_for_llm = []
-    for doc_id, info in candidate_items:
-        meta = info.get("metadata") or {}
-        existing_values = {k: meta.get(k) for k in comparison_keys}
-        diff = _field_diff(new_values, existing_values)
-        preview = _comparison_text(existing_values, comparison_keys)[:300]
-        candidates_for_llm.append({
-            "candidate_id": doc_id,
-            "preview": f"{preview} | diff={diff}" if diff else preview,
-        })
-
+    pool_items = list(pool.items())
+    if len(pool_items) > batch_size:
+        logger.info(
+            f"[SupersedeResolver] {source_file!r}: {len(pool_items)} candidate(s) found, "
+            f"judging in {-(-len(pool_items) // batch_size)} batch(es) of up to {batch_size}"
+        )
     model = str(getattr(conf, "OPENROUTER_MODEL_PDF_SUPERSEDE", conf.OPENROUTER_MODEL_PDF_MATCHING))
-    judgments = _llm_judge(comparison_text, candidates_for_llm, model, cost_accumulator=cost_accumulator)
+    judgments: dict[str, dict] = {}
+    for i in range(0, len(pool_items), batch_size):
+        batch = pool_items[i:i + batch_size]
+        candidates_for_llm = []
+        for doc_id, info in batch:
+            meta = info.get("metadata") or {}
+            existing_values = {k: meta.get(k) for k in comparison_keys}
+            diff = _field_diff(new_values, existing_values)
+            preview = _comparison_text(existing_values, comparison_keys)[:300]
+            candidates_for_llm.append({
+                "candidate_id": doc_id,
+                "preview": f"{preview} | diff={diff}" if diff else preview,
+            })
+        judgments.update(_llm_judge(comparison_text, candidates_for_llm, model, cost_accumulator=cost_accumulator))
 
     update_ids = [doc_id for doc_id, j in judgments.items() if j["is_same_topic"] and j.get("content_status") == "update"]
     duplicate_ids = [doc_id for doc_id, j in judgments.items() if j["is_same_topic"] and j.get("content_status") == "duplicate"]

@@ -376,8 +376,19 @@ def identify_license_topics(pages_markdown: list[str], cost_accumulator: Optiona
     return topics
 
 
+# 2026-10 security fix: this prompt embeds raw PDF page text (combined_text
+# below, straight from OCR output) and was missing INJECTION_GUARD despite
+# every other PDF-text-embedding prompt in this file having it — an
+# oversight against this module's own stated intent (see
+# utils/prompt_safety.py's docstring: "applied everywhere uniformly"). Its
+# output directly controls which topic wins a disputed page, so a
+# successful injection here has a real, concrete effect (page content
+# silently reassigned), not just a cosmetic one — closing this gap mirrors
+# the exact pattern already proven on every other call site in this file.
 _OVERLAP_RESOLUTION_PROMPT = """หน้าต่อไปนี้ถูกระบบแบ่งหัวข้อจัดให้อยู่ใน 2 เรื่องพร้อมกันโดยผิดพลาด (ห้ามเกิดขึ้น
 แต่เกิดขึ้นจริง) ต้องเลือกว่าเนื้อหาหน้านี้ควรอยู่เรื่องไหนมากกว่ากัน — เลือกแค่ 1 เรื่อง
+
+""" + INJECTION_GUARD + """
 
 เรื่อง A: หน่วยงาน "{department_a}" — ประเภทใบอนุญาต "{license_type_a}"
 เรื่อง B: หน่วยงาน "{department_b}" — ประเภทใบอนุญาต "{license_type_b}"
@@ -457,7 +468,14 @@ def _resolve_page_overlaps(
             log_llm_cost(logger, "FieldDrafting/ResolveOverlap", conf.OPENROUTER_MODEL_PDF_TOPIC_SPLIT, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
             raw = resp.choices[0].message.content or "{}"
             winner = parse_leading_json(raw).get("winner", "A")
-            winner_idx, loser_idx = (idx_a, idx_b) if winner == "A" else (idx_b, idx_a)
+            # Fail-closed (2026-10 security fix): only an EXPLICIT "B" flips
+            # the pre-set safe default above — the old `else` branch treated
+            # any non-"A" value (malformed JSON, an injected response trying
+            # to return something unexpected, anything) as an affirmative
+            # "B" vote, which is the opposite of fail-closed. "A" and
+            # anything else now both keep the deterministic default.
+            if winner == "B":
+                winner_idx, loser_idx = idx_b, idx_a
         except Exception as e:
             logger.warning(f"[pdf_field_drafting] Overlap resolution call failed for pages {pages}, defaulting to first-topic-wins: {e}")
 
