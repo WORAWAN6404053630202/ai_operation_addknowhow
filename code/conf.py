@@ -267,6 +267,20 @@ LLM_DOC_CHARS_KNOWHOW = _safe_int("LLM_DOC_CHARS_KNOWHOW", 4000)  # know_how (fe
 PDF_KNOWHOW_CHUNK_MAX_CHARS = _safe_int("PDF_KNOWHOW_CHUNK_MAX_CHARS", 24000)  # per-chunk cap when splitting a topic's full_text — comfortably fits the largest real chapter seen (19,056 chars) as ONE chunk, safety margin below the ~40k-42k measured hard wall
 LLM_DOC_CHARS_PDF_BOOK = _safe_int("LLM_DOC_CHARS_PDF_BOOK", 24000)  # matches PDF_KNOWHOW_CHUNK_MAX_CHARS above — only applies to ingested_via="pdf_auto" docs, NOT the legacy Sheet-based business_guide content (LLM_DOC_CHARS_BUSINESS_GUIDE, still 5500), to avoid ballooning token cost for content that was never affected by this bug
 
+# PDF content supersede resolver (2026-10, PDF-as-sole-source architecture):
+# automated, no-human-review detection of whether a newly-drafted PDF topic is
+# new / updates / duplicates something already live in Chroma. Mirrors the
+# tuning already live-calibrated in pdf_candidate_matching.py's Sheet-only
+# predecessor (same floor/gap/threshold values) since the underlying content
+# (Thai regulatory/know-how text) and failure modes are identical — only the
+# comparison target (Chroma's own index instead of a Sheet row scan) differs.
+PDF_SUPERSEDE_EMBEDDING_FLOOR = _safe_float("PDF_SUPERSEDE_EMBEDDING_FLOOR", 0.70)
+PDF_SUPERSEDE_EMBEDDING_MIN_GAP = _safe_float("PDF_SUPERSEDE_EMBEDDING_MIN_GAP", 0.05)
+PDF_SUPERSEDE_EMBEDDING_MAX_CANDIDATES = _safe_int("PDF_SUPERSEDE_EMBEDDING_MAX_CANDIDATES", 10)
+PDF_SUPERSEDE_IDENTITY_FUZZY_THRESHOLD = _safe_float("PDF_SUPERSEDE_IDENTITY_FUZZY_THRESHOLD", 0.82)
+PDF_SUPERSEDE_LLM_BATCH_SIZE = _safe_int("PDF_SUPERSEDE_LLM_BATCH_SIZE", 15)
+OPENROUTER_MODEL_PDF_SUPERSEDE = os.getenv("OPENROUTER_MODEL_PDF_SUPERSEDE", OPENROUTER_MODEL_PDF_MATCHING)
+
 # RAG Quality: Minimum similarity threshold
 RETRIEVAL_MIN_SIMILARITY = _safe_float("RETRIEVAL_MIN_SIMILARITY", 0.6)
 
@@ -474,6 +488,12 @@ ZILLIZ_API_KEY = os.getenv("ZILLIZ_API_KEY")
 LOCAL_MILVUS_URI = os.getenv("LOCAL_MILVUS_URI", "./milvus_lite.db")
 
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "thai_food_business_v3")
+
+# Archive collection for the PDF content supersede resolver (2026-10) — superseded
+# docs get physically moved here (not flagged-and-filtered) so the live
+# collection + every existing retrieval call site needs zero changes to stay
+# unaware this mechanism exists. See service/pdf_supersede_resolver.py.
+ARCHIVE_COLLECTION_NAME = os.getenv("ARCHIVE_COLLECTION_NAME", COLLECTION_NAME + "_archive")
 
 LOCAL_VECTOR_DIR = os.getenv(
     "LOCAL_VECTOR_DIR",

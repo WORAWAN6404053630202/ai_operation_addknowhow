@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>RESTBIZ Admin</title>
+  <title>RESTBIZ Admin — PDF</title>
   <style>
     :root {
       --bg: #0f1117;
@@ -474,13 +474,29 @@
       min-height: 34px;
     }
     .field-input:focus { border-color: var(--blue); outline: none; }
+    .field-input.field-empty { border-style: dashed; color: var(--muted); }
     .field-readonly { color: var(--muted); font-size: 11px; font-style: italic; padding: 4px 0; }
+    .field-fill-badge { font-size: 10px; padding: 1px 6px; border-radius: 10px; margin-left: 6px; font-weight: 700; }
+    .field-fill-badge.filled { background: rgba(74, 222, 128, 0.15); color: var(--green); }
+    .field-fill-badge.empty { background: rgba(148, 163, 184, 0.15); color: var(--muted); }
+
+    /* ── "what goes to the Sheet" summary — shown BEFORE the raw OCR pages,
+       since that's the decision-relevant content a reviewer needs first ── */
+    .sheet-preview-summary { border: 1px solid var(--accent); border-radius: 8px; padding: 10px 12px; margin-bottom: 14px; font-size: 12px; background: var(--panel-2); }
+    .sheet-preview-summary b { color: var(--accent); }
+    .raw-pages-toggle { border: 1px solid var(--border); border-radius: 8px; margin: 18px 0 14px; overflow: hidden; }
+    .raw-pages-toggle > summary { padding: 10px 12px; cursor: pointer; font-size: 12px; color: var(--muted); list-style: none; display: flex; align-items: center; gap: 8px; }
+    .raw-pages-toggle > summary::-webkit-details-marker { display: none; }
+    .raw-pages-toggle > summary::before { content: "▸"; }
+    .raw-pages-toggle[open] > summary::before { content: "▾"; }
+    .raw-pages-toggle-body { padding: 0 12px 12px; }
   </style>
 </head>
 <body>
 
 <header>
   <h1>RESTBIZ Admin</h1>
+  <span style="color: var(--orange); font-size: 12px; font-weight: 700; border: 1px solid var(--orange); border-radius: 6px; padding: 3px 10px; letter-spacing: 0.03em;">PDF INGESTION</span>
   <div class="nav-toggle">
     <button class="nav-btn active" id="navBtnSessions" onclick="switchView('sessions')">💬 Sessions</button>
     <button class="nav-btn" id="navBtnPdfQueue" onclick="switchView('pdfqueue')">📄 PDF Review Queue<span class="count-pill" id="pdfQueueBadge" style="display:none">0</span></button>
@@ -960,19 +976,42 @@
   function fieldsEditorHtml(item) {
     const fields = item.llm_drafted_fields || {};
     const keys = Object.keys(fields);
+    const filledCount = keys.filter(k => (fields[k] || "").trim()).length;
     const rows = keys.length
-      ? keys.map(k => `
+      ? keys.map(k => {
+          const val = fields[k] || "";
+          const isEmpty = !val.trim();
+          return `
           <div class="field-row">
-            <div class="field-label">${escHtml(k)}</div>
-            <textarea class="field-input" data-field-key="${escHtml(k)}">${escHtml(fields[k] || "")}</textarea>
-          </div>`).join("")
+            <div class="field-label">${escHtml(k)}
+              <span class="field-fill-badge ${isEmpty ? "empty" : "filled"}">${isEmpty ? "ไม่พบในเอกสาร" : "มีข้อมูล"}</span>
+            </div>
+            <textarea class="field-input ${isEmpty ? "field-empty" : ""}" data-field-key="${escHtml(k)}" placeholder="${isEmpty ? "ไม่พบข้อมูลนี้ในเอกสาร — เว้นว่างไว้ได้ หรือกรอกเอง" : ""}">${escHtml(val)}</textarea>
+          </div>`;
+        }).join("")
       : '<div class="field-readonly">ไม่มีข้อมูลที่ร่างไว้ (item นี้อาจถูกสร้างโดยไม่ผ่าน field-drafting)</div>';
 
+    // department/license_type are the 2 fields that identify WHICH license
+    // this row represents — surfaced as a one-line summary up top so a
+    // reviewer doesn't have to scan the whole field list just to know what
+    // they're looking at (this was the exact confusion this section caused
+    // when the underlying document was misclassified — see the 2026-09
+    // content-shape/topic-splitting size-limit fixes).
+    const dept = (fields["หน่วยงาน"] || "").trim();
+    const licenseType = (fields["ใบอนุญาต"] || "").trim();
+    const summaryLine = (dept || licenseType)
+      ? `<b>${escHtml(dept || "(ไม่พบหน่วยงาน)")}</b> — ${escHtml(licenseType || "(ไม่พบประเภทใบอนุญาต)")}`
+      : "⚠️ ไม่พบทั้งหน่วยงานและประเภทใบอนุญาตในเอกสาร — ตรวจสอบว่าเอกสารนี้จัดประเภทถูกต้องหรือไม่ (ดูแถบด้านบนสุด)";
+
     return `
+      <div class="sheet-preview-summary">
+        📋 จะเขียนเข้า Sheet เป็น <b>1 แถวใหม่</b>: ${summaryLine}<br>
+        <span style="color:var(--muted)">กรอกได้ ${filledCount}/${keys.length} คอลัมน์จากเนื้อหาเอกสาร (หน้า ${escHtml(item.pages.length ? `1-${item.pages.length}` : "-")})</span>
+      </div>
       <div class="fields-box">
         <div class="fields-title">📝 ฟิลด์ที่ร่างไว้สำหรับเขียนเข้า Sheet</div>
         <div class="fields-subtitle">
-          ตรวจสอบ/แก้ไขก่อนอนุมัติ — ค่าที่แก้ในนี้จะถูกใช้เขียนจริง ไม่ใช่ค่าที่ LLM ร่างไว้เฉยๆ<br>
+          ตรวจสอบ/แก้ไขก่อนอนุมัติ — ค่าที่แก้ในนี้จะถูกใช้เขียนจริง ไม่ใช่ค่าที่ LLM ร่างไว้เฉยๆ · แต่ละฟิลด์ระบุไว้แล้วว่าเจอข้อมูลในเอกสารหรือไม่<br>
           "อ้างอิง (Research)" จะใส่ชื่อไฟล์ต้นฉบับให้อัตโนมัติ · "เอกสาร AI ร้านอาหาร"/"รวมลิงค์" เว้นว่างไว้ให้กรอกเองถ้าจำเป็น (เป็นลิงก์ภายในทีม ไม่ได้มาจากเอกสาร)
         </div>
         ${rows}
@@ -1260,9 +1299,14 @@
         ${relevanceCheckHtml(item)}
         ${contentShapeHtml(item)}
         ${isKnowhow ? knowhowTopicsHtml(item) : categoryFitHtml(item) + candidateMatchesHtml(item)}
-        ${item.pages.map((p, idx) => pageCard(p, idx)).join("")}
         ${!isKnowhow && item.review_status === "pending" ? fieldsEditorHtml(item) : ""}
         ${decisionHtml}
+        <details class="raw-pages-toggle">
+          <summary>📄 เนื้อหา OCR ต้นฉบับทุกหน้า (${item.pages.length} หน้า, ${totalFlags} flags) — เปิดดูเฉพาะตอนต้องการตรวจทานกับต้นฉบับ</summary>
+          <div class="raw-pages-toggle-body">
+            ${item.pages.map((p, idx) => pageCard(p, idx)).join("")}
+          </div>
+        </details>
       </div>
     `;
   }

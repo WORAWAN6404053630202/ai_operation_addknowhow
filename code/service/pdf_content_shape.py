@@ -22,8 +22,6 @@ graceful-ish degradation this system already had before this module existed)."""
 
 from __future__ import annotations
 
-import json
-import re
 import time
 from typing import Literal, Optional, TypedDict
 
@@ -31,6 +29,7 @@ from openai import OpenAI
 
 import conf
 from utils.llm_cost_logging import CostAccumulator, log_llm_cost
+from utils.llm_json_parse import parse_leading_json
 from utils.logger import get_logger
 from utils.prompt_safety import INJECTION_GUARD
 
@@ -57,6 +56,37 @@ class ShapeCheck(TypedDict):
 
 
 _VALID_SHAPES = ("structured_license", "know_how")
+
+# Real-world evidence (2026-09): a 242-page book's full combined OCR text
+# (~90-130k tokens of Thai) made this call fail outright — caught by the
+# except below, silently defaulting the WHOLE document to the wrong shape.
+# Classifying "is this a license procedure or general know-how" doesn't
+# need every character of every page, so cap the total input and shrink
+# per-page rather than dropping whole pages — keeping a slice of EVERY page
+# (not just the first N) matters because secondary_pages detection needs to
+# know roughly WHERE in the document an embedded license procedure sits,
+# and a license buried on page 500 of 600 would be invisible if only early
+# pages were kept. Chosen generously enough that ordinary documents (the
+# overwhelming majority, well under this cap) are never truncated at all —
+# this only engages for genuinely book-length input.
+_MAX_CLASSIFICATION_CHARS = 60_000
+_MIN_CHARS_PER_PAGE = 150
+
+
+def _bounded_combined_text(pages_markdown: list[str]) -> tuple[str, bool]:
+    """Returns (combined_text, was_truncated). Full text, un-truncated, for
+    the common case where it already fits under _MAX_CLASSIFICATION_CHARS."""
+    numbered_pages = [f"[หน้า {i + 1}]\n{md}" for i, md in enumerate(pages_markdown)]
+    full_text = "\n\n---\n\n".join(numbered_pages)
+    if len(full_text) <= _MAX_CLASSIFICATION_CHARS:
+        return full_text, False
+
+    per_page_cap = max(_MIN_CHARS_PER_PAGE, _MAX_CLASSIFICATION_CHARS // max(1, len(pages_markdown)))
+    truncated_pages = [
+        f"[หน้า {i + 1}]\n{md[:per_page_cap]}" + ("... [ตัดเพื่อความยาว]" if len(md) > per_page_cap else "")
+        for i, md in enumerate(pages_markdown)
+    ]
+    return "\n\n---\n\n".join(truncated_pages), True
 
 # Fail toward "structured_license" — that's the ORIGINAL, longer-proven path
 # (13-field drafting existed and was tested before know-how drafting did), so
@@ -114,41 +144,63 @@ structured_license ได้** (เช่น รวมประกาศใบ�
 """
 
 
+# One retry — added 2026-09 after a live, unreproduced failure ("Unterminated
+# string starting at: line 4 column 3") on a 250-page real document, despite
+# temperature=0. Reproduction attempt: 20 identical repeated calls against the
+# exact same (already-truncated) input, all routed through the same backend
+# (Amazon Bedrock) — every one succeeded, completion_tokens 281-392, well
+# under the 500 cap, so this isn't a reliably reproducible content/token-cap
+# issue, just a rare transient hiccup. Before this fix, ANY failure here
+# (however rare) silently defaulted the WHOLE document to the wrong shape —
+# unlike identify_knowhow_topics/identify_license_topics's batch calls, this
+# was the one call in the trio with zero retry protection.
+_CLASSIFY_MAX_ATTEMPTS = 2
+
+
 def classify_content_shape(pages_markdown: list[str], cost_accumulator: Optional[CostAccumulator] = None) -> ShapeCheck:
-    """One LLM call over all pages combined. Never raises — see
-    _FAILURE_FALLBACK for why the safe default is "structured_license".
-    cost_accumulator (added 2026-09) is optional — pass one from
-    sqs_consumer.py to fold this call's cost into a document-level total."""
-    numbered_pages = [f"[หน้า {i + 1}]\n{md}" for i, md in enumerate(pages_markdown)]
-    combined_text = "\n\n---\n\n".join(numbered_pages)
+    """One LLM call over all pages combined (retried once on failure — see
+    _CLASSIFY_MAX_ATTEMPTS). Never raises — see _FAILURE_FALLBACK for why the
+    safe default is "structured_license". cost_accumulator (added 2026-09) is
+    optional — pass one from sqs_consumer.py to fold this call's cost into a
+    document-level total."""
+    combined_text, was_truncated = _bounded_combined_text(pages_markdown)
     num_pages = len(pages_markdown)
-    try:
-        client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
-        _call_start = time.monotonic()
-        resp = client.chat.completions.create(
-            model=conf.OPENROUTER_MODEL_PDF_CLASSIFICATION,
-            messages=[{"role": "user", "content": _PROMPT_TEMPLATE.format(num_pages=num_pages, combined_text=combined_text)}],
-            max_tokens=500,
-            # Live-tested 2026-08-25: on borderline mixed-shape documents,
-            # default sampling temperature made secondary_pages detection
-            # flip run-to-run (2/4 correct across identical repeated calls).
-            # temperature=0 made the same case 4/4 consistent — this is a
-            # classification task where determinism matters more than
-            # variety, so pin it.
-            temperature=0,
-            # qwen3.7-flash defaults reasoning ON — without disabling it, the
-            # model's own chain-of-thought consumes the whole max_tokens
-            # budget before it ever writes the JSON answer, leaving
-            # message.content=None (finish_reason="length"). Found live
-            # 2026-08-25 switching this call off OPENROUTER_MODEL_PRACTICAL.
-            extra_body={"reasoning": {"enabled": False}},
-        )
-        log_llm_cost(logger, "ClassifyContentShape", conf.OPENROUTER_MODEL_PDF_CLASSIFICATION, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
-        raw = (resp.choices[0].message.content or "{}").strip()
-        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
-        parsed = json.loads(raw)
-    except Exception as e:
-        logger.error(f"[ContentShape] LLM call/parse failed, defaulting to 'structured_license': {e}")
+    if was_truncated:
+        logger.warning(f"[ContentShape] {num_pages}-page document exceeded {_MAX_CLASSIFICATION_CHARS} chars — per-page truncated to keep this call from failing outright")
+
+    parsed = None
+    for attempt in range(1, _CLASSIFY_MAX_ATTEMPTS + 1):
+        try:
+            client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
+            _call_start = time.monotonic()
+            resp = client.chat.completions.create(
+                model=conf.OPENROUTER_MODEL_PDF_CLASSIFICATION,
+                messages=[{"role": "user", "content": _PROMPT_TEMPLATE.format(num_pages=num_pages, combined_text=combined_text)}],
+                max_tokens=500,
+                # Live-tested 2026-08-25: on borderline mixed-shape documents,
+                # default sampling temperature made secondary_pages detection
+                # flip run-to-run (2/4 correct across identical repeated calls).
+                # temperature=0 made the same case 4/4 consistent — this is a
+                # classification task where determinism matters more than
+                # variety, so pin it.
+                temperature=0,
+                # qwen3.7-flash defaults reasoning ON — without disabling it, the
+                # model's own chain-of-thought consumes the whole max_tokens
+                # budget before it ever writes the JSON answer, leaving
+                # message.content=None (finish_reason="length"). Found live
+                # 2026-08-25 switching this call off OPENROUTER_MODEL_PRACTICAL.
+                extra_body={"reasoning": {"enabled": False}},
+            )
+            log_llm_cost(logger, "ClassifyContentShape", conf.OPENROUTER_MODEL_PDF_CLASSIFICATION, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
+            raw = resp.choices[0].message.content or "{}"
+            parsed = parse_leading_json(raw)
+            break
+        except Exception as e:
+            logger.error(f"[ContentShape] LLM call/parse failed (attempt {attempt}/{_CLASSIFY_MAX_ATTEMPTS}): {e}")
+            parsed = None
+
+    if parsed is None:
+        logger.error("[ContentShape] All attempts failed, defaulting to 'structured_license'")
         return _FAILURE_FALLBACK
 
     shape = parsed.get("shape")

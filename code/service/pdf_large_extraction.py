@@ -40,18 +40,24 @@ from service.pdf_extraction_validation import _extract_salient_tokens
 from utils.llm_cost_logging import CostAccumulator, log_call_duration, log_llm_cost
 from utils.logger import get_logger
 from utils.pdf_text_layer import extract_page_native_text
-from utils.pdf_rate_limiter import MinIntervalRateLimiter
+from utils.pdf_rate_limiter import GlobalTyphoonRateLimiter
 
 logger = get_logger(__name__)
 
 _MAX_WORKERS = 4  # same concurrency cap as the Lambda extractor, for the same reason
 
 # Typhoon's own docs (https://docs.opentyphoon.ai/en/rate-limits/, checked
-# 2026-09): typhoon-ocr is rate-limited to 2 requests/sec, 20 requests/min —
-# _MAX_WORKERS=4 page-level concurrency above can otherwise burst past that
-# on a single document alone. 1.8 (not 2.0) leaves a small margin for clock/
-# network jitter between our sleep and Typhoon's own window boundary.
-_typhoon_rate_limiter = MinIntervalRateLimiter(min_interval_seconds=1 / 1.8)
+# 2026-09): typhoon-ocr is rate-limited to 2 requests/sec AND 20 requests/min.
+# GlobalTyphoonRateLimiter (utils/pdf_rate_limiter.py) coordinates against
+# BOTH ceilings via a shared DynamoDB table with every concurrent Lambda
+# invocation AND this EC2 consumer — not just this process's own
+# _MAX_WORKERS=4 page-level concurrency, which a purely local limiter can't
+# protect against once more than one process is extracting at the same time.
+_typhoon_rate_limiter = GlobalTyphoonRateLimiter(
+    table_name=conf.PDF_RATE_LIMIT_DYNAMODB_TABLE,
+    region_name=conf.PDF_RATE_LIMIT_DYNAMODB_REGION,
+    logger=logger,
+)
 
 # Retryable = transient (rate limit, connection blip, Typhoon-side 5xx) —
 # anything else (auth error, bad request, etc.) propagates immediately since
@@ -171,7 +177,7 @@ def _extract_one_page(pdf_bytes: bytes, page_num: int, cost_accumulator: Optiona
     # doesn't need them saves the most per page, and every document over
     # MAX_PAGES_FOR_LAMBDA now lands here unconditionally (the Lambda
     # pre-screen that used to filter some of them out was removed 2026-09).
-    native_text = extract_page_native_text(pdf_bytes, page_num)
+    native_text = extract_page_native_text(pdf_bytes, page_num, cost_accumulator=cost_accumulator)
     if native_text is not None:
         logger.info(f"[LargeExtraction] Page {page_num}: used native PDF text layer ({len(native_text)} chars) — skipped OCR entirely, $0 for this page")
         return {"page_num": page_num, "typhoon_markdown": native_text, "claude_markdown": native_text}

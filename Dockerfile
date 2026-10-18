@@ -158,3 +158,36 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
 EXPOSE 3001
 
 CMD ["uvicorn", "app_pdf:app", "--host", "0.0.0.0", "--port", "3001", "--workers", "1", "--loop", "uvloop", "--http", "httptools"]
+
+# STAGE: PROD-PDF-FULL (dedicated PDF-project instance, 2026-09) — the ONE
+# image that needs to run BOTH the chat bot (uvicorn app:app, needs
+# torch/chromadb/sentence-transformers from the `prod` stage above) AND
+# service/sqs_consumer.py's direct-ingest extraction pipeline (needs
+# pymupdf + typhoon-ocr, which are in NEITHER requirements.txt NOR
+# requirements-pdf.txt — confirmed by grepping every requirements*.txt/.in
+# file in this repo, 2026-09: requirements-pdf.in's own header comment
+# names these as dependencies of sqs_consumer.py but they were never
+# actually captured in any lockfile; the old EC2 instance's separate
+# hand-rolled venv installed them ad hoc, untracked).
+#
+# Deliberately does NOT add these to requirements.in/.txt itself: that
+# would put pymupdf/typhoon-ocr into the REAL production bot's image too,
+# undoing the exact isolation the prod-pdf split above was created for
+# (a PDF-only dependency crash must never take the chat bot down — see
+# that stage's comment, the boto3 incident). This stage extends `prod`
+# instead, so only a deployment that explicitly targets prod-pdf-full
+# (this dedicated PDF-project instance) carries the extra risk.
+#
+# Version note: typhoon-ocr==0.4.1 was confirmed working against
+# openai==3.8.0 on the old instance's venv — requirements.txt currently
+# pins openai==2.53.0 for the base bot. Installed unpinned below on
+# purpose to let uv resolve compatible versions together; re-pin explicitly
+# in a requirements file if this ever needs reproducible-build guarantees
+# (deferred: this is a single dedicated internal instance, not a fleet).
+FROM prod AS prod-pdf-full
+
+USER root
+RUN pip install --no-cache-dir pymupdf typhoon-ocr
+USER appuser
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "3000", "--workers", "1", "--loop", "uvloop", "--http", "httptools"]

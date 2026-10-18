@@ -16,7 +16,9 @@ import httpx
 import openai
 import pytest
 
-from utils.pdf_rate_limiter import MinIntervalRateLimiter
+from unittest.mock import MagicMock
+
+from utils.pdf_rate_limiter import GlobalTyphoonRateLimiter, MinIntervalRateLimiter
 
 
 def _fake_rate_limit_error(retry_after: str | None = None) -> openai.RateLimitError:
@@ -75,6 +77,100 @@ class TestMinIntervalRateLimiter:
 
         assert len(call_times) == 5
         assert max(call_times) - start >= 0.18
+
+
+def _fake_transaction_canceled_error() -> Exception:
+    exc = Exception("Transaction cancelled, please refer cancellation reasons for specific reasons")
+    exc.response = {"Error": {"Code": "TransactionCanceledException"}}
+    return exc
+
+
+def _fake_resource_not_found_error() -> Exception:
+    exc = Exception("Requested resource not found")
+    exc.response = {"Error": {"Code": "ResourceNotFoundException"}}
+    return exc
+
+
+@pytest.mark.unit
+class TestGlobalTyphoonRateLimiter:
+    """GlobalTyphoonRateLimiter (2026-09) — DynamoDB-backed cross-process
+    coordination so every concurrent Lambda invocation + the EC2 consumer
+    share the SAME real budget against Typhoon's 2/sec + 20/min ceiling.
+    boto3 is mocked throughout — no real AWS calls in this test file."""
+
+    def _make_limiter(self, **kwargs) -> GlobalTyphoonRateLimiter:
+        limiter = GlobalTyphoonRateLimiter(table_name="fake-table", region_name="ap-southeast-1", **kwargs)
+        return limiter
+
+    def test_successful_claim_calls_transact_write_items_once(self):
+        limiter = self._make_limiter()
+        mock_client = MagicMock()
+        limiter._client = mock_client  # bypass _get_client()'s real boto3.client(...) call
+
+        limiter.wait()
+
+        assert mock_client.transact_write_items.call_count == 1
+        call_kwargs = mock_client.transact_write_items.call_args.kwargs
+        assert len(call_kwargs["TransactItems"]) == 2  # one for the RPS check, one for the RPM check
+
+    def test_condition_failure_retries_then_succeeds(self):
+        limiter = self._make_limiter()
+        mock_client = MagicMock()
+        mock_client.transact_write_items.side_effect = [
+            _fake_transaction_canceled_error(),
+            _fake_transaction_canceled_error(),
+            None,  # third attempt succeeds
+        ]
+        limiter._client = mock_client
+
+        with patch.object(time, "sleep"):  # skip the real jittered sleep between retries
+            limiter.wait()
+
+        assert mock_client.transact_write_items.call_count == 3
+
+    def test_exhausted_deadline_falls_back_to_local_limiter(self):
+        """A condition that never clears (e.g. genuinely saturated budget)
+        must not retry forever — bounded by max_wait_seconds, then proceeds
+        via the local fallback rather than blocking indefinitely."""
+        limiter = self._make_limiter(max_wait_seconds=0.05)
+        mock_client = MagicMock()
+        mock_client.transact_write_items.side_effect = _fake_transaction_canceled_error()
+        limiter._client = mock_client
+        limiter._fallback.wait = MagicMock()
+
+        with patch.object(time, "sleep"):  # don't actually burn wall-clock time on retry jitter
+            limiter.wait()
+
+        limiter._fallback.wait.assert_called_once()
+
+    def test_non_condition_error_falls_back_immediately_without_retrying(self):
+        """A broken/missing table (ResourceNotFoundException) must fail OPEN
+        immediately — retrying against a table that will never exist just
+        burns the whole max_wait_seconds budget for no reason."""
+        limiter = self._make_limiter(max_wait_seconds=90.0)
+        mock_client = MagicMock()
+        mock_client.transact_write_items.side_effect = _fake_resource_not_found_error()
+        limiter._client = mock_client
+        limiter._fallback.wait = MagicMock()
+
+        start = time.monotonic()
+        limiter.wait()
+        elapsed = time.monotonic() - start
+
+        assert mock_client.transact_write_items.call_count == 1  # no retry loop
+        limiter._fallback.wait.assert_called_once()
+        assert elapsed < 1.0  # did not wait anywhere near max_wait_seconds
+
+    def test_lazy_client_creation_failure_falls_back(self):
+        """If boto3 client construction itself fails (bad credentials, no
+        network, etc.), that must ALSO fail open, not raise out of .wait()."""
+        limiter = self._make_limiter()
+        limiter._get_client = MagicMock(side_effect=RuntimeError("no credentials configured"))
+        limiter._fallback.wait = MagicMock()
+
+        limiter.wait()
+
+        limiter._fallback.wait.assert_called_once()
 
 
 @pytest.mark.unit

@@ -28,8 +28,6 @@ research_reference field (filled deterministically, not drafted)."""
 
 from __future__ import annotations
 
-import json
-import re
 import time
 from typing import Optional, TypedDict
 
@@ -37,6 +35,7 @@ from openai import OpenAI
 
 import conf
 from utils.llm_cost_logging import CostAccumulator, log_llm_cost
+from utils.llm_json_parse import parse_leading_json
 from utils.logger import get_logger
 from utils.page_ranges import fuzzy_ratio, group_into_ranges, merge_topic_chunks
 from utils.prompt_safety import INJECTION_GUARD
@@ -177,15 +176,14 @@ def _resolve_page_overlaps(
             )
             _call_start = time.monotonic()
             resp = client.chat.completions.create(
-                model=conf.OPENROUTER_MODEL_PDF_CLASSIFICATION,
+                model=conf.OPENROUTER_MODEL_PDF_TOPIC_SPLIT,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=50,
                 temperature=0,
             )
-            log_llm_cost(logger, "KnowhowDrafting/ResolveOverlap", conf.OPENROUTER_MODEL_PDF_CLASSIFICATION, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
-            raw = (resp.choices[0].message.content or "{}").strip()
-            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
-            winner = json.loads(raw).get("winner", "A")
+            log_llm_cost(logger, "KnowhowDrafting/ResolveOverlap", conf.OPENROUTER_MODEL_PDF_TOPIC_SPLIT, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
+            raw = resp.choices[0].message.content or "{}"
+            winner = parse_leading_json(raw).get("winner", "A")
             winner_idx, loser_idx = (idx_a, idx_b) if winner == "A" else (idx_b, idx_a)
         except Exception as e:
             logger.warning(f"[KnowhowDrafting] Overlap resolution call failed for pages {pages}, defaulting to first-topic-wins: {e}")
@@ -207,58 +205,129 @@ def _resolve_page_overlaps(
     return resolved
 
 
-def identify_knowhow_topics(pages_markdown: list[str], cost_accumulator: Optional[CostAccumulator] = None) -> list[KnowhowTopicBounds]:
-    """One LLM call. Returns [] (never raises) on any failure — the caller
-    treats an empty list as "could not split into topics" and should fall
-    back to treating the whole document as one topic rather than losing it
-    entirely; see knowhow_write_back.py. document_title/source_type are
-    denormalized onto every returned topic dict (same values repeated) so
-    downstream code (knowhow_write_back.py) doesn't need a separate wrapper
-    shape — every topic is independently routable/writable."""
-    numbered_pages = [f"[หน้า {i + 1}]\n{md}" for i, md in enumerate(pages_markdown)]
+# Real-world evidence (2026-09): a 242-page book's full combined OCR text
+# hit a hard provider error — "prompt is too long: 227307 tokens > 200000
+# maximum" — reproduced live against the exact real OCR text that triggered
+# it. Unlike pdf_content_shape.py's classification call (which can tolerate
+# truncating each page, since it only needs a coarse shape judgment), topic-
+# splitting genuinely needs full page content to draw correct boundaries —
+# so large documents are split into sequential BATCHES that each stay safely
+# under the limit, each run through the same single-call prompt below, and
+# the resulting chunks concatenated and merged exactly as multiple chunks
+# from one call already were (see merge_topic_chunks — a topic split across
+# a batch boundary merges the same way a topic split by an interrupting
+# topic already did). Ratio observed on the real failing document: ~290k
+# chars ≈ 227k tokens (~1.28 tokens/char for Thai) — 100k chars keeps each
+# batch comfortably under 200k tokens even with prompt-template overhead.
+_MAX_BATCH_CHARS = 100_000
+
+
+def _split_into_batches(pages_markdown: list[str], max_chars: int) -> list[tuple[int, list[str]]]:
+    """[(page_offset, batch_pages_markdown), ...] — contiguous, page-aligned
+    (never splits a single page's text across 2 batches). page_offset is how
+    many pages precede this batch in the full document, for remapping this
+    batch's own local 1-based page numbers back to global ones."""
+    batches: list[tuple[int, list[str]]] = []
+    current: list[str] = []
+    current_start = 0
+    current_chars = 0
+    for i, md in enumerate(pages_markdown):
+        if current and current_chars + len(md) > max_chars:
+            batches.append((current_start, current))
+            current, current_start, current_chars = [], i, 0
+        current.append(md)
+        current_chars += len(md)
+    if current:
+        batches.append((current_start, current))
+    return batches
+
+
+# Batching (see identify_knowhow_topics) means a single document now makes
+# several of these calls instead of one — multiplying how often a lone
+# transient failure (a momentary empty response, a network blip) can drop
+# a whole batch's pages into the "uncategorized, needs manual review"
+# catch-all for no real reason. One retry is enough to smooth that over
+# without risking a genuine, repeatable failure retrying forever.
+_BATCH_MAX_ATTEMPTS = 2
+
+
+def _identify_knowhow_topics_batch(
+    batch_pages_markdown: list[str], page_offset: int, cost_accumulator: Optional[CostAccumulator] = None,
+) -> tuple[list[dict], str, str, bool]:
+    """Runs the single-call topic-identification prompt on ONE batch of
+    pages (retried once on failure — see _BATCH_MAX_ATTEMPTS). Returns
+    (chunks, document_title, source_type, failed) with start_page/end_page
+    already remapped to GLOBAL document page numbers via page_offset — never
+    raises. `failed` distinguishes "the call itself broke" from "the LLM
+    legitimately found 0 topics in this batch" (both otherwise look like an
+    empty chunks list) — see _identify_knowhow_topics_batch_adaptive, which
+    only shrinks-and-retries on a real failure, not a legitimate empty
+    result (that would just double cost for the same answer)."""
+    numbered_pages = [f"[หน้า {i + 1}]\n{md}" for i, md in enumerate(batch_pages_markdown)]
     combined_text = "\n\n---\n\n".join(numbered_pages)
 
-    try:
-        client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
-        _call_start = time.monotonic()
-        resp = client.chat.completions.create(
-            model=conf.OPENROUTER_MODEL_PDF_CLASSIFICATION,
-            messages=[{
-                "role": "user",
-                "content": _PROMPT_TEMPLATE.format(num_pages=len(pages_markdown), combined_text=combined_text),
-            }],
-            max_tokens=2500,
-            response_format={"type": "json_object"},
-            # Live-tested 2026-08-25 (same finding as pdf_content_shape.py /
-            # pdf_field_drafting.py): default sampling temperature made a
-            # borderline classification call flip run-to-run; temperature=0
-            # made repeated identical calls consistent.
-            temperature=0,
-            # qwen3.7-flash defaults reasoning ON — without disabling it, the
-            # model's own chain-of-thought can consume the token budget
-            # before ever writing the JSON answer (message.content=None,
-            # finish_reason "length"). Found live 2026-08-25 switching this
-            # call off OPENROUTER_MODEL_PRACTICAL.
-            extra_body={"reasoning": {"enabled": False}},
-        )
-        log_llm_cost(logger, "KnowhowDrafting/IdentifyTopics", conf.OPENROUTER_MODEL_PDF_CLASSIFICATION, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
-        raw = (resp.choices[0].message.content or "{}").strip()
-        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
-        parsed = json.loads(raw)
-    except Exception as e:
-        logger.error(f"[KnowhowDrafting] LLM call/parse failed: {e}")
-        return []
+    parsed = None
+    for attempt in range(1, _BATCH_MAX_ATTEMPTS + 1):
+        try:
+            client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
+            _call_start = time.monotonic()
+            resp = client.chat.completions.create(
+                model=conf.OPENROUTER_MODEL_PDF_TOPIC_SPLIT,
+                messages=[{
+                    "role": "user",
+                    "content": _PROMPT_TEMPLATE.format(num_pages=len(batch_pages_markdown), combined_text=combined_text),
+                }],
+                # 2500 (original) was never revisited after pdf_field_drafting.py's
+                # identify_license_topics() — the sibling function this one mirrors —
+                # found and fixed the EXACT same truncation failure mode (2026-08-25:
+                # live-tested a 45-topic document, got a real JSONDecodeError from
+                # output cut off mid-string at 1500, raised progressively to 6000).
+                # This function's per-topic schema is even LARGER than that one's
+                # (adds "summary" — 2-4 sentences — and "category", which
+                # identify_license_topics doesn't have), so it needs MORE headroom
+                # per topic, not the same ceiling. Live-reproduced 2026-09: a real
+                # marketing/business_guide chapter ("กลยุทธ์ด้านการสื่อสาร") has 23
+                # distinct sub_topics on its own — comfortably capable of exceeding
+                # 2500 tokens once each entry's summary is included, meaning topics
+                # could have been silently truncated at ingestion time with no
+                # error surfaced anywhere (the caller only checks for a JSON parse
+                # failure, not a suspiciously-short topic list). 8000 gives
+                # headroom beyond the proven 6000 baseline for the smaller schema.
+                max_tokens=8000,
+                response_format={"type": "json_object"},
+                # Live-tested 2026-08-25 (same finding as pdf_content_shape.py /
+                # pdf_field_drafting.py): default sampling temperature made a
+                # borderline classification call flip run-to-run; temperature=0
+                # made repeated identical calls consistent.
+                temperature=0,
+                # qwen3.7-flash defaults reasoning ON — without disabling it, the
+                # model's own chain-of-thought can consume the token budget
+                # before ever writing the JSON answer (message.content=None,
+                # finish_reason "length"). Found live 2026-08-25 switching this
+                # call off OPENROUTER_MODEL_PRACTICAL.
+                extra_body={"reasoning": {"enabled": False}},
+            )
+            log_llm_cost(logger, "KnowhowDrafting/IdentifyTopics", conf.OPENROUTER_MODEL_PDF_TOPIC_SPLIT, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
+            raw = resp.choices[0].message.content or "{}"
+            parsed = parse_leading_json(raw)
+            break
+        except Exception as e:
+            logger.error(f"[KnowhowDrafting] LLM call/parse failed for batch starting at page {page_offset + 1} (attempt {attempt}/{_BATCH_MAX_ATTEMPTS}): {e}")
+            parsed = None
+
+    if parsed is None:
+        return [], "", "document", True
 
     if not isinstance(parsed, dict) or not isinstance(parsed.get("topics"), list):
-        logger.error(f"[KnowhowDrafting] LLM returned unexpected shape: {type(parsed)}")
-        return []
+        logger.error(f"[KnowhowDrafting] LLM returned unexpected shape for batch starting at page {page_offset + 1}: {type(parsed)}")
+        return [], "", "document", True
 
     document_title = str(parsed.get("document_title", "")).strip()
     source_type = str(parsed.get("source_type", "")).strip().lower()
     if source_type not in ("book", "document"):
         source_type = "document"  # fail toward the more general tab, not a guess at "book"
 
-    num_pages = len(pages_markdown)
+    num_local_pages = len(batch_pages_markdown)
     chunks: list[dict] = []
     for raw_topic in parsed["topics"]:
         try:
@@ -273,9 +342,9 @@ def identify_knowhow_topics(pages_markdown: list[str], cost_accumulator: Optiona
         # valid topic; a page range that's backwards or fully outside the
         # document is a real error worth dropping instead of guessing.
         start_page = max(1, start_page)
-        end_page = min(num_pages, end_page)
-        if start_page > end_page or start_page > num_pages or end_page < 1:
-            logger.warning(f"[KnowhowDrafting] Skipping topic with out-of-range pages {raw_topic.get('start_page')}-{raw_topic.get('end_page')} (doc has {num_pages} pages)")
+        end_page = min(num_local_pages, end_page)
+        if start_page > end_page or start_page > num_local_pages or end_page < 1:
+            logger.warning(f"[KnowhowDrafting] Skipping topic with out-of-range pages {raw_topic.get('start_page')}-{raw_topic.get('end_page')} (batch has {num_local_pages} pages)")
             continue
 
         main_topic = str(raw_topic.get("main_topic", "")).strip()
@@ -291,14 +360,89 @@ def identify_knowhow_topics(pages_markdown: list[str], cost_accumulator: Optiona
             "sub_topic": sub_topic,
             "summary": str(raw_topic.get("summary", "")).strip(),
             "category": str(raw_topic.get("category", "")).strip(),
-            "start_page": start_page,
-            "end_page": end_page,
+            "start_page": start_page + page_offset,
+            "end_page": end_page + page_offset,
         })
 
-    topics: list[KnowhowTopicBounds] = merge_topic_chunks(chunks, ("main_topic", "sub_topic"), fuzzy_ratio)
+    return chunks, document_title, source_type, False
+
+
+def _identify_knowhow_topics_batch_adaptive(
+    batch_pages_markdown: list[str], page_offset: int, cost_accumulator: Optional[CostAccumulator] = None,
+) -> tuple[list[dict], str, str]:
+    """Wraps _identify_knowhow_topics_batch with shrink-and-retry on a real
+    failure: live-reproduced 2026-09 that an 85-page batch failed with an
+    EMPTY response from the model twice in a row with identical parameters
+    (deterministic, not a transient blip a same-size retry could fix) — most
+    likely the same "model's own reasoning silently eats the whole token
+    budget" failure mode already documented elsewhere in this file, just
+    resurfacing for this specific content at this specific size. Since a
+    same-size retry can't out-run a deterministic failure, split the batch
+    in half and recurse instead — each half is smaller/simpler, more likely
+    to actually complete. Bounded by construction: the batch halves every
+    recursion, so this terminates in at most log2(len(batch)) steps even in
+    the pathological case where every half keeps failing all the way down
+    to individual pages (at which point there's nothing smaller to try, so
+    it just returns whatever that single page's own attempt got — the
+    existing uncovered-pages catch-all in sqs_consumer.py still nets it)."""
+    chunks, doc_title, src_type, failed = _identify_knowhow_topics_batch(batch_pages_markdown, page_offset, cost_accumulator=cost_accumulator)
+    if not failed or len(batch_pages_markdown) <= 1:
+        return chunks, doc_title, src_type
+
+    mid = len(batch_pages_markdown) // 2
+    logger.warning(f"[KnowhowDrafting] Batch at page {page_offset + 1} ({len(batch_pages_markdown)} pages) failed outright even after retry — splitting in half and trying again")
+    left_chunks, left_title, left_type = _identify_knowhow_topics_batch_adaptive(
+        batch_pages_markdown[:mid], page_offset, cost_accumulator=cost_accumulator
+    )
+    right_chunks, right_title, right_type = _identify_knowhow_topics_batch_adaptive(
+        batch_pages_markdown[mid:], page_offset + mid, cost_accumulator=cost_accumulator
+    )
+    title, src = (left_title, left_type) if left_title else (right_title, right_type)
+    return left_chunks + right_chunks, title, src
+
+
+def identify_knowhow_topics(pages_markdown: list[str], cost_accumulator: Optional[CostAccumulator] = None) -> list[KnowhowTopicBounds]:
+    """Returns [] (never raises) on total failure — the caller treats an
+    empty list as "could not split into topics" and should fall back to
+    treating the whole document as one topic rather than losing it entirely;
+    see knowhow_write_back.py. document_title/source_type are denormalized
+    onto every returned topic dict (same values repeated) so downstream code
+    (knowhow_write_back.py) doesn't need a separate wrapper shape — every
+    topic is independently routable/writable.
+
+    Documents small enough to fit _MAX_BATCH_CHARS run as a single call
+    (unchanged behavior/cost from before batching existed — the common
+    case). Larger documents split into sequential batches (see
+    _split_into_batches), each independently topic-split, then merged
+    together exactly as multiple same-call chunks already were."""
+    total_chars = sum(len(md) for md in pages_markdown)
+    if total_chars <= _MAX_BATCH_CHARS:
+        batches = [(0, pages_markdown)]
+    else:
+        batches = _split_into_batches(pages_markdown, _MAX_BATCH_CHARS)
+        logger.warning(f"[KnowhowDrafting] {len(pages_markdown)}-page document ({total_chars} chars) exceeds the single-call budget — splitting into {len(batches)} batch(es)")
+
+    all_chunks: list[dict] = []
+    fallback_document_title, fallback_source_type = "", "document"
+    for offset, batch in batches:
+        chunks, doc_title, src_type = _identify_knowhow_topics_batch_adaptive(batch, offset, cost_accumulator=cost_accumulator)
+        if not fallback_document_title and doc_title:
+            fallback_document_title, fallback_source_type = doc_title, src_type
+        all_chunks.extend(chunks)
+
+    # A book's title/source_type shouldn't fragment across batches just
+    # because a later batch (without the cover page in view) guessed
+    # differently — normalize every chunk to whichever batch found a real
+    # title first (usually the first, since it has the cover/title pages).
+    if fallback_document_title:
+        for c in all_chunks:
+            c["document_title"] = fallback_document_title
+            c["source_type"] = fallback_source_type
+
+    topics: list[KnowhowTopicBounds] = merge_topic_chunks(all_chunks, ("main_topic", "sub_topic"), fuzzy_ratio)
     topics = _resolve_page_overlaps(topics, pages_markdown, cost_accumulator=cost_accumulator)
     logger.info(
-        f"[KnowhowDrafting] {document_title!r} (source_type={source_type}): "
-        f"identified {len(topics)} topic(s) (from {len(chunks)} chunk(s)) across {num_pages} page(s)"
+        f"[KnowhowDrafting] {fallback_document_title!r} (source_type={fallback_source_type}): "
+        f"identified {len(topics)} topic(s) (from {len(all_chunks)} chunk(s) across {len(batches)} batch(es)) across {len(pages_markdown)} page(s)"
     )
     return topics

@@ -30,6 +30,7 @@ edits/deletes existing ones."""
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 import boto3
 import gspread
@@ -83,20 +84,54 @@ def _get_spreadsheet():
     return client.open_by_key(spreadsheet_id)
 
 
-def _ensure_summary_column(worksheet: gspread.Worksheet) -> None:
-    """Idempotent — the 2 real know-how tabs predate this feature and don't
-    have a short-summary column; adds one (appended as the last column, never
-    inserted in the middle, so nothing already reading these tabs by position
-    gets silently shifted) if it isn't already there."""
+def _ensure_column(worksheet: gspread.Worksheet, header_name: str) -> None:
+    """Idempotent — appends a new column (never inserted in the middle, so
+    nothing already reading these tabs by position gets silently shifted) if
+    a column with this exact header text doesn't already exist."""
     header_row = worksheet.row_values(1)
     cleaned = [_clean_header(h) for h in header_row]
-    if _SUMMARY_HEADER in cleaned:
+    if header_name in cleaned:
         return
     next_col = len(header_row) + 1
     if next_col > worksheet.col_count:
         worksheet.add_cols(next_col - worksheet.col_count)
-    worksheet.update_cell(1, next_col, _SUMMARY_HEADER)
-    logger.info(f"[KnowhowWriteBack] Added {_SUMMARY_HEADER!r} column to {worksheet.title!r} at column {next_col}")
+    worksheet.update_cell(1, next_col, header_name)
+    logger.info(f"[KnowhowWriteBack] Added {header_name!r} column to {worksheet.title!r} at column {next_col}")
+
+
+def _ensure_summary_column(worksheet: gspread.Worksheet) -> None:
+    """Idempotent — the 2 real know-how tabs predate this feature and don't
+    have a short-summary column; adds one if it isn't already there."""
+    _ensure_column(worksheet, _SUMMARY_HEADER)
+
+
+_SUPERSEDED_NOTE_HEADER = "superseded_note"
+
+
+def _note_superseded_row(worksheet: gspread.Worksheet, old_row_ref: str, new_topic_label: str, source_file: str) -> None:
+    """Mirrors sheet_write_back.py's _note_superseded_row for the know-how
+    tabs — same additive-only philosophy (never edits/deletes the old row's
+    actual content, just appends a pointer note in a dedicated column) and
+    same auto-create-if-missing behavior as the regulatory version (2026-09;
+    see that function's comment for why silently skipping until a human
+    manually added the column was the wrong default). Never raises — a
+    failure here must not undo the new row this is called right after
+    successfully writing."""
+    try:
+        old_row_number = int(old_row_ref)
+    except (TypeError, ValueError):
+        logger.warning(f"[KnowhowWriteBack] old_row_ref={old_row_ref!r} is not a row number — skipping old-row note for {new_topic_label!r}")
+        return
+    try:
+        _ensure_column(worksheet, _SUPERSEDED_NOTE_HEADER)
+        header_row = worksheet.row_values(1)
+        cleaned_headers = [_clean_header(h) for h in header_row]
+        col_index = cleaned_headers.index(_SUPERSEDED_NOTE_HEADER) + 1  # gspread columns are 1-indexed
+        note = f"มีข้อมูลใหม่มาแทนที่ — ดูหัวข้อใหม่จากไฟล์ {source_file} ({new_topic_label})"
+        worksheet.update_cell(old_row_number, col_index, note)
+        logger.info(f"[KnowhowWriteBack] Noted row {old_row_number} in {worksheet.title!r} as superseded by {new_topic_label!r} from {source_file}")
+    except Exception as e:
+        logger.error(f"[KnowhowWriteBack] Failed to write superseded-note on row {old_row_number} in {worksheet.title!r}: {e}")
 
 
 def _store_full_text(full_text: str, source_file: str, label: str) -> str:
@@ -138,13 +173,31 @@ def _build_row(header_row: list[str], values: dict[str, str], reference_text: st
     return row
 
 
-def append_knowhow_topics(topics: list[dict], source_file: str) -> dict:
+def append_knowhow_topics(
+    topics: list[dict], source_file: str,
+    decision_type: Optional[str] = None, old_row_ref: Optional[str] = None,
+) -> dict:
     """Each topic dict needs: document_title, source_type ("book"|"document"),
     main_topic, sub_topic, summary, full_text, category, page_range (display
     string like "3-5"). Appends ONE row per topic, routed to whichever of the
     2 real know-how tabs source_type points at — a single reviewed PDF can
     produce several rows across either or both tabs, unlike the regulatory
-    path's one-PDF-one-row model."""
+    path's one-PDF-one-row model.
+
+    decision_type/old_row_ref (added 2026-09, alongside
+    pdf_knowhow_candidate_matching.py — see that module's docstring for why):
+    mirrors sheet_write_back.py's decision_type="update" support, which this
+    write-back never had — admin_pdf.py's PdfReviewDecision model has always
+    carried old_row_ref as a single per-ITEM field (not per-topic), so when
+    given, the SAME old_row_ref is marked superseded for every topic this
+    call writes — consistent with what the current review-decision API
+    actually allows a reviewer to express (one decision per approved item,
+    not one per topic within it). A reviewer who genuinely needs different
+    old-row references for different topics in the same multi-topic item
+    must still approve those topics as separate decisions — no worse than
+    the complete absence of this capability before this fix, and the
+    architecturally-correct fix (per-topic decisions) is a larger, separate
+    admin_pdf.py/admin.html change than "add duplicate detection" calls for."""
     if not topics:
         raise ValueError("append_knowhow_topics called with an empty topic list — caller bug")
 
@@ -187,5 +240,8 @@ def append_knowhow_topics(topics: list[dict], source_file: str) -> dict:
         worksheet.append_row(row, value_input_option="USER_ENTERED")
         rows_by_tab[tab_name] = rows_by_tab.get(tab_name, 0) + 1
         logger.info(f"[KnowhowWriteBack] Appended row for {label!r} from {source_file} to tab {tab_name!r}")
+
+        if decision_type == "update" and old_row_ref:
+            _note_superseded_row(worksheet, old_row_ref, label, source_file)
 
     return {"rows_appended": sum(rows_by_tab.values()), "rows_by_tab": rows_by_tab}

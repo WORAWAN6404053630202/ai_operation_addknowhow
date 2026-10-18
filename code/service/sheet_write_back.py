@@ -218,12 +218,33 @@ def _note_superseded_row(worksheet, header_row: list[str], item: ReviewItem) -> 
     valid-but-wrong one."""
     cleaned_headers = [_clean_header(h) for h in header_row]
     if _SUPERSEDED_NOTE_HEADER not in cleaned_headers:
-        logger.warning(
-            f"[SheetWriteBack] Sheet has no '{_SUPERSEDED_NOTE_HEADER}' column — "
-            f"skipping old-row note for review item {item.id}. Add that column manually "
-            f"if you want this automated; old row ref was: {item.old_row_ref!r}"
-        )
-        return None
+        # 2026-09: previously skipped silently here (the note column had to be
+        # added to the Sheet by hand before any "update" decision could ever
+        # mark an old row) — and because ingest_local.py's read side never
+        # checked this column anyway (fixed same day, see data_loader.py /
+        # data_loader_general.py), a missing column meant superseded rows
+        # kept being ingested into Chroma forever with no way to fix it short
+        # of a human noticing and adding the column themselves. Auto-create it
+        # instead: append one new header cell at the end of row 1. Still never
+        # raises on failure — creating the column is a nice-to-have for THIS
+        # approval; a transient Sheets API error here must not block the
+        # already-successfully-written new row.
+        try:
+            new_col_index = len(header_row) + 1  # gspread columns are 1-indexed
+            worksheet.update_cell(1, new_col_index, _SUPERSEDED_NOTE_HEADER)
+            header_row = header_row + [_SUPERSEDED_NOTE_HEADER]
+            cleaned_headers = cleaned_headers + [_SUPERSEDED_NOTE_HEADER]
+            logger.info(
+                f"[SheetWriteBack] Sheet had no '{_SUPERSEDED_NOTE_HEADER}' column — "
+                f"created it at column {new_col_index} (triggered by review item {item.id})"
+            )
+        except Exception as e:
+            logger.warning(
+                f"[SheetWriteBack] Sheet has no '{_SUPERSEDED_NOTE_HEADER}' column and "
+                f"auto-create failed ({e}) — skipping old-row note for review item {item.id}. "
+                f"Old row ref was: {item.old_row_ref!r}"
+            )
+            return None
     try:
         old_row_number = int(item.old_row_ref)
     except (TypeError, ValueError):

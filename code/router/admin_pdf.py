@@ -158,14 +158,22 @@ async def pdf_queue_decide(item_id: str, decision: PdfReviewDecision):
     if decision.review_status == "approved" and decision.decision_type != "duplicate":
         try:
             if item.knowhow_topics:
-                # know_how items skip the structured Sheet entirely — no
-                # duplicate-detection built for the know_how tab yet, so
-                # decision_type is effectively always "new" here regardless
-                # of what the UI sent (see admin.html: it always submits
-                # "new" for this path).
+                # know_how items skip the structured Sheet entirely (they
+                # write to one of the 2 know-how tabs instead — see
+                # knowhow_write_back.py). 2026-09: duplicate-detection now
+                # exists for this path too (pdf_knowhow_candidate_matching.py,
+                # populated per-topic at extraction time — see
+                # sqs_consumer.py), and decision_type="update"/old_row_ref
+                # are now respected here instead of being silently ignored —
+                # see append_knowhow_topics's own docstring for the one
+                # remaining limitation (old_row_ref is per-ITEM, applied to
+                # every topic in a multi-topic item, not per-topic).
                 from service.knowhow_write_back import append_knowhow_topics
 
-                sheet_result = append_knowhow_topics(item.knowhow_topics, item.filename)
+                sheet_result = append_knowhow_topics(
+                    item.knowhow_topics, item.filename,
+                    decision_type=decision.decision_type, old_row_ref=decision.old_row_ref,
+                )
             else:
                 from service.sheet_write_back import append_review_item_to_sheet
 

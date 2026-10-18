@@ -24,9 +24,14 @@ this repo's conf.py/env.properties — this function has no access to those):
 Optional:
   OPENROUTER_BASE_URL     (default: https://openrouter.ai/api/v1)
   OPENROUTER_MODEL_VISION (default: google/gemini-2.5-flash-lite) — per-page image OCR
+  OPENROUTER_MODEL_IMAGE_CHECK (default: google/gemini-2.5-flash-lite) — native-text-layer diagram/image check
   OUTPUT_S3_PREFIX        (default: restbiz/extracted/)
   HANDOFF_S3_PREFIX       (default: restbiz/pending_large/)
   MAX_PAGES_FOR_LAMBDA    (default: 35)
+  PDF_RATE_LIMIT_DYNAMODB_TABLE  (default: restbiz-pdf-rate-limiter) — cross-process Typhoon rate-limit coordination
+  PDF_RATE_LIMIT_DYNAMODB_REGION (default: this Lambda's own ambient AWS_REGION) — set this
+      explicitly if the DynamoDB table lives in a DIFFERENT region than this function is
+      deployed in (AWS_REGION itself is Lambda-reserved and cannot be overridden)
 
 SQS DELIVERY (2026-08-24): originally relied on S3's own bucket notification
 configuration (prefix/suffix rule -> SQS) to tell the EC2 consumer a result
@@ -70,6 +75,7 @@ import re
 import threading
 import time
 import urllib.parse
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
@@ -93,6 +99,13 @@ OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.
 # Sonnet's $3/$15, ~30x cheaper) matched or beat Sonnet's agreement rate
 # with Typhoon on every page tested.
 OPENROUTER_MODEL_VISION = os.environ.get("OPENROUTER_MODEL_VISION", "google/gemini-2.5-flash-lite")
+# Native-text-layer image-detection check (2026-09) — see
+# _page_needs_ocr_for_visual_content() below. Separate env var from
+# OPENROUTER_MODEL_VISION above on purpose, even though both default to the
+# same model today: that one OCRs a whole page's content, this one only ever
+# answers a single yes/no question, so they may reasonably diverge later
+# (e.g. a cheaper/faster model becomes good enough for yes/no but not OCR).
+OPENROUTER_MODEL_IMAGE_CHECK = os.environ.get("OPENROUTER_MODEL_IMAGE_CHECK", "google/gemini-2.5-flash-lite")
 OUTPUT_S3_PREFIX = os.environ.get("OUTPUT_S3_PREFIX", "restbiz/extracted/")
 HANDOFF_S3_PREFIX = os.environ.get("HANDOFF_S3_PREFIX", "restbiz/pending_large/")
 # Same default as conf.PDF_STATUS_S3_PREFIX on the EC2 side (service/
@@ -101,16 +114,36 @@ HANDOFF_S3_PREFIX = os.environ.get("HANDOFF_S3_PREFIX", "restbiz/pending_large/"
 STATUS_S3_PREFIX = os.environ.get("STATUS_S3_PREFIX", "restbiz/status/")
 MAX_PAGES_FOR_LAMBDA = int(os.environ.get("MAX_PAGES_FOR_LAMBDA", "35"))
 SQS_QUEUE_URL = os.environ.get("SQS_QUEUE_URL", "")
+# Cross-process Typhoon OCR rate-limit coordination (2026-09) — see
+# code/utils/pdf_rate_limiter.py's GlobalTyphoonRateLimiter (NOT imported —
+# this Lambda has no access to code/, see module docstring; _GlobalTyphoon
+# RateLimiter below is a hand-copy). Table must be created manually (see
+# that module's docstring for schema); empty/missing-table failures fail
+# OPEN to local-only throttling, never block the pipeline.
+PDF_RATE_LIMIT_DYNAMODB_TABLE = os.environ.get("PDF_RATE_LIMIT_DYNAMODB_TABLE", "restbiz-pdf-rate-limiter")
+# Deliberately NOT read from AWS_REGION — that name is Lambda-RESERVED
+# (Lambda sets it automatically to this function's own deployed region and
+# BLOCKS any attempt to override it via a custom environment variable in
+# the console), so a Lambda deployed in one region can never point this
+# lookup at a DynamoDB table living in a different region without a
+# distinct variable name. Found live 2026-09: this Lambda runs in
+# ap-southeast-2 (Sydney) while the table was first created in
+# ap-southeast-7 (Thailand) — falling back to AWS_REGION here would have
+# silently looked in the wrong region forever, always failing open to
+# local-only throttling with no obvious error.
+PDF_RATE_LIMIT_DYNAMODB_REGION = os.environ.get("PDF_RATE_LIMIT_DYNAMODB_REGION") or os.environ.get("AWS_REGION")
 
 _MAX_WORKERS = 4  # concurrent pages — keep modest, each page = 2 API calls already
 
-# Duplicated from code/utils/rate_limiter.py (NOT imported — this Lambda has
-# no access to code/, see module docstring) — see that module for the full
-# reasoning: Typhoon's own docs (checked 2026-09) say typhoon-ocr is
-# rate-limited to 2 requests/sec, 20 requests/min, and _MAX_WORKERS=4
-# page-level concurrency above can otherwise burst past that on a single
-# document alone. Per-invocation only — does NOT protect against multiple
-# concurrent Lambda invocations processing different documents at once.
+# Duplicated from code/utils/pdf_rate_limiter.py (NOT imported — this Lambda
+# has no access to code/, see module docstring). See that module's docstring
+# for the full history: Typhoon's own docs (checked 2026-09) say typhoon-ocr
+# is rate-limited to 2 requests/sec AND 20 requests/min — a purely local,
+# per-invocation limiter (_MinIntervalRateLimiter below, kept as the
+# fail-open fallback) can enforce the first but not the second, and
+# protects nothing once more than one Lambda invocation or the EC2 consumer
+# is extracting at the same time. _GlobalTyphoonRateLimiter coordinates both
+# ceilings across every concurrent caller via a shared DynamoDB table.
 class _MinIntervalRateLimiter:
     def __init__(self, min_interval_seconds: float):
         self._min_interval = min_interval_seconds
@@ -128,9 +161,100 @@ class _MinIntervalRateLimiter:
             self._last_call_at = now
 
 
-# 1.8 (not 2.0) leaves a small margin for clock/network jitter — same value
-# as pdf_large_extraction.py's EC2-side copy.
-_typhoon_rate_limiter = _MinIntervalRateLimiter(min_interval_seconds=1 / 1.8)
+class _GlobalTyphoonRateLimiter:
+    """Mirrors code/utils/pdf_rate_limiter.py's GlobalTyphoonRateLimiter —
+    see that module's docstring for the full schema/algorithm explanation.
+    Kept byte-for-byte equivalent on purpose (see tests/test_pdf_path_parity.py);
+    if this ever diverges from the shared module, only one side is actually
+    protected against exceeding Typhoon's real rate limit."""
+
+    def __init__(
+        self,
+        table_name: str,
+        region_name,
+        limiter_id: str = "typhoon_ocr",
+        rps_min_interval_seconds: float = 1 / 1.8,
+        rpm_limit: int = 20,
+        max_wait_seconds: float = 90.0,
+        logger=None,
+    ):
+        self._table_name = table_name
+        self._limiter_id = limiter_id
+        self._rps_min_interval = rps_min_interval_seconds
+        self._rpm_limit = rpm_limit
+        self._max_wait_seconds = max_wait_seconds
+        self._logger = logger
+        self._fallback = _MinIntervalRateLimiter(rps_min_interval_seconds)
+        self._client = None
+        self._region_name = region_name
+
+    def _get_client(self):
+        if self._client is None:
+            self._client = boto3.client("dynamodb", region_name=self._region_name or None)
+        return self._client
+
+    def _log(self, level: str, msg: str) -> None:
+        if self._logger is not None:
+            getattr(self._logger, level)(msg)
+
+    def wait(self) -> None:
+        deadline = time.monotonic() + self._max_wait_seconds
+        attempt = 0
+        while time.monotonic() < deadline:
+            attempt += 1
+            now = time.time()
+            minute_bucket = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M")
+            try:
+                client = self._get_client()
+                client.transact_write_items(
+                    TransactItems=[
+                        {
+                            "Update": {
+                                "TableName": self._table_name,
+                                "Key": {"limiter_id": {"S": self._limiter_id}, "bucket": {"S": "_last_call"}},
+                                "UpdateExpression": "SET last_call_at = :now",
+                                "ConditionExpression": "attribute_not_exists(last_call_at) OR last_call_at <= :threshold",
+                                "ExpressionAttributeValues": {
+                                    ":now": {"N": str(now)},
+                                    ":threshold": {"N": str(now - self._rps_min_interval)},
+                                },
+                            }
+                        },
+                        {
+                            "Update": {
+                                "TableName": self._table_name,
+                                "Key": {"limiter_id": {"S": self._limiter_id}, "bucket": {"S": minute_bucket}},
+                                "UpdateExpression": "SET call_count = if_not_exists(call_count, :zero) + :one, expires_at = :ttl",
+                                "ConditionExpression": "attribute_not_exists(call_count) OR call_count < :rpm_limit",
+                                "ExpressionAttributeValues": {
+                                    ":zero": {"N": "0"},
+                                    ":one": {"N": "1"},
+                                    ":rpm_limit": {"N": str(self._rpm_limit)},
+                                    ":ttl": {"N": str(int(now) + 120)},
+                                },
+                            }
+                        },
+                    ]
+                )
+                return
+            except Exception as e:
+                error_response = getattr(e, "response", None) or {}
+                error_code = error_response.get("Error", {}).get("Code")
+                if error_code == "TransactionCanceledException":
+                    time.sleep(0.1 + random.random() * 0.3)
+                    continue
+                self._log("warning", f"[GlobalTyphoonRateLimiter] DynamoDB coordination failed ({type(e).__name__}: {e}) — falling back to local-only throttling for this call")
+                self._fallback.wait()
+                return
+        self._log("warning", f"[GlobalTyphoonRateLimiter] Could not claim a global rate-limit slot within {self._max_wait_seconds}s ({attempt} attempts) — falling back to local-only throttling for this call")
+        self._fallback.wait()
+
+
+_typhoon_rate_limiter = _GlobalTyphoonRateLimiter(
+    table_name=PDF_RATE_LIMIT_DYNAMODB_TABLE,
+    region_name=PDF_RATE_LIMIT_DYNAMODB_REGION,
+    logger=logger,
+)
 
 _TYPHOON_RETRYABLE_ERRORS = (RateLimitError, APIConnectionError, APITimeoutError, InternalServerError)
 _TYPHOON_MAX_RETRIES = 4  # bounded, never infinite — same lesson as the SQS retry-loop incident this pipeline already had once
@@ -427,33 +551,177 @@ def _text_looks_valid(text: str) -> bool:
     return (bad / len(stripped)) <= _MAX_BAD_CHAR_RATIO
 
 
-def _extract_page_native_text(pdf_bytes: bytes, page_num: int) -> str | None:
+# How close (in characters) an out-of-range character must be to a digit to
+# count as "corrupting a high-value token" in _salient_regions_look_valid()
+# below — mirrors code/utils/pdf_text_layer.py's constant of the same name
+# (NOT imported — this Lambda has no access to code/). See that module's
+# docstring for why: _text_looks_valid() above averages corruption across
+# the WHOLE page (5% threshold), which can pass even when the corrupted
+# characters concentrate right next to the one number that matters (a fee
+# amount, date, form/license code — all digit runs). Deliberately does NOT
+# reuse the salient-token regexes duplicated elsewhere in this Lambda
+# (_BAHT_AMOUNT_RE etc., if present) — those require an unbroken `\d` run to
+# match, so a corrupted character INSIDE a number breaks the very pattern
+# meant to detect it. Proximity-to-digit survives that failure mode instead.
+_SALIENT_CORRUPTION_PROXIMITY_CHARS = 3
+
+# Excludes ordinary page-number self-references ("หน้า 6", "หน้า 12") from
+# counting as "near a digit" — mirrors code/utils/pdf_text_layer.py's
+# constant of the same name (NOT imported). Found live against the real
+# ELICENSE document: every page's footer carries a decorative icon glyph
+# (a single PUA codepoint, U+F09E) immediately after "หน้า <N>" — 43 of 66
+# pages got flagged before this exclusion, all the same icon, zero real
+# corruption among them. "หน้า" is a generic Thai word used only for page
+# references, never for a fee amount/date/form/license code, so this
+# exclusion carries near-zero risk of masking real corruption.
+_PAGE_NUMBER_REF_RE = re.compile(r"หน้า\s*\d+")
+
+
+def _salient_regions_look_valid(text: str) -> bool:
+    """See _SALIENT_CORRUPTION_PROXIMITY_CHARS and _PAGE_NUMBER_REF_RE above
+    for the reasoning. Intentionally still flags other unrelated corruption
+    near an ordinary digit (e.g. a list index) — same fail-toward-OCR
+    tradeoff as _page_needs_ocr_for_visual_content() below, since an
+    unnecessary OCR pass is far cheaper than a corrupted fee amount reaching
+    a user. Never raises."""
+    page_number_ref_positions = {i for m in _PAGE_NUMBER_REF_RE.finditer(text) for i in range(*m.span())}
+    for i, ch in enumerate(text):
+        if ch.isspace() or any(lo <= ord(ch) <= hi for lo, hi in _EXPECTED_TEXT_RANGES):
+            continue
+        nearby_range = range(max(0, i - _SALIENT_CORRUPTION_PROXIMITY_CHARS), min(len(text), i + 1 + _SALIENT_CORRUPTION_PROXIMITY_CHARS))
+        if any(text[j].isdigit() and j not in page_number_ref_positions for j in nearby_range if j != i):
+            return False
+    return True
+
+
+# Image-detection background (2026-09): mirrors code/utils/pdf_text_layer.py
+# on the EC2 side (NOT imported — this Lambda has no access to code/, see
+# module docstring) — see that module's docstring for the full history,
+# including why a first, simpler area-ratio approach (checking
+# page.get_image_info() bboxes) was replaced. Short version: get_text() has
+# no concept of images at all, so a page with just enough caption text above
+# a real diagram would silently drop the diagram; the area-ratio approach
+# that first tried to fix this was itself blind to vector-drawn diagrams and
+# used page area as a proxy for visual importance rather than checking it
+# directly. Replaced with a two-stage check: a cheap local pre-filter
+# (Approach A) that only ever SKIPS the paid check for a confidently
+# text-only page, plus a real vision-model check (Approach B) for everything
+# else. Real-measured cost: $0.0001355/page via google/gemini-2.5-flash-lite.
+_TEXT_COVERAGE_SKIP_THRESHOLD = 0.70
+
+_VISION_IMAGE_CHECK_PROMPT = (
+    "Does this page contain EITHER of the following that would be lost or "
+    "misunderstood if only the text were extracted?\n"
+    "1. A diagram, chart, flowchart, photo, or other meaningful image.\n"
+    "2. A stamp, watermark, or seal indicating the document's status "
+    "(e.g. \"DRAFT\", \"APPROVED\", \"COPY\", a red official seal) — this "
+    "changes how the whole page should be interpreted, not just one detail.\n"
+    "Ignore decorative logos, letterheads, and plain page borders. "
+    'Answer with only JSON: {"has_meaningful_visual_content": true or false}'
+)
+
+
+def _parse_leading_json(raw: str):
+    """Duplicated (minimal) from code/utils/llm_json_parse.py's
+    parse_leading_json (NOT imported — this Lambda has no access to code/) —
+    strips a leading markdown code fence, then parses only the FIRST valid
+    JSON value in what remains, ignoring any trailing text after it."""
+    text = re.sub(r"^```(?:json)?\s*", "", (raw or "").strip())
+    obj, _end_index = json.JSONDecoder().raw_decode(text)
+    return obj
+
+
+def _text_coverage_ratio(page) -> float:
+    """Approach A — see block comment above. Cheap, local, no API call.
+    Never raises; a failure returns 0.0 (never confidently text-only), which
+    only means the real vision check below still runs."""
+    try:
+        page_area = page.rect.width * page.rect.height
+        if page_area <= 0:
+            return 0.0
+        text_area = 0.0
+        for block in page.get_text("dict").get("blocks", []):
+            if block.get("type") != 0:  # 0 = text block, 1 = image block — a full-page
+                continue                # image block must never count as "text coverage"
+            bbox = block.get("bbox")
+            if not bbox:
+                continue
+            x0, y0, x1, y1 = bbox
+            text_area += max(0.0, x1 - x0) * max(0.0, y1 - y0)
+        return min(1.0, text_area / page_area)
+    except Exception:
+        return 0.0
+
+
+def _page_needs_ocr_for_visual_content(page, cost_accumulator: "_CostAccumulator | None" = None) -> bool:
+    """Approach B — see block comment above. Fails SAFE toward True (assume
+    an image is present -> caller falls back to OCR) on any error: an
+    unnecessary OCR pass costs a little money, a silently dropped diagram
+    costs correctness."""
+    try:
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(0.5, 0.5))
+        img_bytes = pix.tobytes("png")
+        b64 = base64.b64encode(img_bytes).decode("utf-8")
+        client = OpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL)
+        _call_start = time.time()
+        resp = client.chat.completions.create(
+            model=OPENROUTER_MODEL_IMAGE_CHECK,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _VISION_IMAGE_CHECK_PROMPT},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                ],
+            }],
+            max_tokens=30,
+        )
+        _log_llm_cost("ImageCheck", OPENROUTER_MODEL_IMAGE_CHECK, resp, time.time() - _call_start, accumulator=cost_accumulator)
+        result = _parse_leading_json(resp.choices[0].message.content or "")
+        return bool(result.get("has_meaningful_visual_content", True))
+    except Exception as e:
+        logger.warning(f"Vision image-check failed, defaulting to OCR fallback (safe direction): {e}")
+        return True
+
+
+def _extract_page_native_text(pdf_bytes: bytes, page_num: int, cost_accumulator: "_CostAccumulator | None" = None) -> str | None:
     """Zero-cost alternative to OCR: many digital-native (non-scanned) PDFs
     already carry an extractable text layer via pymupdf's page.get_text() —
     added 2026-09, this codebase had never used it anywhere in the actual
     extraction path before. Returns None (caller falls back to OCR) for a
     scanned/image-only page with no meaningful embedded text, a text layer
-    that fails the character-validity check above (likely a corrupted/
-    mismapped font), or if extraction itself errors — never raises."""
+    that fails the page-wide or salient-region character-validity check
+    above (likely a corrupted/mismapped font), a page whose rendered
+    content includes a meaningful diagram/chart/image/status-stamp per the
+    Approach A+B check above, or if extraction itself errors — never
+    raises."""
     try:
         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
         try:
-            text = doc[page_num - 1].get_text()
+            page = doc[page_num - 1]
+            text = page.get_text()
+            if len(text.strip()) < _MIN_PAGE_TEXT_LAYER_CHARS:
+                return None
+            if not _text_looks_valid(text):
+                logger.info(f"Page {page_num}: native text layer present but failed the character-validity check (likely a corrupted/mismapped font) — falling back to OCR")
+                return None
+            if not _salient_regions_look_valid(text):
+                logger.info(f"Page {page_num}: corrupted character found right next to a number (fee amount/date/form/license code) — falling back to OCR even though the page-wide validity check passed")
+                return None
+            if _text_coverage_ratio(page) >= _TEXT_COVERAGE_SKIP_THRESHOLD:
+                return text
+            if _page_needs_ocr_for_visual_content(page, cost_accumulator=cost_accumulator):
+                logger.info(f"Page {page_num}: vision check found meaningful visual content — falling back to OCR so it gets described, not silently dropped")
+                return None
+            return text
         finally:
             doc.close()
     except Exception as e:
         logger.warning(f"Page {page_num}: native text-layer extraction failed, falling back to OCR: {e}")
         return None
-    if len(text.strip()) < _MIN_PAGE_TEXT_LAYER_CHARS:
-        return None
-    if not _text_looks_valid(text):
-        logger.info(f"Page {page_num}: native text layer present but failed the character-validity check (likely a corrupted/mismapped font) — falling back to OCR")
-        return None
-    return text
 
 
 def _extract_one_page(pdf_bytes: bytes, page_num: int, cost_accumulator: "_CostAccumulator | None" = None) -> dict:
-    native_text = _extract_page_native_text(pdf_bytes, page_num)
+    native_text = _extract_page_native_text(pdf_bytes, page_num, cost_accumulator=cost_accumulator)
     if native_text is not None:
         logger.info(f"Page {page_num}: used native PDF text layer ({len(native_text)} chars) — skipped OCR entirely, $0 for this page")
         # Same value in both fields: this IS the source text, not a second

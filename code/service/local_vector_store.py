@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import shutil
+import time
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -57,6 +58,7 @@ class LocalVectorStoreManager:
         self.embedding_model = None
         self.vectorstore: Optional[Chroma] = None
         self.retriever = None
+        self._archive_store: Optional[Chroma] = None
 
     def initialize_embeddings(self) -> None:
         if self.embedding_model is not None:
@@ -309,6 +311,143 @@ class LocalVectorStoreManager:
         print(f"[VectorStore] Deleted {len(ids)} doc(s) for source_file={source_file!r} | collection count now={self._collection_count()}")
         return len(ids)
 
+    def _archive_vectorstore(self) -> Chroma:
+        """Lazily connects to a SEPARATE Chroma collection (same persist dir,
+        different collection name — conf.ARCHIVE_COLLECTION_NAME) used for
+        superseded docs (service/pdf_supersede_resolver.py). Kept as its own
+        collection rather than a metadata flag on the live one specifically
+        so every existing retrieval call site (including the several direct
+        `collection.get(where=...)` sites in persona_supervisor.py that
+        bypass the main retrieval path) needs zero changes — a superseded
+        doc is never physically present in the live collection to begin with."""
+        if self.embedding_model is None:
+            self.initialize_embeddings()
+        if self._archive_store is None:
+            self._archive_store = Chroma(
+                collection_name=str(getattr(conf, "ARCHIVE_COLLECTION_NAME", self._collection_name() + "_archive")),
+                embedding_function=self.embedding_model,
+                persist_directory=self._persist_dir(),
+                collection_metadata={"hnsw:space": "cosine"},
+            )
+        return self._archive_store
+
+    def archive_and_remove(self, doc_ids: List[str], reason: str) -> int:
+        """Moves docs OUT of the live collection into the archive collection —
+        soft-delete semantics: hidden from retrieval immediately, but
+        recoverable via restore_from_archive (not a hard, permanent delete).
+        The archive-add happens BEFORE the live-delete and the live-delete is
+        skipped entirely if the archive-add raises — a confirmed copy must
+        exist elsewhere before anything disappears from the bot's searchable
+        corpus. Reuses the already-computed embeddings fetched from live, so
+        this costs zero extra OpenRouter embedding calls."""
+        if not doc_ids:
+            return 0
+        if self.vectorstore is None:
+            self.connect_to_existing(fail_if_empty=False)
+        fetched = self.vectorstore._collection.get(
+            ids=doc_ids, include=["documents", "metadatas", "embeddings"],
+        )
+        ids = fetched.get("ids") or []
+        if not ids:
+            print(f"[VectorStore] archive_and_remove: none of {len(doc_ids)} id(s) found in live collection, no-op")
+            return 0
+        documents = fetched.get("documents") or []
+        metadatas = fetched.get("metadatas") or []
+        embeddings = fetched.get("embeddings") or []
+
+        now = time.time()
+        stamped_metadatas = []
+        for m in metadatas:
+            stamped = dict(m or {})
+            stamped["superseded_at"] = now
+            stamped["superseded_reason"] = reason or ""
+            stamped_metadatas.append(_stringify_metadata(stamped))
+
+        archive_store = self._archive_vectorstore()
+        # Archive-add BEFORE live-delete, deliberately not wrapped in a blanket
+        # try/except — if this raises, the function must stop here and the
+        # live docs must stay untouched, not be deleted anyway.
+        archive_store._collection.add(
+            ids=ids, documents=documents, metadatas=stamped_metadatas, embeddings=embeddings,
+        )
+        try:
+            archive_store.persist()
+        except Exception:
+            pass
+
+        self.vectorstore._collection.delete(ids=ids)
+        try:
+            self.vectorstore.persist()
+        except Exception:
+            pass
+        print(
+            f"[VectorStore] archive_and_remove: moved {len(ids)} doc(s) to archive "
+            f"(reason={reason!r}) | live collection count now={self._collection_count()}"
+        )
+        return len(ids)
+
+    def list_archived_docs(self, pattern: Optional[str] = None) -> List[Dict]:
+        """Audit/inspection helper — the periodic review mechanism that
+        compensates for there being no real-time human gate on supersede
+        decisions (see pdf_supersede_resolver.py). Optional `pattern`
+        substring-filters by source_file."""
+        archive_store = self._archive_vectorstore()
+        raw = archive_store._collection.get(include=["metadatas", "documents"])
+        ids = raw.get("ids") or []
+        metadatas = raw.get("metadatas") or []
+        documents = raw.get("documents") or []
+        out: List[Dict] = []
+        for doc_id, m, d in zip(ids, metadatas, documents):
+            meta = m or {}
+            if pattern and pattern not in str(meta.get("source_file") or ""):
+                continue
+            out.append({"id": doc_id, "metadata": meta, "content": d or ""})
+        return out
+
+    def restore_from_archive(self, doc_ids: List[str]) -> int:
+        """Reverse of archive_and_remove — manual rollback path for a wrong
+        automated supersede decision. Strips the superseded_at/
+        superseded_reason stamp back off before re-adding to live, so a
+        restored doc is indistinguishable from one that was never archived."""
+        if not doc_ids:
+            return 0
+        archive_store = self._archive_vectorstore()
+        fetched = archive_store._collection.get(
+            ids=doc_ids, include=["documents", "metadatas", "embeddings"],
+        )
+        ids = fetched.get("ids") or []
+        if not ids:
+            print(f"[VectorStore] restore_from_archive: none of {len(doc_ids)} id(s) found in archive, no-op")
+            return 0
+        documents = fetched.get("documents") or []
+        metadatas = fetched.get("metadatas") or []
+        embeddings = fetched.get("embeddings") or []
+
+        cleaned_metadatas = []
+        for m in metadatas:
+            cleaned = dict(m or {})
+            cleaned.pop("superseded_at", None)
+            cleaned.pop("superseded_reason", None)
+            cleaned_metadatas.append(_stringify_metadata(cleaned))
+
+        if self.vectorstore is None:
+            self.connect_to_existing(fail_if_empty=False)
+        self.vectorstore._collection.add(
+            ids=ids, documents=documents, metadatas=cleaned_metadatas, embeddings=embeddings,
+        )
+        try:
+            self.vectorstore.persist()
+        except Exception:
+            pass
+
+        archive_store._collection.delete(ids=ids)
+        try:
+            archive_store.persist()
+        except Exception:
+            pass
+        print(f"[VectorStore] restore_from_archive: restored {len(ids)} doc(s) to live | live collection count now={self._collection_count()}")
+        return len(ids)
+
     # Retrieval helpers (infra-only)
     def retrieve_raw_docs(self, query: str, k: Optional[int] = None) -> List[Document]:
         if not query or not str(query).strip():
@@ -341,6 +480,38 @@ class LocalVectorStoreManager:
         except Exception:
             docs = self.vectorstore.similarity_search(query, **kwargs)
             return [(d, None) for d in docs]
+
+    def query_live_with_ids(self, text: str, k: int, filter: Optional[dict] = None) -> List[Dict]:
+        """Like retrieve_with_scores, but returns Chroma's own document ids
+        too — langchain's Document wrapper silently drops them (see
+        _results_to_docs_and_scores in the langchain_community Chroma
+        source). Needed by callers that must act on a SPECIFIC matched
+        document afterward (service/pdf_supersede_resolver.py retiring a
+        superseded doc via archive_and_remove, which needs its id). Bypasses
+        the langchain wrapper and queries the Chroma collection directly.
+        score = cosine similarity (1 - distance), valid because every
+        collection this project creates sets collection_metadata=
+        {"hnsw:space": "cosine"}."""
+        if self.vectorstore is None:
+            self.connect_to_existing(fail_if_empty=False)
+        if not text or not text.strip():
+            return []
+        embedding = self.embedding_model.embed_query(text)
+        kwargs: dict = {
+            "query_embeddings": [embedding], "n_results": k,
+            "include": ["metadatas", "documents", "distances"],
+        }
+        if filter:
+            kwargs["where"] = filter
+        results = self.vectorstore._collection.query(**kwargs)
+        ids = (results.get("ids") or [[]])[0]
+        distances = (results.get("distances") or [[]])[0]
+        metadatas = (results.get("metadatas") or [[]])[0]
+        documents = (results.get("documents") or [[]])[0]
+        out: List[Dict] = []
+        for doc_id, dist, meta, content in zip(ids, distances, metadatas, documents):
+            out.append({"id": doc_id, "score": 1.0 - float(dist), "metadata": meta or {}, "content": content or ""})
+        return out
 
     def retrieve_docs(self, query: str, k: Optional[int] = None, clip_chars: int = 600) -> List[Dict]:
         docs = self.retrieve_raw_docs(query, k=k)
@@ -411,3 +582,23 @@ def list_pdf_ingested_files() -> Dict[str, int]:
 def delete_by_source_file(source_file: str) -> int:
     """Public API — see LocalVectorStoreManager.delete_by_source_file."""
     return _MANAGER.delete_by_source_file(source_file)
+
+
+def archive_and_remove(doc_ids: List[str], reason: str) -> int:
+    """Public API — see LocalVectorStoreManager.archive_and_remove."""
+    return _MANAGER.archive_and_remove(doc_ids, reason)
+
+
+def list_archived_docs(pattern: Optional[str] = None) -> List[Dict]:
+    """Public API — see LocalVectorStoreManager.list_archived_docs."""
+    return _MANAGER.list_archived_docs(pattern)
+
+
+def restore_from_archive(doc_ids: List[str]) -> int:
+    """Public API — see LocalVectorStoreManager.restore_from_archive."""
+    return _MANAGER.restore_from_archive(doc_ids)
+
+
+def query_live_with_ids(text: str, k: int, filter: Optional[dict] = None) -> List[Dict]:
+    """Public API — see LocalVectorStoreManager.query_live_with_ids."""
+    return _MANAGER.query_live_with_ids(text, k, filter=filter)

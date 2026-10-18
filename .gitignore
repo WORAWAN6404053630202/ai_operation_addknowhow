@@ -63,3 +63,10 @@ code_friday_backup/
 .claude/
 code_friday_backup/
 .claude/
+
+# Local test/scratch artifacts — never commit
+.deepeval/
+code/scripts/chat_final*.json
+code/scripts/chat_results_*.json
+data/
+local_chroma_v3_test_link/
