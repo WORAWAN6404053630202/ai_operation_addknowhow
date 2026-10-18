@@ -560,6 +560,29 @@ PDF_RATE_LIMIT_DYNAMODB_REGION = os.getenv("PDF_RATE_LIMIT_DYNAMODB_REGION", "")
 # very different access patterns/lifetimes, no reason to share one table).
 PDF_DRAFT_CACHE_DYNAMODB_TABLE = os.getenv("PDF_DRAFT_CACHE_DYNAMODB_TABLE", "restbiz-pdf-draft-cache")
 PDF_DRAFT_CACHE_DYNAMODB_REGION = os.getenv("PDF_DRAFT_CACHE_DYNAMODB_REGION", "") or AWS_REGION
+
+# Cross-process daily $ spend TRACKER (2026-10, see utils/pdf_cost_guard.py's
+# DailyCostGuard) — OBSERVATIONAL ONLY, feeds the admin dashboard's running
+# total. Used to gate processing (a calendar-day auto-block) until 2026-10;
+# removed after real use showed it couldn't tell a genuine large bulk
+# upload from an actual malfunction and blocked both equally — see
+# service/sqs_consumer.py's _MAX_HANDOFF_ATTEMPTS / lambda/pdf_extraction/
+# handler.py's _MAX_ATTEMPTS for the real fix (a bounded per-document retry
+# cap, which targets the actual failure mode instead of capping legitimate
+# throughput). Same manual-table, fail-open-on-any-DynamoDB-error philosophy
+# as the two tables above; a separate table since this one is a running
+# counter keyed by UTC date, not a cache or a rate-limit claim. Shared by
+# BOTH the Lambda (OCR/vision calls) and the EC2 consumer (drafting/resolver
+# calls) so the dashboard shows ONE real total, not two disconnected ones.
+PDF_COST_GUARD_DYNAMODB_TABLE = os.getenv("PDF_COST_GUARD_DYNAMODB_TABLE", "restbiz-pdf-cost-guard")
+PDF_COST_GUARD_DYNAMODB_REGION = os.getenv("PDF_COST_GUARD_DYNAMODB_REGION", "") or AWS_REGION
+
+# Lightweight ingestion-activity log for the admin dashboard (2026-10) — see
+# utils/pdf_ingestion_log.py. One JSONL file per UTC day under this S3
+# prefix, inside the SAME bucket as PDF_INGESTION_S3_BUCKET above (no new
+# bucket needed). Display-only, never gates processing (unlike the cost
+# guard above) — a write failure here must never block real ingestion work.
+PDF_INGESTION_LOG_S3_PREFIX = os.getenv("PDF_INGESTION_LOG_S3_PREFIX", "restbiz/ingestion_log/")
 # Keeps dev/test uploads scoped under a clearly-labeled sub-prefix, separate from
 # wherever a real production Lambda might eventually watch within this bucket.
 PDF_INGESTION_S3_PREFIX = os.getenv("PDF_INGESTION_S3_PREFIX", "")
@@ -667,7 +690,20 @@ if not OPENROUTER_API_KEY:
 
 # Cost & Budget Configuration
 COST_WARNING_THRESHOLD = _safe_float("COST_WARNING_THRESHOLD", 1.0)  # Warn if single call > $1
-DAILY_BUDGET_USD = _safe_float("DAILY_BUDGET_USD", 50.0)  # Daily spending limit
+# PDF ingestion pipeline's dashboard reference amount (2026-10) — was a
+# dead/unread stub (default 50.0, nothing ever checked it), briefly wired up
+# as an enforced daily kill-switch, then UN-wired from enforcement the same
+# week: a calendar-day auto-block has no way to tell a genuine large bulk
+# upload from an actual runaway malfunction, and blocking the former just as
+# hard as the latter is exactly backwards — see service/sqs_consumer.py's
+# _MAX_HANDOFF_ATTEMPTS / lambda/pdf_extraction/handler.py's _MAX_ATTEMPTS
+# for the real fix: a bounded per-document retry cap that targets the
+# actual failure mode (a document stuck looping) without touching
+# legitimate throughput at all. This value now only feeds the admin
+# dashboard's color-coded running-total display (utils/pdf_cost_guard.py) —
+# purely a human-noticeable "spend looks unusually high today" cue, not an
+# enforced limit.
+DAILY_BUDGET_USD = _safe_float("DAILY_BUDGET_USD", 25.0)
 
 # Token budget alerts (per-call thresholds — warning/logging only, not enforced)
 TOKEN_BUDGET_PER_CALL = _safe_int("TOKEN_BUDGET_PER_CALL", 8000)

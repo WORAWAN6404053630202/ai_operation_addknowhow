@@ -179,6 +179,41 @@ class TestKnowhowItemsDirectSupersedeWiring:
         mock_expand.assert_called_once_with(["old-kh-chunk-1"])
         mock_archive.assert_called_once_with(["old-kh-chunk-1", "old-kh-chunk-2"], reason="superseded by updated_book.pdf")
 
+    def test_expand_sibling_chunks_failure_falls_back_to_matched_ids_not_raise(self):
+        """2026-10 fix: expand_knowhow_matches_to_full_chunks used to be the
+        ONE unwrapped fallible call in this function — a transient Chroma
+        error here would raise straight out, with no attempt cap backing up
+        this code path (unlike the handoff path's _MAX_HANDOFF_ATTEMPTS),
+        meaning SQS would redeliver the whole document indefinitely. Must
+        now degrade to retiring just the directly-matched id(s) instead."""
+        pages, markdowns = _make_pages(2)
+
+        def fake_identify_knowhow_topics(page_markdowns, cost_accumulator=None):
+            return [{
+                "document_title": "คู่มือ", "source_type": "book",
+                "main_topic": "การตลาด", "sub_topic": "โปรโมชั่น",
+                "summary": "สรุป", "category": "", "page_ranges": [(1, 2)],
+            }]
+
+        def fake_resolve(topic_dict, source_file, cost_accumulator=None):
+            return SupersedeDecision("update", matched_doc_ids=["old-kh-chunk-1"])
+
+        with patch.object(sqs_consumer, "identify_knowhow_topics", side_effect=fake_identify_knowhow_topics), \
+             patch.object(sqs_consumer.pdf_supersede_resolver, "resolve_knowhow_topic", side_effect=fake_resolve), \
+             patch.object(sqs_consumer.pdf_supersede_resolver, "expand_knowhow_matches_to_full_chunks",
+                           side_effect=RuntimeError("chroma unreachable")), \
+             patch.object(sqs_consumer, "_add_documents_to_vectorstore") as mock_add, \
+             patch.object(sqs_consumer, "_archive_and_remove_in_vectorstore") as mock_archive:
+            mock_add.return_value = 1
+            result = sqs_consumer._build_knowhow_items_direct(
+                "updated_book.pdf", "s3://bucket/updated_book.pdf", pages, markdowns,
+                relevance_check=None, content_shape={"shape": "know_how"},
+            )  # must not raise
+
+        assert result == []
+        mock_add.assert_called_once()  # the new doc still gets written
+        mock_archive.assert_called_once_with(["old-kh-chunk-1"], reason="superseded by updated_book.pdf")
+
 
 class _FakeDraftCache:
     """In-memory stand-in for utils.pdf_draft_cache.DraftCache — records

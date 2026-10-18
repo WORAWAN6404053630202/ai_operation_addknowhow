@@ -48,6 +48,7 @@ from utils.llm_cost_logging import CostAccumulator
 from utils.logger import get_logger
 from utils.page_ranges import format_page_ranges, group_into_ranges
 from utils.pdf_draft_cache import content_hash, get_draft_cache
+from utils.pdf_ingestion_log import append_event
 
 logger = get_logger(__name__)
 
@@ -345,6 +346,7 @@ def _build_knowhow_items_direct(
     knowhow_topics = []
     retire_doc_ids: list[str] = []
     covered_local: set[int] = set()
+    new_count = update_count = duplicate_count = 0
     for t in topic_bounds:
         topic_pages, topic_markdowns = _slice_by_ranges(pages, page_markdowns, t["page_ranges"])
         for s, e in t["page_ranges"]:
@@ -378,18 +380,43 @@ def _build_knowhow_items_direct(
                 f"[SQSConsumer] {filename} topic ({t['main_topic']!r}/{t['sub_topic']!r}): "
                 f"duplicate of {decision.matched_doc_ids} — skipping, nothing added"
             )
+            duplicate_count += 1
             continue
         if decision is not None and decision.decision == "update":
             # A know-how topic can span multiple chunk_index/chunk_total
             # sub-documents — retiring only the surfaced chunk(s) would
             # orphan its siblings. Expand to the full set sharing the
             # matched doc's own main_topic/sub_topic before retiring.
-            expanded = pdf_supersede_resolver.expand_knowhow_matches_to_full_chunks(decision.matched_doc_ids)
+            #
+            # 2026-10 fix: this call used to be the ONE unwrapped fallible
+            # call in this whole function (every sibling call below —
+            # vectorstore write, archive/retire, activity log — already
+            # catches its own failures) — a transient Chroma error here
+            # would raise straight out of this function with no attempt cap
+            # backing it up on this code path, unlike the handoff path's
+            # _MAX_HANDOFF_ATTEMPTS. Falls back to retiring just the
+            # directly-matched ids (pre-expansion behavior) rather than
+            # losing the whole document's processing to one lookup failure —
+            # may orphan a sibling chunk in the rare failure case, self-heals
+            # on the next upload of this topic, same as every other
+            # degraded-but-safe path in this pipeline.
+            try:
+                expanded = pdf_supersede_resolver.expand_knowhow_matches_to_full_chunks(decision.matched_doc_ids)
+            except Exception as e:
+                logger.error(
+                    f"[SQSConsumer] {filename} topic ({t['main_topic']!r}/{t['sub_topic']!r}): "
+                    f"expand_knowhow_matches_to_full_chunks failed, retiring only the directly-matched "
+                    f"id(s) instead of the full sibling set: {e}"
+                )
+                expanded = decision.matched_doc_ids
             logger.info(
                 f"[SQSConsumer] {filename} topic ({t['main_topic']!r}/{t['sub_topic']!r}): "
                 f"update — will retire {expanded} after the new doc(s) are written"
             )
             retire_doc_ids.extend(expanded)
+            update_count += 1
+        else:
+            new_count += 1
 
         knowhow_topics.append(topic_dict)
 
@@ -416,6 +443,7 @@ def _build_knowhow_items_direct(
             "full_text": "\n\n---\n\n".join(leftover_markdowns),
         })
 
+    write_error: Optional[str] = None
     try:
         docs = pdf_direct_ingest.build_knowhow_documents(knowhow_topics, filename)
         added = _add_documents_to_vectorstore(docs)
@@ -432,6 +460,17 @@ def _build_knowhow_items_direct(
                 )
     except Exception as e:
         logger.error(f"[SQSConsumer] Direct vectorstore write failed for {filename} (know-how), nothing written for this slice: {e}")
+        write_error = str(e)
+
+    # Activity log for the admin dashboard (2026-10) — display-only, see
+    # utils/pdf_ingestion_log.py. Never blocks/raises; a logging failure
+    # here must not affect the real ingestion work above.
+    append_event(conf.PDF_INGESTION_S3_BUCKET, {
+        "filename": filename, "shape": "know_how",
+        "new_count": new_count, "update_count": update_count, "duplicate_count": duplicate_count,
+        "cost_usd": cost_accumulator.total_cost_usd if cost_accumulator is not None else 0.0,
+        "error": write_error,
+    })
 
     return []
 
@@ -474,6 +513,7 @@ def _build_license_items_direct(
     merged_topics = []
     retire_doc_ids: list[str] = []
     covered_local: set[int] = set()
+    new_count = update_count = duplicate_count = 0
     for topic in topic_bounds:
         topic_pages, topic_markdowns = _slice_by_ranges(pages, page_markdowns, topic["page_ranges"])
         for s, e in topic["page_ranges"]:
@@ -515,6 +555,7 @@ def _build_license_items_direct(
                 f"[SQSConsumer] {filename} topic ({topic['department']!r}/{topic['license_type']!r}): "
                 f"duplicate of {decision.matched_doc_ids} — skipping, nothing added"
             )
+            duplicate_count += 1
             continue
         if decision is not None and decision.decision == "update":
             logger.info(
@@ -522,9 +563,13 @@ def _build_license_items_direct(
                 f"update — will retire {decision.matched_doc_ids} after the new doc is written"
             )
             retire_doc_ids.extend(decision.matched_doc_ids)
+            update_count += 1
+        else:
+            new_count += 1
 
         merged_topics.append(merged)
 
+    write_error: Optional[str] = None
     if merged_topics:
         try:
             docs = pdf_direct_ingest.build_regulatory_documents_full(merged_topics, filename)
@@ -544,6 +589,16 @@ def _build_license_items_direct(
                     )
         except Exception as e:
             logger.error(f"[SQSConsumer] Direct vectorstore write failed for {filename} (regulatory), nothing written: {e}")
+            write_error = str(e)
+
+    # Activity log for the admin dashboard (2026-10) — see the identical
+    # pattern/rationale in _build_knowhow_items_direct above.
+    append_event(conf.PDF_INGESTION_S3_BUCKET, {
+        "filename": filename, "shape": "structured_license",
+        "new_count": new_count, "update_count": update_count, "duplicate_count": duplicate_count,
+        "cost_usd": cost_accumulator.total_cost_usd if cost_accumulator is not None else 0.0,
+        "error": write_error,
+    })
 
     # Same routing-gap fix as _build_license_items — pages that don't
     # describe a license procedure go through the know-how direct path
@@ -593,6 +648,17 @@ def _build_and_save_review_item(
         present; that chunk is run through the OTHER pipeline too, producing
         additional sibling item(s) alongside the primary one, instead of
         silently dropping whichever shape didn't win the primary classification."""
+    # Cost tracking (2026-10) — see utils/pdf_cost_guard.py. No longer a
+    # blocking ceiling here either — see pdf_large_extraction.py's
+    # extract_full_document for why (a calendar-day auto-block penalized
+    # legitimate bulk uploads exactly like a genuine malfunction). The real
+    # fix for "a document is stuck looping" is _MAX_HANDOFF_ATTEMPTS below /
+    # handler.py's _MAX_ATTEMPTS, a bounded per-document retry cap — this
+    # function itself has no retry-loop risk of its own: every stage below
+    # already catches and logs its own failures rather than raising (see
+    # each try/except in _build_license_items_direct/_build_knowhow_items_
+    # direct), so there was never an uncontrolled-loop path through here to
+    # begin with.
     cost_accumulator = CostAccumulator()
     cost_accumulator.add(extraction_cost_usd)
     pages: list[PageExtractionRecord] = []
@@ -844,11 +910,46 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
     # extraction_cost_usd/extraction_started_at: absent on items written by a
     # Lambda deploy from before 2026-09 (pre-dates these fields) — .get()
     # defaults keep this backward-compatible rather than KeyError-ing.
-    items = _build_and_save_review_item(
-        filename, s3_raw_pdf_path, raw_pages, use_llm_comparison,
-        extraction_cost_usd=data.get("extraction_cost_usd", 0.0),
-        extraction_started_at=data.get("extraction_started_at"),
-    )
+    #
+    # Bounded give-up (2026-10) — this branch used to have ZERO attempt
+    # tracking at all, unlike the handoff branch above (_MAX_HANDOFF_
+    # ATTEMPTS). _build_and_save_review_item's own call sites are each
+    # individually try/except'd internally (see their own comments), so in
+    # practice nothing currently escapes uncaught from here — but that's an
+    # invariant of today's code, not a structural guarantee, and a 2026-10
+    # audit found exactly one call (expand_knowhow_matches_to_full_chunks,
+    # now fixed) that briefly broke it. This try/except is the same
+    # defense-in-depth backstop _MAX_HANDOFF_ATTEMPTS/handler.py's
+    # _MAX_ATTEMPTS already give the other two paths, so a FUTURE bug here
+    # is bounded too, not an unbounded SQS-redelivery loop.
+    build_attempt = pdf_status_tracker.next_attempt_number(bucket, filename)
+    pdf_status_tracker.write_status(bucket, filename, stage="processing", attempt=build_attempt)
+    try:
+        items = _build_and_save_review_item(
+            filename, s3_raw_pdf_path, raw_pages, use_llm_comparison,
+            extraction_cost_usd=data.get("extraction_cost_usd", 0.0),
+            extraction_started_at=data.get("extraction_started_at"),
+        )
+    except Exception as e:
+        pdf_status_tracker.write_status(bucket, filename, stage="failed", attempt=build_attempt, error=str(e))
+        if build_attempt >= _MAX_HANDOFF_ATTEMPTS:
+            logger.error(
+                f"[SQSConsumer] {filename}: giving up after {build_attempt} failed build-phase attempts, "
+                f"saving for manual review instead of retrying again: {e}"
+            )
+            item = ReviewItem(
+                filename=filename, s3_raw_pdf_path=s3_raw_pdf_path, extraction_completed_at=time.time(),
+                pages=[],
+                relevance_check={
+                    "tier": "extraction_failed",
+                    "reasoning": f"หยุดลองใหม่หลังล้มเหลว {build_attempt} ครั้งติดต่อกัน (ขั้นตอนประมวลผลเนื้อหา) — ข้อผิดพลาดล่าสุด: {e}",
+                },
+            )
+            _queue_manager.save(item)
+            pdf_status_tracker.clear(bucket, filename)
+            return [item]
+        raise
+
     # Clears the status Lambda's normal (≤MAX_PAGES_FOR_LAMBDA) path wrote —
     # see lambda/pdf_extraction/handler.py's _write_status. Mirrors the
     # handoff branch above: covers the full gap (Lambda OCR + this

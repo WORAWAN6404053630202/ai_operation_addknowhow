@@ -39,6 +39,7 @@ import conf
 from service.pdf_extraction_validation import _extract_salient_tokens
 from utils.llm_cost_logging import CostAccumulator, log_call_duration, log_llm_cost
 from utils.logger import get_logger
+from utils.pdf_cost_guard import get_cost_guard
 from utils.pdf_text_layer import extract_page_native_text
 from utils.pdf_rate_limiter import GlobalTyphoonRateLimiter
 
@@ -144,7 +145,7 @@ def _run_typhoon(png_bytes: bytes, page_num: int) -> str:
         os.remove(tmp_path)
 
 
-def _run_vision_verify(png_bytes: bytes, cost_accumulator: Optional[CostAccumulator] = None) -> str:
+def _run_vision_verify(png_bytes: bytes, cost_accumulator: Optional[CostAccumulator] = None, cost_guard=None) -> str:
     """Second-opinion OCR pass on top of Typhoon's — model is
     conf.OPENROUTER_MODEL_PDF_VISION (see conf.py for why this is its own
     constant, not conf.OPENROUTER_MODEL), not necessarily Claude despite the
@@ -165,11 +166,11 @@ def _run_vision_verify(png_bytes: bytes, cost_accumulator: Optional[CostAccumula
         ],
         max_tokens=4000,
     )
-    log_llm_cost(logger, "LargeExtraction/VisionVerify", conf.OPENROUTER_MODEL_PDF_VISION, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
+    log_llm_cost(logger, "LargeExtraction/VisionVerify", conf.OPENROUTER_MODEL_PDF_VISION, resp, time.monotonic() - _call_start, accumulator=cost_accumulator, cost_guard=cost_guard)
     return resp.choices[0].message.content or "(no text returned)"
 
 
-def _extract_one_page(pdf_bytes: bytes, page_num: int, cost_accumulator: Optional[CostAccumulator] = None) -> dict:
+def _extract_one_page(pdf_bytes: bytes, page_num: int, cost_accumulator: Optional[CostAccumulator] = None, cost_guard=None) -> dict:
     # Added 2026-09 (same optimization shipped to lambda/pdf_extraction/
     # handler.py's normal path first) — many digital-native pages need no
     # OCR at all. Matters even more here than on the Lambda side: this is
@@ -177,7 +178,7 @@ def _extract_one_page(pdf_bytes: bytes, page_num: int, cost_accumulator: Optiona
     # doesn't need them saves the most per page, and every document over
     # MAX_PAGES_FOR_LAMBDA now lands here unconditionally (the Lambda
     # pre-screen that used to filter some of them out was removed 2026-09).
-    native_text = extract_page_native_text(pdf_bytes, page_num, cost_accumulator=cost_accumulator)
+    native_text = extract_page_native_text(pdf_bytes, page_num, cost_accumulator=cost_accumulator, cost_guard=cost_guard)
     if native_text is not None:
         logger.info(f"[LargeExtraction] Page {page_num}: used native PDF text layer ({len(native_text)} chars) — skipped OCR entirely, $0 for this page")
         return {"page_num": page_num, "typhoon_markdown": native_text, "claude_markdown": native_text}
@@ -199,7 +200,7 @@ def _extract_one_page(pdf_bytes: bytes, page_num: int, cost_accumulator: Optiona
         # documents accumulate to confirm this still holds.
         salient = _extract_salient_tokens(typhoon_markdown)
         if any(salient[k] for k in salient):
-            claude_markdown = _run_vision_verify(png_bytes, cost_accumulator=cost_accumulator)
+            claude_markdown = _run_vision_verify(png_bytes, cost_accumulator=cost_accumulator, cost_guard=cost_guard)
         else:
             claude_markdown = ""
             logger.info(f"[LargeExtraction] Page {page_num}: no salient tokens in Typhoon output, skipping Claude cross-check")
@@ -240,6 +241,17 @@ def extract_full_document(
     thread-safe itself. Whether/how often that actually turns into an S3
     write is the caller's call (see sqs_consumer.py) — this function just
     reports every single page, no throttling logic here."""
+    # Cost tracking (2026-10) — see utils/pdf_cost_guard.py. No longer a
+    # blocking ceiling (REMOVED 2026-10: a calendar-day auto-block had no way
+    # to distinguish a genuine large bulk upload from an actual runaway
+    # malfunction, and made the first look worse than the second — see
+    # sqs_consumer.py's _MAX_HANDOFF_ATTEMPTS and lambda/pdf_extraction/
+    # handler.py's _MAX_ATTEMPTS for the actual fix: a bounded per-document
+    # retry cap, which targets the real failure mode directly instead of
+    # capping legitimate throughput). cost_guard here still records every
+    # call's cost for the admin dashboard's running total — display only.
+    cost_guard = get_cost_guard()
+
     started_at = time.time()
     s3 = boto3.client("s3", region_name=conf.AWS_REGION or None)
     logger.info(f"[LargeExtraction] Downloading s3://{bucket}/{raw_pdf_key}")
@@ -255,7 +267,7 @@ def extract_full_document(
     pages: list[dict | None] = [None] * num_pages
     pages_done = 0
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
-        futures = {pool.submit(_extract_one_page, pdf_bytes, p, cost_accumulator): p for p in range(1, num_pages + 1)}
+        futures = {pool.submit(_extract_one_page, pdf_bytes, p, cost_accumulator, cost_guard): p for p in range(1, num_pages + 1)}
         for future in as_completed(futures):
             page_num = futures[future]
             pages[page_num - 1] = future.result()

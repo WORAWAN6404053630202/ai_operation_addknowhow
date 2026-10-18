@@ -133,7 +133,25 @@ PDF_RATE_LIMIT_DYNAMODB_TABLE = os.environ.get("PDF_RATE_LIMIT_DYNAMODB_TABLE", 
 # local-only throttling with no obvious error.
 PDF_RATE_LIMIT_DYNAMODB_REGION = os.environ.get("PDF_RATE_LIMIT_DYNAMODB_REGION") or os.environ.get("AWS_REGION")
 
+# Cross-process daily $ spend ceiling / kill-switch (2026-10) — see
+# code/utils/pdf_cost_guard.py's DailyCostGuard (NOT imported — this Lambda
+# has no access to code/, see module docstring; _DailyCostGuard below is a
+# hand-copy, same "kept byte-for-byte equivalent" caveat as
+# _GlobalTyphoonRateLimiter above). This Lambda and the EC2 consumer share
+# ONE daily total across the SAME DynamoDB table/ceiling, since both incur
+# real LLM cost against the same budget.
+PDF_COST_GUARD_DYNAMODB_TABLE = os.environ.get("PDF_COST_GUARD_DYNAMODB_TABLE", "restbiz-pdf-cost-guard")
+PDF_COST_GUARD_DYNAMODB_REGION = os.environ.get("PDF_COST_GUARD_DYNAMODB_REGION") or os.environ.get("AWS_REGION")
+DAILY_BUDGET_USD = float(os.environ.get("DAILY_BUDGET_USD", "25.0"))
+
 _MAX_WORKERS = 4  # concurrent pages — keep modest, each page = 2 API calls already
+
+# Bounded give-up for the normal (≤MAX_PAGES_FOR_LAMBDA) extraction path
+# (2026-10) — see its use in lambda_handler's except block below. Same
+# value/reasoning as service/pdf_large_extraction.py's _MAX_HANDOFF_ATTEMPTS
+# (sqs_consumer.py): a document that keeps failing for a non-transient
+# reason must eventually stop being retried automatically, not loop forever.
+_MAX_ATTEMPTS = 3
 
 # Duplicated from code/utils/pdf_rate_limiter.py (NOT imported — this Lambda
 # has no access to code/, see module docstring). See that module's docstring
@@ -256,6 +274,82 @@ _typhoon_rate_limiter = _GlobalTyphoonRateLimiter(
     logger=logger,
 )
 
+
+class _DailyCostGuard:
+    """Hand-copy of code/utils/pdf_cost_guard.py's DailyCostGuard — see that
+    module's docstring for the full history/rationale. OBSERVATIONAL ONLY
+    (2026-10): feeds the admin dashboard's running-total display, does not
+    gate processing — a calendar-day auto-block briefly lived here and was
+    removed the same week (couldn't distinguish a genuine bulk upload from
+    an actual runaway document; see _MAX_ATTEMPTS below for the real fix).
+    record_cost()/get_today_total() never raise; any DynamoDB error degrades
+    to "today's spend shows $0.00 for now", same fail-open philosophy as the
+    rate limiter above."""
+
+    def __init__(self, table_name: str, region_name, ceiling_usd: float, logger=None):
+        self._table_name = table_name
+        self._region_name = region_name
+        self._ceiling_usd = ceiling_usd
+        self._logger = logger
+        self._client = None
+
+    def _get_client(self):
+        if self._client is None:
+            self._client = boto3.client("dynamodb", region_name=self._region_name or None)
+        return self._client
+
+    def _log(self, level: str, msg: str) -> None:
+        if self._logger is not None:
+            getattr(self._logger, level)(msg)
+
+    def _today_bucket(self) -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def record_cost(self, cost_usd: float) -> None:
+        if cost_usd <= 0:
+            return
+        bucket = self._today_bucket()
+        expires_at = int(time.time()) + 35 * 24 * 60 * 60
+        try:
+            client = self._get_client()
+            client.update_item(
+                TableName=self._table_name,
+                Key={"date_bucket": {"S": bucket}},
+                UpdateExpression=(
+                    "SET running_total_usd = if_not_exists(running_total_usd, :zero) + :amount, "
+                    "expires_at = :ttl"
+                ),
+                ExpressionAttributeValues={
+                    ":zero": {"N": "0"},
+                    ":amount": {"N": str(cost_usd)},
+                    ":ttl": {"N": str(expires_at)},
+                },
+            )
+        except Exception as e:
+            self._log("warning", f"[CostGuard] record_cost({cost_usd:.6f}) for {bucket} failed, spend NOT tracked for this call: {type(e).__name__}: {e}")
+
+    def get_today_total(self) -> float:
+        bucket = self._today_bucket()
+        try:
+            client = self._get_client()
+            resp = client.get_item(TableName=self._table_name, Key={"date_bucket": {"S": bucket}})
+            item = resp.get("Item")
+            if not item:
+                return 0.0
+            raw = item.get("running_total_usd", {}).get("N")
+            return float(raw) if raw is not None else 0.0
+        except Exception as e:
+            self._log("warning", f"[CostGuard] get_today_total() for {bucket} failed, treating today's spend as $0.00: {type(e).__name__}: {e}")
+            return 0.0
+
+
+_cost_guard = _DailyCostGuard(
+    table_name=PDF_COST_GUARD_DYNAMODB_TABLE,
+    region_name=PDF_COST_GUARD_DYNAMODB_REGION,
+    ceiling_usd=DAILY_BUDGET_USD,
+    logger=logger,
+)
+
 _TYPHOON_RETRYABLE_ERRORS = (RateLimitError, APIConnectionError, APITimeoutError, InternalServerError)
 _TYPHOON_MAX_RETRIES = 4  # bounded, never infinite — same lesson as the SQS retry-loop incident this pipeline already had once
 
@@ -318,7 +412,14 @@ def _log_llm_cost(label: str, model: str, response, elapsed_seconds: float | Non
     checked 2 RPS / 20 RPM rate limit; a slow/retried call is the first
     visible symptom, and this pipeline had no timing data anywhere before).
     Returns the computed cost (0.0 on any failure/unknown-pricing path) and
-    adds it to `accumulator` if given — added alongside _CostAccumulator."""
+    adds it to `accumulator` if given — added alongside _CostAccumulator.
+
+    Always also records into the module-level `_cost_guard` (2026-10) — see
+    that class's docstring. Unlike code/utils/llm_cost_logging.py's
+    log_llm_cost(), no optional parameter is needed here: this Lambda has
+    exactly one caller of this cost-logging function (itself) and every
+    call site IS PDF-pipeline spend, so there is no bot-vs-PDF scoping
+    concern to guard against."""
     elapsed_str = "" if elapsed_seconds is None else f" elapsed_s={elapsed_seconds:.2f}"
     try:
         usage = getattr(response, "usage", None)
@@ -328,6 +429,7 @@ def _log_llm_cost(label: str, model: str, response, elapsed_seconds: float | Non
         logger.warning(f"[CostLog] {label}: could not read token usage from the response, logging nothing{elapsed_str}: {e}")
         if accumulator is not None:
             accumulator.add(0.0)
+        _cost_guard.record_cost(0.0)
         return 0.0
 
     total_tokens = prompt_tokens + completion_tokens
@@ -340,6 +442,7 @@ def _log_llm_cost(label: str, model: str, response, elapsed_seconds: float | Non
         )
         if accumulator is not None:
             accumulator.add(0.0)
+        _cost_guard.record_cost(0.0)
         return 0.0
 
     cost_usd = (prompt_tokens * pricing["input"] + completion_tokens * pricing["output"]) / 1_000_000
@@ -350,6 +453,7 @@ def _log_llm_cost(label: str, model: str, response, elapsed_seconds: float | Non
     )
     if accumulator is not None:
         accumulator.add(cost_usd)
+    _cost_guard.record_cost(cost_usd)
     return cost_usd
 
 
@@ -861,10 +965,26 @@ def lambda_handler(event, context):
             logger.info(f"Wrote extraction result to s3://{bucket}/{output_key}")
             _notify_sqs(bucket, output_key)
         except Exception as e:
-            # Status only — Lambda's own async-invoke retry policy is
-            # unchanged by this, this just makes a failed attempt visible
-            # instead of only existing in CloudWatch logs.
             _write_status(bucket, filename, stage="failed", pages_total=num_pages, attempt=attempt, error=str(e))
+            # Bounded give-up (2026-10) — mirrors service/pdf_large_extraction.py's
+            # _MAX_HANDOFF_ATTEMPTS pattern (sqs_consumer.py), which this normal
+            # (≤MAX_PAGES_FOR_LAMBDA) path never had: before this, a
+            # persistently-failing document (e.g. an out-of-credits account,
+            # or any other non-transient error) just re-raised unconditionally
+            # forever, relying entirely on Lambda's own async-invoke retry
+            # count/DLQ config — which may or may not be set, and which this
+            # repo has no visibility into either way. Past _MAX_ATTEMPTS, stop
+            # re-raising (so this Lambda is not reinvoked for the same event
+            # again) — the "failed" status object above already makes this
+            # visible in the admin dashboard's in-flight list for manual
+            # attention, same as the handoff path's give-up case.
+            if attempt >= _MAX_ATTEMPTS:
+                logger.error(
+                    f"{filename}: giving up after {attempt} failed attempts (normal extraction), "
+                    f"leaving a failed status for manual review instead of retrying again: {e}"
+                )
+                results.append({"input_key": key, "page_count": num_pages, "gave_up_after_attempts": attempt, "error": str(e)})
+                continue
             raise
         results.append({"input_key": key, "output_key": output_key, "page_count": num_pages})
 

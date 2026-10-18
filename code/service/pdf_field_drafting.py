@@ -36,6 +36,7 @@ from openai import OpenAI
 
 import conf
 from utils.llm_cost_logging import CostAccumulator, log_llm_cost
+from utils.pdf_cost_guard import get_cost_guard
 from utils.llm_json_parse import parse_leading_json
 from utils.logger import get_logger
 from utils.page_ranges import fuzzy_ratio as _fuzzy_ratio
@@ -124,7 +125,7 @@ def draft_fields_from_pages(pages_markdown: list[str], cost_accumulator: Optiona
         messages=[{"role": "user", "content": prompt}],
         max_tokens=3000,
     )
-    log_llm_cost(logger, "FieldDrafting/DraftFields", conf.OPENROUTER_MODEL_PDF_DRAFTING, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
+    log_llm_cost(logger, "FieldDrafting/DraftFields", conf.OPENROUTER_MODEL_PDF_DRAFTING, resp, time.monotonic() - _call_start, accumulator=cost_accumulator, cost_guard=get_cost_guard())
     raw = resp.choices[0].message.content or "{}"
 
     try:
@@ -274,7 +275,7 @@ def _identify_license_topics_batch(batch_pages_markdown: list[str], page_offset:
                 # OPENROUTER_MODEL_PRACTICAL.
                 extra_body={"reasoning": {"enabled": False}},
             )
-            log_llm_cost(logger, "FieldDrafting/IdentifyLicenseTopics", conf.OPENROUTER_MODEL_PDF_TOPIC_SPLIT, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
+            log_llm_cost(logger, "FieldDrafting/IdentifyLicenseTopics", conf.OPENROUTER_MODEL_PDF_TOPIC_SPLIT, resp, time.monotonic() - _call_start, accumulator=cost_accumulator, cost_guard=get_cost_guard())
             raw = resp.choices[0].message.content or "[]"
             parsed = parse_leading_json(raw)
             if not isinstance(parsed, list):
@@ -465,7 +466,7 @@ def _resolve_page_overlaps(
                 max_tokens=50,
                 temperature=0,
             )
-            log_llm_cost(logger, "FieldDrafting/ResolveOverlap", conf.OPENROUTER_MODEL_PDF_TOPIC_SPLIT, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
+            log_llm_cost(logger, "FieldDrafting/ResolveOverlap", conf.OPENROUTER_MODEL_PDF_TOPIC_SPLIT, resp, time.monotonic() - _call_start, accumulator=cost_accumulator, cost_guard=get_cost_guard())
             raw = resp.choices[0].message.content or "{}"
             winner = parse_leading_json(raw).get("winner", "A")
             # Fail-closed (2026-10 security fix): only an EXPLICIT "B" flips

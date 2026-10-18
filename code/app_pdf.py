@@ -13,6 +13,16 @@ review pipeline. This process only serves router/admin_pdf.py's endpoints.
 static/admin.html (the combined dashboard shell) is still served by the BOT
 service (app.py) — its PDF-related fetch calls point at this service's own
 base URL/port instead of a relative path, which is why CORS is open here.
+
+NOT ACTUALLY DEPLOYED for the pure-PDF EC2 instance (2026-10 discovery): that
+instance's "web" container runs `uvicorn app:app` (the full bot), not this
+file — this module exists and works standalone (e.g. for local testing),
+but in practice app.py directly registers router/admin_pdf.py's two newest
+routes (/admin/api/pdf-status, /admin/dashboard) itself rather than this
+service being a separate running process there. See app.py's own comment
+for why (router/admin.py, already included in app.py, has its own
+un-removed duplicate of the older /api/pdf-queue routes this file also
+defines — a wholesale include_router here would collide with those).
 """
 
 import os
@@ -61,6 +71,12 @@ app.add_middleware(
 app.add_middleware(BodySizeLimitMiddleware, max_bytes=getattr(conf, "MAX_REQUEST_BODY_BYTES", 1_000_000))
 
 app.include_router(admin_pdf_router)
+# /admin/dashboard comes along automatically via the include above — the
+# route now lives on admin_pdf_router itself (router/admin_pdf.py), not
+# defined here, so it's reachable the same way wherever that router is
+# included (this app, or app.py's direct registration — see app.py's own
+# comment for why app.py registers the two new routes directly instead of
+# including this whole router there).
 
 
 @app.get("/health", tags=["health"], include_in_schema=False)

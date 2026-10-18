@@ -31,6 +31,7 @@ import conf
 from utils.llm_cost_logging import CostAccumulator, log_llm_cost
 from utils.llm_json_parse import parse_leading_json
 from utils.logger import get_logger
+from utils.pdf_cost_guard import get_cost_guard
 from utils.prompt_safety import INJECTION_GUARD
 
 logger = get_logger(__name__)
@@ -191,7 +192,7 @@ def classify_content_shape(pages_markdown: list[str], cost_accumulator: Optional
                 # 2026-08-25 switching this call off OPENROUTER_MODEL_PRACTICAL.
                 extra_body={"reasoning": {"enabled": False}},
             )
-            log_llm_cost(logger, "ClassifyContentShape", conf.OPENROUTER_MODEL_PDF_CLASSIFICATION, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
+            log_llm_cost(logger, "ClassifyContentShape", conf.OPENROUTER_MODEL_PDF_CLASSIFICATION, resp, time.monotonic() - _call_start, accumulator=cost_accumulator, cost_guard=get_cost_guard())
             raw = resp.choices[0].message.content or "{}"
             parsed = parse_leading_json(raw)
             break

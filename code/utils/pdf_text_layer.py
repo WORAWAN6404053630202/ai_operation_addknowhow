@@ -206,7 +206,7 @@ def _text_coverage_ratio(page) -> float:
         return 0.0
 
 
-def _page_needs_ocr_for_visual_content(page, cost_accumulator: Optional[CostAccumulator] = None) -> bool:
+def _page_needs_ocr_for_visual_content(page, cost_accumulator: Optional[CostAccumulator] = None, cost_guard=None) -> bool:
     """Approach B (see module docstring): renders the page as a low-res
     thumbnail and asks a real vision model whether it carries a diagram/
     chart/meaningful image OR a document-status stamp/watermark (see
@@ -242,6 +242,7 @@ def _page_needs_ocr_for_visual_content(page, cost_accumulator: Optional[CostAccu
             resp,
             time.monotonic() - _call_start,
             accumulator=cost_accumulator,
+            cost_guard=cost_guard,
         )
         result = parse_leading_json(resp.choices[0].message.content or "")
         return bool(result.get("has_meaningful_visual_content", True))
@@ -250,7 +251,7 @@ def _page_needs_ocr_for_visual_content(page, cost_accumulator: Optional[CostAccu
         return True
 
 
-def extract_page_native_text(pdf_bytes: bytes, page_num: int, cost_accumulator: Optional[CostAccumulator] = None) -> str | None:
+def extract_page_native_text(pdf_bytes: bytes, page_num: int, cost_accumulator: Optional[CostAccumulator] = None, cost_guard=None) -> str | None:
     """Returns None (caller falls back to OCR) for a scanned/image-only page
     with no meaningful embedded text, a text layer that fails the
     page-wide or salient-region character-validity check above (likely a
@@ -273,7 +274,7 @@ def extract_page_native_text(pdf_bytes: bytes, page_num: int, cost_accumulator: 
                 return None
             if _text_coverage_ratio(page) >= _TEXT_COVERAGE_SKIP_THRESHOLD:
                 return text
-            if _page_needs_ocr_for_visual_content(page, cost_accumulator=cost_accumulator):
+            if _page_needs_ocr_for_visual_content(page, cost_accumulator=cost_accumulator, cost_guard=cost_guard):
                 logger.info(f"[PdfTextLayer] Page {page_num}: vision check found meaningful visual content — falling back to OCR so it gets described, not silently dropped")
                 return None
             return text

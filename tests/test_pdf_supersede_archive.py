@@ -132,3 +132,48 @@ class TestListArchivedDocs:
         result = mgr.list_archived_docs(pattern="labor")
         assert len(result) == 1
         assert result[0]["id"] == "a"
+
+    def test_results_sorted_newest_archived_first_by_default(self):
+        """2026-10 fix — before this, callers got an unsorted dump straight
+        from Chroma's own internal ordering."""
+        mgr, archive_store = _manager_with_mocked_stores()
+        archive_store._collection.get.return_value = {
+            "ids": ["oldest", "newest", "middle"],
+            # superseded_at comes back as a STRING — every value is run
+            # through _stringify_metadata before being written to Chroma.
+            "metadatas": [
+                {"source_file": "a.pdf", "superseded_at": "100"},
+                {"source_file": "b.pdf", "superseded_at": "300"},
+                {"source_file": "c.pdf", "superseded_at": "200"},
+            ],
+            "documents": ["x", "y", "z"],
+        }
+        result = mgr.list_archived_docs()
+        assert [r["id"] for r in result] == ["newest", "middle", "oldest"]
+
+    def test_since_epoch_filters_out_older_docs(self):
+        mgr, archive_store = _manager_with_mocked_stores()
+        archive_store._collection.get.return_value = {
+            "ids": ["old", "recent"],
+            "metadatas": [
+                {"source_file": "a.pdf", "superseded_at": "100"},
+                {"source_file": "b.pdf", "superseded_at": "1000"},
+            ],
+            "documents": ["x", "y"],
+        }
+        result = mgr.list_archived_docs(since_epoch=500)
+        assert len(result) == 1
+        assert result[0]["id"] == "recent"
+
+    def test_malformed_superseded_at_sorts_as_oldest_not_raise(self):
+        mgr, archive_store = _manager_with_mocked_stores()
+        archive_store._collection.get.return_value = {
+            "ids": ["malformed", "valid"],
+            "metadatas": [
+                {"source_file": "a.pdf", "superseded_at": "not-a-number"},
+                {"source_file": "b.pdf", "superseded_at": "50"},
+            ],
+            "documents": ["x", "y"],
+        }
+        result = mgr.list_archived_docs()  # must not raise
+        assert [r["id"] for r in result] == ["valid", "malformed"]

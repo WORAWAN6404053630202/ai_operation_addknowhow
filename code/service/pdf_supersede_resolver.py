@@ -39,6 +39,7 @@ import conf
 from service.local_vector_store import get_vs_manager
 from service.pdf_candidate_matching import _field_diff
 from utils.llm_cost_logging import CostAccumulator, log_llm_cost
+from utils.pdf_cost_guard import get_cost_guard
 from utils.logger import get_logger
 from utils.page_ranges import fuzzy_ratio
 from utils.prompt_safety import INJECTION_GUARD
@@ -202,7 +203,7 @@ def _llm_judge(
         )
         log_llm_cost(
             logger, "SupersedeResolver/LLMJudge", model, resp,
-            time.monotonic() - _call_start, accumulator=cost_accumulator,
+            time.monotonic() - _call_start, accumulator=cost_accumulator, cost_guard=get_cost_guard(),
         )
         raw = (resp.choices[0].message.content or "{}").strip()
         raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()

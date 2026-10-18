@@ -386,22 +386,46 @@ class LocalVectorStoreManager:
         )
         return len(ids)
 
-    def list_archived_docs(self, pattern: Optional[str] = None) -> List[Dict]:
+    def list_archived_docs(self, pattern: Optional[str] = None, since_epoch: Optional[float] = None) -> List[Dict]:
         """Audit/inspection helper — the periodic review mechanism that
         compensates for there being no real-time human gate on supersede
         decisions (see pdf_supersede_resolver.py). Optional `pattern`
-        substring-filters by source_file."""
+        substring-filters by source_file.
+
+        `since_epoch` (added 2026-10, part of the pure-PDF-project audit's
+        item 4) keeps only docs archived at or after this epoch-seconds
+        timestamp, filtering on metadata["superseded_at"] (set by
+        archive_and_remove above). Always returns results sorted NEWEST
+        archived first, regardless of whether a filter was given — before
+        this, callers got an unsorted dump straight from Chroma, making
+        "what got archived recently" a manual scroll-and-guess.
+
+        superseded_at comes back from Chroma as a STRING (every value
+        written through _stringify_metadata above) — parsed defensively
+        here; a doc with a missing/malformed value sorts as oldest (treated
+        as epoch 0) rather than raising, since that's display/audit
+        tooling, not a correctness-critical path."""
         archive_store = self._archive_vectorstore()
         raw = archive_store._collection.get(include=["metadatas", "documents"])
         ids = raw.get("ids") or []
         metadatas = raw.get("metadatas") or []
         documents = raw.get("documents") or []
+
+        def _superseded_at(meta: dict) -> float:
+            try:
+                return float(meta.get("superseded_at") or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
         out: List[Dict] = []
         for doc_id, m, d in zip(ids, metadatas, documents):
             meta = m or {}
             if pattern and pattern not in str(meta.get("source_file") or ""):
                 continue
+            if since_epoch is not None and _superseded_at(meta) < since_epoch:
+                continue
             out.append({"id": doc_id, "metadata": meta, "content": d or ""})
+        out.sort(key=lambda item: _superseded_at(item["metadata"]), reverse=True)
         return out
 
     def restore_from_archive(self, doc_ids: List[str]) -> int:
@@ -589,9 +613,9 @@ def archive_and_remove(doc_ids: List[str], reason: str) -> int:
     return _MANAGER.archive_and_remove(doc_ids, reason)
 
 
-def list_archived_docs(pattern: Optional[str] = None) -> List[Dict]:
+def list_archived_docs(pattern: Optional[str] = None, since_epoch: Optional[float] = None) -> List[Dict]:
     """Public API — see LocalVectorStoreManager.list_archived_docs."""
-    return _MANAGER.list_archived_docs(pattern)
+    return _MANAGER.list_archived_docs(pattern, since_epoch=since_epoch)
 
 
 def restore_from_archive(doc_ids: List[str]) -> int:

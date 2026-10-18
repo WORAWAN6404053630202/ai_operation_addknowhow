@@ -29,14 +29,17 @@ except Exception:
     _conf = None
 
 from fastapi import APIRouter, Depends
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from model.pdf_review_queue_manager import PdfReviewQueueManager
 from service import pdf_status_tracker
+from service.local_vector_store import list_archived_docs
 from utils.admin_auth import require_admin_key
 from utils.logger import get_logger
 from utils.page_ranges import format_page_ranges
+from utils.pdf_cost_guard import get_cost_guard
+from utils.pdf_ingestion_log import read_recent_events
 
 _LOG = get_logger(__name__)
 
@@ -277,3 +280,234 @@ async def pdf_queue_reprocess(item_id: str):
 
     _LOG.info(f"[pdf_queue_reprocess] Re-queued {item.filename} ({item_id}) for full extraction, handoff_key={handoff_key}")
     return JSONResponse({"ok": True, "handoff_key": handoff_key})
+
+
+@router.get("/api/pdf-status", dependencies=[_auth])
+async def pdf_status():
+    """Status feed for the pure-PDF project's dashboard (app_pdf.py's
+    GET /admin/dashboard, 2026-10) — covers the LIVE direct-ingest pipeline
+    this router otherwise says nothing about (every route above only ever
+    reads/writes the old human-review queue, which the direct-ingest path
+    never populates — see sqs_consumer.py's 2026-09 architectural pivot).
+
+    Three things, each independently best-effort (one source failing must
+    not blank out the other two):
+      - today's cumulative $ spend vs. a reference amount (utils/
+        pdf_cost_guard.py) — OBSERVATIONAL ONLY (2026-10: a calendar-day
+        auto-block used to gate here, removed — it couldn't tell a genuine
+        bulk upload from an actual malfunction, and punished the former as
+        hard as the latter; see sqs_consumer.py's _MAX_HANDOFF_ATTEMPTS /
+        lambda/pdf_extraction/handler.py's _MAX_ATTEMPTS for the real fix, a
+        bounded per-document retry cap targeting the actual failure mode).
+        The color here is still useful as a human-noticeable "spend looks
+        unusually high today, go check why" cue — the user explicitly chose
+        dashboard-only visibility over any push notification channel — it
+        just no longer blocks anything on its own.
+      - recent ingestion activity (utils/pdf_ingestion_log.py) — per-
+        document new/update/duplicate counts and cost, something to look at
+        besides raw CloudWatch/journalctl logs.
+      - recently archived (superseded) docs (service/local_vector_store.py's
+        list_archived_docs, now sorted newest-first with a date filter —
+        2026-10 audit item 4) — the same periodic-review data
+        pdf_archive_inspect.py shows from the CLI, now also here."""
+    cost_guard = get_cost_guard()
+    try:
+        today_cost_usd = cost_guard.get_today_total()
+    except Exception as e:
+        _LOG.warning(f"[pdf_status] Failed to read today's cost total: {e}")
+        today_cost_usd = 0.0
+    ceiling_usd = cost_guard.ceiling_usd
+    pct_of_ceiling = round((today_cost_usd / ceiling_usd) * 100, 1) if ceiling_usd > 0 else 0.0
+
+    bucket = getattr(_conf, "PDF_INGESTION_S3_BUCKET", "") if _conf else ""
+    recent_activity = []
+    if bucket:
+        try:
+            recent_activity = read_recent_events(bucket, days=7)
+        except Exception as e:
+            _LOG.warning(f"[pdf_status] Failed to read recent ingestion activity: {e}")
+
+    recent_archived = []
+    try:
+        since_epoch = time.time() - 7 * 86400
+        recent_archived = [
+            {"id": d["id"], "metadata": d["metadata"]}
+            for d in list_archived_docs(since_epoch=since_epoch)
+        ]
+    except Exception as e:
+        _LOG.warning(f"[pdf_status] Failed to read recent archived docs: {e}")
+
+    return JSONResponse({
+        "today_cost_usd": round(today_cost_usd, 4),
+        "ceiling_usd": ceiling_usd,
+        "pct_of_ceiling": pct_of_ceiling,
+        "over_ceiling": today_cost_usd >= ceiling_usd,
+        "recent_activity": recent_activity,
+        "recent_archived": recent_archived,
+    })
+
+
+# Dashboard page for pdf_status above (2026-10). Lives on THIS router (not
+# wherever it happens to be served from) specifically so it travels with
+# admin_pdf_router wherever that router is included — originally only
+# app_pdf.py (the standalone PDF-admin-only service envisioned in this
+# file's own module docstring), but that service was never actually
+# deployed for the pure-PDF EC2 instance in practice (confirmed live,
+# 2026-10: that instance's "web" container runs app.py, the full bot, not
+# app_pdf.py) — app.py registers this exact route function directly
+# (see its own comment) rather than including this whole router wholesale,
+# since router/admin.py (already included there) still carries its own
+# un-removed duplicate of the /api/pdf-queue routes from before this file
+# was split out, and a wholesale include would collide with those.
+#
+# No X-Admin-Key dependency on the page itself — it's static HTML/JS with no
+# embedded secrets; the data it fetches (pdf_status above) is already
+# gated. Same pattern static/admin.html already uses (public shell,
+# authenticated API calls).
+_DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<title>Restbiz PDF Pipeline — Dashboard</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", sans-serif; background: #0f1115; color: #e6e6e6; margin: 0; padding: 24px; }
+  h1 { font-size: 18px; margin: 0 0 16px; }
+  .card { background: #1a1d24; border-radius: 10px; padding: 18px; margin-bottom: 20px; }
+  .cost-row { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+  .cost-amount { font-size: 28px; font-weight: 600; }
+  .cost-ceiling { color: #999; font-size: 14px; }
+  .bar-track { background: #2a2e38; border-radius: 6px; height: 14px; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 6px; transition: width 0.3s ease; }
+  .bar-fill.ok { background: #3fb950; }
+  .bar-fill.warn { background: #d29922; }
+  .bar-fill.over { background: #da3633; }
+  .pct-label { margin-top: 6px; font-size: 13px; color: #aaa; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #2a2e38; }
+  th { color: #999; font-weight: 500; }
+  .err { color: #f85149; }
+  .muted { color: #777; }
+  .refresh-note { color: #666; font-size: 12px; margin-top: 8px; }
+</style>
+</head>
+<body>
+  <h1>Restbiz — PDF Pipeline Dashboard (feature/pdf-only-source)</h1>
+
+  <div class="card">
+    <div class="cost-row">
+      <span class="cost-amount" id="costAmount">—</span>
+      <span class="cost-ceiling" id="costCeiling"></span>
+    </div>
+    <div class="bar-track"><div class="bar-fill ok" id="costBar" style="width:0%"></div></div>
+    <div class="pct-label" id="costPct"></div>
+  </div>
+
+  <div class="card">
+    <h2 style="font-size:14px;margin:0 0 10px;">กิจกรรมล่าสุด (7 วัน)</h2>
+    <table id="activityTable">
+      <thead><tr><th>เวลา</th><th>ไฟล์</th><th>ประเภท</th><th>ใหม่</th><th>อัปเดต</th><th>ซ้ำ</th><th>ต้นทุน</th><th>ผิดพลาด</th></tr></thead>
+      <tbody><tr><td colspan="8" class="muted">กำลังโหลด...</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2 style="font-size:14px;margin:0 0 10px;">เอกสารที่ถูกเก็บเข้า archive ล่าสุด (7 วัน)</h2>
+    <table id="archivedTable">
+      <thead><tr><th>วันที่</th><th>ไฟล์ต้นฉบับ</th><th>หัวข้อ</th><th>เหตุผล</th></tr></thead>
+      <tbody><tr><td colspan="4" class="muted">กำลังโหลด...</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="refresh-note">อัปเดตอัตโนมัติทุก 30 วินาที</div>
+
+<script>
+function getAdminKey() {
+  let key = sessionStorage.getItem("pdf_admin_key");
+  if (!key) {
+    key = window.prompt("X-Admin-Key:") || "";
+    sessionStorage.setItem("pdf_admin_key", key);
+  }
+  return key;
+}
+
+function fmtTime(ts) {
+  if (!ts) return "";
+  return new Date(ts * 1000).toLocaleString("th-TH");
+}
+
+async function apiGet(path) {
+  const resp = await fetch(path, { headers: { "X-Admin-Key": getAdminKey() } });
+  if (resp.status === 401) {
+    sessionStorage.removeItem("pdf_admin_key");
+    throw new Error("Invalid admin key");
+  }
+  if (!resp.ok) throw new Error("HTTP " + resp.status);
+  return resp.json();
+}
+
+function renderCost(data) {
+  document.getElementById("costAmount").textContent = "$" + data.today_cost_usd.toFixed(2);
+  document.getElementById("costCeiling").textContent = "/ $" + data.ceiling_usd.toFixed(2) + " ต่อวัน";
+  const pct = Math.min(data.pct_of_ceiling, 100);
+  const bar = document.getElementById("costBar");
+  bar.style.width = pct + "%";
+  bar.className = "bar-fill " + (data.over_ceiling ? "over" : pct >= 70 ? "warn" : "ok");
+  document.getElementById("costPct").textContent =
+    data.over_ceiling
+      ? "ค่าใช้จ่ายวันนี้สูงกว่าปกติ — ไม่ได้บล็อกการทำงาน แค่เตือนให้เข้ามาดูว่าผิดปกติหรือไม่ (เช่น เอกสารจำนวนมากพร้อมกัน หรือติดลูปซ้ำ)"
+      : data.pct_of_ceiling.toFixed(1) + "% ของค่าอ้างอิงวันนี้";
+}
+
+function renderActivity(events) {
+  const tbody = document.querySelector("#activityTable tbody");
+  if (!events.length) { tbody.innerHTML = '<tr><td colspan="8" class="muted">ไม่มีกิจกรรม</td></tr>'; return; }
+  tbody.innerHTML = events.map(e => `
+    <tr>
+      <td>${fmtTime(e.timestamp)}</td>
+      <td>${e.filename || ""}</td>
+      <td>${e.shape || ""}</td>
+      <td>${e.new_count ?? 0}</td>
+      <td>${e.update_count ?? 0}</td>
+      <td>${e.duplicate_count ?? 0}</td>
+      <td>$${(e.cost_usd || 0).toFixed(4)}</td>
+      <td class="err">${e.error || ""}</td>
+    </tr>`).join("");
+}
+
+function renderArchived(docs) {
+  const tbody = document.querySelector("#archivedTable tbody");
+  if (!docs.length) { tbody.innerHTML = '<tr><td colspan="4" class="muted">ไม่มีเอกสาร</td></tr>'; return; }
+  tbody.innerHTML = docs.map(d => {
+    const m = d.metadata || {};
+    const topic = m.license_type || m.main_topic || "";
+    return `
+    <tr>
+      <td>${fmtTime(parseFloat(m.superseded_at))}</td>
+      <td>${m.source_file || ""}</td>
+      <td>${topic}</td>
+      <td>${m.superseded_reason || ""}</td>
+    </tr>`;
+  }).join("");
+}
+
+async function loadAll() {
+  try {
+    const data = await apiGet("/admin/api/pdf-status");
+    renderCost(data);
+    renderActivity(data.recent_activity || []);
+    renderArchived(data.recent_archived || []);
+  } catch (e) {
+    document.getElementById("costAmount").textContent = "โหลดข้อมูลไม่สำเร็จ: " + e.message;
+  }
+}
+
+loadAll();
+setInterval(loadAll, 30000);
+</script>
+</body>
+</html>"""
+
+
+@router.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
+async def admin_pdf_dashboard():
+    return HTMLResponse(_DASHBOARD_HTML)

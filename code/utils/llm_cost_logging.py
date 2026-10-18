@@ -58,6 +58,7 @@ def log_llm_cost(
     response: Any,
     elapsed_seconds: float | None = None,
     accumulator: Optional[CostAccumulator] = None,
+    cost_guard: Optional[Any] = None,
 ) -> float:
     """Call once, right after receiving a chat-completion (or embedding)
     response, with a short label identifying which call site this was (e.g.
@@ -86,7 +87,17 @@ def log_llm_cost(
     the log line — or pass a CostAccumulator via `accumulator` to have this
     function do that bookkeeping for you (added when the accumulator itself
     was added; 0-cost outcomes are added too, harmlessly, so the accumulator
-    stays accurate without the caller needing to branch on which path ran)."""
+    stays accurate without the caller needing to branch on which path ran).
+
+    `cost_guard` (added 2026-10, duck-typed as Any to avoid this bot-shared
+    module depending on utils/pdf_cost_guard.py) is an object exposing
+    `record_cost(cost_usd: float) -> None` — pass
+    `utils.pdf_cost_guard.get_cost_guard()` ONLY from PDF-pipeline call
+    sites. Deliberately NOT a blanket hook for every caller of this
+    function: it is also used by the main chat bot (utils/llm_call.py,
+    router/admin.py), and the PDF project's daily $ ceiling must only ever
+    count PDF-pipeline spend. 0-cost outcomes are recorded too, same
+    reasoning as `accumulator`."""
     elapsed_str = _elapsed_suffix(elapsed_seconds)
     try:
         usage = getattr(response, "usage", None)
@@ -96,6 +107,8 @@ def log_llm_cost(
         logger.warning(f"[CostLog] {label}: could not read token usage from the response, logging nothing{elapsed_str}: {e}")
         if accumulator is not None:
             accumulator.add(0.0)
+        if cost_guard is not None:
+            cost_guard.record_cost(0.0)
         return 0.0
 
     total_tokens = prompt_tokens + completion_tokens
@@ -109,6 +122,8 @@ def log_llm_cost(
         )
         if accumulator is not None:
             accumulator.add(0.0)
+        if cost_guard is not None:
+            cost_guard.record_cost(0.0)
         return 0.0
 
     cost_usd = (prompt_tokens * pricing["input"] + completion_tokens * pricing["output"]) / 1_000_000
@@ -119,6 +134,8 @@ def log_llm_cost(
     )
     if accumulator is not None:
         accumulator.add(cost_usd)
+    if cost_guard is not None:
+        cost_guard.record_cost(cost_usd)
     return cost_usd
 
 

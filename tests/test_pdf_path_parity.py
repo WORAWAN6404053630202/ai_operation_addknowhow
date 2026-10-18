@@ -539,6 +539,71 @@ class TestGlobalTyphoonRateLimiterParity:
 
 
 @pytest.mark.unit
+class TestDailyCostGuardParity:
+    """DailyCostGuard (2026-10) — the daily $ spend TRACKER feeding the
+    admin dashboard's running total (OBSERVATIONAL ONLY since 2026-10; it
+    briefly gated processing as a calendar-day auto-block, removed the same
+    week — see conf.DAILY_BUDGET_USD's comment and sqs_consumer.py's
+    _MAX_HANDOFF_ATTEMPTS / handler.py's _MAX_ATTEMPTS for the real
+    runaway-document fix), hand-copied into lambda/pdf_extraction/handler.py
+    as _DailyCostGuard the same way GlobalTyphoonRateLimiter was above (see
+    that class's docstring for the exact drift risk this guards against: a
+    mechanism added to only one side first, silently leaving the other side
+    unprotected). Both sides must share the SAME table/reference value or
+    the dashboard would show two disconnected numbers instead of one real
+    daily total."""
+
+    def test_default_table_name_and_ceiling_match_conf_defaults(self):
+        import conf
+        from utils.pdf_cost_guard import get_cost_guard
+
+        handler = _lambda_handler_module()
+        ec2_guard = get_cost_guard()
+        assert conf.PDF_COST_GUARD_DYNAMODB_TABLE == ec2_guard._table_name == handler.PDF_COST_GUARD_DYNAMODB_TABLE, (
+            "DynamoDB table name has diverged between EC2 and Lambda — they would track "
+            "spend against two DIFFERENT tables instead of sharing one real daily total."
+        )
+        assert conf.DAILY_BUDGET_USD == ec2_guard.ceiling_usd == handler.DAILY_BUDGET_USD, (
+            "Dashboard reference amount has diverged between EC2 and Lambda defaults."
+        )
+
+    def test_lambda_region_lookup_does_not_rely_on_reserved_aws_region_alone(self):
+        """Same real bug class as TestGlobalTyphoonRateLimiterParity's
+        identical check above — AWS_REGION is Lambda-reserved, so a
+        dedicated PDF_COST_GUARD_DYNAMODB_REGION var must be checked first."""
+        handler = _lambda_handler_module()
+        src = inspect.getsource(handler)
+        assert 'PDF_COST_GUARD_DYNAMODB_REGION = os.environ.get("PDF_COST_GUARD_DYNAMODB_REGION") or os.environ.get("AWS_REGION")' in src, (
+            "lambda/pdf_extraction/handler.py no longer checks PDF_COST_GUARD_DYNAMODB_REGION "
+            "before falling back to the reserved AWS_REGION."
+        )
+
+    def test_both_sides_fail_open_on_dynamodb_error(self):
+        """The dangerous direction: a broken/missing table must never block
+        real OCR/drafting work, and must never make the dashboard falsely
+        report today's spend as higher than it actually is."""
+        from utils.pdf_cost_guard import DailyCostGuard
+
+        handler = _lambda_handler_module()
+        for name, cls in (("EC2", DailyCostGuard), ("Lambda", handler._DailyCostGuard)):
+            get_src = inspect.getsource(cls.get_today_total)
+            assert "return 0.0" in get_src, f"{name}'s DailyCostGuard.get_today_total() no longer fails open to 0.0 on error."
+            record_src = inspect.getsource(cls.record_cost)
+            assert "except Exception" in record_src, f"{name}'s DailyCostGuard.record_cost() no longer swallows errors."
+
+    def test_both_sides_use_update_item_not_a_transaction(self):
+        """A single unconditional increment needs no multi-item transaction
+        (unlike GlobalTyphoonRateLimiter's linked RPS+RPM claim above) —
+        both sides should use the simpler update_item call."""
+        from utils.pdf_cost_guard import DailyCostGuard
+
+        handler = _lambda_handler_module()
+        for name, cls in (("EC2", DailyCostGuard), ("Lambda", handler._DailyCostGuard)):
+            src = inspect.getsource(cls.record_cost)
+            assert "update_item" in src, f"{name}'s DailyCostGuard.record_cost() no longer uses update_item."
+
+
+@pytest.mark.unit
 class TestPerPageFaultIsolationPresentOnBothPaths:
     """Added 2026-09: one page's unrecoverable failure used to crash the
     whole document (ThreadPoolExecutor future.result() re-raises), silently
@@ -562,4 +627,48 @@ class TestPerPageFaultIsolationPresentOnBothPaths:
         assert "except Exception" in src, (
             "lambda/pdf_extraction/handler.py's _extract_one_page no longer catches per-page "
             "failures — one bad page can once again crash the whole document."
+        )
+
+
+@pytest.mark.unit
+class TestLambdaNormalPathBoundedGiveUp:
+    """2026-10: the normal (<=MAX_PAGES_FOR_LAMBDA) extraction path's except
+    block used to re-raise unconditionally forever on every failure, with no
+    cap at all — unlike the EC2 handoff path's already-proven
+    _MAX_HANDOFF_ATTEMPTS (sqs_consumer.py). This is the real fix for "a
+    document is stuck looping, burning cost every retry": a bounded
+    per-document attempt cap that stops the SAME malfunctioning document
+    without touching any other document's processing — replacing an earlier
+    calendar-day cost ceiling that blocked ALL new documents equally,
+    whether the backlog was a bug or a legitimate bulk upload."""
+
+    def test_max_attempts_constant_exists_and_is_bounded(self):
+        handler = _lambda_handler_module()
+        assert isinstance(handler._MAX_ATTEMPTS, int)
+        assert 1 <= handler._MAX_ATTEMPTS <= 10, "_MAX_ATTEMPTS should be a small, deliberately bounded number."
+
+    def test_except_block_checks_max_attempts_before_reraising(self):
+        handler = _lambda_handler_module()
+        src = inspect.getsource(handler.lambda_handler)
+        # The except block for the normal path must reference _MAX_ATTEMPTS
+        # (so it can stop re-raising past the cap) — not just an unconditional
+        # bare `raise` with nothing checking the attempt count first.
+        assert "attempt >= _MAX_ATTEMPTS" in src, (
+            "lambda_handler's normal-path except block no longer checks _MAX_ATTEMPTS — "
+            "a persistently-failing document would once again retry forever with no cap."
+        )
+
+    def test_give_up_path_does_not_reraise(self):
+        """Walk the except block's source: once the give-up branch is
+        entered (attempt >= _MAX_ATTEMPTS), it must reach `continue` (move on
+        to the next record / end this invocation normally) before ever
+        hitting the fallback `raise` — not re-raise regardless."""
+        handler = _lambda_handler_module()
+        src = inspect.getsource(handler.lambda_handler)
+        give_up_idx = src.index("if attempt >= _MAX_ATTEMPTS:")
+        reraise_idx = src.index("raise\n", give_up_idx)
+        continue_idx = src.index("continue", give_up_idx)
+        assert continue_idx < reraise_idx, (
+            "The give-up branch must reach 'continue' before the fallback 'raise' — "
+            "otherwise a document past the attempt cap would still be re-raised."
         )

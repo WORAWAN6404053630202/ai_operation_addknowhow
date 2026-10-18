@@ -35,6 +35,7 @@ from openai import OpenAI
 
 import conf
 from utils.llm_cost_logging import CostAccumulator, log_llm_cost
+from utils.pdf_cost_guard import get_cost_guard
 from utils.llm_json_parse import parse_leading_json
 from utils.logger import get_logger
 from utils.page_ranges import fuzzy_ratio, group_into_ranges, merge_topic_chunks
@@ -193,7 +194,7 @@ def _resolve_page_overlaps(
                 max_tokens=50,
                 temperature=0,
             )
-            log_llm_cost(logger, "KnowhowDrafting/ResolveOverlap", conf.OPENROUTER_MODEL_PDF_TOPIC_SPLIT, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
+            log_llm_cost(logger, "KnowhowDrafting/ResolveOverlap", conf.OPENROUTER_MODEL_PDF_TOPIC_SPLIT, resp, time.monotonic() - _call_start, accumulator=cost_accumulator, cost_guard=get_cost_guard())
             raw = resp.choices[0].message.content or "{}"
             winner = parse_leading_json(raw).get("winner", "A")
             # Fail-closed (2026-10 security fix) — see pdf_field_drafting.py's
@@ -324,7 +325,7 @@ def _identify_knowhow_topics_batch(
                 # call off OPENROUTER_MODEL_PRACTICAL.
                 extra_body={"reasoning": {"enabled": False}},
             )
-            log_llm_cost(logger, "KnowhowDrafting/IdentifyTopics", conf.OPENROUTER_MODEL_PDF_TOPIC_SPLIT, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
+            log_llm_cost(logger, "KnowhowDrafting/IdentifyTopics", conf.OPENROUTER_MODEL_PDF_TOPIC_SPLIT, resp, time.monotonic() - _call_start, accumulator=cost_accumulator, cost_guard=get_cost_guard())
             raw = resp.choices[0].message.content or "{}"
             parsed = parse_leading_json(raw)
             break

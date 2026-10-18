@@ -46,6 +46,7 @@ from typing import Any, Optional
 
 import conf
 from utils.llm_cost_logging import CostAccumulator, log_llm_cost
+from utils.pdf_cost_guard import get_cost_guard
 from utils.logger import get_logger
 from utils.prompt_safety import INJECTION_GUARD
 
@@ -290,7 +291,7 @@ def compare_extractions_llm(
         )
         log_llm_cost(
             logger, "ExtractionValidation/LLMComparison", conf.OPENROUTER_MODEL_PRACTICAL, resp,
-            time.monotonic() - _call_start, accumulator=cost_accumulator,
+            time.monotonic() - _call_start, accumulator=cost_accumulator, cost_guard=get_cost_guard(),
         )
         raw = (resp.choices[0].message.content or "[]").strip()
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
