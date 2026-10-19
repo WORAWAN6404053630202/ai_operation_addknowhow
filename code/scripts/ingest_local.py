@@ -1,6 +1,7 @@
 # code/scripts/ingest_local.py
 from __future__ import annotations
 
+import argparse
 import re
 import sys
 from pathlib import Path
@@ -256,6 +257,21 @@ def normalize_documents(docs: Iterable[Any]) -> None:
 
 
 def main():
+    # 2026-10 fix: this script wipes and rebuilds the ENTIRE local Chroma
+    # collection (reset=True below) with no confirmation prompt — on this
+    # branch the PDF-auto-ingested content has no Sheet backup at all, so a
+    # mistaken run (wrong terminal, wrong directory, muscle memory) could
+    # permanently destroy the only copy of every ingested PDF. Mirrors the
+    # --confirm/dry-run convention already used correctly in
+    # code/scripts/pdf_delete_by_source.py. Only gates the DESTRUCTIVE step
+    # (ingest_documents(..., reset=True) near the end) — everything above
+    # that (loading from Sheets, snapshotting existing PDF docs, validation)
+    # is read-only and still runs in dry-run mode so the summary it prints
+    # is accurate, not a guess.
+    parser = argparse.ArgumentParser(description=__doc__ or "", formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--confirm", action="store_true", help="Actually wipe and rebuild the collection (omit for a dry run that only prints what would happen)")
+    args = parser.parse_args()
+
     all_docs: List[Document] = []
 
     # ── Source A: Regulatory / government procedures ─────────────────────────
@@ -319,7 +335,17 @@ def main():
         all_docs.extend(_pdf_docs)
         print(f"[Ingest]   → {len(_pdf_docs)} PDF-auto-ingested docs carried forward")
     except Exception as e:
-        print(f"[Ingest]   ⚠️  Could not read existing PDF-auto-ingested docs, none carried forward: {e}")
+        # 2026-10 fix: this used to be a caught-and-continue warning — one
+        # line among ~30 of progress output — after which the script
+        # proceeded straight to reset=True anyway. Any failure here (locked
+        # DB, wrong LOCAL_VECTOR_DIR, a chromadb API change) meant every
+        # PDF-ingested doc was about to be permanently deleted with nothing
+        # to restore it from on this branch (no Sheet backup exists for PDF
+        # content). Fatal now: stop before the destructive step, not after
+        # silently losing data past the point of no return.
+        print(f"[Ingest]   ✗ FATAL: could not read existing PDF-auto-ingested docs — refusing to proceed, "
+              f"since reset=True below would permanently delete them with nothing to carry forward: {e}")
+        sys.exit(1)
 
     # ── Normalize all docs ───────────────────────────────────────────────────
     docs = all_docs
@@ -350,6 +376,12 @@ def main():
     print(f"[Ingest]   know_how docs   : {len(kh_docs)}")
     print(f"[Ingest]   location populated: {len(locs)}/{len(docs)}")
     print(f"[Ingest]   entity_type populated: {len(entities)}/{len(docs)}")
+
+    if not args.confirm:
+        print(f"\n[Ingest] DRY RUN — would wipe and rebuild the collection with the {len(docs)} doc(s) "
+              f"counted above (including the {len(_pdf_docs)} PDF-auto-ingested doc(s) carried forward). "
+              f"Re-run with --confirm to actually do it.")
+        return
 
     # Release the read connection opened above (Source E's snapshot) before
     # reset=True opens a fresh one — live-reproduced 2026-09: keeping both
