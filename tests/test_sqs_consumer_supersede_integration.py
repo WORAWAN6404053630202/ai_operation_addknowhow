@@ -235,6 +235,78 @@ class _FakeDraftCache:
 
 
 @pytest.mark.unit
+class TestHighSeverityFlagsSurfacedOnDashboard:
+    """PDF-M1/PDF-M3 cluster (2026-10): validate_extraction()'s high-severity
+    flags (arithmetic mismatches, dual-model disagreements) are computed in
+    _build_and_save_review_item and stored on PageExtractionRecord.flags,
+    then passed into the direct builders as `pages` — but nothing read them
+    there before this fix, silently discarding the one piece of automated
+    QA signal this no-human-review pipeline has. Now surfaced into the
+    append_event() call that feeds the admin dashboard's activity table."""
+
+    @staticmethod
+    def _pages_with_flags(flags_by_page: dict):
+        from model.pdf_review_item import PageExtractionRecord
+        pages = []
+        for i in range(1, 3):
+            pages.append(PageExtractionRecord(
+                page_num=i, typhoon_markdown=f"page {i}", claude_markdown="",
+                flags=flags_by_page.get(i, []),
+            ))
+        markdowns = [p.typhoon_markdown for p in pages]
+        return pages, markdowns
+
+    def test_high_severity_flags_counted_and_summarized(self):
+        pages, _ = self._pages_with_flags({
+            1: [{"category": "arithmetic", "severity": "high", "message": "รวมไม่ตรง: 100 != 90"}],
+            2: [
+                {"category": "dual_model_disagreement", "severity": "high", "message": "ตัวเลขไม่ตรงกัน"},
+                {"category": "arithmetic", "severity": "medium", "message": "เรื่องรอง ไม่นับ"},
+            ],
+        })
+        count, examples = sqs_consumer._high_severity_flag_summary(pages)
+        assert count == 2
+        assert "รวมไม่ตรง: 100 != 90" in examples
+        assert "ตัวเลขไม่ตรงกัน" in examples
+        assert all("เรื่องรอง" not in e for e in examples)
+
+    def test_no_flags_yields_zero(self):
+        pages, _ = self._pages_with_flags({})
+        count, examples = sqs_consumer._high_severity_flag_summary(pages)
+        assert count == 0
+        assert examples == []
+
+    def test_license_direct_builder_passes_flag_summary_to_append_event(self):
+        pages, markdowns = self._pages_with_flags({
+            1: [{"category": "arithmetic", "severity": "high", "message": "รวมไม่ตรง"}],
+        })
+
+        def fake_identify(page_markdowns, cost_accumulator=None):
+            return [{"department": "Dept A", "license_type": "License A", "page_ranges": [(1, 2)]}]
+
+        def fake_draft(topic_markdowns, cost_accumulator=None):
+            return {"แนวคำตอบ": "x"}
+
+        def fake_resolve(merged, source_file, cost_accumulator=None):
+            return SupersedeDecision("new")
+
+        with patch.object(sqs_consumer, "identify_license_topics", side_effect=fake_identify), \
+             patch.object(sqs_consumer, "draft_fields_from_pages", side_effect=fake_draft), \
+             patch.object(sqs_consumer.pdf_supersede_resolver, "resolve_regulatory_topic", side_effect=fake_resolve), \
+             patch.object(sqs_consumer, "_add_documents_to_vectorstore", return_value=1), \
+             patch.object(sqs_consumer, "append_event") as mock_append:
+            sqs_consumer._build_license_items_direct(
+                "test.pdf", "s3://bucket/test.pdf", pages, markdowns,
+                relevance_check=None, content_shape={"shape": "structured_license"},
+            )
+
+        mock_append.assert_called_once()
+        event = mock_append.call_args[0][1]
+        assert event["high_severity_flags"] == 1
+        assert "รวมไม่ตรง" in event["high_severity_flag_examples"]
+
+
+@pytest.mark.unit
 class TestDraftCacheWiring:
     """2026-10: content-hash cache wired into both _direct builders —
     proves a cache hit skips the LLM call entirely, a miss calls through
@@ -329,6 +401,81 @@ class TestDraftCacheWiring:
             )
 
         assert expected_draft_key in fake_cache.get_calls
+
+    def test_empty_license_topic_split_result_is_not_cached(self):
+        """PDF-M1 (2026-10): identify_license_topics never raises (degrades
+        to [] on a real failure, same shape as a genuine 0-topics verdict —
+        see its own docstring), so a transient LLM outage must not get
+        permanently cached as "no topics here" — this cache has no TTL."""
+        pages, markdowns = _make_pages(2)
+        fake_cache = _FakeDraftCache()
+
+        def fake_identify_empty(page_markdowns, cost_accumulator=None):
+            return []  # simulates a failed-even-after-shrink-retry outcome
+
+        with patch.object(sqs_consumer, "get_draft_cache", return_value=fake_cache), \
+             patch.object(sqs_consumer, "identify_license_topics", side_effect=fake_identify_empty):
+            sqs_consumer._build_license_items_direct(
+                "test.pdf", "s3://bucket/test.pdf", pages, markdowns,
+                relevance_check=None, content_shape={"shape": "structured_license"},
+            )
+
+        assert fake_cache.put_calls == [], (
+            "An empty topic-split result was cached — a transient LLM outage would "
+            "now permanently poison this exact content's future reprocessing"
+        )
+
+    def test_empty_knowhow_topic_split_result_is_not_cached(self):
+        pages, markdowns = _make_pages(2)
+        fake_cache = _FakeDraftCache()
+
+        def fake_identify_empty(page_markdowns, cost_accumulator=None):
+            return []
+
+        with patch.object(sqs_consumer, "get_draft_cache", return_value=fake_cache), \
+             patch.object(sqs_consumer, "identify_knowhow_topics", side_effect=fake_identify_empty):
+            sqs_consumer._build_knowhow_items_direct(
+                "test.pdf", "s3://bucket/test.pdf", pages, markdowns,
+                relevance_check=None, content_shape={"shape": "business_guide"},
+            )
+
+        assert fake_cache.put_calls == []
+
+    def test_all_blank_field_draft_result_is_not_cached(self):
+        """draft_fields_from_pages also never raises on a malformed LLM
+        response — swallows json.JSONDecodeError internally and returns all
+        13 fields blank instead (see its own try/except). Must not be
+        cached as "this document's fields are genuinely all blank"."""
+        pages, markdowns = _make_pages(2)
+        fake_cache = _FakeDraftCache()
+
+        def fake_identify(page_markdowns, cost_accumulator=None):
+            return [{"department": "Dept A", "license_type": "License A", "page_ranges": [(1, 2)]}]
+
+        def fake_draft_all_blank(topic_markdowns, cost_accumulator=None):
+            from service.pdf_field_drafting import DRAFTABLE_FIELDS
+            return {header_variants[0]: "" for header_variants in DRAFTABLE_FIELDS.values()}
+
+        def fake_resolve(merged, source_file, cost_accumulator=None):
+            return SupersedeDecision("new")
+
+        with patch.object(sqs_consumer, "get_draft_cache", return_value=fake_cache), \
+             patch.object(sqs_consumer, "identify_license_topics", side_effect=fake_identify), \
+             patch.object(sqs_consumer, "draft_fields_from_pages", side_effect=fake_draft_all_blank), \
+             patch.object(sqs_consumer.pdf_supersede_resolver, "resolve_regulatory_topic", side_effect=fake_resolve), \
+             patch.object(sqs_consumer, "_add_documents_to_vectorstore", return_value=1):
+            sqs_consumer._build_license_items_direct(
+                "test.pdf", "s3://bucket/test.pdf", pages, markdowns,
+                relevance_check=None, content_shape={"shape": "structured_license"},
+            )
+
+        put_keys = [k for k, _v in fake_cache.put_calls]
+        assert not any(k.startswith("license_draft:") for k in put_keys), (
+            "An all-blank field-draft result was cached — a transient LLM outage "
+            "would now permanently poison this exact topic's future reprocessing"
+        )
+        # The topic-split result itself was genuinely non-empty, so it SHOULD still cache.
+        assert any(k.startswith("license_topics:") for k in put_keys)
 
     def test_cache_key_changes_when_prompt_version_differs(self):
         """Pins the invalidation mechanism itself: same content, different

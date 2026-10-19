@@ -300,7 +300,9 @@ def _llm_scan_candidates(
     return results
 
 
-def _field_diff(new_values: dict[str, str], existing_values: dict[str, str]) -> list[dict[str, str]]:
+def _field_diff(
+    new_values: dict[str, str], existing_values: dict[str, str], diff_keys: Optional[list[str]] = None,
+) -> list[dict[str, str]]:
     """Live-tested 2026-08-24: the naive "both sides non-empty and different"
     check silently dropped the case where the existing row's field was blank
     and the new document actually has a value for it — real Sheet rows
@@ -308,9 +310,19 @@ def _field_diff(new_values: dict[str, str], existing_values: dict[str, str]) -> 
     just not drafted at the time), and a reviewer deciding ③ update very much
     wants to know "this document adds fee/duration/etc. info that was never
     recorded before", not just "this document changes an existing value" —
-    so blank-old is surfaced too, tagged distinctly from a genuine change."""
+    so blank-old is surfaced too, tagged distinctly from a genuine change.
+
+    `diff_keys` defaults to _PROCEDURAL_FIELD_KEYS (this module's own Sheet-
+    row shape). 2026-10 fix (PDF-M1): pdf_supersede_resolver.py reuses this
+    function for BOTH regulatory topics (which DO use that shape) and
+    know-how topics (main_topic/sub_topic/summary/category — zero overlap
+    with _PROCEDURAL_FIELD_KEYS), and previously always passed the default —
+    silently returning an empty diff for every know-how candidate regardless
+    of whether summary/category actually changed, starving the LLM judge of
+    the one structured signal this function exists to provide. Callers whose
+    data isn't shaped like a Sheet row must pass their own diff_keys."""
     diffs = []
-    for key in _PROCEDURAL_FIELD_KEYS:
+    for key in (diff_keys if diff_keys is not None else _PROCEDURAL_FIELD_KEYS):
         new_v = (new_values.get(key) or "").strip()
         old_v = (existing_values.get(key) or "").strip()
         if new_v and not old_v:

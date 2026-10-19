@@ -37,7 +37,7 @@ from openai import OpenAI
 
 import conf
 from service.local_vector_store import get_vs_manager
-from service.pdf_candidate_matching import _field_diff
+from service.pdf_candidate_matching import _field_diff, _PROCEDURAL_FIELD_KEYS
 from utils.llm_cost_logging import CostAccumulator, log_llm_cost
 from utils.pdf_cost_guard import get_cost_guard
 from utils.logger import get_logger
@@ -54,6 +54,18 @@ _REGULATORY_IDENTITY_KEYS = ("department", "license_type")
 _REGULATORY_COMPARISON_KEYS = ("department", "license_type", "operation_topic", "answer_guideline")
 _KNOWHOW_IDENTITY_KEYS = ("main_topic", "sub_topic")
 _KNOWHOW_COMPARISON_KEYS = ("main_topic", "sub_topic", "summary", "category")
+
+# Fields an actual content UPDATE would change, fed to _field_diff below —
+# deliberately separate from *_IDENTITY_KEYS/*_COMPARISON_KEYS above, which
+# are about FINDING the right candidate, not describing what changed about
+# it. 2026-10 fix (PDF-M1): _field_diff's own default (_PROCEDURAL_FIELD_KEYS,
+# imported from pdf_candidate_matching.py) only matches the regulatory shape
+# (registration_type/fees/operation_duration/...) — passed unconditionally
+# for know-how topics too, which share ZERO keys with that list, silently
+# producing an empty diff for every know-how candidate regardless of whether
+# summary/category actually changed.
+_REGULATORY_DIFF_KEYS = _PROCEDURAL_FIELD_KEYS
+_KNOWHOW_DIFF_KEYS = ["summary", "category"]
 
 # Know-how's deterministic catch-all topic (see sqs_consumer.py's
 # _build_knowhow_items_direct) — its main_topic/sub_topic are fixed generic
@@ -228,6 +240,7 @@ def _resolve(
     new_values: dict[str, str],
     identity_keys: tuple,
     comparison_keys: tuple,
+    diff_keys: list[str],
     data_type_filter: dict,
     source_file: str,
     cost_accumulator: Optional[CostAccumulator] = None,
@@ -278,8 +291,8 @@ def _resolve(
         candidates_for_llm = []
         for doc_id, info in batch:
             meta = info.get("metadata") or {}
-            existing_values = {k: meta.get(k) for k in comparison_keys}
-            diff = _field_diff(new_values, existing_values)
+            existing_values = {k: meta.get(k) for k in set(comparison_keys) | set(diff_keys)}
+            diff = _field_diff(new_values, existing_values, diff_keys=diff_keys)
             preview = _comparison_text(existing_values, comparison_keys)[:300]
             candidates_for_llm.append({
                 "candidate_id": doc_id,
@@ -308,6 +321,7 @@ def resolve_regulatory_topic(
         new_values=merged_topic,
         identity_keys=_REGULATORY_IDENTITY_KEYS,
         comparison_keys=_REGULATORY_COMPARISON_KEYS,
+        diff_keys=_REGULATORY_DIFF_KEYS,
         data_type_filter={"data_type": "regulatory"},
         source_file=source_file,
         cost_accumulator=cost_accumulator,
@@ -330,6 +344,7 @@ def resolve_knowhow_topic(
         new_values=topic_dict,
         identity_keys=_KNOWHOW_IDENTITY_KEYS,
         comparison_keys=_KNOWHOW_COMPARISON_KEYS,
+        diff_keys=_KNOWHOW_DIFF_KEYS,
         data_type_filter={"data_type": {"$in": ["business_guide", "marketing"]}},
         source_file=source_file,
         cost_accumulator=cost_accumulator,

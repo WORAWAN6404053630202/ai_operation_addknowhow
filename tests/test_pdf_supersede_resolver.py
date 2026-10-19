@@ -110,6 +110,69 @@ class TestResolveDecision:
 
 
 @pytest.mark.unit
+class TestFieldDiffUsesContentAppropriateKeys:
+    """PDF-M1 (2026-10): _field_diff defaults to _PROCEDURAL_FIELD_KEYS
+    (registration_type/fees/operation_duration/...), which only matches the
+    regulatory shape — previously passed unconditionally for know-how topics
+    too (main_topic/sub_topic/summary/category, zero overlap), silently
+    producing an empty diff for every know-how candidate. Also previously
+    built existing_values from comparison_keys only, so even the regulatory
+    path's diff never saw the actual old procedural field values."""
+
+    def test_knowhow_diff_reflects_summary_change_not_empty(self):
+        pool = {"doc-6": {"score": 0.9, "metadata": {
+            "main_topic": "การตลาดออนไลน์", "sub_topic": "โปรโมชั่น",
+            "summary": "สรุปเดิม", "category": "กลยุทธ์การตลาด",
+        }, "content": "c"}}
+        captured = {}
+
+        def fake_llm_judge(new_summary, candidates, model, cost_accumulator=None):
+            captured["candidates"] = candidates
+            return {"doc-6": {"is_same_topic": True, "content_status": "update", "reasoning": "r"}}
+
+        with patch.object(resolver, "_embedding_candidates", return_value=pool), \
+             patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
+             patch.object(resolver, "_llm_judge", side_effect=fake_llm_judge):
+            resolver.resolve_knowhow_topic(
+                {
+                    "main_topic": "การตลาดออนไลน์", "sub_topic": "โปรโมชั่น",
+                    "summary": "สรุปใหม่ที่เปลี่ยนไป", "category": "กลยุทธ์การตลาด",
+                    "full_text": "เนื้อหาเต็ม",
+                },
+                "f.pdf",
+            )
+        preview = captured["candidates"][0]["preview"]
+        assert "diff=" in preview, f"Expected a non-empty field diff in the LLM preview, got: {preview!r}"
+        assert "summary" in preview
+
+    def test_regulatory_diff_shows_changed_not_added_for_existing_field(self):
+        """Before the fix, existing_values never included the procedural
+        fields at all, so old_v was always "" — every real change showed up
+        as change_type="added" instead of "changed"."""
+        pool = {"doc-7": {"score": 0.9, "metadata": {
+            "department": "X", "license_type": "Y", "fees": "100 บาท",
+        }, "content": "c"}}
+        captured = {}
+
+        def fake_llm_judge(new_summary, candidates, model, cost_accumulator=None):
+            captured["candidates"] = candidates
+            return {"doc-7": {"is_same_topic": True, "content_status": "update", "reasoning": "r"}}
+
+        with patch.object(resolver, "_embedding_candidates", return_value=pool), \
+             patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
+             patch.object(resolver, "_llm_judge", side_effect=fake_llm_judge):
+            resolver.resolve_regulatory_topic(
+                {"department": "X", "license_type": "Y", "answer_guideline": "z", "fees": "200 บาท"},
+                "f.pdf",
+            )
+        preview = captured["candidates"][0]["preview"]
+        assert "'change_type': 'changed'" in preview, (
+            f"Expected fees' real old value (100 บาท) to be seen, giving change_type='changed', "
+            f"not 'added': {preview!r}"
+        )
+
+
+@pytest.mark.unit
 class TestKnowhowCatchAllExemption:
     def test_catchall_topic_is_always_new_without_touching_chroma(self):
         with patch.object(resolver, "_embedding_candidates") as mock_emb:

@@ -110,12 +110,20 @@ _PROMPT_TEMPLATE = """ต่อไปนี้คือข้อความท�
 """
 
 
-def draft_fields_from_pages(pages_markdown: list[str], cost_accumulator: Optional[CostAccumulator] = None) -> dict[str, str]:
-    """Runs one LLM call over all pages combined and returns a dict keyed by the
-    REAL Sheet header text (via DRAFTABLE_FIELDS, 13 fields), ready to hand to
-    sheet_write_back.py. Fields the LLM couldn't find are empty strings, not
-    omitted — callers should always see all 12 draftable keys present."""
-    combined_text = "\n\n---\n\n".join(pages_markdown)
+# Identity-like fields expected to be THE SAME value across every batch of a
+# single topic (a topic's department/license_type/etc. don't change mid-topic)
+# — used by _merge_drafted_batches below to pick first-non-empty rather than
+# concatenate, unlike the content fields (fees/operation_steps/...), which can
+# legitimately have real content spread across more than one batch.
+_IDENTITY_LIKE_HEADER_KEYS = {
+    DRAFTABLE_FIELDS[k][0] for k in ("department", "license_type", "operation_by_department", "operation_topic", "registration_type")
+}
+
+
+def _draft_fields_single_batch(combined_text: str, cost_accumulator: Optional[CostAccumulator] = None) -> dict[str, str]:
+    """One LLM call over already-combined text, returning a dict keyed by the
+    REAL Sheet header text (via DRAFTABLE_FIELDS, 13 fields). Fields the LLM
+    couldn't find are empty strings, not omitted."""
     client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
 
     prompt = _PROMPT_TEMPLATE.format(combined_text=combined_text)
@@ -142,6 +150,56 @@ def draft_fields_from_pages(pages_markdown: list[str], cost_accumulator: Optiona
     for internal_key, header_variants in DRAFTABLE_FIELDS.items():
         value = drafted.get(internal_key, "")
         result[header_variants[0]] = value if isinstance(value, str) else str(value)
+    return result
+
+
+def _merge_drafted_batches(batch_results: list[dict[str, str]]) -> dict[str, str]:
+    """Combines 2+ batches' header-keyed drafted-field dicts into one.
+    Identity-like fields (department/license_type/...) take the first
+    non-empty value — repeating them per batch would be redundant at best,
+    contradictory at worst. Content fields (fees/operation_steps/...)
+    concatenate every batch's non-empty value instead (deduped, order
+    preserved) — a single large topic split across batches can legitimately
+    have its real content (e.g. steps 1-5 in batch 1, 6-10 in batch 2) spread
+    across more than one batch; first-wins would silently drop the rest."""
+    merged: dict[str, str] = {}
+    for header in (headers[0] for headers in DRAFTABLE_FIELDS.values()):
+        values = [b.get(header, "").strip() for b in batch_results if b.get(header, "").strip()]
+        if not values:
+            merged[header] = ""
+        elif header in _IDENTITY_LIKE_HEADER_KEYS:
+            merged[header] = values[0]
+        else:
+            merged[header] = "\n".join(dict.fromkeys(values))
+    return merged
+
+
+def draft_fields_from_pages(pages_markdown: list[str], cost_accumulator: Optional[CostAccumulator] = None) -> dict[str, str]:
+    """Runs the field-drafting prompt over all pages and returns a dict keyed
+    by the REAL Sheet header text (via DRAFTABLE_FIELDS, 13 fields), ready to
+    hand to sheet_write_back.py. Fields the LLM couldn't find are empty
+    strings, not omitted — callers should always see all 13 draftable keys
+    present.
+
+    2026-10 fix (PDF-M1): previously always a single LLM call over the whole
+    combined text, unlike its sibling identify_license_topics — which already
+    needed _MAX_BATCH_CHARS/_split_into_batches after a live-reproduced
+    failure ("prompt is too long: 227142 tokens > 200000 maximum" on a real
+    242-page document, see that constant's comment). A single TOPIC's pages
+    are usually much smaller than a whole multi-topic document, but nothing
+    structurally prevents one huge single-topic document from hitting the
+    exact same ceiling — this was the one call left with no size guard at all."""
+    total_chars = sum(len(md) for md in pages_markdown)
+    if total_chars <= _MAX_BATCH_CHARS:
+        result = _draft_fields_single_batch("\n\n---\n\n".join(pages_markdown), cost_accumulator=cost_accumulator)
+    else:
+        batches = _split_into_batches(pages_markdown, _MAX_BATCH_CHARS)
+        logger.warning(f"[pdf_field_drafting] Topic text ({total_chars} chars across {len(pages_markdown)} pages) exceeds the single-call budget — drafting in {len(batches)} batch(es)")
+        batch_results = [
+            _draft_fields_single_batch("\n\n---\n\n".join(batch_pages), cost_accumulator=cost_accumulator)
+            for _offset, batch_pages in batches
+        ]
+        result = _merge_drafted_batches(batch_results)
 
     logger.info(f"[pdf_field_drafting] Drafted {sum(1 for v in result.values() if v)} / {len(result)} fields")
     return result
