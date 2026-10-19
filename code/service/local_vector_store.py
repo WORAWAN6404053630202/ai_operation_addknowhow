@@ -46,6 +46,30 @@ def _stringify_metadata(metadata: dict) -> dict:
     return clean
 
 
+def _materialize_embeddings(raw: dict) -> list:
+    """2026-10 fix: Chroma's `.get(include=["embeddings"])` always returns
+    `embeddings` as a numpy ndarray when requested — NOT a plain list, unlike
+    every other field in the same response (ids/documents/metadatas are
+    always plain lists; confirmed live against a real
+    chromadb.EphemeralClient(), both checked and present in the same
+    response dict as embeddings). A plain `raw.get("embeddings") or []`
+    truthy-checks the ndarray directly, which numpy refuses outright and
+    raises ValueError unconditionally — confirmed live for every size
+    including a single embedding and an explicitly empty one (there is no
+    size at which ndarray truthiness is well-defined enough for `or` to work
+    here). This was a 100%-reproducible crash on every real call, not an
+    edge case — archive_and_remove()/restore_from_archive() below never
+    completed successfully against real Chroma before this fix, regardless
+    of how many ids were passed in. The existing mocked tests never caught
+    it because they stood in a plain Python list for `embeddings`, which
+    doesn't exhibit numpy's ambiguous-truthiness behavior at all — see
+    tests/test_pdf_supersede_archive.py's real-Chroma test added alongside
+    this fix, which doesn't depend on a human remembering to mock the
+    correct return type."""
+    emb = raw.get("embeddings")
+    return [] if emb is None or len(emb) == 0 else list(emb)
+
+
 class LocalVectorStoreManager:
     """
     Local-only VectorStore manager using Chroma
@@ -353,7 +377,7 @@ class LocalVectorStoreManager:
             return 0
         documents = fetched.get("documents") or []
         metadatas = fetched.get("metadatas") or []
-        embeddings = fetched.get("embeddings") or []
+        embeddings = _materialize_embeddings(fetched)
 
         now = time.time()
         stamped_metadatas = []
@@ -445,7 +469,7 @@ class LocalVectorStoreManager:
             return 0
         documents = fetched.get("documents") or []
         metadatas = fetched.get("metadatas") or []
-        embeddings = fetched.get("embeddings") or []
+        embeddings = _materialize_embeddings(fetched)
 
         cleaned_metadatas = []
         for m in metadatas:

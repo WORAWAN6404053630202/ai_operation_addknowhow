@@ -3,7 +3,18 @@
 PDF content supersede resolver's soft-delete mechanics). Covers the ordering
 guarantee (archive-add must happen BEFORE live-delete, and a failed
 archive-add must abort without touching live) and the restore round-trip.
-No real Chroma/network — vectorstore/_collection are MagicMocks.
+
+Mocked tests here return `embeddings` as a real numpy.ndarray (2026-10
+fix), not a plain Python list — the original mocks used a plain list, which
+masked a 100%-reproducible crash: real Chroma always returns `embeddings`
+(when requested) as an ndarray, and `ndarray or []` raises ValueError
+unconditionally (every size, not just >1 element — numpy has no
+well-defined truthiness for it at all here). See
+_materialize_embeddings()'s docstring in local_vector_store.py. A second,
+real-Chroma test class at the bottom of this file (TestArchiveRoundTripRealChroma)
+doesn't depend on a mock's return type being realistic at all — add it to
+guard against this exact class of bug recurring even if these mocks ever
+drift out of sync with Chroma's real behavior again.
 """
 from __future__ import annotations
 
@@ -11,6 +22,7 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 
 _CODE_DIR = Path(__file__).parent.parent / "code"
@@ -28,7 +40,7 @@ def _manager_with_mocked_stores():
         "ids": ["doc-1"],
         "documents": ["เนื้อหาเดิม"],
         "metadatas": [{"license_type": "ทะเบียนนายจ้าง", "department": "สำนักงานประกันสังคม"}],
-        "embeddings": [[0.1, 0.2, 0.3]],
+        "embeddings": np.array([[0.1, 0.2, 0.3]]),
     }
     archive_store = MagicMock()
     mgr._archive_store = archive_store
@@ -79,7 +91,12 @@ class TestArchiveAndRemove:
         mgr.archive_and_remove(["doc-1"], reason="test")
         mgr.embedding_model.embed_documents.assert_not_called()
         _, kwargs = archive_store._collection.add.call_args
-        assert kwargs["embeddings"] == [[0.1, 0.2, 0.3]]
+        # kwargs["embeddings"] is a list of 1D ndarrays (see
+        # _materialize_embeddings) — a direct `==` against a nested plain
+        # list hits the exact numpy-truthiness ValueError this whole fix is
+        # about, so compare via np.allclose instead.
+        assert len(kwargs["embeddings"]) == 1
+        assert np.allclose(kwargs["embeddings"][0], [0.1, 0.2, 0.3])
 
     def test_no_ids_found_in_live_is_noop(self):
         mgr, archive_store = _manager_with_mocked_stores()
@@ -100,7 +117,7 @@ class TestRestoreFromArchive:
                 "superseded_at": 123.0,
                 "superseded_reason": "superseded by new_law.pdf",
             }],
-            "embeddings": [[0.1, 0.2, 0.3]],
+            "embeddings": np.array([[0.1, 0.2, 0.3]]),
         }
 
         restored = mgr.restore_from_archive(["doc-1"])
@@ -177,3 +194,78 @@ class TestListArchivedDocs:
         }
         result = mgr.list_archived_docs()  # must not raise
         assert [r["id"] for r in result] == ["valid", "malformed"]
+
+
+class _CollectionHolder:
+    """Minimal stand-in for langchain's Chroma wrapper — archive_and_remove/
+    restore_from_archive only ever touch `.vectorstore._collection` and
+    `.vectorstore.persist()` (the latter wrapped in try/except: pass by the
+    real code, so omitting persist() here is fine — AttributeError gets
+    swallowed the same way a real persist() failure would be)."""
+    def __init__(self, collection):
+        self._collection = collection
+
+
+@pytest.mark.unit
+class TestArchiveRoundTripRealChroma:
+    """2026-10: the mocked tests above use MagicMock/plain-dict returns,
+    which can only ever be as realistic as whoever wrote the mock remembered
+    to make them — exactly how the original embeddings-as-plain-list bug
+    went undetected despite full test coverage of the ordering logic. These
+    tests run archive_and_remove/restore_from_archive against a REAL
+    chromadb.EphemeralClient() (in-memory, no network, no disk, no OpenRouter
+    calls — embedding_model is never touched because both functions reuse
+    already-fetched embeddings) so the test can't be fooled by an
+    unrealistic mock shape ever again."""
+
+    def _manager_with_real_chroma(self):
+        chromadb = pytest.importorskip("chromadb")
+        import uuid
+        # EphemeralClient() shares collection namespace across instances
+        # within one process — a fixed collection name collides between
+        # tests ("already exists"). Unique suffix per call sidesteps it
+        # without needing explicit teardown.
+        suffix = uuid.uuid4().hex[:8]
+        client = chromadb.EphemeralClient()
+        live = client.create_collection(f"live-test-{suffix}")
+        archive = client.create_collection(f"archive-test-{suffix}")
+        live.add(
+            ids=["doc-1", "doc-2"],
+            embeddings=[[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
+            documents=["เนื้อหา 1", "เนื้อหา 2"],
+            metadatas=[{"license_type": "ทะเบียนนายจ้าง"}, {"license_type": "ภพ.20"}],
+        )
+        mgr = LocalVectorStoreManager()
+        mgr.embedding_model = MagicMock()
+        mgr.vectorstore = _CollectionHolder(live)
+        mgr._archive_store = _CollectionHolder(archive)
+        return mgr, live, archive
+
+    def test_archive_and_remove_does_not_raise_against_real_chroma(self):
+        mgr, live, archive = self._manager_with_real_chroma()
+        moved = mgr.archive_and_remove(["doc-1"], reason="test update")  # must not raise ValueError
+        assert moved == 1
+        assert live.count() == 1
+        assert archive.count() == 1
+        mgr.embedding_model.embed_documents.assert_not_called()  # reused fetched embeddings, no new API call
+
+    def test_archived_doc_keeps_its_real_embedding_not_a_placeholder(self):
+        mgr, live, archive = self._manager_with_real_chroma()
+        mgr.archive_and_remove(["doc-1"], reason="test update")
+        back = archive.get(ids=["doc-1"], include=["embeddings"])
+        archived_emb = list(back["embeddings"])[0]
+        assert np.allclose(archived_emb, [0.1, 0.2, 0.3])
+
+    def test_restore_round_trips_through_real_chroma_without_raising(self):
+        mgr, live, archive = self._manager_with_real_chroma()
+        mgr.archive_and_remove(["doc-1"], reason="test update")
+        assert live.count() == 1
+
+        restored = mgr.restore_from_archive(["doc-1"])  # must not raise ValueError
+
+        assert restored == 1
+        assert live.count() == 2
+        assert archive.count() == 0
+        back = live.get(ids=["doc-1"], include=["embeddings", "metadatas"])
+        assert np.allclose(list(back["embeddings"])[0], [0.1, 0.2, 0.3])
+        assert "superseded_at" not in back["metadatas"][0]
