@@ -135,6 +135,44 @@ class LocalVectorStoreManager:
         except Exception:
             return None
 
+    def _corpus_version_path(self) -> Path:
+        return Path(self._persist_dir()) / ".corpus_version"
+
+    def _bump_corpus_version(self) -> None:
+        """Call after every mutating operation (add/delete/archive/restore/
+        reset) below. Long-lived persona processes (persona_supervisor.py /
+        persona_academic.py / persona_practical.py) cache corpus-derived
+        lists (topic menus, department lists, ...) in memory for the life of
+        the process — without this, a PDF ingest or Sheet re-ingest never
+        becomes visible to an already-running bot process until restart.
+        A plain counter file next to the Chroma persist dir, not a field
+        inside Chroma itself, so it works identically whether the write came
+        from this process or a different one sharing the same
+        LOCAL_VECTOR_DIR (e.g. the SQS consumer and the web app running
+        alongside each other on the same instance, see
+        pdf_project_instance_split's "OWN separate vector DB (Sheet data +
+        PDFs merged)" setup)."""
+        path = self._corpus_version_path()
+        try:
+            current = int(path.read_text().strip()) if path.exists() else 0
+        except Exception:
+            current = 0
+        try:
+            path.write_text(str(current + 1))
+        except Exception:
+            pass  # best-effort — a missed bump just costs one extra stale-cache round-trip later, never a crash
+
+    def get_corpus_version(self) -> int:
+        """Cheap (single small-file read) freshness marker — callers that
+        cache corpus-derived data store the version they computed at, and
+        recompute when this no longer matches. Returns 0 (never equal to a
+        real bumped version, which starts at 1) if the file doesn't exist
+        yet or can't be read, so a fresh process always recomputes once."""
+        try:
+            return int(self._corpus_version_path().read_text().strip())
+        except Exception:
+            return 0
+
     def _build_retriever(self, k: Optional[int] = None):
         kk = int(k or getattr(conf, "RETRIEVAL_TOP_K", 20))
         self.retriever = self.vectorstore.as_retriever(search_kwargs={"k": kk})
@@ -167,6 +205,28 @@ class LocalVectorStoreManager:
             raise RuntimeError(
                 "Local Chroma collection is empty. You must ingest documents first.\n"
                 "Fix: run `python code/scripts/ingest_local.py` from the project root"
+            )
+        # 2026-10 addition: the PDF consumer deliberately calls this with
+        # fail_if_empty=False (add_documents() below) — correct for the
+        # pure-PDF project, which legitimately starts at 0 docs and grows
+        # one upload at a time, so refusing to write here would be wrong.
+        # But an empty collection is ALSO exactly what you'd silently get if
+        # LOCAL_VECTOR_DIR/COLLECTION_NAME point at the wrong place (a stray
+        # dev path, a typo'd collection name) — Chroma creates a fresh empty
+        # one on connect rather than erroring, so a misconfigured path and a
+        # legitimately-new project look identical from here. Can't
+        # distinguish the two automatically, so: make it loud instead of a
+        # plain INFO-level print buried among the others above, so a
+        # misconfigured deploy is something a human notices in the first
+        # log line, not something that silently writes into the void for
+        # weeks before anyone checks.
+        elif not fail_if_empty and (count is None or count == 0):
+            print(
+                f"[VectorStore] ⚠️  WARNING: connected to an EMPTY collection "
+                f"(persist_directory={Path(persist_dir).resolve()}, collection={collection_name}) "
+                f"— correct if this is genuinely the first write ever to this corpus; "
+                f"WRONG if this path/collection name was supposed to already have data. "
+                f"Double-check LOCAL_VECTOR_DIR and COLLECTION_NAME before trusting any writes that follow."
             )
 
         return self._build_retriever()
@@ -248,6 +308,7 @@ class LocalVectorStoreManager:
 
         count = self._collection_count()
         print(f"[VectorStore] Created successfully | count={count}")
+        self._bump_corpus_version()
 
         return self._build_retriever()
 
@@ -283,6 +344,7 @@ class LocalVectorStoreManager:
 
         count = self._collection_count()
         print(f"[VectorStore] Added {len(docs)} doc(s) incrementally | collection count now={count}")
+        self._bump_corpus_version()
         return len(docs)
 
     def list_pdf_ingested_files(self) -> Dict[str, int]:
@@ -333,6 +395,7 @@ class LocalVectorStoreManager:
         except Exception:
             pass
         print(f"[VectorStore] Deleted {len(ids)} doc(s) for source_file={source_file!r} | collection count now={self._collection_count()}")
+        self._bump_corpus_version()
         return len(ids)
 
     def _archive_vectorstore(self) -> Chroma:
@@ -408,6 +471,7 @@ class LocalVectorStoreManager:
             f"[VectorStore] archive_and_remove: moved {len(ids)} doc(s) to archive "
             f"(reason={reason!r}) | live collection count now={self._collection_count()}"
         )
+        self._bump_corpus_version()
         return len(ids)
 
     def list_archived_docs(self, pattern: Optional[str] = None, since_epoch: Optional[float] = None) -> List[Dict]:
@@ -494,6 +558,7 @@ class LocalVectorStoreManager:
         except Exception:
             pass
         print(f"[VectorStore] restore_from_archive: restored {len(ids)} doc(s) to live | live collection count now={self._collection_count()}")
+        self._bump_corpus_version()
         return len(ids)
 
     # Retrieval helpers (infra-only)
@@ -650,3 +715,12 @@ def restore_from_archive(doc_ids: List[str]) -> int:
 def query_live_with_ids(text: str, k: int, filter: Optional[dict] = None) -> List[Dict]:
     """Public API — see LocalVectorStoreManager.query_live_with_ids."""
     return _MANAGER.query_live_with_ids(text, k, filter=filter)
+
+
+def get_corpus_version() -> int:
+    """Public API — see LocalVectorStoreManager.get_corpus_version. Callers
+    that cache corpus-derived data (topic lists, department lists, ...) for
+    a process's whole lifetime should store this value alongside their
+    cache and recompute whenever it changes — see persona_supervisor.py /
+    persona_academic.py / persona_practical.py."""
+    return _MANAGER.get_corpus_version()

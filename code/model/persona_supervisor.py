@@ -2565,6 +2565,13 @@ class PersonaSupervisor:
         # populated lazily on first call per unique key — avoids repeated LLM round-trips
         self._llm_op_group_classifier = self._default_op_group_classifier_llm_call()
         self._op_groups_cache: Dict[tuple, Tuple[List[str], Dict]] = {}
+        # Corpus version this cache was last validated against — core-C4 (2026-10).
+        # The level-1 (license_type, entity_type_normalized) key short-circuits
+        # BEFORE combined_ops is ever re-queried from Chroma, so unlike the level-2
+        # (license_type, frozenset(ops)) key — which is already self-invalidating
+        # since it's keyed on freshly-queried content — a corpus change (e.g. a PDF
+        # adding a new operation_by_department value) would otherwise never be seen.
+        self._op_groups_cache_version: int = -1
 
         # Reusable LLM for "select all" intent detection — cached to avoid per-call construction.
         self._llm_select_all = ChatOpenAI(
@@ -9633,17 +9640,31 @@ class PersonaSupervisor:
     _cached_operation_topics: Optional[List[str]] = None
     _cached_unique_operation_by_depts: Optional[List[str]] = None
     _cached_departments: Optional[List[str]] = None
+    # 2026-10 fix (core-C4): each _cached_* above was "cached after first call" FOREVER
+    # for the life of this singleton process — PDF direct-ingest/Sheet re-ingest adding
+    # or changing these metadata values was invisible until a restart. Each entry below
+    # records the corpus version its matching _cached_* was last built at (see
+    # service/local_vector_store.py's get_corpus_version/_bump_corpus_version); a
+    # mismatch means rebuild instead of trusting the stale list.
+    _cached_departments_version: Optional[int] = None
+    _cached_operation_topics_version: Optional[int] = None
+    _cached_unique_operation_by_depts_version: Optional[int] = None
+    _cached_sub_topics_version: Optional[int] = None
+    _cached_main_topics_version: Optional[int] = None
 
     def _get_all_departments_from_store(self) -> List[str]:
         """
         Returns a deduplicated list of all `department` metadata values in the Chroma
-        collection (e.g. "ธนาคารกสิกรไทย", "ธนาคารไทยพาณิชย์"). Cached after first call.
+        collection (e.g. "ธนาคารกสิกรไทย", "ธนาคารไทยพาณิชย์"). Cached per corpus
+        version (see get_corpus_version, core-C4 2026-10 — previously cached forever).
         Used to detect a bank/department name mentioned in free text on the FIRST turn
         of a topic (before any docs have been retrieved this turn), so it can be saved
         to collected_slots immediately instead of only being captured later when the
         user explicitly switches away from an already-cached department.
         """
-        if self._cached_departments is not None:
+        from service.local_vector_store import get_corpus_version
+        _cv = get_corpus_version()
+        if self._cached_departments is not None and self._cached_departments_version == _cv:
             return self._cached_departments
         try:
             _vstore = getattr(self.retriever, "vectorstore", None)
@@ -9658,6 +9679,7 @@ class PersonaSupervisor:
                 if _d and _d.lower() not in ("nan", "none", "") and len(_d) >= 4:
                     _seen[_d] = True
             self._cached_departments = list(_seen.keys())
+            self._cached_departments_version = _cv
             _LOG.info("[Supervisor] cached %d distinct departments from store", len(self._cached_departments))
         except Exception as _ex:
             _LOG.warning("[Supervisor] _get_all_departments_from_store failed: %s", _ex)
@@ -9672,7 +9694,9 @@ class PersonaSupervisor:
         (e.g. "การจดทะเบียนพาณิชย์ที่ได้รับการยกเว้น" matches operation_topic of the exemption row).
         These rows have sub_topic=None so _get_all_sub_topics_from_store() misses them.
         """
-        if self._cached_operation_topics is not None:
+        from service.local_vector_store import get_corpus_version
+        _cv = get_corpus_version()
+        if self._cached_operation_topics is not None and self._cached_operation_topics_version == _cv:
             return self._cached_operation_topics
         try:
             _vstore = getattr(self.retriever, "vectorstore", None)
@@ -9687,6 +9711,7 @@ class PersonaSupervisor:
                 if _ot and _ot.lower() not in ("nan", "none", "") and len(_ot) >= 4:
                     _seen[_ot] = True
             self._cached_operation_topics = list(_seen.keys())
+            self._cached_operation_topics_version = _cv
             _LOG.info("[Supervisor] cached %d distinct operation_topics from store", len(self._cached_operation_topics))
         except Exception as _ex:
             _LOG.warning("[Supervisor] _get_all_operation_topics_from_store failed: %s", _ex)
@@ -9699,9 +9724,11 @@ class PersonaSupervisor:
         Excludes values shared across multiple licenses (e.g. "แก้ไข เปลี่ยนแปลง" which
         appears in ใบทะเบียนพาณิชย์, POS ID, and ทะเบียนผู้ประกันตน) to prevent
         cross-license collision when doing exact-match chapter retrieval.
-        Cached after first call.
+        Cached per corpus version (core-C4 2026-10).
         """
-        if self._cached_unique_operation_by_depts is not None:
+        from service.local_vector_store import get_corpus_version
+        _cv = get_corpus_version()
+        if self._cached_unique_operation_by_depts is not None and self._cached_unique_operation_by_depts_version == _cv:
             return self._cached_unique_operation_by_depts
         try:
             _vstore = getattr(self.retriever, "vectorstore", None)
@@ -9722,6 +9749,7 @@ class PersonaSupervisor:
             self._cached_unique_operation_by_depts = [
                 obd for obd, lics in _obd_to_lics.items() if len(lics) == 1
             ]
+            self._cached_unique_operation_by_depts_version = _cv
             _LOG.info(
                 "[Supervisor] cached %d unique operation_by_dept values (of %d total)",
                 len(self._cached_unique_operation_by_depts), len(_obd_to_lics),
@@ -9737,8 +9765,11 @@ class PersonaSupervisor:
         Cached after first call. Only includes values with len >= 4.
         Used for chapter retrieval when a query exactly names a sub_topic
         (e.g. "การตลาดแบบ B2B" matches sub_topic="การตลาดแบบ B2B").
+        Cached per corpus version (core-C4 2026-10).
         """
-        if self._cached_sub_topics is not None:
+        from service.local_vector_store import get_corpus_version
+        _cv = get_corpus_version()
+        if self._cached_sub_topics is not None and self._cached_sub_topics_version == _cv:
             return self._cached_sub_topics
         try:
             _vstore = getattr(self.retriever, "vectorstore", None)
@@ -9753,6 +9784,7 @@ class PersonaSupervisor:
                 if _st and _st.lower() not in ("nan", "none", "") and len(_st) >= 4:
                     _seen[_st] = True
             self._cached_sub_topics = list(_seen.keys())
+            self._cached_sub_topics_version = _cv
             _LOG.info("[Supervisor] cached %d distinct sub_topics from store", len(self._cached_sub_topics))
         except Exception as _ex:
             _LOG.warning("[Supervisor] _get_all_sub_topics_from_store failed: %s", _ex)
@@ -9762,10 +9794,14 @@ class PersonaSupervisor:
     def _get_all_main_topics_from_store(self) -> List[str]:
         """
         Returns a deduplicated list of all main_topic values in the Chroma collection.
-        Result is cached on the instance after the first call (topics don't change at runtime).
+        Cached per corpus version (core-C4 2026-10 — this docstring used to say "topics
+        don't change at runtime", which stopped being true once PDF direct-ingest could
+        add new main_topic values to an already-running process without a restart).
         Only includes topics with len >= 5 to avoid empty/junk values.
         """
-        if self._cached_main_topics is not None:
+        from service.local_vector_store import get_corpus_version
+        _cv = get_corpus_version()
+        if self._cached_main_topics is not None and self._cached_main_topics_version == _cv:
             return self._cached_main_topics
         try:
             _vstore = getattr(self.retriever, "vectorstore", None)
@@ -9780,6 +9816,7 @@ class PersonaSupervisor:
                 if _mt and _mt.lower() not in ("nan", "none", "") and len(_mt) >= 5:
                     _seen[_mt] = True
             self._cached_main_topics = list(_seen.keys())
+            self._cached_main_topics_version = _cv
             _LOG.info("[Supervisor] cached %d distinct main_topics from store", len(self._cached_main_topics))
         except Exception as _ex:
             _LOG.warning("[Supervisor] _get_all_main_topics_from_store failed: %s", _ex)
@@ -9840,6 +9877,12 @@ class PersonaSupervisor:
             coll = getattr(vectorstore, "_collection", None)
             if coll is None:
                 return [], {}
+
+            from service.local_vector_store import get_corpus_version
+            _corpus_v_og = get_corpus_version()
+            if self._op_groups_cache_version != _corpus_v_og:
+                self._op_groups_cache.clear()
+                self._op_groups_cache_version = _corpus_v_og
 
             # ── Cache check (level 1): by (license, entity) — skips all Chroma + LLM work ──
             _cache_key = (license_type, entity_type_normalized)
