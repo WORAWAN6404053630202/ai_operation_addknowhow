@@ -19,9 +19,21 @@ EVIDENCE CONSTRAINT) is a content-hallucination guard, not an instruction-
 injection guard; a user telling the bot to ignore its rules is a different
 attack from the bot inventing a phone number. Only the direct-injection case
 is covered here (user message tries to override instructions or extract the
-system prompt) — indirect injection via retrieved documents is a much smaller
-concern for this project specifically, since the corpus is curated/ingested
-by the team, not user-uploaded.
+system prompt).
+
+Indirect injection via retrieved documents (2026-10 update — this was
+previously dismissed here as "a much smaller concern... the corpus is
+curated/ingested by the team, not user-uploaded", which stopped being true
+once feature/pdf-ingestion started feeding externally-sourced PDFs into the
+same corpus DOCUMENTS draws from) is a real, already-demonstrated attack
+class in this codebase — see utils/prompt_safety.py's docstring for a PDF
+that successfully manipulated an LLM call via embedded "[คำสั่งระบบ]"
+text before INJECTION_GUARD existed. persona_practical.py and
+persona_academic.py's answer prompts now include INJECTION_GUARD around
+DOCUMENTS (2026-10) to close that gap, matching the pattern already used by
+every PDF-pipeline LLM call. Not covered by a live test here yet — doing so
+needs a retriever double that can inject attacker-controlled text into
+DOCUMENTS, which is more involved than this file's direct-message fixtures.
 
 Coverage — 12 patterns across the categories OWASP's LLM01 guidance calls out
 as distinct attack shapes, not just repeats of the same phrasing translated:

@@ -13,6 +13,8 @@ from model.conversation_state import ConversationState
 from model.clarification_flags import ENTITY_INJECTION_SKIP_FLAGS, has_any_flag
 from utils.llm_call import llm_invoke, extract_llm_text, build_speed_extra_body, build_cached_system_message, build_thinking_extra_body, get_shared_http_client
 from utils.prompts_practical import SYSTEM_PROMPT as SYSTEM_PROMPT_PRACTICAL, build_lqs_license_detect_prompt, build_satisfaction_detect_prompt, build_dont_know_detect_prompt, build_short_followup_detect_prompt
+from utils.prompt_safety import INJECTION_GUARD
+from utils.phone_extraction import extract_thai_phone_numbers as _shared_extract_thai_phone_numbers
 from utils.prompts_supervisor import build_legal_q_detect_prompt, build_greeting_detect_prompt
 from utils.query_synonyms import SYNONYM_PATTERNS
 from utils.query_rewriter import enrich_query_for_retrieval, _needs_rewrite as _qr_needs_rewrite
@@ -517,31 +519,15 @@ class PracticalPersonaService:
     # (verified against the full real corpus, zero false positives). Only the much
     # shorter 4-digit hotline codes (e.g. "1506") stay keyword-gated, since a bare
     # 4-digit number IS genuinely ambiguous with a baht amount ("ค่าธรรมเนียม 1500 บาท").
-    _PHONE_CANDIDATE_RE = re.compile(r'\+?\d[\d\-\.\s]{6,15}\d')
-    _HOTLINE_WITH_CTX_RE = re.compile(
-        r'(?:📞|โทร(?:ศัพท์|สาร)?|สายด่วน|Tel\.?|Fax\.?|แฟกซ์|Call Center|Customer Service|Hotline|ติดต่อ)'
-        r'.{0,15}?(?<!\d)(1\d{3})(?!\d)',
-        re.IGNORECASE,
-    )
-
     @classmethod
     def _extract_thai_phone_numbers(cls, text: str) -> set:
-        """Shared by both the doc-side whitelist builder and the answer-side strip
-        check below, so the two can never again drift apart the way the original
-        keyword-only version did. Returns numbers normalized to local form (leading
-        "0", no separators) so "+66 2 123 4567" and "02-123-4567" compare equal."""
-        text = (text or "").replace("(", " ").replace(")", " ")
-        found: set = set()
-        for _m in cls._PHONE_CANDIDATE_RE.finditer(text):
-            _has_plus = _m.group(0).strip().startswith("+")
-            _digits = re.sub(r"\D", "", _m.group(0))
-            if _has_plus and _digits.startswith("66") and len(_digits) in (10, 11):
-                found.add("0" + _digits[2:])
-            elif _digits.startswith("0") and len(_digits) in (9, 10):
-                found.add(_digits)
-        for _m in cls._HOTLINE_WITH_CTX_RE.finditer(text):
-            found.add(_m.group(1))
-        return found
+        """2026-10: moved to utils/phone_extraction.py (core-M5/M6) so
+        persona_academic.py's own phone-hallucination defense (newly added,
+        ported from this file) uses the IDENTICAL extraction logic instead
+        of a second hand-copy — kept as a thin classmethod wrapper here so
+        every existing call site in this file is unchanged. See that
+        module's docstring for the full shape-based-matching rationale."""
+        return _shared_extract_thai_phone_numbers(text)
 
     @classmethod
     def _extract_inline_service_urls(cls, line: str) -> List[Tuple[str, str]]:
@@ -1786,6 +1772,7 @@ class PracticalPersonaService:
     def __init__(self, retriever):
         self.retriever = retriever
         self._topic_menu_cache: Optional[List[str]] = None
+        self._topic_menu_cache_version: int = -1
 
         self.llm_greet_call = self._default_greet_llm_call()
         self._lqs_license_llm_call = self._default_lqs_license_llm_call()
@@ -2357,12 +2344,20 @@ class PracticalPersonaService:
         return menu
 
     def _get_topic_menu(self, state: ConversationState) -> List[str]:
-        if self._topic_menu_cache:
+        # 2026-10 fix (core-C4): this process-lifetime cache used to never
+        # invalidate — a PDF ingest or Sheet re-ingest that changed the set
+        # of topics was invisible to an already-running bot process until
+        # restart. Compare against get_corpus_version() (bumped by every
+        # mutating local_vector_store.py call) to detect staleness cheaply.
+        from service.local_vector_store import get_corpus_version
+        _cv = get_corpus_version()
+        if self._topic_menu_cache and self._topic_menu_cache_version == _cv:
             return self._topic_menu_cache
 
         cached = (state.context or {}).get("topic_menu")
         if isinstance(cached, list) and all(isinstance(x, str) for x in cached) and cached:
             self._topic_menu_cache = cached
+            self._topic_menu_cache_version = _cv
             return cached
 
         menu = self._build_topic_menu_from_corpus(state=state)
@@ -2372,6 +2367,7 @@ class PracticalPersonaService:
         state.context = state.context or {}
         state.context["topic_menu"] = menu
         self._topic_menu_cache = menu
+        self._topic_menu_cache_version = _cv
         return menu
 
     def _build_multi_topic_summary_menu(self, state: ConversationState, topics: List[str]) -> str:
@@ -2652,14 +2648,21 @@ class PracticalPersonaService:
 
     def _get_nonreg_main_topics(self, vectorstore) -> List[str]:
         """Distinct main_topic values for non-regulatory (marketing/business_guide)
-        rows, fetched live from Chroma and cached per-process (invalidated by
-        redeploy/re-ingest, which restarts the process). Sorted longest-first so a
-        substring check never matches a short topic name that's itself a substring
-        of a longer, more specific one. Zero hardcoded topic names — any topic
-        added to the data shows up here automatically.
+        rows, fetched live from Chroma and cached per-process. Sorted longest-first
+        so a substring check never matches a short topic name that's itself a
+        substring of a longer, more specific one. Zero hardcoded topic names — any
+        topic added to the data shows up here automatically.
+
+        2026-10 fix (core-C4): this docstring used to say "invalidated by
+        redeploy/re-ingest, which restarts the process" — true for the Sheet
+        rebuild path, but false since the PDF direct-ingest path added docs
+        without any restart at all (that's the whole point of direct-ingest).
+        Now checked against get_corpus_version() instead of assumed stale-free.
         """
+        from service.local_vector_store import get_corpus_version
+        _cv = get_corpus_version()
         _cached = getattr(self, "_nonreg_main_topics_cache", None)
-        if _cached is not None:
+        if _cached is not None and getattr(self, "_nonreg_main_topics_cache_version", -1) == _cv:
             return _cached
         _topics: set = set()
         if vectorstore is not None:
@@ -2675,6 +2678,7 @@ class PracticalPersonaService:
                     _LOG.debug("[Practical] nonreg main_topic fetch failed: %s", _mt_lookup_e)
         _sorted = sorted(_topics, key=len, reverse=True)
         self._nonreg_main_topics_cache = _sorted
+        self._nonreg_main_topics_cache_version = _cv
         return _sorted
 
     def _retrieve_docs(
@@ -6469,6 +6473,8 @@ RECENT MESSAGES:
 
 CONTEXT_MEMORY:
 {json.dumps(slim_context, ensure_ascii=False)}
+
+{INJECTION_GUARD}
 
 DOCUMENTS ({len(docs_json)} found):
 {json.dumps(docs_json, ensure_ascii=False)}

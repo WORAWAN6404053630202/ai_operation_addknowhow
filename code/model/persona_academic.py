@@ -12,6 +12,8 @@ from model.conversation_state import ConversationState
 from model.persona_practical import _classify_link, _parse_link_entries
 from utils.llm_call import llm_invoke, extract_llm_text, build_speed_extra_body, get_shared_http_client
 from utils.prompts_academic import SYSTEM_PROMPT as SYSTEM_PROMPT_ACADEMIC
+from utils.prompt_safety import INJECTION_GUARD
+from utils.phone_extraction import extract_thai_phone_numbers
 from utils.prompts_supervisor import build_greeting_detect_prompt, build_topic_group_detect_prompt, build_meta_request_detect_prompt
 from utils.query_synonyms import SYNONYM_PATTERNS
 from utils.query_rewriter import enrich_query_for_retrieval, _needs_rewrite as _qr_needs_rewrite
@@ -243,6 +245,7 @@ class AcademicPersonaService:
         self.retriever = retriever
         self._cached_main_topics: Optional[List[str]] = None  # populated lazily, same pattern as supervisor
         self._cached_sub_topics: Optional[List[str]] = None   # populated together with _cached_main_topics
+        self._cached_topics_version: int = -1  # corpus version these two were built at — core-C4 (2026-10)
         self._init_llm()
 
     def _init_llm(self):
@@ -682,9 +685,13 @@ class AcademicPersonaService:
                 _vstore_ac = getattr(self.retriever, "vectorstore", None)
                 _coll_ac = getattr(_vstore_ac, "_collection", None) if _vstore_ac else None
                 if _coll_ac is not None:
-                    # Use cached topic lists — built once per instance from a single Chroma get().
-                    # Both main_topics and sub_topics are populated together to avoid two full-scan calls.
-                    if self._cached_main_topics is None:
+                    # Use cached topic lists — built once per instance from a single Chroma get(),
+                    # rebuilt whenever the corpus changes (get_corpus_version(), core-C4 2026-10:
+                    # this used to only ever build once per process, going stale the moment a PDF
+                    # ingest or Sheet re-ingest added/changed topics without a process restart).
+                    from service.local_vector_store import get_corpus_version
+                    _corpus_v_ac = get_corpus_version()
+                    if self._cached_main_topics is None or self._cached_topics_version != _corpus_v_ac:
                         _all_mt_res = _coll_ac.get(include=["metadatas"])
                         _all_metas_cache = _all_mt_res.get("metadatas") or []
                         self._cached_main_topics = list({
@@ -703,9 +710,10 @@ class AcademicPersonaService:
                             and len((m.get("sub_topic") or "").strip()) >= 8
                             and str(m.get("data_type") or "").strip() in ("marketing", "business_guide")
                         })
+                        self._cached_topics_version = _corpus_v_ac
                         _LOG.info(
-                            "[Academic] cached %d main_topics, %d sub_topics from store",
-                            len(self._cached_main_topics), len(self._cached_sub_topics),
+                            "[Academic] cached %d main_topics, %d sub_topics from store (corpus_version=%d)",
+                            len(self._cached_main_topics), len(self._cached_sub_topics), _corpus_v_ac,
                         )
                     _q_lower_ac_ch = query.lower()
                     _matched_mts_ac = [mt for mt in self._cached_main_topics if mt.lower() in _q_lower_ac_ch]
@@ -4767,6 +4775,28 @@ class AcademicPersonaService:
                     f"- Do NOT turn this into a question — it's a statement the user can correct, not something you're asking.\n"
                 )
 
+        # Phone-number hallucination defense, Layer 2 (2026-10, core-M5/M6) —
+        # ported from persona_practical.py, same shared extraction (see
+        # utils/phone_extraction.py) so the two personas' whitelists can
+        # never drift apart. Layer 1 = the Evidence Constraint at the top of
+        # SYSTEM_PROMPT_ACADEMIC. Layer 3 = the post-processing strip in
+        # _finalize_answer below, which re-derives this same whitelist from
+        # this prompt text (same trick _allowed_urls there already uses).
+        _ac_doc_phones: set = set()
+        for _ac_dp in docs_json:
+            _ac_doc_phones |= extract_thai_phone_numbers(json.dumps(_ac_dp, ensure_ascii=False))
+        if _ac_doc_phones:
+            _ac_phone_guard_instruction = (
+                f"\n\n⛔ PHONE NUMBER GUARD: Only these phone numbers appear verbatim in DOCUMENTS: "
+                f"{', '.join(sorted(_ac_doc_phones))}. Do NOT write any other phone number or hotline number."
+            )
+        else:
+            _ac_phone_guard_instruction = (
+                "\n\n⛔ PHONE NUMBER GUARD: No phone numbers appear in the retrieved DOCUMENTS. "
+                "Do NOT write any phone number, hotline number (e.g. 1570), or contact number. "
+                "Write 'ติดต่อ [ชื่อหน่วยงาน] โดยตรง' without a number."
+            )
+
         return f"""USER_QUESTION:
 {user_question}
 
@@ -4780,6 +4810,9 @@ FORMATTING RULES:
 - operation_steps in source data may have "Step 1 ...", "Step 2 ..." prefixes from the database.
   When writing the ขั้นตอน section, STRIP the "Step X" prefix completely and present as plain numbered list: "1. ...", "2. ..." etc.
   NEVER output "1) Step 1 ..." or "• Step 1 ..." — the word "Step" must not appear in the output.
+{_ac_phone_guard_instruction}
+
+{INJECTION_GUARD}
 
 DOCUMENTS ({len(state.current_docs or [])} found):
 {json.dumps(docs_json, ensure_ascii=False)}
@@ -4860,6 +4893,13 @@ Return JSON:
             u.rstrip(".,;)")
             for u in re.findall(r"https?://[^\s\n，。、\"']+", prompt)
         }
+
+        # Phone-number hallucination defense, Layer 3 (2026-10, core-M5/M6) —
+        # same whitelist-from-prompt trick as _allowed_urls above, re-deriving
+        # the DOCUMENTS-verified whitelist from the already-built prompt text
+        # instead of re-scanning state.current_docs separately, so this can
+        # never disagree with what Layer 2 actually told the LLM.
+        _allowed_phones: set = extract_thai_phone_numbers(prompt)
 
         try:
             emit_progress("กำลังเรียบเรียงคำตอบ...")
@@ -4942,6 +4982,31 @@ Return JSON:
                 _ac_out.append(_ac_line)
             _ac_i += 1
         ans = '\n'.join(_ac_out)
+
+        # Phone-number hallucination defense, Layer 3 continued (2026-10,
+        # core-M5/M6) — strip any line containing a phone/hotline number not
+        # in _allowed_phones. Ported verbatim from persona_practical.py's
+        # identical post-processing step (same shared extraction, see
+        # utils/phone_extraction.py), replacing the previous "ABSOLUTE
+        # PROHIBITION — never output ANY contact info" prompt rule, which
+        # directly contradicted the Evidence Constraint (which says a fact
+        # verbatim in DOCUMENTS IS allowed) and diverged from Practical mode,
+        # which actively mandates showing real contact info when present.
+        _ac_phone_out: list = []
+        _ac_phone_stripped = False
+        for _ac_pl in ans.split('\n'):
+            _ac_line_phones = extract_thai_phone_numbers(_ac_pl)
+            _ac_bad_phones = _ac_line_phones - _allowed_phones
+            if _ac_bad_phones:
+                _LOG.warning(
+                    "[Academic] hallucinated phone number stripped: %s from: %r",
+                    _ac_bad_phones, _ac_pl[:80],
+                )
+                _ac_phone_stripped = True
+                continue
+            _ac_phone_out.append(_ac_pl)
+        if _ac_phone_stripped:
+            ans = '\n'.join(_ac_phone_out)
 
         cu = ex.get("context_update", {})
         if isinstance(cu, dict) and cu:
