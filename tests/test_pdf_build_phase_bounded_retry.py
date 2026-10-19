@@ -8,8 +8,11 @@ the normal path: re-raise (so SQS retries) below the attempt cap, but past
 it, save a manual-review placeholder and return normally instead of raising
 again, so the message isn't redelivered forever.
 
-No real AWS/LLM calls — the S3 client inside process_extraction_result and
-pdf_status_tracker's attempt-tracking are both mocked.
+No real AWS/LLM calls — the S3 client inside process_extraction_result,
+pdf_status_tracker's status writes, and get_attempt_counter() (2026-10:
+the atomic DynamoDB counter that replaced pdf_status_tracker.
+next_attempt_number as the source of the attempt number feeding this
+give-up decision — see utils/pdf_attempt_counter.py) are all mocked.
 """
 from __future__ import annotations
 
@@ -42,10 +45,12 @@ class TestNormalPathBoundedGiveUp:
         payload = {"filename": "test.pdf", "s3_raw_pdf_path": "s3://bucket/test.pdf", "pages": []}
         mock_s3_client = MagicMock()
         mock_s3_client.get_object.return_value = _s3_object_body(payload)
+        mock_counter = MagicMock()
+        mock_counter.increment_and_get.return_value = attempt
 
         with patch.object(sqs_consumer, "boto3") as mock_boto3, \
              patch.object(sqs_consumer, "_assert_dev_environment"), \
-             patch.object(sqs_consumer.pdf_status_tracker, "next_attempt_number", return_value=attempt), \
+             patch.object(sqs_consumer, "get_attempt_counter", return_value=mock_counter), \
              patch.object(sqs_consumer.pdf_status_tracker, "write_status"), \
              patch.object(sqs_consumer.pdf_status_tracker, "clear"), \
              patch.object(sqs_consumer, "_build_and_save_review_item", side_effect=build_error), \

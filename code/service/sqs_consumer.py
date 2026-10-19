@@ -47,6 +47,7 @@ from service import pdf_status_tracker
 from utils.llm_cost_logging import CostAccumulator
 from utils.logger import get_logger
 from utils.page_ranges import format_page_ranges, group_into_ranges
+from utils.pdf_attempt_counter import get_attempt_counter
 from utils.pdf_draft_cache import content_hash, get_draft_cache
 from utils.pdf_ingestion_log import append_event
 
@@ -73,6 +74,27 @@ def _assert_dev_environment() -> None:
             "sqs_consumer refused to run: conf.py loaded the REAL env.properties "
             "(RESTBIZ_ENV_FILE was not set). Set RESTBIZ_ENV_FILE=env.dev.properties first."
         )
+
+
+def _high_severity_flag_summary(pages: list[PageExtractionRecord]) -> tuple[int, list[str]]:
+    """2026-10 fix (PDF-M3): validate_extraction()'s flags (see
+    _build_and_save_review_item, which populates PageExtractionRecord.flags
+    before dispatching to the direct builders below) were computed and then
+    silently discarded — the direct-ingest builders take `pages` as a
+    parameter specifically so they COULD read them, but nothing ever did,
+    since there's no ReviewItem for a human to review them on anymore.
+    Returns (count, example messages capped at 5) for the direct builders'
+    append_event() calls, the only remaining place a human can see them
+    (the admin dashboard) now that the review queue is bypassed. Count
+    matches PageExtractionRecord.high_severity_flag_count's own definition."""
+    count = sum(p.high_severity_flag_count for p in pages)
+    examples = [
+        str(f.get("message", ""))
+        for p in pages
+        for f in (p.flags or [])
+        if isinstance(f, dict) and f.get("severity") == "high"
+    ]
+    return count, examples[:5]
 
 
 def _slice_by_ranges(
@@ -341,7 +363,14 @@ def _build_knowhow_items_direct(
         except Exception as e:
             logger.error(f"[SQSConsumer] Know-how topic-splitting failed for {filename}, nothing written for this slice: {e}")
             return []
-        get_draft_cache().put(_topic_split_cache_key, topic_bounds)
+        # 2026-10 fix (PDF-M1): identify_knowhow_topics never raises by design
+        # (degrades to [] on a real LLM failure, same as "0 topics found" —
+        # see its own docstring) — only cache a non-empty result, so a
+        # transient outage can't get permanently cached as "no topics here"
+        # (this cache has no TTL; only the prompt-version segment in the key
+        # invalidates it). Recomputing an empty result costs nothing extra.
+        if topic_bounds:
+            get_draft_cache().put(_topic_split_cache_key, topic_bounds)
 
     knowhow_topics = []
     retire_doc_ids: list[str] = []
@@ -465,11 +494,14 @@ def _build_knowhow_items_direct(
     # Activity log for the admin dashboard (2026-10) — display-only, see
     # utils/pdf_ingestion_log.py. Never blocks/raises; a logging failure
     # here must not affect the real ingestion work above.
+    _high_count, _high_examples = _high_severity_flag_summary(pages)
     append_event(conf.PDF_INGESTION_S3_BUCKET, {
         "filename": filename, "shape": "know_how",
         "new_count": new_count, "update_count": update_count, "duplicate_count": duplicate_count,
         "cost_usd": cost_accumulator.total_cost_usd if cost_accumulator is not None else 0.0,
         "error": write_error,
+        "high_severity_flags": _high_count,
+        "high_severity_flag_examples": _high_examples,
     })
 
     return []
@@ -504,7 +536,12 @@ def _build_license_items_direct(
         except Exception as e:
             logger.error(f"[SQSConsumer] License topic-splitting failed for {filename}, nothing written for this slice: {e}")
             return []
-        get_draft_cache().put(_topic_split_cache_key, topic_bounds)
+        # 2026-10 fix (PDF-M1): same rationale as _build_knowhow_items_direct's
+        # identical guard above — identify_license_topics never raises by
+        # design, so a real failure degrades to [] indistinguishable from a
+        # genuine "0 topics" verdict; only cache it when non-empty.
+        if topic_bounds:
+            get_draft_cache().put(_topic_split_cache_key, topic_bounds)
 
     if not topic_bounds:
         logger.info(f"[SQSConsumer] {filename}: no license topics identified in this slice, nothing written")
@@ -528,7 +565,14 @@ def _build_license_items_direct(
             except Exception as e:
                 logger.error(f"[SQSConsumer] Field drafting failed for {filename} ({topic['department']!r}/{topic['license_type']!r}), nothing written for this topic: {e}")
                 continue
-            get_draft_cache().put(_draft_cache_key, drafted)
+            # 2026-10 fix (PDF-M1): draft_fields_from_pages also never raises
+            # on a malformed/empty LLM response (swallows json.JSONDecodeError
+            # internally, returns all-13-fields-blank — see its own try/except)
+            # — same risk as the topic-split caches above, just shaped as "all
+            # values empty" instead of "empty list". Only cache when at least
+            # one field actually drafted to something.
+            if any(str(v).strip() for v in (drafted or {}).values()):
+                get_draft_cache().put(_draft_cache_key, drafted)
         merged = pdf_direct_ingest.merge_drafted_fields(topic, drafted)
         merged["page_range"] = format_page_ranges([p.page_num for p in topic_pages])
         merged["_raw_text"] = "\n\n".join(topic_markdowns)
@@ -593,11 +637,14 @@ def _build_license_items_direct(
 
     # Activity log for the admin dashboard (2026-10) — see the identical
     # pattern/rationale in _build_knowhow_items_direct above.
+    _high_count, _high_examples = _high_severity_flag_summary(pages)
     append_event(conf.PDF_INGESTION_S3_BUCKET, {
         "filename": filename, "shape": "structured_license",
         "new_count": new_count, "update_count": update_count, "duplicate_count": duplicate_count,
         "cost_usd": cost_accumulator.total_cost_usd if cost_accumulator is not None else 0.0,
         "error": write_error,
+        "high_severity_flags": _high_count,
+        "high_severity_flag_examples": _high_examples,
     })
 
     # Same routing-gap fix as _build_license_items — pages that don't
@@ -822,7 +869,15 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
         # see until either success or a manual journalctl dig). attempt is
         # read from any status object a PRIOR failed attempt left behind, so
         # the admin UI shows a real retry count instead of always "1".
-        attempt = pdf_status_tracker.next_attempt_number(bucket, filename)
+        # 2026-10 fix (Infra-C4): the attempt number that actually feeds the
+        # give-up decision below now comes from an atomic DynamoDB counter
+        # (utils/pdf_attempt_counter.py), not pdf_status_tracker's best-effort
+        # S3 read — a failed S3 write after a failed attempt used to make the
+        # NEXT read silently see "no object" and restart the count at 1,
+        # defeating _MAX_HANDOFF_ATTEMPTS entirely. pdf_status_tracker's
+        # write_status() call right after is unchanged — still S3, still
+        # purely for the human-facing dashboard, and still fine to be lossy.
+        attempt = get_attempt_counter().increment_and_get(filename, stage="ec2_handoff")
         pdf_status_tracker.write_status(
             bucket, filename, stage="processing", pages_done=0, pages_total=page_count, attempt=attempt,
         )
@@ -872,6 +927,7 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
                 )
                 _queue_manager.save(item)
                 pdf_status_tracker.clear(bucket, filename)
+                get_attempt_counter().clear(filename, stage="ec2_handoff")
                 return [item]
             raise
 
@@ -880,6 +936,7 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
             extraction_cost_usd=extraction_cost_usd, extraction_started_at=extraction_started_at,
         )
         pdf_status_tracker.clear(bucket, filename)
+        get_attempt_counter().clear(filename, stage="ec2_handoff")
         return items
 
     filename = data["filename"]
@@ -922,7 +979,10 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
     # defense-in-depth backstop _MAX_HANDOFF_ATTEMPTS/handler.py's
     # _MAX_ATTEMPTS already give the other two paths, so a FUTURE bug here
     # is bounded too, not an unbounded SQS-redelivery loop.
-    build_attempt = pdf_status_tracker.next_attempt_number(bucket, filename)
+    # 2026-10 fix (Infra-C4): same fail-closed DynamoDB counter as the handoff
+    # branch above, keyed with a distinct stage ("ec2_build" vs "ec2_handoff")
+    # specifically so these two independent give-up checks never share a count.
+    build_attempt = get_attempt_counter().increment_and_get(filename, stage="ec2_build")
     pdf_status_tracker.write_status(bucket, filename, stage="processing", attempt=build_attempt)
     try:
         items = _build_and_save_review_item(
@@ -947,6 +1007,7 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
             )
             _queue_manager.save(item)
             pdf_status_tracker.clear(bucket, filename)
+            get_attempt_counter().clear(filename, stage="ec2_build")
             return [item]
         raise
 
@@ -955,6 +1016,7 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
     # handoff branch above: covers the full gap (Lambda OCR + this
     # validation/drafting step), not just the Lambda portion.
     pdf_status_tracker.clear(bucket, filename)
+    get_attempt_counter().clear(filename, stage="ec2_build")
     return items
 
 

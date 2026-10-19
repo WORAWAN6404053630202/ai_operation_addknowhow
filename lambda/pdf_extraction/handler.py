@@ -144,6 +144,15 @@ PDF_COST_GUARD_DYNAMODB_TABLE = os.environ.get("PDF_COST_GUARD_DYNAMODB_TABLE", 
 PDF_COST_GUARD_DYNAMODB_REGION = os.environ.get("PDF_COST_GUARD_DYNAMODB_REGION") or os.environ.get("AWS_REGION")
 DAILY_BUDGET_USD = float(os.environ.get("DAILY_BUDGET_USD", "25.0"))
 
+# Atomic cross-process retry-attempt counter (2026-10, Infra-C4) — see
+# _PdfAttemptCounter below (hand-copy of code/utils/pdf_attempt_counter.py)
+# for why this replaced the old _next_attempt_number()/_write_status()
+# S3-read-inferred counter: a failed S3 write after a failed attempt used
+# to make the next read silently see "no object" and restart the count at
+# 1, defeating _MAX_ATTEMPTS below entirely.
+PDF_ATTEMPT_COUNTER_DYNAMODB_TABLE = os.environ.get("PDF_ATTEMPT_COUNTER_DYNAMODB_TABLE", "restbiz-pdf-attempt-counter")
+PDF_ATTEMPT_COUNTER_DYNAMODB_REGION = os.environ.get("PDF_ATTEMPT_COUNTER_DYNAMODB_REGION") or os.environ.get("AWS_REGION")
+
 _MAX_WORKERS = 4  # concurrent pages — keep modest, each page = 2 API calls already
 
 # Bounded give-up for the normal (≤MAX_PAGES_FOR_LAMBDA) extraction path
@@ -343,6 +352,77 @@ class _DailyCostGuard:
             return 0.0
 
 
+_ATTEMPT_COUNTER_FAIL_CLOSED = 999  # comfortably above _MAX_ATTEMPTS — see class docstring
+
+
+class _PdfAttemptCounter:
+    """Hand-copy of code/utils/pdf_attempt_counter.py's PdfAttemptCounter —
+    see that module's docstring for the full history/rationale. Deliberately
+    FAIL-CLOSED, unlike _GlobalTyphoonRateLimiter/_DailyCostGuard above: this
+    one feeds the _MAX_ATTEMPTS give-up decision directly, so "can't reach
+    DynamoDB, assume attempt 1" would reproduce the exact unbounded-retry bug
+    this class exists to fix. A DynamoDB error instead returns
+    _ATTEMPT_COUNTER_FAIL_CLOSED, which always exceeds _MAX_ATTEMPTS and
+    trips the give-up path — wasteful if the outage was transient, never an
+    unbounded-cost loop."""
+
+    def __init__(self, table_name: str, region_name, logger=None):
+        self._table_name = table_name
+        self._region_name = region_name
+        self._logger = logger
+        self._client = None
+
+    def _get_client(self):
+        if self._client is None:
+            self._client = boto3.client("dynamodb", region_name=self._region_name or None)
+        return self._client
+
+    def _log(self, level: str, msg: str) -> None:
+        if self._logger is not None:
+            getattr(self._logger, level)(msg)
+
+    def increment_and_get(self, filename: str, stage: str) -> int:
+        key = f"{filename}#{stage}"
+        expires_at = int(time.time()) + 14 * 24 * 60 * 60
+        try:
+            client = self._get_client()
+            resp = client.update_item(
+                TableName=self._table_name,
+                Key={"attempt_key": {"S": key}},
+                UpdateExpression="SET attempt_count = if_not_exists(attempt_count, :zero) + :one, expires_at = :ttl",
+                ExpressionAttributeValues={
+                    ":zero": {"N": "0"},
+                    ":one": {"N": "1"},
+                    ":ttl": {"N": str(expires_at)},
+                },
+                ReturnValues="UPDATED_NEW",
+            )
+            raw = resp.get("Attributes", {}).get("attempt_count", {}).get("N")
+            return int(raw) if raw is not None else _ATTEMPT_COUNTER_FAIL_CLOSED
+        except Exception as e:
+            self._log(
+                "warning",
+                f"[AttemptCounter] increment_and_get({key!r}) failed — failing CLOSED "
+                f"(returning {_ATTEMPT_COUNTER_FAIL_CLOSED}, not 1): {type(e).__name__}: {e}",
+            )
+            return _ATTEMPT_COUNTER_FAIL_CLOSED
+
+    def clear(self, filename: str, stage: str) -> None:
+        key = f"{filename}#{stage}"
+        try:
+            client = self._get_client()
+            client.delete_item(TableName=self._table_name, Key={"attempt_key": {"S": key}})
+        except Exception as e:
+            self._log("warning", f"[AttemptCounter] clear({key!r}) failed (harmless, TTL will clean it up): {type(e).__name__}: {e}")
+
+
+_attempt_counter = _PdfAttemptCounter(
+    table_name=PDF_ATTEMPT_COUNTER_DYNAMODB_TABLE,
+    region_name=PDF_ATTEMPT_COUNTER_DYNAMODB_REGION,
+    logger=logger,
+)
+
+
 _cost_guard = _DailyCostGuard(
     table_name=PDF_COST_GUARD_DYNAMODB_TABLE,
     region_name=PDF_COST_GUARD_DYNAMODB_REGION,
@@ -484,17 +564,6 @@ def _write_status(bucket, filename, *, stage, pages_done=None, pages_total=None,
         )
     except Exception as e:
         logger.warning(f"{filename}: failed to write status: {e}")
-
-
-def _next_attempt_number(bucket, filename) -> int:
-    """1 for a fresh document, or (prior attempt + 1) if a status object
-    from an earlier failed invocation is still there."""
-    try:
-        obj = s3.get_object(Bucket=bucket, Key=f"{STATUS_S3_PREFIX}{filename}.json")
-        prior = json.loads(obj["Body"].read().decode("utf-8"))
-        return prior.get("attempt", 0) + 1
-    except Exception:
-        return 1
 
 
 def _notify_sqs(bucket: str, key: str) -> None:
@@ -930,7 +999,12 @@ def lambda_handler(event, context):
         # exact same silent way an out-of-credits account broke the EC2
         # large-doc path — previously invisible until the item either landed
         # in the review queue or someone went digging through CloudWatch.
-        attempt = _next_attempt_number(bucket, filename)
+        # 2026-10 fix (Infra-C4): the attempt number that feeds _MAX_ATTEMPTS
+        # below now comes from the atomic DynamoDB counter above, not
+        # _next_attempt_number's best-effort S3 read — see _PdfAttemptCounter's
+        # docstring. _write_status right after is unchanged — still S3, still
+        # purely for the human-facing dashboard.
+        attempt = _attempt_counter.increment_and_get(filename, stage="lambda_extract")
         _write_status(bucket, filename, stage="processing", pages_done=0, pages_total=num_pages, attempt=attempt)
         _PROGRESS_WRITE_EVERY_N_PAGES = 5  # small enough to matter for a ≤35-page doc
 
@@ -964,6 +1038,7 @@ def lambda_handler(event, context):
             )
             logger.info(f"Wrote extraction result to s3://{bucket}/{output_key}")
             _notify_sqs(bucket, output_key)
+            _attempt_counter.clear(filename, stage="lambda_extract")
         except Exception as e:
             _write_status(bucket, filename, stage="failed", pages_total=num_pages, attempt=attempt, error=str(e))
             # Bounded give-up (2026-10) — mirrors service/pdf_large_extraction.py's
@@ -984,6 +1059,7 @@ def lambda_handler(event, context):
                     f"leaving a failed status for manual review instead of retrying again: {e}"
                 )
                 results.append({"input_key": key, "page_count": num_pages, "gave_up_after_attempts": attempt, "error": str(e)})
+                _attempt_counter.clear(filename, stage="lambda_extract")
                 continue
             raise
         results.append({"input_key": key, "output_key": output_key, "page_count": num_pages})

@@ -577,6 +577,16 @@ PDF_DRAFT_CACHE_DYNAMODB_REGION = os.getenv("PDF_DRAFT_CACHE_DYNAMODB_REGION", "
 PDF_COST_GUARD_DYNAMODB_TABLE = os.getenv("PDF_COST_GUARD_DYNAMODB_TABLE", "restbiz-pdf-cost-guard")
 PDF_COST_GUARD_DYNAMODB_REGION = os.getenv("PDF_COST_GUARD_DYNAMODB_REGION", "") or AWS_REGION
 
+# Atomic cross-process retry-attempt counter (2026-10, utils/pdf_attempt_counter.py) —
+# feeds the bounded give-up checks (_MAX_HANDOFF_ATTEMPTS / _MAX_ATTEMPTS) that used to
+# read their attempt number from a best-effort S3 status write (pdf_status_tracker.py),
+# which could silently reset to 1 on a transient S3 write failure and defeat the cap
+# entirely. Unlike every other table on this page, this one is deliberately
+# FAIL-CLOSED on a DynamoDB error (see that module's docstring) — the one place in this
+# pipeline where failing open would reproduce the exact unbounded-retry bug being fixed.
+PDF_ATTEMPT_COUNTER_DYNAMODB_TABLE = os.getenv("PDF_ATTEMPT_COUNTER_DYNAMODB_TABLE", "restbiz-pdf-attempt-counter")
+PDF_ATTEMPT_COUNTER_DYNAMODB_REGION = os.getenv("PDF_ATTEMPT_COUNTER_DYNAMODB_REGION", "") or AWS_REGION
+
 # Lightweight ingestion-activity log for the admin dashboard (2026-10) — see
 # utils/pdf_ingestion_log.py. One JSONL file per UTC day under this S3
 # prefix, inside the SAME bucket as PDF_INGESTION_S3_BUCKET above (no new
