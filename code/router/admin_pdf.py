@@ -1,16 +1,29 @@
 """
-Admin Router — PDF review queue only.
+Admin Router — PDF review queue + pipeline status/dashboard.
 
-Split off from the old router/admin.py (2026-09) into its own file, served by
-a separate app/process/port (see app_pdf.py) from the production chat bot —
-so a PDF-pipeline dependency crash (see the boto3 incident, 2026-09-06/07)
-can never take the bot down again. The bot's own session-monitoring routes
-live in router/admin_bot.py.
+Split off from the old router/admin.py (2026-09) into its own file,
+originally meant to be served by a separate app/process/port (see
+app_pdf.py) from the production chat bot — so a PDF-pipeline dependency
+crash (see the boto3 incident, 2026-09-06/07) can never take the bot down
+again. The bot's own session-monitoring routes live in router/admin_bot.py.
 
-static/admin.html (the combined dashboard shell, still served by the BOT
-service) points its PDF-related fetch calls at this service's own base URL —
-see admin.html's PDF_API_BASE constant — so the one page still shows both
-Sessions and PDF Queue tabs even though two different backends serve them.
+Included from THREE places as of 2026-10 (all should behave identically —
+same router object, same handler functions, no logic duplicated anywhere):
+  - app_pdf.py — the originally-intended standalone PDF-admin-only service.
+  - router/run_admin_server.py-style production entrypoint, if in use there.
+  - app.py (the full chat bot) — added 2026-10 after discovering a real
+    deployment (the pure-PDF EC2 instance) runs app.py directly and never
+    actually runs app_pdf.py as a separate process; a stale, drifted
+    duplicate of these same routes used to live in router/admin.py from
+    before this file was split out (removed 2026-10 — see admin.py's own
+    comment at the point it used to sit).
+
+static/admin.html (the combined dashboard shell) points its PDF-related
+fetch calls at a base URL controlled by admin.html's own PDF_API_BASE
+constant — same-origin when already on the right port, otherwise an
+explicit cross-origin base. Whichever process actually serves admin.html in
+a given deployment needs this router included (directly or reachable at
+that base URL) for the PDF Queue tab to work.
 
 Each endpoint below carries its own dependencies=[_auth] (X-Admin-Key), same
 as the pattern in admin_bot.py — there is no router-level auth dependency to
@@ -349,16 +362,9 @@ async def pdf_status():
 
 # Dashboard page for pdf_status above (2026-10). Lives on THIS router (not
 # wherever it happens to be served from) specifically so it travels with
-# admin_pdf_router wherever that router is included — originally only
-# app_pdf.py (the standalone PDF-admin-only service envisioned in this
-# file's own module docstring), but that service was never actually
-# deployed for the pure-PDF EC2 instance in practice (confirmed live,
-# 2026-10: that instance's "web" container runs app.py, the full bot, not
-# app_pdf.py) — app.py registers this exact route function directly
-# (see its own comment) rather than including this whole router wholesale,
-# since router/admin.py (already included there) still carries its own
-# un-removed duplicate of the /api/pdf-queue routes from before this file
-# was split out, and a wholesale include would collide with those.
+# admin_pdf_router wherever that router is included — see this module's
+# docstring for the full list of places that currently do (app_pdf.py,
+# app.py, and whichever standalone admin entrypoint production uses).
 #
 # No X-Admin-Key dependency on the page itself — it's static HTML/JS with no
 # embedded secrets; the data it fetches (pdf_status above) is already

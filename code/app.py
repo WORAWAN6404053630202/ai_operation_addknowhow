@@ -16,7 +16,7 @@ import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -26,8 +26,7 @@ import conf
 from router.route_v1 import api_v1
 from router.monitoring import router as monitoring_router
 from router.admin import router as admin_router
-from router.admin_pdf import admin_pdf_dashboard, pdf_status
-from utils.admin_auth import require_admin_key
+from router.admin_pdf import router as admin_pdf_router
 from utils.middleware import MonitoringMiddleware, HealthCheckMiddleware, BodySizeLimitMiddleware
 from utils.logger import setup_logging, get_logger
 
@@ -127,20 +126,16 @@ app.add_middleware(BodySizeLimitMiddleware, max_bytes=getattr(conf, "MAX_REQUEST
 app.include_router(api_v1, prefix="/api/v1")
 app.include_router(monitoring_router)
 app.include_router(admin_router)
-
-# PDF pipeline dashboard (2026-10) — registered directly here rather than
-# `app.include_router(admin_pdf_router)` (see router/admin_pdf.py), because
-# admin_router above still carries its own un-removed duplicate of the
-# older /admin/api/pdf-queue routes from before admin_pdf.py was split out
-# — a wholesale include would collide with those. These two are the only
-# genuinely new paths (no existing route at either path in admin_router),
-# so registering them individually sidesteps the collision entirely while
-# still reusing admin_pdf.py's actual handler functions, not duplicating
-# their logic. Discovered live, 2026-10: the pure-PDF EC2 instance's "web"
-# container runs this file (app:app), never app_pdf.py — so these routes
-# were otherwise completely unreachable there despite having been built.
-app.add_api_route("/admin/api/pdf-status", pdf_status, methods=["GET"], dependencies=[Depends(require_admin_key)])
-app.add_api_route("/admin/dashboard", admin_pdf_dashboard, methods=["GET"], response_class=HTMLResponse, include_in_schema=False)
+# PDF pipeline admin routes (pdf-queue, pdf-status, dashboard) — see
+# router/admin_pdf.py. Used to collide with a stale duplicate of the
+# pdf-queue routes that had been left behind in admin_router above when
+# admin_pdf.py was split out (2026-09); that duplicate is now removed (see
+# admin.py's own comment), so a plain wholesale include works. Discovered
+# live, 2026-10: the pure-PDF EC2 instance's "web" container runs this file
+# (app:app), never app_pdf.py (the standalone service admin_pdf.py's own
+# docstring describes) — so these routes need to live here to be reachable
+# there at all.
+app.include_router(admin_pdf_router)
 
 
 @app.get("/health", tags=["health"], include_in_schema=False)

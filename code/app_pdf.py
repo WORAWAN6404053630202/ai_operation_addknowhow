@@ -17,12 +17,9 @@ base URL/port instead of a relative path, which is why CORS is open here.
 NOT ACTUALLY DEPLOYED for the pure-PDF EC2 instance (2026-10 discovery): that
 instance's "web" container runs `uvicorn app:app` (the full bot), not this
 file — this module exists and works standalone (e.g. for local testing),
-but in practice app.py directly registers router/admin_pdf.py's two newest
-routes (/admin/api/pdf-status, /admin/dashboard) itself rather than this
-service being a separate running process there. See app.py's own comment
-for why (router/admin.py, already included in app.py, has its own
-un-removed duplicate of the older /api/pdf-queue routes this file also
-defines — a wholesale include_router here would collide with those).
+but in practice app.py includes router/admin_pdf.py directly itself (see
+app.py's own comment) rather than this service being a separate running
+process there.
 """
 
 import os
