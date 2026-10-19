@@ -1,6 +1,21 @@
 """
 Admin Router — PDF review queue + pipeline status/dashboard.
 
+2026-10 scope note (PDF-M8): since the direct-ingest architectural pivot
+(2026-09), real successful content writes straight to Chroma and never
+reaches this queue — sqs_consumer.py's _build_knowhow_items/_build_license_
+items (the old human-review builders that used to populate it for every
+document) are no longer called at all (kept in the file per explicit
+instruction, not deleted — see that file's own comment at the point they
+stopped being wired in). This queue now ONLY receives two kinds of item:
+a Lambda-era legacy skip-marker ("not_relevant", can no longer be produced
+by anything but kept for historical items) and a give-up-after-N-attempts
+failure placeholder ("extraction_failed", pages=[]/llm_drafted_fields=None).
+Both have no real drafted content — /decision rejects an "approved" attempt
+on either (see that endpoint). An empty or near-empty queue means the
+pipeline is working, not that nothing has happened; check router/admin_pdf.
+py's /api/pdf-status or the dashboard for real ingestion activity instead.
+
 Split off from the old router/admin.py (2026-09) into its own file,
 originally meant to be served by a separate app/process/port (see
 app_pdf.py) from the production chat bot — so a PDF-pipeline dependency
@@ -92,7 +107,11 @@ async def pdf_queue_list():
     EC2 large-document OCR path (or stuck retrying against a failure) that
     have no ReviewItem yet — see service/pdf_status_tracker.py's docstring
     for the incident that motivated this: a 634-page document silently
-    retried for 13+ hours with nothing visible here beforehand."""
+    retried for 13+ hours with nothing visible here beforehand.
+
+    See this module's docstring (PDF-M8, 2026-10) for why the list below
+    "in_flight" is now only failure/legacy-skip placeholders, not a pending-
+    approval queue — an empty list here does not mean nothing has happened."""
     items = _pdf_queue_manager.list_all()
     items.sort(key=lambda i: i.uploaded_at, reverse=True)
 
@@ -156,6 +175,21 @@ async def pdf_queue_decide(item_id: str, decision: PdfReviewDecision):
         return JSONResponse({"error": "decision_type is required when approving"}, status_code=400)
     if decision.decision_type not in (None, "new", "duplicate", "update", "new_category"):
         return JSONResponse({"error": "invalid decision_type"}, status_code=400)
+    # 2026-10 fix (PDF-M8): since the direct-ingest pivot, every item that
+    # reaches this queue is either a Lambda-era legacy skip-marker
+    # ("not_relevant") or a give-up-after-N-attempts failure placeholder
+    # ("extraction_failed", pages=[] / llm_drafted_fields=None — see
+    # sqs_consumer.py's give-up branches) — real successful content now goes
+    # straight to Chroma and never reaches this queue at all. Approving one
+    # of these would write an item with NO real drafted content as a new
+    # Sheet row. The only sensible actions on these are "reprocess" (retry
+    # extraction) or "rejected" (acknowledge and drop).
+    _tier = (item.relevance_check or {}).get("tier")
+    if decision.review_status == "approved" and _tier in ("extraction_failed", "not_relevant"):
+        return JSONResponse(
+            {"error": f"Cannot approve a {_tier!r} item — it has no real drafted content to write. Use /reprocess to retry extraction, or reject to dismiss it."},
+            status_code=400,
+        )
 
     item.review_status = decision.review_status
     item.decision_type = decision.decision_type
@@ -392,6 +426,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #2a2e38; }
   th { color: #999; font-weight: 500; }
   .err { color: #f85149; }
+  .flag-high { color: #da3633; font-weight: 600; cursor: help; }
   .muted { color: #777; }
   .refresh-note { color: #666; font-size: 12px; margin-top: 8px; }
 </style>
@@ -411,8 +446,8 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="card">
     <h2 style="font-size:14px;margin:0 0 10px;">กิจกรรมล่าสุด (7 วัน)</h2>
     <table id="activityTable">
-      <thead><tr><th>เวลา</th><th>ไฟล์</th><th>ประเภท</th><th>ใหม่</th><th>อัปเดต</th><th>ซ้ำ</th><th>ต้นทุน</th><th>ผิดพลาด</th></tr></thead>
-      <tbody><tr><td colspan="8" class="muted">กำลังโหลด...</td></tr></tbody>
+      <thead><tr><th>เวลา</th><th>ไฟล์</th><th>ประเภท</th><th>ใหม่</th><th>อัปเดต</th><th>ซ้ำ</th><th>ต้นทุน</th><th>แฟล็กร้ายแรง</th><th>ผิดพลาด</th></tr></thead>
+      <tbody><tr><td colspan="9" class="muted">กำลังโหลด...</td></tr></tbody>
     </table>
   </div>
 
@@ -441,6 +476,22 @@ function fmtTime(ts) {
   return new Date(ts * 1000).toLocaleString("th-TH");
 }
 
+// 2026-10 fix: every value rendered below (filename, shape, error,
+// source_file, license_type/main_topic, superseded_reason) can originate
+// from an uploaded PDF's own text via the LLM drafting/classification
+// steps — this codebase already treats PDF-derived text as attacker-
+// influenceable everywhere else (see INJECTION_GUARD). The render
+// functions used to interpolate these straight into innerHTML with no
+// escaping, which is stored XSS: a PDF crafted so a drafted field becomes
+// e.g. "<img src=x onerror=...>" would run arbitrary JS in this page,
+// including reading the admin key out of sessionStorage below. Escape
+// every interpolated value through this before it reaches innerHTML.
+function escapeHtml(value) {
+  const div = document.createElement("div");
+  div.textContent = value == null ? "" : String(value);
+  return div.innerHTML;
+}
+
 async function apiGet(path) {
   const resp = await fetch(path, { headers: { "X-Admin-Key": getAdminKey() } });
   if (resp.status === 401) {
@@ -466,18 +517,30 @@ function renderCost(data) {
 
 function renderActivity(events) {
   const tbody = document.querySelector("#activityTable tbody");
-  if (!events.length) { tbody.innerHTML = '<tr><td colspan="8" class="muted">ไม่มีกิจกรรม</td></tr>'; return; }
-  tbody.innerHTML = events.map(e => `
+  if (!events.length) { tbody.innerHTML = '<tr><td colspan="9" class="muted">ไม่มีกิจกรรม</td></tr>'; return; }
+  tbody.innerHTML = events.map(e => {
+    // 2026-10 fix (PDF-M3): validate_extraction()'s high-severity flags
+    // (arithmetic mismatches, dual-model disagreements) used to be computed
+    // then silently discarded — this is the one place a human can see them
+    // now that the review queue no longer gates successful documents.
+    const highCount = e.high_severity_flags || 0;
+    const examples = (e.high_severity_flag_examples || []).map(escapeHtml).join("; ");
+    const flagCell = highCount > 0
+      ? `<span class="flag-high" title="${examples}">⚠ ${highCount}</span>`
+      : "-";
+    return `
     <tr>
-      <td>${fmtTime(e.timestamp)}</td>
-      <td>${e.filename || ""}</td>
-      <td>${e.shape || ""}</td>
+      <td>${escapeHtml(fmtTime(e.timestamp))}</td>
+      <td>${escapeHtml(e.filename || "")}</td>
+      <td>${escapeHtml(e.shape || "")}</td>
       <td>${e.new_count ?? 0}</td>
       <td>${e.update_count ?? 0}</td>
       <td>${e.duplicate_count ?? 0}</td>
       <td>$${(e.cost_usd || 0).toFixed(4)}</td>
-      <td class="err">${e.error || ""}</td>
-    </tr>`).join("");
+      <td>${flagCell}</td>
+      <td class="err">${escapeHtml(e.error || "")}</td>
+    </tr>`;
+  }).join("");
 }
 
 function renderArchived(docs) {
@@ -488,10 +551,10 @@ function renderArchived(docs) {
     const topic = m.license_type || m.main_topic || "";
     return `
     <tr>
-      <td>${fmtTime(parseFloat(m.superseded_at))}</td>
-      <td>${m.source_file || ""}</td>
-      <td>${topic}</td>
-      <td>${m.superseded_reason || ""}</td>
+      <td>${escapeHtml(fmtTime(parseFloat(m.superseded_at)))}</td>
+      <td>${escapeHtml(m.source_file || "")}</td>
+      <td>${escapeHtml(topic)}</td>
+      <td>${escapeHtml(m.superseded_reason || "")}</td>
     </tr>`;
   }).join("");
 }
