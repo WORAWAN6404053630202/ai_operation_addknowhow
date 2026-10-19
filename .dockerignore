@@ -6,10 +6,16 @@ __pycache__/
 .Python
 
 # Virtual environment
-venv/
-.venv/
-env/
-ENV/
+# 2026-10 fix: these were root-only patterns (Docker .dockerignore only
+# matches unanchored patterns at the build-context root, same rule as
+# .gitignore) — code/venv/ (~16MB) was never actually excluded, and worse,
+# PYTHONPATH=/app/code in the Dockerfile makes a shipped code/venv/ an
+# importable package literally named `venv` that shadows the stdlib module
+# at runtime. **/ matches at every depth, not just the root.
+**/venv/
+**/.venv/
+**/env/
+**/ENV/
 
 # IDE
 .vscode/
@@ -29,8 +35,20 @@ Dockerfile
 *.log
 logs/
 
-# Environment (จะ mount แทน)
-# env.properties
+# Environment / credentials — 2026-10 fix: this was commented out, meaning
+# every secret file (OpenRouter/Typhoon API keys, admin passwords, Google
+# service-account credentials) was NEVER excluded from the Docker build
+# context. No COPY instruction currently touches these, so nothing has
+# actually shipped into a layer yet — but that's one careless `COPY .
+# /app/` away from being a permanent, unrecoverable leak (anyone who ever
+# pulls that image layer can extract the secret forever, even after the
+# file is later removed from a newer layer). Mounted at runtime via
+# docker-compose's volumes, never meant to be baked in — this makes that
+# intent enforced, not just assumed.
+**/env.properties
+**/env.dev.properties
+**/env.dev.properties.*
+**/credentials*.json
 
 # Sessions (runtime data)
 code/sessions/
@@ -53,15 +71,19 @@ quick-deploy.sh
 # Embedding model cache (mounted as Docker volume บน EC2)
 model_cache/
 
-# Chroma DB duplicates (only local_chroma_v3/ is used)
-chroma/
-chroma_data/
-chroma_db/
-chroma_store/
+# Chroma DB duplicates (only the root-level local_chroma_v3/ is used — the
+# Dockerfile's own COPY targets that one explicitly, never these).
+# 2026-10 fix: same root-only-pattern bug as venv/ above — code/chroma_db/,
+# code/data/chroma*/, etc. were never actually excluded, ~500KB+ of dead
+# weight shipped into every build stage.
+**/chroma/
+**/chroma_data/
+**/chroma_db/
+**/chroma_store/
 
 # Milvus (not used in prod)
-milvus_lite/
-milvus_lite.db/
+**/milvus_lite/
+**/milvus_lite.db/
 
 # Backup & dev-only directories
 code_friday_backup/
