@@ -32,6 +32,13 @@ services:
       # Host dir must be owned by uid:gid 1000:1000 (appuser in Dockerfile) — see
       # deploy_ec2.md one-time setup step.
       - /opt/restbiz-data:/app/code/data
+      # 2026-10 fix (Infra-M10): persists the rotating incident log (see
+      # LOG_FILE in env.properties) across container recreation — without
+      # this mount the file lives only in the writable layer and is lost on
+      # every redeploy, the exact problem this feature was built to solve
+      # (see incident_diagnosability memory). Host dir needs the same
+      # uid:gid 1000:1000 ownership as /opt/restbiz-data above.
+      - /opt/restbiz-logs:/app/logs
     environment:
       - PYTHONPATH=/app/code
     env_file:

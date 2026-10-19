@@ -56,7 +56,17 @@ jobs:
   test:
     name: Run Tests
     runs-on: ubuntu-latest
-    needs: lint
+    # 2026-10 fix (Infra-M2): this job (and security/eval below) used to
+    # `need: lint` — black/isort were never actually applied to this
+    # codebase (grown organically, long Thai prompt strings routinely over
+    # flake8's 120-char limit too), so `lint` has failed on every single
+    # push/PR since this workflow was added, and NOTHING downstream
+    # (test/security/build) has EVER run as a result — zero real CI signal
+    # this whole time. Unblocking here, not fixing lint itself (reformatting
+    # ~40+ files with black/isort is a large, separate, deliberate change,
+    # not a low-effort cleanup item) — lint still runs and still reports its
+    # real (currently failing) status, it just no longer gates the things
+    # that actually matter.
     env:
       # conf.py hard-fails at import time (RuntimeError) if this is unset — it's
       # required just to import the app modules, not to actually call the API.
@@ -110,7 +120,6 @@ jobs:
   security:
     name: Security Scan
     runs-on: ubuntu-latest
-    needs: lint
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -208,7 +217,6 @@ jobs:
   eval:
     name: LLM Eval Suite (RAG faithfulness + prompt injection)
     runs-on: ubuntu-latest
-    needs: lint
     if: github.event_name == 'workflow_dispatch' && inputs.run_eval == true
     env:
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}

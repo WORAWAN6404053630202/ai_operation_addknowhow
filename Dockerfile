@@ -98,7 +98,14 @@ COPY local_chroma_v3/ /app/local_chroma_v3/
 COPY pyproject.toml /app/
 
 # Create necessary directories and set permissions
-RUN mkdir -p /app/code/sessions /app/chroma_db && \
+# /app/logs: 2026-10 fix (Infra-M10) — utils/logger.py's RotatingFileHandler
+# (added 2026-09 after an undiagnosable incident, see incident_diagnosability
+# memory) has had LOG_FILE unset in every env file since it shipped, so it
+# has never actually activated in any deployment. Needs to exist and be
+# writable by appuser before LOG_FILE=/app/logs/app.log (see env.properties)
+# can write to it; docker-compose.prod.yaml mounts a host dir here so the
+# file survives container recreation, the whole point of this fix.
+RUN mkdir -p /app/code/sessions /app/chroma_db /app/logs && \
     chown -R appuser:appuser /app
 
 # Switch to non-root user
