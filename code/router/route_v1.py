@@ -22,6 +22,7 @@ from model.persona_supervisor import PersonaSupervisor
 from utils.simple_cache import get_cache
 from utils.rate_limiter import get_rate_limiter
 from utils.progress import set_progress_callback, clear_progress_callback
+from utils.session_auth import client_key_from_request, owns_session
 
 import conf
 
@@ -172,14 +173,18 @@ def _client_identifier(http_request: Request) -> str:
     """Identifier for rate limiting — must NOT be something the caller can
     cheaply rotate (session_id is client-supplied and was previously used
     here, which let a caller bypass the limit by minting a new session_id
-    per request). X-Forwarded-For's first hop is trusted only because this
-    service sits behind a reverse proxy/load balancer that sets it; if
-    deployed with the app port directly internet-facing, that header is
-    itself attacker-controlled and this would need a trusted-proxy check.
+    per request).
+
+    2026-10 fix: this used to trust X-Forwarded-For's first hop, on the
+    assumption that a reverse proxy/load balancer sat in front of this
+    service and set that header itself. Verified via AWS Console (EC2
+    load balancers, CloudFront, Route 53) that neither Restbiz EC2
+    instance has anything in front of it — both are directly
+    internet-facing, reached by callers as a bare http://IP:PORT. That
+    means X-Forwarded-For was always attacker-controlled: any caller
+    could set it to a fresh random value per request and bypass the rate
+    limit entirely. Always use the real TCP connection's address instead.
     """
-    xff = http_request.headers.get("x-forwarded-for")
-    if xff:
-        return xff.split(",")[0].strip()
     return http_request.client.host if http_request.client else "unknown"
 
 
@@ -213,9 +218,9 @@ async def _delete_state_async(session_id: str) -> None:
     await loop.run_in_executor(None, state_manager.delete, session_id)
 
 
-async def _list_sessions_async(limit: int = 20) -> list:
+async def _list_sessions_async(limit: int = 20, client_key: str = "") -> list:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, state_manager.list_sessions, limit)
+    return await loop.run_in_executor(None, state_manager.list_sessions, limit, client_key)
 
 
 async def _cleanup_old_sessions_async() -> None:
@@ -324,7 +329,7 @@ def _build_topics_from_state(state: ConversationState):
 
 
 @api_v1.post("/greeting")
-async def start_session(payload: Optional[NewSessionRequest] = None):
+async def start_session(http_request: Request, payload: Optional[NewSessionRequest] = None):
     if supervisor is None or state_manager is None:
         raise HTTPException(status_code=503, detail="Services not initialized")
 
@@ -337,10 +342,14 @@ async def start_session(payload: Optional[NewSessionRequest] = None):
     session_id = f"s_{uuid.uuid4().hex[:8]}"
     branch_id = ((payload.branch_id if payload else "") or "").strip() or None
     branch_name = ((payload.branch_name if payload else "") or "").strip() or None
+    # 2026-10: stamp the owner so /sessions, /session/load, /session/delete
+    # can scope to it later — see client_key_from_request's docstring (utils/session_auth.py).
+    client_key = client_key_from_request(http_request)
+    initial_context = {"client_key": client_key} if client_key else {}
     state = ConversationState(
         session_id=session_id,
         persona_id=persona_id,
-        context={},
+        context=initial_context,
         branch_id=branch_id,
         branch_name=branch_name,
     )
@@ -401,13 +410,19 @@ async def reset_session(request: SessionRequest):
 
 
 @api_v1.get("/sessions")
-async def list_sessions():
+async def list_sessions(http_request: Request):
     if state_manager is None:
         raise HTTPException(status_code=503, detail="State manager not initialized")
 
     await _cleanup_old_sessions_async()
 
-    sessions = await _list_sessions_async(limit=20)
+    # 2026-10 fix: this used to return the 20 most recently active sessions
+    # from EVERY visitor, unfiltered — see _client_key_from_request's
+    # docstring. No client id sent (e.g. a stale cached page from before
+    # this shipped) means we can't verify ownership of anything, so return
+    # nothing rather than falling back to the old global-list behavior.
+    client_key = client_key_from_request(http_request)
+    sessions = await _list_sessions_async(limit=20, client_key=client_key) if client_key else []
     return HandleSuccess(
         message="Sessions loaded",
         sessions=sessions,
@@ -416,7 +431,7 @@ async def list_sessions():
 
 
 @api_v1.post("/session/load")
-async def load_session(request: SessionRequest):
+async def load_session(request: SessionRequest, http_request: Request):
     if state_manager is None:
         raise HTTPException(status_code=503, detail="State manager not initialized")
 
@@ -425,6 +440,11 @@ async def load_session(request: SessionRequest):
 
     state = await _load_state_async(request.session_id)
     if state is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    # 404, not 403 — doesn't reveal to a caller that a session they don't
+    # own exists at all. See owns_session's docstring (utils/session_auth.py) for the transition
+    # policy on sessions created before this fix shipped.
+    if not owns_session(state, client_key_from_request(http_request)):
         raise HTTPException(status_code=404, detail="Session not found")
 
     return HandleSuccess(
@@ -436,12 +456,21 @@ async def load_session(request: SessionRequest):
 
 
 @api_v1.post("/session/delete")
-async def delete_session(request: SessionRequest):
+async def delete_session(request: SessionRequest, http_request: Request):
     if state_manager is None:
         raise HTTPException(status_code=503, detail="State manager not initialized")
 
     if not request.session_id:
         raise HTTPException(status_code=400, detail="session_id is required")
+
+    # 2026-10 fix: used to delete by session_id alone — anyone who knew (or
+    # guessed) a session_id could delete it, no ownership check at all. Must
+    # load first to check ownership; a session that doesn't exist or isn't
+    # owned by this caller reports the same 404 either way (see
+    # owns_session's docstring (utils/session_auth.py) for the legacy-session transition policy).
+    state = await _load_state_async(request.session_id)
+    if state is None or not owns_session(state, client_key_from_request(http_request)):
+        raise HTTPException(status_code=404, detail="Session not found")
 
     await _delete_state_async(request.session_id)
 
