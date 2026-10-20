@@ -237,8 +237,22 @@ def normalize_documents(docs: Iterable[Any]) -> None:
       - doc.page_content (if exists)
       - doc.metadata (if exists)
     Compatible with LangChain Document-like objects.
+
+    2026-10 fix (PDF2-M1): this used to run over Source E's carried-forward
+    pdf_auto docs too — collapsing every newline in page_content (breaking
+    tables/numbered steps) and in every metadata string including
+    answer_guideline (up to 24,000 chars for PDF book chunks), then
+    re-running the 4-pass Thai dup-token regex over book-length prose it
+    was never calibrated for (the same regex class that already corrupted
+    "จัดการการเงิน" once live). PDF-sourced docs are already normalized at
+    ingest time (see service/pdf_direct_ingest.py) and never came from a
+    raw Sheet cell, so they're skipped here entirely.
     """
     for d in docs or []:
+        md_existing = getattr(d, "metadata", None) or {}
+        if str(md_existing.get("ingested_via") or "") == "pdf_auto":
+            continue
+
         # page_content
         if hasattr(d, "page_content"):
             try:
