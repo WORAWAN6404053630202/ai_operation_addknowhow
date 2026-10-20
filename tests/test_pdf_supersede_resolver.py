@@ -244,6 +244,44 @@ class TestKnowhowMetadataKeyAliasing:
 
 
 @pytest.mark.unit
+class TestIdentityFuzzyCandidatesSkipsDocumentBodies:
+    """PDF2-M4 (2026-10): this function's own docstring already said
+    "metadata-only... no document bodies needed", but it fetched
+    include=["metadatas", "documents"] anyway — "content" was never read
+    anywhere downstream. Called once per topic from _resolve, a 40-topic
+    book against a 1,500-doc corpus pulled ~40 full-partition fetches of
+    real document bodies. Now fetches metadatas only."""
+
+    def test_fetch_only_requests_metadatas(self):
+        mock_vectorstore = MagicMock()
+        mock_vectorstore._collection.get.return_value = {"ids": [], "metadatas": []}
+        with patch.object(resolver, "get_vs_manager") as mock_vs_mgr:
+            mock_vs_mgr.return_value.vectorstore = mock_vectorstore
+            resolver._identity_fuzzy_candidates(
+                {"department": "X", "license_type": "Y"}, {"data_type": "regulatory"},
+                resolver._REGULATORY_IDENTITY_KEYS,
+            )
+        call_kwargs = mock_vectorstore._collection.get.call_args.kwargs
+        assert call_kwargs["include"] == ["metadatas"]
+
+    def test_matched_candidate_still_returned_with_empty_content_placeholder(self):
+        mock_vectorstore = MagicMock()
+        mock_vectorstore._collection.get.return_value = {
+            "ids": ["doc-1"],
+            "metadatas": [{"department": "X", "license_type": "Y"}],
+        }
+        with patch.object(resolver, "get_vs_manager") as mock_vs_mgr:
+            mock_vs_mgr.return_value.vectorstore = mock_vectorstore
+            result = resolver._identity_fuzzy_candidates(
+                {"department": "X", "license_type": "Y"}, {"data_type": "regulatory"},
+                resolver._REGULATORY_IDENTITY_KEYS,
+            )
+        assert "doc-1" in result
+        assert result["doc-1"]["content"] == ""
+        assert result["doc-1"]["metadata"] == {"department": "X", "license_type": "Y"}
+
+
+@pytest.mark.unit
 class TestKnowhowCatchAllExemption:
     def test_catchall_topic_is_always_new_without_touching_chroma(self):
         with patch.object(resolver, "_embedding_candidates") as mock_emb:

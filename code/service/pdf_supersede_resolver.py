@@ -162,12 +162,24 @@ def _identity_fuzzy_candidates(
         vectorstore = get_vs_manager().vectorstore
     if vectorstore is None:
         return {}
-    raw = vectorstore._collection.get(where=data_type_filter, include=["metadatas", "documents"])
+    # 2026-10 fix (PDF2-M4): this used to also fetch include=["documents"]
+    # — this function's own docstring already said "metadata-only... no
+    # document bodies needed", and `content` below was never actually read
+    # anywhere downstream (confirmed: no caller of this function's return
+    # value ever accesses the "content" key). Called once per topic from
+    # _resolve, a 40-topic book against a 1,500-doc corpus pulled ~40
+    # full-partition fetches of real document bodies — ~600MB of churn and
+    # real latency on the single-threaded consumer. Dropping "documents"
+    # removes the actual cost driver; the per-topic repetition of this now-
+    # cheap metadata-only fetch is left as a known, much smaller residual
+    # (hoisting it out of the per-topic loop would need threading a
+    # pre-fetched partition through 2 more call sites across both
+    # sqs_consumer.py builders).
+    raw = vectorstore._collection.get(where=data_type_filter, include=["metadatas"])
     ids = raw.get("ids") or []
     metadatas = raw.get("metadatas") or []
-    documents = raw.get("documents") or []
     out: dict[str, dict] = {}
-    for doc_id, meta, content in zip(ids, metadatas, documents):
+    for doc_id, meta in zip(ids, metadatas):
         meta = meta or {}
         matched_fields = 0
         for key in identity_keys:
@@ -176,7 +188,10 @@ def _identity_fuzzy_candidates(
             if new_v and fuzzy_ratio(new_v, old_v) >= threshold:
                 matched_fields += 1
         if matched_fields == len(identity_keys):
-            out[doc_id] = {"score": None, "metadata": meta, "content": content or ""}
+            # "content" kept as an empty placeholder (not fetched above, see
+            # this function's docstring) only to match _embedding_candidates'
+            # output shape for the pool.setdefault() merge in _resolve.
+            out[doc_id] = {"score": None, "metadata": meta, "content": ""}
     return out
 
 
