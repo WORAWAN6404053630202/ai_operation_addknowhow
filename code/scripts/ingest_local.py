@@ -347,6 +347,29 @@ def main():
               f"since reset=True below would permanently delete them with nothing to carry forward: {e}")
         sys.exit(1)
 
+    # ── Source E continued: snapshot the ARCHIVE collection too (PDF2-C3,
+    # 2026-10) ────────────────────────────────────────────────────────────
+    # The archive collection (service.pdf_supersede_resolver.py's superseded
+    # docs) lives in the SAME persist_directory as live — different Chroma
+    # collection name only (see local_vector_store._archive_vectorstore's
+    # docstring). reset=True below renames the whole persist_dir away and
+    # deletes it once the new one is promoted, which destroys the archive's
+    # on-disk data too — unlike the PDF-auto live docs just above, nothing
+    # here goes into `all_docs` (the archive must stay archived, hidden
+    # from retrieval); it's written back into a fresh archive collection
+    # after the rebuild via restore_archive_snapshot below. Same fatal
+    # policy as Source E above: refuse to proceed rather than silently
+    # destroy the only rollback path pdf_supersede_resolver.py's whole
+    # "no human review is safe" design depends on.
+    print("\n[Ingest] Source E (archive) — snapshotting superseded docs (carrying forward across rebuild)...")
+    try:
+        _archive_snapshot = _mgr.snapshot_archive()
+        print(f"[Ingest]   → {len(_archive_snapshot.get('ids') or [])} archived doc(s) will be carried forward")
+    except Exception as e:
+        print(f"[Ingest]   ✗ FATAL: could not read the existing archive collection — refusing to proceed, "
+              f"since reset=True below would permanently delete it with nothing to carry forward: {e}")
+        sys.exit(1)
+
     # ── Normalize all docs ───────────────────────────────────────────────────
     docs = all_docs
     normalize_documents(docs)
@@ -398,11 +421,28 @@ def main():
         _mgr = get_vs_manager()
         _mgr.vectorstore = None
         _mgr.retriever = None
+        # 2026-10 fix (PDF2-C3): the archive collection's cached chromadb
+        # client handle also points at the persist_dir that's about to be
+        # renamed away and deleted — clear it alongside `vectorstore` so
+        # _archive_vectorstore() reconnects fresh against the new path
+        # (post-reset) rather than reusing a handle into deleted files.
+        _mgr._archive_store = None
         SharedSystemClient.clear_system_cache()
     except Exception as e:
         print(f"[Ingest]   ⚠️  Could not release prior Chroma connection cleanly: {e}")
 
     ingest_documents(docs, reset=True)  # wipe old local chroma before rebuild
+
+    # Carry the archive collection forward into the freshly-rebuilt store
+    # (PDF2-C3, 2026-10) — see the snapshot_archive fatal-check above.
+    try:
+        _restored = _mgr.restore_archive_snapshot(_archive_snapshot)
+        print(f"[Ingest] Archive carried forward: {_restored} doc(s) restored to the new archive collection.")
+    except Exception as e:
+        print(f"[Ingest]   ⚠️  FAILED to carry the archive collection forward after rebuild — "
+              f"the {len(_archive_snapshot.get('ids') or [])} previously-archived doc(s) are NOT in the "
+              f"new store. They are still referenced by this script's in-memory snapshot only for this "
+              f"run; re-run ingest with --confirm after fixing the underlying issue, or restore manually: {e}")
 
     # Invalidate BM25 cache so hybrid search rebuilds from new docs on next query
     try:

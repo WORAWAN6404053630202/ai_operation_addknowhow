@@ -561,6 +561,63 @@ class LocalVectorStoreManager:
         self._bump_corpus_version()
         return len(ids)
 
+    def snapshot_archive(self) -> Dict:
+        """2026-10 fix (PDF2-C3): the archive collection lives in the SAME
+        persist_directory as live (see _archive_vectorstore's docstring —
+        different collection name only). create_vectorstore(reset=True)
+        renames the whole persist_dir to a temp path and deletes it once
+        the new one is promoted — which destroys the archive's on-disk
+        data too, since it's physically stored in the same directory.
+        scripts/ingest_local.py's own Source E already snapshots
+        pdf_auto-ingested LIVE docs before a reset for exactly this reason;
+        this is the equivalent for the archive — read everything out
+        BEFORE reset=True runs, so restore_archive_snapshot can write it
+        back into the freshly-rebuilt archive collection afterward.
+        Without this, the only rollback path for an automated supersede
+        decision (service.pdf_supersede_resolver.py's whole "no human
+        review is safe because archive is durable" design) was wiped by a
+        routine Sheet-refresh rebuild."""
+        archive_store = self._archive_vectorstore()
+        raw = archive_store._collection.get(include=["documents", "metadatas", "embeddings"])
+        return {
+            "ids": raw.get("ids") or [],
+            "documents": raw.get("documents") or [],
+            "metadatas": raw.get("metadatas") or [],
+            "embeddings": _materialize_embeddings(raw),
+        }
+
+    def restore_archive_snapshot(self, snapshot: Dict) -> int:
+        """Writes a snapshot captured by snapshot_archive() (BEFORE a
+        create_vectorstore(reset=True) call) back into the archive
+        collection, which by this point has been freshly recreated empty
+        at the new persist_dir path. Caller must clear self._archive_store
+        (set to None) after the reset completes, same as it already must
+        for self.vectorstore, so _archive_vectorstore() reconnects fresh
+        rather than reusing a chromadb client handle pointing at the
+        now-deleted old directory."""
+        ids = snapshot.get("ids") or []
+        if not ids:
+            return 0
+        archive_store = self._archive_vectorstore()
+        archive_store._collection.add(
+            ids=ids,
+            documents=snapshot.get("documents") or [],
+            metadatas=snapshot.get("metadatas") or [],
+            # _materialize_embeddings (not `snapshot.get("embeddings") or []`)
+            # — snapshot_archive() already stores a materialized plain list
+            # here, but a numpy ndarray triggers the exact "truth value of an
+            # array is ambiguous" crash this same sweep fixed in
+            # archive_and_remove/restore_from_archive if this is ever called
+            # with raw Chroma output directly.
+            embeddings=_materialize_embeddings(snapshot),
+        )
+        try:
+            archive_store.persist()
+        except Exception:
+            pass
+        print(f"[VectorStore] restore_archive_snapshot: carried forward {len(ids)} archived doc(s) across rebuild")
+        return len(ids)
+
     # Retrieval helpers (infra-only)
     def retrieve_raw_docs(self, query: str, k: Optional[int] = None) -> List[Document]:
         if not query or not str(query).strip():

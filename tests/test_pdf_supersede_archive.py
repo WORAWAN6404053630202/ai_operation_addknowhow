@@ -269,3 +269,93 @@ class TestArchiveRoundTripRealChroma:
         back = live.get(ids=["doc-1"], include=["embeddings", "metadatas"])
         assert np.allclose(list(back["embeddings"])[0], [0.1, 0.2, 0.3])
         assert "superseded_at" not in back["metadatas"][0]
+
+
+@pytest.mark.unit
+class TestSnapshotAndRestoreArchive:
+    """PDF2-C3 (2026-10): the archive collection lives in the SAME
+    persist_directory as live — create_vectorstore(reset=True) (called by
+    scripts/ingest_local.py --confirm) renames the whole persist_dir away
+    and deletes it, which used to destroy the archive's on-disk data too,
+    since nothing snapshotted it first (unlike pdf_auto live docs, which
+    Source E already carried forward). snapshot_archive/
+    restore_archive_snapshot are the carry-forward mechanism for the
+    archive specifically."""
+
+    def test_snapshot_empty_archive_returns_empty_lists(self):
+        mgr, archive_store = _manager_with_mocked_stores()
+        archive_store._collection.get.return_value = {
+            "ids": [], "documents": [], "metadatas": [], "embeddings": np.array([]),
+        }
+        snapshot = mgr.snapshot_archive()
+        assert snapshot["ids"] == []
+
+    def test_restore_empty_snapshot_is_noop(self):
+        mgr, archive_store = _manager_with_mocked_stores()
+        assert mgr.restore_archive_snapshot({"ids": []}) == 0
+        archive_store._collection.add.assert_not_called()
+
+    def test_restore_writes_snapshot_back_into_archive_collection(self):
+        mgr, archive_store = _manager_with_mocked_stores()
+        snapshot = {
+            "ids": ["archived-1"],
+            "documents": ["เนื้อหาที่ถูก archive"],
+            "metadatas": [{"superseded_at": 123.0, "superseded_reason": "test"}],
+            # A raw ndarray here (not yet materialized) — proves
+            # restore_archive_snapshot handles it safely rather than
+            # tripping the ndarray-truthiness bug this same sweep fixed in
+            # archive_and_remove/restore_from_archive.
+            "embeddings": np.array([[0.1, 0.2, 0.3]]),
+        }
+        restored = mgr.restore_archive_snapshot(snapshot)
+        assert restored == 1
+        call_kwargs = archive_store._collection.add.call_args.kwargs
+        assert call_kwargs["ids"] == ["archived-1"]
+        assert call_kwargs["documents"] == ["เนื้อหาที่ถูก archive"]
+        assert call_kwargs["metadatas"] == [{"superseded_at": 123.0, "superseded_reason": "test"}]
+        assert np.allclose(call_kwargs["embeddings"][0], [0.1, 0.2, 0.3])
+
+
+@pytest.mark.unit
+class TestArchiveSurvivesRebuildRealChroma:
+    """2026-10: proves the actual bug scenario end-to-end against a REAL
+    chromadb.EphemeralClient() — a doc sitting in the archive collection,
+    snapshotted, the archive collection "destroyed" (simulating what
+    create_vectorstore(reset=True) does to the physical directory) and
+    recreated fresh, then restored — must survive with its real embedding
+    intact, not a placeholder."""
+
+    def test_archived_doc_survives_simulated_rebuild(self):
+        chromadb = pytest.importorskip("chromadb")
+        import uuid
+        suffix = uuid.uuid4().hex[:8]
+        client = chromadb.EphemeralClient()
+        old_archive = client.create_collection(f"archive-old-{suffix}")
+        old_archive.add(
+            ids=["archived-doc-1"],
+            embeddings=[[0.7, 0.8, 0.9]],
+            documents=["เนื้อหาที่ถูก supersede ไปแล้ว"],
+            metadatas=[{"superseded_at": 1000.0, "superseded_reason": "updated by newer PDF"}],
+        )
+
+        mgr = LocalVectorStoreManager()
+        mgr.embedding_model = MagicMock()
+        mgr._archive_store = _CollectionHolder(old_archive)
+
+        snapshot = mgr.snapshot_archive()
+        assert snapshot["ids"] == ["archived-doc-1"]
+
+        # Simulate create_vectorstore(reset=True) destroying the old
+        # physical directory (and therefore the old archive collection)
+        # and the caller reconnecting _archive_store to a fresh one at the
+        # new path, exactly as ingest_local.py now does.
+        client.delete_collection(f"archive-old-{suffix}")
+        new_archive = client.create_collection(f"archive-new-{suffix}")
+        mgr._archive_store = _CollectionHolder(new_archive)
+
+        restored = mgr.restore_archive_snapshot(snapshot)
+        assert restored == 1
+        assert new_archive.count() == 1
+        back = new_archive.get(ids=["archived-doc-1"], include=["embeddings", "metadatas"])
+        assert np.allclose(list(back["embeddings"])[0], [0.7, 0.8, 0.9])
+        assert back["metadatas"][0]["superseded_reason"] == "updated by newer PDF"
