@@ -9309,18 +9309,33 @@ class PersonaSupervisor:
         cache[cache_key] = result
         return result
 
-    def _thanks_llm_check(self, user_text: str, state=None) -> bool:
+    def _thanks_llm_check(self, user_text: str, state=None, _skip_cache_write: bool = False) -> bool:
         """
         LLM fallback: is this a thanks expression?
         Called from _looks_like_greeting_or_thanks when _THANKS_RE misses
         and text has no legal/question signals. Catches formal Thai thanks
         like "ขอบพระคุณ", "กราบขอบพระคุณ", "ขอขอบคุณ".
         Caches in state.context['_thanks_llm_cache'] when state is available.
+
+        _skip_cache_write (2026-10, core2-M4): set by the classifier
+        pre-warm pool's submit call below — see that block's comment for
+        why a background thread must never write into state.context itself.
         """
         q = (user_text or "").strip()
         if not q or len(q) < 3 or len(q) > 60:
             return False
-        cache = (state.context or {}).setdefault("_thanks_llm_cache", {}) if state is not None else {}
+        # 2026-10 fix (core2-M4): the read must never mutate state.context —
+        # the old `(state.context or {}).setdefault(name, {})` inserted an
+        # empty sub-dict under a NEW top-level key the first time this ran,
+        # which is itself a size-changing mutation of state.context. Calling
+        # that from an orphaned pre-warm thread (the whole reason
+        # _skip_cache_write exists) could still race with
+        # state_manager.save()'s state.model_dump() even with the result
+        # write already guarded — .get() (read-only) replaces .setdefault()
+        # here; the mutating .setdefault() only happens in the write branch
+        # below, which is already skipped when _skip_cache_write is True.
+        _ctx = state.context if state is not None else None
+        cache = (_ctx.get("_thanks_llm_cache") or {}) if _ctx else {}
         cache_key = q[:60]
         if cache_key in cache:
             return cache[cache_key]
@@ -9333,7 +9348,8 @@ class PersonaSupervisor:
             result = False
         if result:
             _LOG.info("[Supervisor/thanks] LLM detected thanks: %r (conf=%.2f)", q[:50], conf)
-        cache[cache_key] = result
+        if not _skip_cache_write and _ctx is not None:
+            _ctx.setdefault("_thanks_llm_cache", {})[cache_key] = result
         return result
 
     def _academic_stop_llm_check(self, user_text: str, state) -> bool:
@@ -9398,12 +9414,14 @@ class PersonaSupervisor:
         cache[cache_key] = result
         return result
 
-    def _smalltalk_llm_check(self, user_text: str, state) -> bool:
+    def _smalltalk_llm_check(self, user_text: str, state, _skip_cache_write: bool = False) -> bool:
         """
         LLM fallback: is this off-topic small talk directed at the bot?
         Called from section 2.7 when _SMALLTALK_RE misses.
         Guards: not a legal question (LEGAL_SIGNAL_RE), text 4-80 chars.
         Caches in state.context['_smalltalk_llm_cache'].
+
+        _skip_cache_write: see _thanks_llm_check's matching comment (core2-M4).
         """
         q = (user_text or "").strip()
         if not q or len(q) < 4 or len(q) > 80:
@@ -9411,7 +9429,9 @@ class PersonaSupervisor:
         # Skip LLM if text already looks like legal content
         if self._LEGAL_SIGNAL_RE.search(q) or self._QUESTION_MARKERS_RE.search(q):
             return False
-        cache = (state.context or {}).setdefault("_smalltalk_llm_cache", {})
+        # See _thanks_llm_check's matching comment (core2-M4).
+        _ctx = state.context if state is not None else None
+        cache = (_ctx.get("_smalltalk_llm_cache") or {}) if _ctx else {}
         cache_key = q[:60]
         if cache_key in cache:
             return cache[cache_key]
@@ -9424,20 +9444,25 @@ class PersonaSupervisor:
             result = False
         if result:
             _LOG.info("[Supervisor/smalltalk] LLM detected smalltalk: %r (conf=%.2f)", q[:50], conf)
-        cache[cache_key] = result
+        if not _skip_cache_write and _ctx is not None:
+            _ctx.setdefault("_smalltalk_llm_cache", {})[cache_key] = result
         return result
 
-    def _switch_without_target_llm_check(self, user_text: str, state) -> bool:
+    def _switch_without_target_llm_check(self, user_text: str, state, _skip_cache_write: bool = False) -> bool:
         """
         LLM fallback: does user want to change response style without naming academic/practical?
         Called from _looks_like_switch_without_target when regex misses.
         High threshold (0.80) — false positive = unwanted persona switch.
         Caches in state.context['_switch_no_target_llm_cache'].
+
+        _skip_cache_write: see _thanks_llm_check's matching comment (core2-M4).
         """
         q = (user_text or "").strip()
         if not q or len(q) < 4:
             return False
-        cache = (state.context or {}).setdefault("_switch_no_target_llm_cache", {})
+        # See _thanks_llm_check's matching comment (core2-M4).
+        _ctx = state.context if state is not None else None
+        cache = (_ctx.get("_switch_no_target_llm_cache") or {}) if _ctx else {}
         cache_key = q[:60]
         if cache_key in cache:
             return cache[cache_key]
@@ -9450,7 +9475,8 @@ class PersonaSupervisor:
             result = False
         if result:
             _LOG.info("[Supervisor/switch_no_target] LLM detected switch: %r (conf=%.2f)", q[:50], conf)
-        cache[cache_key] = result
+        if not _skip_cache_write and _ctx is not None:
+            _ctx.setdefault("_switch_no_target_llm_cache", {})[cache_key] = result
         return result
 
     def _link_request_llm_check(self, user_text: str, state) -> bool:
@@ -9509,18 +9535,24 @@ class PersonaSupervisor:
         cache[cache_key] = result
         return result
 
-    def _greeting_llm_check(self, user_text: str, state=None) -> bool:
+    def _greeting_llm_check(self, user_text: str, state=None, _skip_cache_write: bool = False) -> bool:
         """
         LLM fallback: is this a greeting or polite social opener?
         Called from _looks_like_greeting_or_thanks after thanks check misses.
         Guards already applied upstream: no legal signal, no question marker.
         High threshold (0.80) — false positive = ignoring a real question.
         Caches in state.context['_greeting_llm_cache'] when state is available.
+
+        _skip_cache_write: see _thanks_llm_check's matching comment (core2-M4).
         """
         q = (user_text or "").strip()
         if not q or len(q) < 3 or len(q) > 60:
             return False
-        cache = (state.context or {}).setdefault("_greeting_llm_cache", {}) if state is not None else {}
+        # See _thanks_llm_check's matching comment (core2-M4) — .get() keeps
+        # the read non-mutating; only the write branch below touches
+        # state.context, and it's skipped when _skip_cache_write is True.
+        _ctx = state.context if state is not None else None
+        cache = (_ctx.get("_greeting_llm_cache") or {}) if _ctx else {}
         cache_key = q[:60]
         if cache_key in cache:
             return cache[cache_key]
@@ -9533,7 +9565,8 @@ class PersonaSupervisor:
             result = False
         if result:
             _LOG.info("[Supervisor/greeting] LLM detected greeting: %r (conf=%.2f)", q[:50], conf_val)
-        cache[cache_key] = result
+        if not _skip_cache_write and _ctx is not None:
+            _ctx.setdefault("_greeting_llm_cache", {})[cache_key] = result
         return result
 
     def _info_action_q_llm_check(self, user_text: str, state) -> tuple:
@@ -9582,17 +9615,21 @@ class PersonaSupervisor:
         cache[cache_key] = result
         return (result["is_info"], result["is_action"])
 
-    def _legal_q_llm_check(self, user_text: str, state) -> bool:
+    def _legal_q_llm_check(self, user_text: str, state, _skip_cache_write: bool = False) -> bool:
         """
         LLM fallback: is this a legal/regulatory question about Thai restaurant business?
         Called from _looks_like_legal_question when both _LEGAL_SIGNAL_RE and _QUESTION_MARKERS_RE miss.
         Catches unusual phrasing: "ขอข้อมูลค่าใช้จ่าย", "แนะนำให้ถูกกฎหมายหน่อย", "ต้องติดต่อที่ไหน".
         Caches in state.context['_legal_q_llm_cache'] — called up to 10x/turn, cache makes repeats free.
+
+        _skip_cache_write: see _thanks_llm_check's matching comment (core2-M4).
         """
         q = (user_text or "").strip()
         if not q or len(q) < 4:
             return False
-        cache = (state.context or {}).setdefault("_legal_q_llm_cache", {})
+        # See _thanks_llm_check's matching comment (core2-M4).
+        _ctx = state.context if state is not None else None
+        cache = (_ctx.get("_legal_q_llm_cache") or {}) if _ctx else {}
         cache_key = q[:80]
         if cache_key in cache:
             return cache[cache_key]
@@ -9606,23 +9643,32 @@ class PersonaSupervisor:
             result = False
         if result:
             _LOG.info("[Supervisor/legal_q] LLM detected legal question: %r (conf=%.2f)", q[:50], conf_val)
-        cache[cache_key] = result
+        if not _skip_cache_write and _ctx is not None:
+            _ctx.setdefault("_legal_q_llm_cache", {})[cache_key] = result
         return result
 
-    def _prewarm_style(self, text: str, last_q: str, state) -> None:
+    def _prewarm_style(self, text: str, last_q: str, state, _skip_cache_write: bool = False) -> Any:
         """Pre-warm style detection so result is cached before section 2.3 reads it.
 
         Called from the classifier pre-warm pool. Stores result in
         state.context['_style_pw_cache'][(text[:80], last_q[:80])].
         Main code checks the cache before calling _infer_user_style_request_hybrid,
         saving 1-3s for ambiguous-style inputs that would otherwise trigger serial LLM.
+
+        _skip_cache_write (core2-M4): see _thanks_llm_check's matching
+        comment — when True, returns the computed result instead of
+        writing it to state.context itself, so the submitting thread (the
+        pre-warm dispatch block, always the main thread) can decide whether
+        to write it after confirming the future completed in time.
         """
         try:
             result = self._infer_user_style_request_hybrid(text, last_q, state=state)
-            if state is not None and state.context is not None:
+            if not _skip_cache_write and state is not None and state.context is not None:
                 state.context.setdefault("_style_pw_cache", {})[(text[:80], (last_q or "")[:80])] = result
+            return result
         except Exception as _e:
             _LOG.debug("[Supervisor/style_prewarm] failed: %s", _e)
+            return None
 
     def _infer_entity_type_from_query(self, query: str) -> Optional[str]:
         """
@@ -14463,17 +14509,61 @@ class PersonaSupervisor:
         if _needs_classifier_llm:
             try:
                 # Module-level pool reused across turns (no per-request thread spin-up).
-                # wait() only blocks for this turn's futures; orphaned threads from prior
-                # turns still write to their own state cache — no cross-turn data race.
+                # 2026-10 fix (core2-M4): the comment this replaces claimed
+                # "orphaned threads from prior turns still write to their own
+                # state cache — no cross-turn data race", reasoning that the
+                # GIL makes each dict write atomic. That's true per-write, but
+                # doesn't cover the actual failure: route_v1.py calls
+                # state_manager.save(state) -> state.model_dump() right after
+                # this turn returns, which ITERATES state.context — if an
+                # orphaned classifier thread is still running past the 1.5s
+                # wait() below and writes a NEW key into one of these cache
+                # dicts (nested inside state.context) at that exact moment,
+                # model_dump() can raise "dictionary changed size during
+                # iteration". Separately, a classifier that doesn't finish
+                # within 1.5s left no cache entry at all, so whichever
+                # section (2.5/2.7/2.9) calls it again synchronously a few
+                # lines below re-dispatched a second, fully duplicate LLM
+                # call for input it had already asked about.
+                #
+                # Fix: every classifier above takes _skip_cache_write and,
+                # when True, returns its result instead of writing it into
+                # state.context itself — only this block (always the main
+                # thread) does that write, and ONLY for futures confirmed
+                # done within the wait() window below. A future that times
+                # out keeps running on its executor thread until it finishes,
+                # but its result is simply discarded — it never touches
+                # state.context from off the main thread. This doesn't
+                # recover the double-bill for a classifier that's still slow
+                # (same as before), but it does remove the only path that
+                # could crash the eventual state_manager.save() call.
                 _pw_futs = [
-                    _CLASSIFIER_POOL.submit(self._thanks_llm_check, _pw_t, state),
-                    _CLASSIFIER_POOL.submit(self._greeting_llm_check, _pw_t, state),
-                    _CLASSIFIER_POOL.submit(self._smalltalk_llm_check, raw_stripped, state),
-                    _CLASSIFIER_POOL.submit(self._switch_without_target_llm_check, raw_stripped, state),
-                    _CLASSIFIER_POOL.submit(self._legal_q_llm_check, _pw_t, state),
-                    _CLASSIFIER_POOL.submit(self._prewarm_style, raw_stripped, _last_q_for_style, state),
+                    _CLASSIFIER_POOL.submit(self._thanks_llm_check, _pw_t, state, True),
+                    _CLASSIFIER_POOL.submit(self._greeting_llm_check, _pw_t, state, True),
+                    _CLASSIFIER_POOL.submit(self._smalltalk_llm_check, raw_stripped, state, True),
+                    _CLASSIFIER_POOL.submit(self._switch_without_target_llm_check, raw_stripped, state, True),
+                    _CLASSIFIER_POOL.submit(self._legal_q_llm_check, _pw_t, state, True),
+                    _CLASSIFIER_POOL.submit(self._prewarm_style, raw_stripped, _last_q_for_style, state, True),
                 ]
                 concurrent.futures.wait(_pw_futs, timeout=1.5)
+
+                def _commit_prewarm(fut, cache_name: str, cache_key) -> None:
+                    if not fut.done():
+                        return  # still running in the background — discarded, see comment above
+                    try:
+                        result = fut.result()
+                    except Exception as _fut_e:
+                        _LOG.debug("[Supervisor] classifier pre-warm future failed: %s", _fut_e)
+                        return
+                    if result is not None:
+                        state.context.setdefault(cache_name, {})[cache_key] = result
+
+                _commit_prewarm(_pw_futs[0], "_thanks_llm_cache", _pw_t.strip()[:60])
+                _commit_prewarm(_pw_futs[1], "_greeting_llm_cache", _pw_t.strip()[:60])
+                _commit_prewarm(_pw_futs[2], "_smalltalk_llm_cache", raw_stripped.strip()[:60])
+                _commit_prewarm(_pw_futs[3], "_switch_no_target_llm_cache", raw_stripped.strip()[:60])
+                _commit_prewarm(_pw_futs[4], "_legal_q_llm_cache", _pw_t.strip()[:80])
+                _commit_prewarm(_pw_futs[5], "_style_pw_cache", (raw_stripped[:80], (_last_q_for_style or "")[:80]))
                 _LOG.debug("[Supervisor] classifier pre-warm done for %r", raw_stripped[:40])
             except Exception as _pw_e:
                 _LOG.debug("[Supervisor] classifier pre-warm error: %s", _pw_e)
