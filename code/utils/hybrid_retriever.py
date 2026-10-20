@@ -48,10 +48,15 @@ def _tokenize(text: str) -> List[str]:
 # ── BM25 index ────────────────────────────────────────────────────────────────
 
 class _BM25Index:
-    def __init__(self, docs: List[Document]):
+    def __init__(self, docs: List[Document], corpus_version: int = 0):
         from rank_bm25 import BM25Okapi
         self._docs = docs
         self.doc_count = len(docs)
+        # 2026-10 fix (core2-C5): stamped with the corpus-version counter
+        # (service.local_vector_store.get_corpus_version) that every other
+        # corpus-derived cache in the project already checks — see
+        # _get_bm25_index below for why doc count alone isn't enough.
+        self.corpus_version = corpus_version
         tokenized = [_tokenize(d.page_content) for d in docs]
         self._bm25 = BM25Okapi(tokenized)
         _LOG.info("[BM25] Index built: %d docs", len(docs))
@@ -68,6 +73,17 @@ def _get_bm25_index(vectorstore: Any) -> Optional[_BM25Index]:
 
     Compares Chroma doc count on every call to detect re-ingest from another
     process — if count changed, the cached index is invalidated and rebuilt.
+
+    2026-10 fix (core2-C5): doc count alone missed the PDF supersede
+    resolver's "update" decisions — those archive one doc and add one new
+    doc in the same operation, so the live collection's count is unchanged
+    even though the text that was indexed is now stale. Every other
+    corpus-derived cache in the project (9 of them, across all 3 personas)
+    was already wired to service.local_vector_store.get_corpus_version()
+    for exactly this reason; BM25 was the one cache this got missed on —
+    without it, a retired regulatory doc's text stays searchable (and still
+    gets the BM25-hit similarity-floor bypass) for the rest of this
+    process's life.
     """
     try:
         coll = vectorstore._collection
@@ -75,6 +91,12 @@ def _get_bm25_index(vectorstore: Any) -> Optional[_BM25Index]:
     except Exception as e:
         _LOG.warning("[BM25] Cannot access collection: %s", e)
         return None
+
+    from service.local_vector_store import get_corpus_version
+    try:
+        current_corpus_version = get_corpus_version()
+    except Exception:
+        current_corpus_version = 0
 
     # Cache coll.count() to avoid a SQLite query on every retrieval call.
     # invalidate_bm25_cache() clears both _INDEX_CACHE and _COUNT_CACHE,
@@ -93,14 +115,16 @@ def _get_bm25_index(vectorstore: Any) -> Optional[_BM25Index]:
 
     cached = _INDEX_CACHE.get(coll_name)
     if cached is not None:
-        if cached.doc_count == current_count:
+        if cached.doc_count == current_count and cached.corpus_version == current_corpus_version:
             return cached
-        _LOG.info("[BM25] Doc count changed (%d→%d) — rebuilding index for %r",
-                  cached.doc_count, current_count, coll_name)
+        _LOG.info(
+            "[BM25] Doc count/corpus-version changed (%d→%d docs, v%s→v%s) — rebuilding index for %r",
+            cached.doc_count, current_count, cached.corpus_version, current_corpus_version, coll_name,
+        )
 
     with _INDEX_LOCK:
         cached = _INDEX_CACHE.get(coll_name)
-        if cached is not None and cached.doc_count == current_count:
+        if cached is not None and cached.doc_count == current_count and cached.corpus_version == current_corpus_version:
             return cached
         try:
             result = coll.get(include=["documents", "metadatas"])
@@ -114,7 +138,7 @@ def _get_bm25_index(vectorstore: Any) -> Optional[_BM25Index]:
             if not docs:
                 _LOG.warning("[BM25] Collection %r has no docs — BM25 disabled", coll_name)
                 return None
-            idx = _BM25Index(docs)
+            idx = _BM25Index(docs, corpus_version=current_corpus_version)
             _INDEX_CACHE[coll_name] = idx
             return idx
         except Exception as e:
