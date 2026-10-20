@@ -40,7 +40,13 @@ TYPHOON_OCR_API_KEY = os.getenv("TYPHOON_OCR_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-4-5")
 
 OPENROUTER_MODEL_ACADEMIC = os.getenv("OPENROUTER_MODEL_ACADEMIC", "openai/gpt-5.1")
-OPENROUTER_MODEL_PRACTICAL = os.getenv("OPENROUTER_MODEL_PRACTICAL", "anthropic/claude-sonnet-4-5")
+# 2026-10 fix (Infra2-M13): the 2026-09-27 switch to Haiku (measured
+# ~65-68% cost reduction, see practical_model_switch memory) was recorded
+# as deployed, but every config copy in the repo — including this
+# fallback default — still said Sonnet. A fresh deploy/rebuild/local run
+# with no env override silently reverted to the 3x-more-expensive model
+# with no error or log line.
+OPENROUTER_MODEL_PRACTICAL = os.getenv("OPENROUTER_MODEL_PRACTICAL", "anthropic/claude-haiku-4-5")
 
 OPENROUTER_SWITCH_MODEL = os.getenv("OPENROUTER_SWITCH_MODEL", "anthropic/claude-haiku-4-5")
 # Separate fast model for topic_picker (non-critical, fail-fast friendly)
