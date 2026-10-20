@@ -111,7 +111,11 @@ class DataLoader:
         print("\nLoading data from Google Sheet...")
         csv_url = self._build_csv_export_url(sheet_url)
         print("CSV export URL:", csv_url)
-        df = pd.read_csv(csv_url)
+        # 2026-10 fix (core2-N3): without dtype=str (data_loader_general.py's
+        # sibling already has this), pandas infers a fully-numeric column as
+        # float64 — "1000" becomes "1000.0" and a leading-zero code like
+        # "007" loses its zero on the way into the corpus.
+        df = pd.read_csv(csv_url, dtype=str)
         df.rename(columns={c: self.clean_header(c) for c in df.columns}, inplace=True)
         # NEW: schema validation (fail fast)
         self._validate_sheet_schema(df, sheet_url)
@@ -711,7 +715,9 @@ class DataLoader:
         quality issue in practice, not preemptively."""
         print("\nLoading know-how data from Google Sheet...")
         csv_url = self._build_csv_export_url(sheet_url)
-        df = pd.read_csv(csv_url)
+        # 2026-10 fix (core2-N3): see the matching comment in
+        # load_from_google_sheet above — same dtype=str parity fix.
+        df = pd.read_csv(csv_url, dtype=str)
         df.rename(columns={c: self.clean_header(c) for c in df.columns}, inplace=True)
 
         docs_before = len(self.documents)
