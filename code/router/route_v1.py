@@ -378,14 +378,30 @@ async def start_session(http_request: Request, payload: Optional[NewSessionReque
 
 
 @api_v1.post("/reset")
-async def reset_session(request: SessionRequest):
+async def reset_session(request: SessionRequest, http_request: Request):
     if supervisor is None or state_manager is None:
         raise HTTPException(status_code=503, detail="Services not initialized")
 
     await _cleanup_old_sessions_async()
 
-    session_id = request.session_id or f"s_{uuid.uuid4().hex[:8]}"
-    state = ConversationState(session_id=session_id, persona_id="practical", context={})
+    client_key = client_key_from_request(http_request)
+
+    # 2026-10 fix: this used to build a fresh ConversationState over ANY
+    # session_id the caller supplied with no ownership check at all — more
+    # destructive than /session/delete (which at least requires ownership),
+    # since it silently wipes a victim's history/slots/cost. Only check
+    # ownership when the id already names a real session; a brand-new id is
+    # fine to create (same policy as /chat for an unknown session_id).
+    if request.session_id:
+        existing = await _load_state_async(request.session_id)
+        if existing is not None and not owns_session(existing, client_key):
+            raise HTTPException(status_code=404, detail="Session not found")
+        session_id = request.session_id
+    else:
+        session_id = f"s_{uuid.uuid4().hex[:8]}"
+
+    initial_context = {"client_key": client_key} if client_key else {}
+    state = ConversationState(session_id=session_id, persona_id="practical", context=initial_context)
 
     try:
         loop = asyncio.get_running_loop()
@@ -549,7 +565,19 @@ async def chat(request: ChatRequest, http_request: Request):
     try:
         # Load state
         saved = await _load_state_async(session_id)
-        state = saved if saved else ConversationState(session_id=session_id, persona_id="practical", context={})
+        # 2026-10 fix: /chat used to load/mutate ANY session_id the caller
+        # supplied with zero ownership check — a caller who knew a victim's
+        # session_id could read context-aware answers derived from the
+        # victim's history, append turns into it permanently, and burn the
+        # victim's token/round budget. Same 404-not-403 policy as
+        # /session/load (see owns_session's docstring).
+        _client_key = client_key_from_request(http_request)
+        if saved is not None and not owns_session(saved, _client_key):
+            raise HTTPException(status_code=404, detail="Session not found")
+        state = saved if saved else ConversationState(
+            session_id=session_id, persona_id="practical",
+            context={"client_key": _client_key} if _client_key else {},
+        )
         _merge_branch_fields(state, request.branch_id, request.branch_name)
 
         # Session-level token budget: monitor-only (no blocking).
@@ -706,7 +734,8 @@ def _run_supervisor_with_progress(state, message, progress_cb):
 
 
 async def _stream_reply(
-    session_id: str, message: str, branch_id: str = "", branch_name: str = "", client_id: str = ""
+    session_id: str, message: str, branch_id: str = "", branch_name: str = "", client_id: str = "",
+    client_key: str = "",
 ) -> AsyncGenerator[str, None]:
     """
     Generator ที่ส่งคำตอบทีละ chunk แบบ SSE (Server-Sent Events)
@@ -739,8 +768,15 @@ async def _stream_reply(
     state: Optional[ConversationState] = None
     try:
         saved = await _load_state_async(session_id)
+        # 2026-10 fix: same ownership gap as /chat — see the matching
+        # comment there. Goes through the existing _stream_error path (same
+        # as the token-rate-limit check below) so the lock-release in
+        # `finally` stays the single place that releases it.
+        if saved is not None and not owns_session(saved, client_key):
+            _stream_error = "Session not found"
         state = saved if saved else ConversationState(
-            session_id=session_id, persona_id="practical", context={}
+            session_id=session_id, persona_id="practical",
+            context={"client_key": client_key} if client_key else {},
         )
         _merge_branch_fields(state, branch_id, branch_name)
 
@@ -915,7 +951,10 @@ async def chat_stream(request: ChatRequest, http_request: Request):
         )
 
     return StreamingResponse(
-        _stream_reply(session_id, request.message.strip(), request.branch_id, request.branch_name, client_id),
+        _stream_reply(
+            session_id, request.message.strip(), request.branch_id, request.branch_name, client_id,
+            client_key_from_request(http_request),
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
