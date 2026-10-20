@@ -99,12 +99,33 @@ def _filter_to_pdf_auto_ids(doc_ids: list[str], filename: str) -> list[str]:
 
 
 def _assert_dev_environment() -> None:
-    """Same training-wheel as pdf_dual_extraction.py — this module still isn't
-    a reviewed production path. Remove deliberately once it is."""
+    """Same training-wheel as pdf_dual_extraction.py — originally meant to
+    stop this not-yet-reviewed module from accidentally running against the
+    real, shared bot+Sheet production corpus. The direct-ingest pipeline is
+    reviewed and deployed now (this IS the production path for the
+    dedicated pure-PDF project instance), but this check still infers
+    safety from the env FILENAME alone — which means the real production
+    consumer can only ever run under a file literally named something
+    other than "env.properties" (its own COLLECTION_NAME/LOCAL_VECTOR_DIR
+    values are never actually checked), forcing every real deployment to
+    carry a config file misleadingly named like a dev config forever.
+
+    2026-10 fix (PDF2-N7): added an explicit opt-in escape hatch
+    (PDF_CONSUMER_ACKNOWLEDGED_PRODUCTION) that bypasses the filename check
+    entirely when set — a real decision an operator makes once per
+    deployment, not an inference from a filename. Defaults to False, so
+    every existing deployment (still relying on a dev-named file) is
+    completely unaffected; this only adds a cleaner path for a future one
+    that wants to use a file actually named for production.
+    """
+    if conf.PDF_CONSUMER_ACKNOWLEDGED_PRODUCTION:
+        return
     if conf.ENV_FILE_NAME == "env.properties":
         raise RuntimeError(
             "sqs_consumer refused to run: conf.py loaded the REAL env.properties "
-            "(RESTBIZ_ENV_FILE was not set). Set RESTBIZ_ENV_FILE=env.dev.properties first."
+            "(RESTBIZ_ENV_FILE was not set). Set RESTBIZ_ENV_FILE=env.dev.properties, "
+            "or set PDF_CONSUMER_ACKNOWLEDGED_PRODUCTION=true if this really is the "
+            "intended pure-PDF production deployment."
         )
 
 

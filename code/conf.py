@@ -346,6 +346,12 @@ RERANKER_ENABLED = os.getenv("RERANKER_ENABLED", "false").lower() == "true"
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
 RERANKER_TOP_K = _safe_int("RERANKER_TOP_K", 10)
 
+# 2026-10 fix (PDF2-N7): explicit opt-in for sqs_consumer.py's _assert_dev_environment()
+# training-wheel to run against a config file NOT named "env.properties" — decouples the
+# check from inferring safety from the env filename. Defaults false; every existing
+# deployment (which relies on a dev-named file) is unaffected.
+PDF_CONSUMER_ACKNOWLEDGED_PRODUCTION = os.getenv("PDF_CONSUMER_ACKNOWLEDGED_PRODUCTION", "false").lower() == "true"
+
 # Reranker inference backend: "pytorch" (default, current behavior, sentence-transformers
 # CrossEncoder float32) or "onnx" (quantized INT8 via Hugging Face Optimum + ONNX Runtime,
 # ~2-3x faster on CPU per sbert.net docs). OFF by default pending live validation — same
