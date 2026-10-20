@@ -31,6 +31,7 @@ import conf
 from utils.llm_cost_logging import CostAccumulator, log_llm_cost
 from utils.llm_json_parse import parse_leading_json
 from utils.logger import get_logger
+from utils.page_ranges import group_into_ranges
 from utils.pdf_cost_guard import get_cost_guard
 from utils.prompt_safety import INJECTION_GUARD
 
@@ -231,6 +232,15 @@ def classify_content_shape(pages_markdown: list[str], cost_accumulator: Optional
         s, e = max(1, s), min(num_pages, e)
         if s <= e:
             secondary_pages.append((s, e))
+
+    # 2026-10 fix (PDF2-N2): the model's answer can list overlapping ranges
+    # (e.g. [[6,10],[8,12]] for one real secondary section) — left as-is,
+    # the overlapping pages (8-10 here) get processed twice by the
+    # secondary builder downstream, writing duplicate vectorstore docs for
+    # the same content. Collapsed into disjoint ranges.
+    if secondary_pages:
+        flat_pages = [p for s, e in secondary_pages for p in range(s, e + 1)]
+        secondary_pages = group_into_ranges(flat_pages)
 
     logger.info(f"[ContentShape] shape={shape} secondary_pages={secondary_pages}")
     return {"shape": shape, "reasoning": reasoning, "secondary_pages": secondary_pages}
