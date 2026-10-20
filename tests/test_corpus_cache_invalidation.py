@@ -38,14 +38,23 @@ class TestCorpusVersionMechanics:
         mgr = LocalVectorStoreManager()
         assert mgr.get_corpus_version() == 0
 
-    def test_bump_increments_monotonically(self, tmp_path, monkeypatch):
+    def test_bump_produces_a_new_distinct_value_each_time(self, tmp_path, monkeypatch):
+        """2026-10 fix (PDF2-N4): the stored value is now time.time_ns(),
+        not a simple 1/2/3 increment (the old read-then-write increment
+        was non-atomic across two concurrent writers — see
+        _bump_corpus_version's docstring). Every caller only ever compares
+        this value for equality, never does arithmetic on it, so the only
+        real contract to test is "never 0, and a later bump produces a
+        different value than an earlier one"."""
         monkeypatch.setattr(conf, "LOCAL_VECTOR_DIR", str(tmp_path))
         mgr = LocalVectorStoreManager()
         mgr._bump_corpus_version()
-        assert mgr.get_corpus_version() == 1
+        v1 = mgr.get_corpus_version()
+        assert v1 != 0
         mgr._bump_corpus_version()
-        mgr._bump_corpus_version()
-        assert mgr.get_corpus_version() == 3
+        v2 = mgr.get_corpus_version()
+        assert v2 != 0
+        assert v2 != v1
 
     def test_visible_across_separate_manager_instances_sharing_a_dir(self, tmp_path, monkeypatch):
         """Must behave the same whether the bump and the read happen in the
@@ -58,7 +67,7 @@ class TestCorpusVersionMechanics:
         reader = LocalVectorStoreManager()
         assert reader.get_corpus_version() == 0
         writer._bump_corpus_version()
-        assert reader.get_corpus_version() == 1
+        assert reader.get_corpus_version() != 0
 
     def test_corrupt_version_file_fails_open_to_zero(self, tmp_path, monkeypatch):
         monkeypatch.setattr(conf, "LOCAL_VECTOR_DIR", str(tmp_path))

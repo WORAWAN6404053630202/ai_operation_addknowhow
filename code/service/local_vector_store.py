@@ -151,14 +151,23 @@ class LocalVectorStoreManager:
         LOCAL_VECTOR_DIR (e.g. the SQS consumer and the web app running
         alongside each other on the same instance, see
         pdf_project_instance_split's "OWN separate vector DB (Sheet data +
-        PDFs merged)" setup)."""
+        PDFs merged)" setup).
+
+        2026-10 fix (PDF2-N4): used to be a read-then-write increment
+        (read current int, write current+1) — non-atomic across two
+        concurrent writers sharing one LOCAL_VECTOR_DIR (the consumer and
+        the web app), so two near-simultaneous bumps could both read N and
+        both write N+1, losing one increment — a long-lived persona
+        process would then keep serving a stale cached topic list after a
+        PDF ingest that it should have noticed. Every caller only ever
+        compares this value for equality (never does arithmetic on it —
+        confirmed by reading every get_corpus_version() call site), so a
+        monotonic counter was never actually required: writing the current
+        time in nanoseconds removes the read entirely, making each bump a
+        single atomic write with no race window at all."""
         path = self._corpus_version_path()
         try:
-            current = int(path.read_text().strip()) if path.exists() else 0
-        except Exception:
-            current = 0
-        try:
-            path.write_text(str(current + 1))
+            path.write_text(str(time.time_ns()))
         except Exception:
             pass  # best-effort — a missed bump just costs one extra stale-cache round-trip later, never a crash
 
@@ -166,8 +175,9 @@ class LocalVectorStoreManager:
         """Cheap (single small-file read) freshness marker — callers that
         cache corpus-derived data store the version they computed at, and
         recompute when this no longer matches. Returns 0 (never equal to a
-        real bumped version, which starts at 1) if the file doesn't exist
-        yet or can't be read, so a fresh process always recomputes once."""
+        real bumped version — _bump_corpus_version always writes a real
+        time.time_ns() value) if the file doesn't exist yet or can't be
+        read, so a fresh process always recomputes once."""
         try:
             return int(self._corpus_version_path().read_text().strip())
         except Exception:
