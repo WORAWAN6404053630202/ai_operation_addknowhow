@@ -4381,7 +4381,18 @@ class AcademicPersonaService:
             },
         }
 
-    def _build_final_prompt(self, state: ConversationState, user_question: str) -> str:
+    def _build_final_prompt(self, state: ConversationState, user_question: str) -> tuple:
+        # Returns (prompt, doc_phones) — doc_phones (2026-10 fix, core2-M1)
+        # is the set of phone numbers verbatim in DOCUMENTS, handed straight
+        # to _finalize_answer's Layer 3 strip instead of that layer
+        # re-deriving it by re-scanning the whole assembled prompt text. The
+        # re-scan approach broke in the "no real phones" branch below: its
+        # own guard text reads "...hotline number (e.g. 1570)...", and
+        # utils.phone_extraction's hotline-context regex (keyword + up to 15
+        # chars + a 4-digit number) matches "1570" inside that sentence —
+        # so a model hallucinating exactly "ติดต่อสายด่วน 1570" (the literal
+        # wrong-answer example both personas' prompts call out) had an
+        # empty strip set and got waved through.
         ctx = state.context or {}
         slots = ctx.get("academic_slots") or {}
         selected = ctx.get("selected_sections") or {"type": "all", "keys": []}
@@ -4797,7 +4808,7 @@ class AcademicPersonaService:
                 "Write 'ติดต่อ [ชื่อหน่วยงาน] โดยตรง' without a number."
             )
 
-        return f"""USER_QUESTION:
+        _ac_prompt_text = f"""USER_QUESTION:
 {user_question}
 
 SLOTS:
@@ -4819,6 +4830,7 @@ DOCUMENTS ({len(state.current_docs or [])} found):
 
 Return JSON:
 """.strip()
+        return _ac_prompt_text, _ac_doc_phones
 
     _URL_TRAILING_RE = re.compile(r'https?://\S+$')
     _URL_CONTINUATION_RE = re.compile(r'^[a-zA-Z0-9._/\-?=&%+#@!~,;:]+')
@@ -4882,7 +4894,7 @@ Return JSON:
         uq = uq or getattr(conf, "DEFAULT_RETRIEVAL_FALLBACK_QUERY",
                            "กฎหมายร้านอาหาร ใบอนุญาต ภาษี VAT จดทะเบียน สุขาภิบาล ประกันสังคม")
 
-        prompt = self._build_final_prompt(state, user_question=uq)
+        prompt, _ac_doc_phones = self._build_final_prompt(state, user_question=uq)
 
         # Fix 6: Collect allowed URLs from the injected link sections so we can strip any
         # hallucinated URLs the LLM generates that are NOT from the approved source list.
@@ -4894,12 +4906,13 @@ Return JSON:
             for u in re.findall(r"https?://[^\s\n，。、\"']+", prompt)
         }
 
-        # Phone-number hallucination defense, Layer 3 (2026-10, core-M5/M6) —
-        # same whitelist-from-prompt trick as _allowed_urls above, re-deriving
-        # the DOCUMENTS-verified whitelist from the already-built prompt text
-        # instead of re-scanning state.current_docs separately, so this can
-        # never disagree with what Layer 2 actually told the LLM.
-        _allowed_phones: set = extract_thai_phone_numbers(prompt)
+        # Phone-number hallucination defense, Layer 3 (2026-10, core-M5/M6;
+        # core2-M1 fix) — _build_final_prompt now hands back the exact
+        # doc-derived whitelist it computed for Layer 2, instead of this
+        # layer re-deriving it by re-scanning the whole prompt text (which
+        # could pick up the guard instruction's own "e.g. 1570" example as
+        # an "allowed" phone — see _build_final_prompt's docstring).
+        _allowed_phones: set = _ac_doc_phones
 
         try:
             emit_progress("กำลังเรียบเรียงคำตอบ...")

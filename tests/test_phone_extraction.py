@@ -81,7 +81,11 @@ class TestAcademicPhoneGuardPromptInjection:
         ac = self._academic()
         state = ConversationState(session_id="t1", persona_id="academic", context={})
         state.current_docs = docs
-        return ac._build_final_prompt(state, user_question="ติดต่อยังไง")
+        # 2026-10 fix (core2-M1): _build_final_prompt now returns
+        # (prompt, doc_phones) — see its docstring. Tests here only need
+        # the prompt text; the doc_phones half is covered separately below.
+        prompt, _doc_phones = ac._build_final_prompt(state, user_question="ติดต่อยังไง")
+        return prompt
 
     def test_phone_in_documents_appears_in_guard_whitelist(self):
         docs = [{"content": "c", "metadata": {
@@ -98,6 +102,45 @@ class TestAcademicPhoneGuardPromptInjection:
         }}]
         prompt = self._build_prompt(docs)
         assert "No phone numbers appear in the retrieved DOCUMENTS" in prompt
+
+
+@pytest.mark.unit
+class TestAcademicLayer3DoesNotWhitelistItsOwnGuardTextExample:
+    """core2-M1 (2026-10): Layer 3 used to re-derive its whitelist by
+    calling extract_thai_phone_numbers(prompt) — scanning the WHOLE
+    assembled prompt, including the no-phones-available branch's own guard
+    text ("...hotline number (e.g. 1570)..."). utils.phone_extraction's
+    hotline-context regex (keyword + up to 15 chars + a 4-digit number)
+    matched "1570" inside that sentence, so _allowed_phones = {"1570"} even
+    when DOCUMENTS had zero real phone numbers — if the model then
+    hallucinated exactly "ติดต่อสายด่วน 1570" (the literal wrong-answer
+    example both personas' prompts call out), Layer 3 computed an empty
+    strip set and let it through. Fixed by having _build_final_prompt hand
+    back the real doc-derived whitelist directly instead of this layer
+    re-scanning prompt text that can contain example numbers of its own."""
+
+    @staticmethod
+    def _academic():
+        from model.persona_academic import AcademicPersonaService
+        return AcademicPersonaService.__new__(AcademicPersonaService)
+
+    def test_doc_phones_returned_are_empty_when_no_real_phone_in_documents(self):
+        """The actual fix, verified directly: _build_final_prompt's second
+        return value must be empty here, even though the prompt text it
+        also returns contains "1570" (inside the guard's own example)."""
+        from model.conversation_state import ConversationState
+        ac = self._academic()
+        state = ConversationState(session_id="t1", persona_id="academic", context={})
+        state.current_docs = [{"content": "c", "metadata": {
+            "license_type": "ทะเบียนนายจ้าง", "department": "สำนักงานประกันสังคม",
+        }}]
+        prompt, doc_phones = ac._build_final_prompt(state, user_question="ติดต่อยังไง")
+
+        assert "1570" in prompt  # sanity: the guard's own example is in there
+        assert doc_phones == set(), (
+            f"doc_phones must be empty when DOCUMENTS has no real phone number — "
+            f"got {doc_phones!r}, which would let a hallucinated '1570' through Layer 3 unstripped"
+        )
 
 
 @pytest.mark.unit
