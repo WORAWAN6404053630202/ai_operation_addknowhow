@@ -26,7 +26,9 @@ Split off from the old router/admin.py (2026-09) into its own file,
 originally meant to be served by a separate app/process/port (see
 app_pdf.py) from the production chat bot — so a PDF-pipeline dependency
 crash (see the boto3 incident, 2026-09-06/07) can never take the bot down
-again. The bot's own session-monitoring routes live in router/admin_bot.py.
+again. The bot's own session-monitoring routes live in router/admin.py
+(router/admin_bot.py was a stale, never-imported duplicate of that same
+file — see core2-M8/Infra2-M14 — deleted 2026-10).
 
 Included from THREE places as of 2026-10 (all should behave identically —
 same router object, same handler functions, no logic duplicated anywhere):
@@ -47,8 +49,8 @@ a given deployment needs this router included (directly or reachable at
 that base URL) for the PDF Queue tab to work.
 
 Each endpoint below carries its own dependencies=[_auth] (X-Admin-Key), same
-as the pattern in admin_bot.py — there is no router-level auth dependency to
-inherit from (the old router-level require_admin_basic_auth was removed in
+as the pattern in router/admin.py — there is no router-level auth dependency
+to inherit from (the old router-level require_admin_basic_auth was removed in
 favor of this per-route mechanism; merging that removal with main's new
 per-route auth left these endpoints open until fixed).
 """

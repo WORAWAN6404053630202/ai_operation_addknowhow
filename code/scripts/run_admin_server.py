@@ -10,9 +10,10 @@ Updated 2026-09 (bot/PDF service-split work) to import the now-separate
 router/admin_pdf.py instead of the old combined router/admin.py — this is the
 service actually running in production for PDF review today (systemd unit
 restbiz-pdf-admin.service, port 8001), so it gets its own dashboard-shell
-route here rather than relying on the bot's admin_bot.py for that (which
-would mean this "isolated" server suddenly depends on the bot being up to
-show its own UI — defeats the point of isolating it).
+route here rather than relying on the bot's own admin dashboard (router/
+admin.py) for that (which would mean this "isolated" server suddenly
+depends on the bot being up to show its own UI — defeats the point of
+isolating it).
 
 static/admin.html's PDF_API_BASE constant is origin-aware: when the page is
 loaded from this server directly (as it is today, via the route below), PDF
@@ -46,7 +47,7 @@ app.include_router(admin_pdf_router)
 
 @app.get("/admin/", response_class=HTMLResponse, include_in_schema=False)
 async def admin_dashboard():
-    """Same dashboard shell as router/admin_bot.py's admin_dashboard() — this
+    """Same dashboard shell as router/admin.py's admin_dashboard() — this
     server needs its own copy since it deliberately doesn't depend on the bot
     service being up at all to show its own UI."""
     html_path = code_dir / "static" / "admin.html"
