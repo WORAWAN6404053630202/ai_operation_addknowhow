@@ -285,6 +285,12 @@ PDF_SUPERSEDE_EMBEDDING_MIN_GAP = _safe_float("PDF_SUPERSEDE_EMBEDDING_MIN_GAP",
 PDF_SUPERSEDE_EMBEDDING_MAX_CANDIDATES = _safe_int("PDF_SUPERSEDE_EMBEDDING_MAX_CANDIDATES", 10)
 PDF_SUPERSEDE_IDENTITY_FUZZY_THRESHOLD = _safe_float("PDF_SUPERSEDE_IDENTITY_FUZZY_THRESHOLD", 0.82)
 PDF_SUPERSEDE_LLM_BATCH_SIZE = _safe_int("PDF_SUPERSEDE_LLM_BATCH_SIZE", 15)
+
+# 2026-10 fix (Infra2-L2): env.properties/env.dev.properties both set this,
+# but conf.py never defined it — model/persona_practical.py's getattr(conf,
+# "SIBLING_DOCS_CAP", 10) silently fell back to the hardcoded default every
+# time, so the env value was never actually applied.
+SIBLING_DOCS_CAP = _safe_int("SIBLING_DOCS_CAP", 10)
 OPENROUTER_MODEL_PDF_SUPERSEDE = os.getenv("OPENROUTER_MODEL_PDF_SUPERSEDE", OPENROUTER_MODEL_PDF_MATCHING)
 
 # RAG Quality: Minimum similarity threshold
