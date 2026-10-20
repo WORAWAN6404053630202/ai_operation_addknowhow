@@ -945,7 +945,41 @@ def lambda_handler(event, context):
     for record in event.get("Records", []):
         bucket = record["s3"]["bucket"]["name"]
         key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
-        filename = key.rsplit("/", 1)[-1]
+
+        # 2026-10 fix (Infra2-M7): nothing used to check that the triggering
+        # key is actually a raw PDF upload, not one of THIS Lambda's own
+        # output objects (which it writes back into the SAME bucket under
+        # OUTPUT_S3_PREFIX/HANDOFF_S3_PREFIX/STATUS_S3_PREFIX). The only
+        # thing preventing a recursive self-trigger loop today is a
+        # suffix/prefix filter in the S3 bucket-notification config itself
+        # — console-managed, not tracked in this repo, and already hand-
+        # edited more than once per this file's own history. A
+        # misconfiguration there (the exact class of mistake that produced
+        # the 2026-08 $78-80 cost-runaway incident once already) would have
+        # this Lambda re-invoke itself on every object it writes, forever.
+        # Three lines here make that console config irrelevant to this
+        # specific risk.
+        if not key.lower().endswith(".pdf"):
+            logger.info(f"Skipping non-PDF key s3://{bucket}/{key} (not a raw upload)")
+            continue
+        if key.startswith(OUTPUT_S3_PREFIX) or key.startswith(HANDOFF_S3_PREFIX) or key.startswith(STATUS_S3_PREFIX):
+            logger.warning(f"Skipping s3://{bucket}/{key} — matches one of this Lambda's own output prefixes, refusing to self-trigger")
+            continue
+
+        # 2026-10 fix (Infra2-M6/PDF2-M6): used to be key.rsplit("/", 1)[-1]
+        # (bare basename) — every S3 key below (handoff/output/status) AND
+        # the attempt-counter key were derived from it. Two uploads sharing
+        # a basename under different S3 prefixes (e.g. this bucket's
+        # per-environment PDF_INGESTION_S3_PREFIX, see conf.py on the EC2
+        # side) silently overwrote each other's output/status/handoff
+        # objects and shared one retry-attempt budget — one failing
+        # document could exhaust the shared cap of an unrelated healthy
+        # one. Sanitizing the FULL key instead makes every derived object
+        # unique per actual S3 path; the EC2 side needs no matching change
+        # since it only ever reads this value back out of the JSON Lambda
+        # itself writes (sqs_consumer.py's `filename = data["filename"]`),
+        # never re-derives it independently.
+        filename = key.replace("/", "__")
 
         logger.info(f"Processing s3://{bucket}/{key}")
         # Captured here, not at Lambda cold-start — this is "extraction
