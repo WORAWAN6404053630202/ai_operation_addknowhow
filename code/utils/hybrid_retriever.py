@@ -357,6 +357,7 @@ def hybrid_scored_search(
     if _eff_filter:
         kwargs["filter"] = _eff_filter
     _dense_max_attempts = 3
+    _dense_fully_failed = False
     for _attempt in range(1, _dense_max_attempts + 1):
         try:
             dense_pairs = vectorstore.similarity_search_with_relevance_scores(query, **kwargs)
@@ -365,7 +366,24 @@ def hybrid_scored_search(
             if _attempt < _dense_max_attempts:
                 _LOG.info("[Hybrid] Dense search attempt %d/%d failed: %s — retrying", _attempt, _dense_max_attempts, e)
             else:
-                _LOG.warning("[Hybrid] Dense search failed after %d attempts: %s", _dense_max_attempts, e)
+                _dense_fully_failed = True
+                # 2026-10 fix (core2-N4): this used to be a WARNING, same
+                # level as a single transient retry just above — total
+                # dense failure degrades every doc's score to BM25-only
+                # (dense_pairs stays [], so _rrf_fuse below treats every
+                # candidate as having zero dense signal, and the similarity
+                # floor then relies entirely on BM25 hits), silently
+                # answering from a thin/partial pool instead of surfacing
+                # the real degraded-service event the rotating file log and
+                # LangSmith tracing were built to catch. ERROR (not just a
+                # retry-exhausted warning) so it's distinguishable from the
+                # routine single-attempt retries, and a query= field so
+                # OpenRouter outages are greppable/traceable per-query.
+                _LOG.error(
+                    "[Hybrid] DENSE_SEARCH_TOTAL_FAILURE after %d attempts — falling back to "
+                    "BM25-only for this query: %s | query=%r",
+                    _dense_max_attempts, e, query[:120],
+                )
 
     bm25_pairs = bm25_future.result()
     if bm25_pairs is None:
@@ -373,8 +391,9 @@ def hybrid_scored_search(
 
     fused = _rrf_fuse(dense_pairs, bm25_pairs, rrf_k=rrf_k, bm25_bypass_min_ratio=bm25_bypass_min_ratio)
     _LOG.info(
-        "[Hybrid] dense=%d bm25=%d → fused=%d (rrf_k=%d filter=%s)",
+        "[Hybrid] dense=%d bm25=%d → fused=%d (rrf_k=%d filter=%s%s)",
         len(dense_pairs), len(bm25_pairs), len(fused), rrf_k,
         str(metadata_filter) if metadata_filter else "none",
+        " DENSE_DEGRADED=True" if _dense_fully_failed else "",
     )
     return fused[:k]
