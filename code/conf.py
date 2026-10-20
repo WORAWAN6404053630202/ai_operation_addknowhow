@@ -752,6 +752,16 @@ TOKEN_BUDGET_PER_SESSION = _safe_int("TOKEN_BUDGET_PER_SESSION", 0)
 # Set to 0 to disable (default).
 TOKEN_RATE_LIMIT_PER_WINDOW = _safe_int("TOKEN_RATE_LIMIT_PER_WINDOW", 0)
 
+# 2026-10 fix (core2-N2): utils/rate_limiter.py's get_rate_limiter() used
+# to hardcode RateLimiter(max_requests=10, window_seconds=60) with no conf
+# lookup at all — an operator couldn't tighten the limit during an active
+# abuse incident, or loosen it for a shared office IP, without a code
+# change. RATE_LIMIT_WINDOW_SECONDS was also already referenced by the
+# comment above (shared with the token-rate-limit window) despite never
+# being defined anywhere in the repo.
+RATE_LIMIT_MAX_REQUESTS = _safe_int("RATE_LIMIT_MAX_REQUESTS", 10)
+RATE_LIMIT_WINDOW_SECONDS = _safe_int("RATE_LIMIT_WINDOW_SECONDS", 60)
+
 
 def validate_config() -> None:
     """

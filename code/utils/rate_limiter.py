@@ -245,10 +245,23 @@ _global_limiter: RateLimiter = None
 
 
 def get_rate_limiter() -> RateLimiter:
-    """Get global rate limiter instance (singleton)."""
+    """Get global rate limiter instance (singleton).
+
+    2026-10 fix (core2-N2): used to hardcode max_requests=10/window_seconds=60
+    with no conf lookup — an operator couldn't tighten the limit during an
+    active abuse incident, or loosen it for a shared office IP, without a
+    code change. Now reads conf.RATE_LIMIT_MAX_REQUESTS/
+    RATE_LIMIT_WINDOW_SECONDS (same defaults, so behavior is unchanged
+    unless an operator actually sets them)."""
     global _global_limiter
     if _global_limiter is None:
         with _GLOBAL_LIMITER_LOCK:
             if _global_limiter is None:
-                _global_limiter = RateLimiter(max_requests=10, window_seconds=60)
+                try:
+                    import conf
+                    max_requests = int(getattr(conf, "RATE_LIMIT_MAX_REQUESTS", 10) or 10)
+                    window_seconds = int(getattr(conf, "RATE_LIMIT_WINDOW_SECONDS", 60) or 60)
+                except Exception:
+                    max_requests, window_seconds = 10, 60
+                _global_limiter = RateLimiter(max_requests=max_requests, window_seconds=window_seconds)
     return _global_limiter
