@@ -12,6 +12,10 @@ from langchain_community.vectorstores import Chroma
 
 import conf
 from utils.llm_call import get_shared_http_client
+from utils.logger import get_logger
+from utils.model_pricing import MODEL_PRICING
+
+_LOG = get_logger(__name__)
 
 
 # Safe directories for rmtree — prevents accidental deletion outside project scope
@@ -68,6 +72,40 @@ def _materialize_embeddings(raw: dict) -> list:
     correct return type."""
     emb = raw.get("embeddings")
     return [] if emb is None or len(emb) == 0 else list(emb)
+
+
+def _record_embedding_cost_estimate(label: str, texts: list[str]) -> None:
+    """2026-10 fix (PDF2-N6): every other LLM call in the PDF pipeline
+    records its real cost via utils.llm_cost_logging.log_llm_cost, but the
+    two real billed OpenRouter embedding call sites in this file
+    (embed_documents in add_documents, embed_query in
+    query_live_with_ids) never did — the dashboard's "today's spend"
+    systematically understated actual cost. LangChain's embedding wrapper
+    doesn't surface token usage from the underlying API call (unlike a
+    raw OpenAI-SDK chat/embedding response, which log_llm_cost reads
+    directly), so this estimates tokens from character count (~4 chars/
+    token, the standard rough heuristic — not exact for Thai, but a real
+    non-zero estimate is a large improvement over the current silent
+    zero) and records it the same way log_llm_cost would have.
+    Best-effort only — this must never affect the real embedding call it's
+    observing, cost_guard is PDF-only (see log_llm_cost's own docstring on
+    why it's never used for the main chat bot's embedding calls, which
+    don't go through this module)."""
+    try:
+        from utils.pdf_cost_guard import get_cost_guard
+        total_chars = sum(len(t or "") for t in texts)
+        estimated_tokens = max(1, total_chars // 4)
+        pricing = MODEL_PRICING.get(conf.EMBEDDING_MODEL)
+        if pricing is None:
+            return
+        cost_usd = (estimated_tokens * pricing["input"]) / 1_000_000
+        _LOG.info(
+            f"[CostLog] {label} | model={conf.EMBEDDING_MODEL} estimated_tokens={estimated_tokens} "
+            f"cost_usd={cost_usd:.6f} (estimated from char count, not real usage data)"
+        )
+        get_cost_guard().record_cost(cost_usd)
+    except Exception:
+        pass  # best-effort — a missed cost record must never affect real ingestion/retrieval work
 
 
 class LocalVectorStoreManager:
@@ -347,6 +385,7 @@ class LocalVectorStoreManager:
             return 0
 
         self.vectorstore.add_documents(docs)
+        _record_embedding_cost_estimate("VectorStore/embed_documents", [d.page_content for d in docs])
         try:
             self.vectorstore.persist()
         except Exception:
@@ -677,6 +716,7 @@ class LocalVectorStoreManager:
         if not text or not text.strip():
             return []
         embedding = self.embedding_model.embed_query(text)
+        _record_embedding_cost_estimate("VectorStore/embed_query", [text])
         kwargs: dict = {
             "query_embeddings": [embedding], "n_results": k,
             "include": ["metadatas", "documents", "distances"],
