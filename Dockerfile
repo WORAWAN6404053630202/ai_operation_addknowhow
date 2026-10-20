@@ -21,20 +21,25 @@ WORKDIR /app
 # (re-resolve + re-test) rather than letting it drift silently.
 COPY --from=ghcr.io/astral-sh/uv:latest@sha256:637bbca55303e5c6abee80ec3ef86c89f487e118e45b8d693a4a8889cee2bfe4 /uv /uvx /bin/
 
-# 2026-10 fix (Infra2-M2): requirements-dev.txt deliberately excludes torch itself
-# (--no-emit-package torch, see header) but sentence-transformers still pulls it
-# in transitively — without this pre-install, that pull picks the default PyPI
-# build (CUDA-enabled, ~2.5 GB) since nothing here already satisfies the
-# constraint, unlike the `prod` stage below which has always had this line.
-# Pinned (Infra2-M4) to the version currently resolved unpinned from this same
-# CPU index, so this is a reproducibility fix only — no behavior change.
-RUN pip install --no-cache-dir torch==2.6.0+cpu --index-url https://download.pytorch.org/whl/cpu
-
 # Copy requirements ก่อนเพื่อใช้ Docker cache
 COPY requirements.txt requirements-dev.txt /app/
 
-# ติดตั้ง Python dependencies รวม dev tools (gradio, pytest)
-RUN uv pip install --system --no-cache -r requirements-dev.txt
+# 2026-10 fix (Infra2-M2, revised after verifying with a real build): this
+# stage used to have no CPU-only torch handling at all, unlike `prod` below
+# — requirements-dev.txt deliberately excludes torch itself
+# (--no-emit-package torch, see header), so when sentence-transformers pulls
+# it in transitively, uv needs its own instruction on which build to pick.
+# A first attempt added a `pip install torch==X+cpu` pre-install step (same
+# as `prod` below always had) — a real `docker buildx build` then proved
+# that pre-install line does NOT survive: uv re-resolves torch from scratch
+# to satisfy sentence-transformers regardless of what's already installed,
+# silently replacing it with a ~1.1GB CUDA build (confirmed via `docker run
+# ... python3 -c "import torch; print(torch.__version__)"` returning
+# `2.14.1+cu130`). `--torch-backend cpu` on the actual install step is what
+# controls the real outcome — same flag this lockfile's own compile command
+# already uses (see file header) — so the separate pre-install was pure dead
+# weight once this flag is here; removed rather than left as inert cruft.
+RUN uv pip install --system --no-cache --torch-backend cpu -r requirements-dev.txt
 
 # Copy code และ data
 COPY code/ /app/code/
@@ -66,15 +71,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY --from=ghcr.io/astral-sh/uv:latest@sha256:637bbca55303e5c6abee80ec3ef86c89f487e118e45b8d693a4a8889cee2bfe4 /uv /uvx /bin/  # Infra2-M5: pinned by digest, see develop stage comment above
-
-# 2026-10 fix (Infra2-M2/M4): same CPU-only, pinned torch pre-install as the
-# develop stage above — otherwise sentence-transformers' transitive pull picks
-# the default CUDA-enabled build here too.
-RUN pip install --no-cache-dir torch==2.6.0+cpu --index-url https://download.pytorch.org/whl/cpu
+# Infra2-M5: pinned by digest, see develop stage comment above
+COPY --from=ghcr.io/astral-sh/uv:latest@sha256:637bbca55303e5c6abee80ec3ef86c89f487e118e45b8d693a4a8889cee2bfe4 /uv /uvx /bin/
 
 COPY requirements.txt /app/
-RUN uv pip install --system --no-cache -r requirements.txt
+# 2026-10 fix (Infra2-M2): --torch-backend cpu — see the matching comment on
+# the develop stage above for why (verified via a real build) this is the
+# one line that actually controls CPU-vs-CUDA torch, not a pre-install step.
+RUN uv pip install --system --no-cache --torch-backend cpu -r requirements.txt
 
 COPY code/ /app/code/
 COPY local_chroma_v3/ /app/local_chroma_v3/
@@ -103,19 +107,28 @@ RUN useradd -m -u 1000 appuser
 
 WORKDIR /app
 
-COPY --from=ghcr.io/astral-sh/uv:latest@sha256:637bbca55303e5c6abee80ec3ef86c89f487e118e45b8d693a4a8889cee2bfe4 /uv /uvx /bin/  # Infra2-M5: pinned by digest, see develop stage comment above
+# Infra2-M5: pinned by digest, see develop stage comment above
+COPY --from=ghcr.io/astral-sh/uv:latest@sha256:637bbca55303e5c6abee80ec3ef86c89f487e118e45b8d693a4a8889cee2bfe4 /uv /uvx /bin/
 
-# Install CPU-only PyTorch first to avoid pulling in the GPU build (~2.5 GB → ~500 MB)
-# 2026-10 fix (Infra2-M4): pinned to an exact version — was unpinned, so a
-# rebuild weeks apart could silently resolve a different torch release with
-# no record of which one actually got tested. 2.6.0 is the version this
-# same unpinned install currently resolves to on this CPU index (verified
-# 2026-10-20), so this is a reproducibility fix only, not a version change.
-RUN pip install --no-cache-dir torch==2.6.0+cpu --index-url https://download.pytorch.org/whl/cpu
-
-# Copy and install requirements (torch already installed above, so sentence-transformers skips it)
+# Copy and install requirements.
+# 2026-10 fix (Infra2-M4/M2, revised after verifying with a real build): this
+# stage used to have a separate `pip install torch==X --index-url .../cpu`
+# pre-install step here, with a comment claiming it meant "torch already
+# installed above, so sentence-transformers skips it." A real `docker buildx
+# build --target prod-pdf-full` proved that comment WRONG: uv doesn't see
+# torch as pinned in requirements.txt (--no-emit-package torch, see file
+# header) and, needing it to satisfy sentence-transformers, silently
+# re-resolves and REPLACES whatever's already installed — confirmed
+# `torch==2.14.1+cu130` (a ~1.1GB CUDA build) actually landed in the image
+# before this fix, meaning the "~2.5 GB → ~500 MB" savings that pre-install
+# step was supposed to buy was never actually happening in any deployed
+# image. `--torch-backend cpu` on THIS install is what actually controls the
+# outcome (verified: CPU-tagged torch, ~711MB) — same flag this lockfile's
+# own compile command already uses (see file header) — so the separate
+# pre-install step was pure dead weight once this flag is here; removed
+# rather than left as inert cruft that still downloads an unused wheel.
 COPY requirements.txt /app/
-RUN uv pip install --system --no-cache -r requirements.txt
+RUN uv pip install --system --no-cache --torch-backend cpu -r requirements.txt
 
 # Copy application code
 COPY code/ /app/code/
@@ -166,7 +179,8 @@ RUN useradd -m -u 1000 appuser
 
 WORKDIR /app
 
-COPY --from=ghcr.io/astral-sh/uv:latest@sha256:637bbca55303e5c6abee80ec3ef86c89f487e118e45b8d693a4a8889cee2bfe4 /uv /uvx /bin/  # Infra2-M5: pinned by digest, see develop stage comment above
+# Infra2-M5: pinned by digest, see develop stage comment above
+COPY --from=ghcr.io/astral-sh/uv:latest@sha256:637bbca55303e5c6abee80ec3ef86c89f487e118e45b8d693a4a8889cee2bfe4 /uv /uvx /bin/
 
 COPY requirements-pdf.txt /app/
 RUN uv pip install --system --no-cache -r requirements-pdf.txt
