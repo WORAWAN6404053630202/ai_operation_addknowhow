@@ -28,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -40,6 +41,20 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
 from router.admin_pdf import router as admin_pdf_router
+from utils.logger import setup_logging, get_logger
+
+# 2026-10 fix (Infra2-L6): this entry point never called setup_logging() at
+# all, unlike app.py/app_pdf.py — it ran on Python's bare default root logger,
+# which re-exposes the exact botocore-credential-leak risk already fixed
+# elsewhere this session (LOG_LEVEL=DEBUG making botocore log real AWS STS
+# creds into container logs) for this one process specifically, and skips the
+# rotating file handler too. Same env-var + call convention as app_pdf.py.
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+LOG_FORMAT = os.getenv("LOG_FORMAT", "human")
+LOG_FILE = os.getenv("LOG_FILE", None)
+
+setup_logging(level=LOG_LEVEL, log_format=LOG_FORMAT, log_file=LOG_FILE)
+logger = get_logger(__name__)
 
 app = FastAPI(title="Restbiz PDF Review Admin (dev, isolated)")
 app.include_router(admin_pdf_router)
