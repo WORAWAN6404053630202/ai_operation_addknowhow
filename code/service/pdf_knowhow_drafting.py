@@ -163,11 +163,15 @@ def _resolve_page_overlaps(
     if not overlapping:
         return topics
 
-    # Group contiguous pages that share the exact same pair of competing
+    # Group contiguous pages that share the exact same set of competing
     # topics into one dispute (one follow-up call per dispute, not per page).
-    runs: list[tuple[list[int], tuple[int, int]]] = []
+    # 2026-10 fix (PDF2-N3): `owners` used to be truncated to the first 2
+    # (sorted(page_owners[p])[:2]) — see pdf_field_drafting.py's identical
+    # fix for the full rationale: a genuine 3-way claim still left 2 owners
+    # standing after "resolution" since the 3rd owner was never considered.
+    runs: list[tuple[list[int], tuple[int, ...]]] = []
     for p in overlapping:
-        owners = tuple(sorted(page_owners[p])[:2])  # 3+-way overlap: just take the first 2, rare enough not to warrant a bespoke multi-way prompt
+        owners = tuple(sorted(page_owners[p]))
         if runs and runs[-1][1] == owners and runs[-1][0][-1] == p - 1:
             runs[-1][0].append(p)
         else:
@@ -175,7 +179,22 @@ def _resolve_page_overlaps(
 
     losers: dict[int, set[int]] = {}
     client: OpenAI | None = None
-    for pages, (idx_a, idx_b) in runs:
+    for pages, owners in runs:
+        if len(owners) > 2:
+            # 3+-way: no bespoke multi-way prompt (rare enough not to
+            # warrant one) — deterministically keep the lowest-index owner
+            # and drop ALL others, guaranteeing exactly one owner remains.
+            winner_idx = min(owners)
+            for loser_idx in owners:
+                if loser_idx != winner_idx:
+                    losers.setdefault(loser_idx, set()).update(pages)
+            logger.warning(
+                f"[KnowhowDrafting] {len(owners)}-way page overlap at {pages} (topics {owners}) — "
+                f"no multi-way resolution prompt, deterministically assigning to topic {winner_idx}"
+            )
+            continue
+
+        idx_a, idx_b = owners
         winner_idx, loser_idx = idx_a, idx_b  # safe default if the resolution call below fails
         try:
             if client is None:

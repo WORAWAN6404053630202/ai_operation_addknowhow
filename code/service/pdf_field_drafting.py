@@ -495,9 +495,15 @@ def _resolve_page_overlaps(
     if not overlapping:
         return topics
 
-    runs: list[tuple[list[int], tuple[int, int]]] = []
+    # 2026-10 fix (PDF2-N3): `owners` used to be truncated to the first 2
+    # (sorted(page_owners[p])[:2]) — a genuine 3-way claim on one page
+    # still left 2 owners after "resolution" (the loser of the LLM
+    # pairwise call between owners #1/#2 was removed, but owner #3 was
+    # never considered at all, so its own page_ranges still included that
+    # page untouched). Grouped runs now keep the FULL owner set per page.
+    runs: list[tuple[list[int], tuple[int, ...]]] = []
     for p in overlapping:
-        owners = tuple(sorted(page_owners[p])[:2])
+        owners = tuple(sorted(page_owners[p]))
         if runs and runs[-1][1] == owners and runs[-1][0][-1] == p - 1:
             runs[-1][0].append(p)
         else:
@@ -505,7 +511,24 @@ def _resolve_page_overlaps(
 
     losers: dict[int, set[int]] = {}
     client: OpenAI | None = None
-    for pages, (idx_a, idx_b) in runs:
+    for pages, owners in runs:
+        if len(owners) > 2:
+            # 3+-way: no bespoke multi-way prompt (rare enough not to
+            # warrant one) — deterministically keep the lowest-index
+            # owner and drop ALL others, guaranteeing exactly one owner
+            # remains for these pages (unlike the old 2-of-N truncation,
+            # which could leave 2 owners standing after "resolution").
+            winner_idx = min(owners)
+            for loser_idx in owners:
+                if loser_idx != winner_idx:
+                    losers.setdefault(loser_idx, set()).update(pages)
+            logger.warning(
+                f"[pdf_field_drafting] {len(owners)}-way page overlap at {pages} (topics {owners}) — "
+                f"no multi-way resolution prompt, deterministically assigning to topic {winner_idx}"
+            )
+            continue
+
+        idx_a, idx_b = owners
         winner_idx, loser_idx = idx_a, idx_b  # safe default if the resolution call below fails
         try:
             if client is None:
