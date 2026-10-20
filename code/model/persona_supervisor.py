@@ -931,6 +931,19 @@ class PersonaSupervisor:
             _body = f"ขออภัยครับ ข้อมูลที่ผมมีครอบคลุมเฉพาะ {_opts_str} เท่านั้น — ไม่มีข้อมูลเฉพาะของ \"{_ans}\" ในระบบครับ"
         else:
             _body = f"ขออภัยครับ ไม่มีข้อมูลเฉพาะของ \"{_ans}\" ในระบบครับ"
+        # 2026-10 fix (core2-M2): this used to append the feedback menu
+        # unconditionally, with no _FEEDBACK_MENU_ENABLED check at all (the
+        # dispatcher in _handle_inner IS gated — see its own comment — but
+        # this append site, and the pending_feedback_choice set at this
+        # method's call site, were not). While disabled, a menu that can
+        # never be routed is worse than no menu: pending_slot is left armed
+        # by the caller, so the user's next reply (e.g. "1", meaning the
+        # first feedback option) silently falls through to whatever
+        # pending_slot handling comes later and gets answered as if it were
+        # a reply to the ORIGINAL slot question instead — no indication the
+        # input was reinterpreted.
+        if not self._FEEDBACK_MENU_ENABLED:
+            return _body
         return f"{_body}\n\n---\n{self._FEEDBACK_MENU_TEXT}"
 
     def _build_slot_mismatch_query(self, state: ConversationState, user_input: str) -> str:
@@ -10533,10 +10546,19 @@ class PersonaSupervisor:
             # repeating a rigid reask (see round7+ feedback thread for the rigid-loop complaint).
             if err == "กรุณาตอบเป็นตัวเลขตามตัวเลือกครับ":
                 msg = self._normalize_male(self._build_slot_mismatch_message(pending, user_input))
-                self._add_assistant(state, msg)
                 state.context = state.context or {}
-                state.context["pending_feedback_choice"] = True
-                state.context["pending_feedback_query"] = self._build_slot_mismatch_query(state, user_input)
+                # 2026-10 fix (core2-M2): only arm pending_feedback_choice
+                # while the feedback menu is actually enabled — see
+                # _build_slot_mismatch_message's matching comment. While
+                # disabled, re-surface the still-armed pending_slot question
+                # instead, so the user's next reply has somewhere real to go
+                # rather than being silently reinterpreted as an answer to it.
+                if self._FEEDBACK_MENU_ENABLED:
+                    state.context["pending_feedback_choice"] = True
+                    state.context["pending_feedback_query"] = self._build_slot_mismatch_query(state, user_input)
+                else:
+                    msg = self._append_pending_slot_reminder(state, msg)
+                self._add_assistant(state, msg)
                 state.last_action = "pending_slot_mismatch_feedback_offer"
                 return state, msg
             msg = self._normalize_male(err)
