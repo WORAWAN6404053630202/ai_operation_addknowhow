@@ -33,10 +33,22 @@ api_v1 = APIRouter()
 
 SESSION_RETENTION_DAYS = 7
 
+# 2026-10 fix (core2-N1): StateManager._safe_session_id only ever replaced
+# "/" and "\\" — "a/b" and "a_b" silently collided onto the same state
+# file, and an id over ~255 bytes made save() raise an uncaught
+# OSError(ENAMETOOLONG) (a bare 500 after the LLM call had already run and
+# been billed). Validating the shape here, at the API boundary, closes
+# both: every session_id this server itself mints is
+# f"s_{uuid4().hex[:8]}", comfortably inside this pattern, so no legitimate
+# caller is affected. Also closes core2-C4's input side (a session_id
+# containing quotes/HTML can never reach storage/the admin dashboard at
+# all now, on top of that dashboard's own output-side escaping fix).
+_SESSION_ID_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
+
 
 class ChatRequest(BaseModel):
     message: str = Field(..., max_length=5000, description="User message to chatbot")
-    session_id: Optional[str] = Field(None, description="Session ID for conversation continuity")
+    session_id: Optional[str] = Field(None, pattern=_SESSION_ID_PATTERN, description="Session ID for conversation continuity")
     # Always sent by the caller (can be ""). A non-empty value updates the session's
     # stored branch identity; "" leaves whatever was captured on a prior turn untouched
     # (see _merge_branch_fields in chat()/_stream_reply()).
@@ -45,7 +57,7 @@ class ChatRequest(BaseModel):
 
 
 class SessionRequest(BaseModel):
-    session_id: Optional[str] = Field(None, description="Session ID")
+    session_id: Optional[str] = Field(None, pattern=_SESSION_ID_PATTERN, description="Session ID")
 
 
 class NewSessionRequest(BaseModel):
