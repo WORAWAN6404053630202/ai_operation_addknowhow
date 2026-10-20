@@ -56,7 +56,17 @@
     </main>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <!-- 2026-10 fix (core2-M12): both scripts below used to load unpinned
+       (marked) or not-at-all (DOMPurify, didn't exist) from a third-party
+       CDN — a supply-chain risk independent of the sanitization gap itself.
+       Vendored locally (served from this app's own /static mount) at a
+       fixed version instead, so there is no runtime dependency on any CDN
+       being reachable or uncompromised. See app.js's assistantToHtml for
+       why DOMPurify matters: since the PDF direct-ingest pivot, corpus
+       content can come straight from an uploaded PDF with no human review,
+       and marked.parse() has not sanitized its output by default since v5. -->
+  <script src="/static/vendor/marked.min.js"></script>
+  <script src="/static/vendor/purify.min.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

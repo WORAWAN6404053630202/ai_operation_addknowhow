@@ -62,10 +62,22 @@ function textToHtml(text) {
 }
 
 // Fix 2: Render markdown for finalized assistant messages
+// 2026-10 fix (core2-M12): marked.parse()'s output used to go straight into
+// innerHTML with no sanitization — marked hasn't sanitized by default since
+// v5. Since the PDF direct-ingest pivot, corpus content can come straight
+// from an uploaded PDF with no human review (and the prompts actively
+// encourage copying fields like operation_steps/identification_documents
+// verbatim), so a crafted PDF's content becoming retrievable corpus text is
+// a real path to this running in every user's browser who asks about that
+// topic. DOMPurify.sanitize() runs on the parsed HTML before assignment.
 function assistantToHtml(text) {
   if (typeof marked !== "undefined") {
     try {
-      return marked.parse(String(text || ""));
+      const rawHtml = marked.parse(String(text || ""));
+      if (typeof DOMPurify !== "undefined") {
+        return DOMPurify.sanitize(rawHtml);
+      }
+      return rawHtml;
     } catch { /* fall through */ }
   }
   return textToHtml(text);
