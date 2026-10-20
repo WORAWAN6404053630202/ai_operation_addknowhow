@@ -410,6 +410,14 @@ def _build_knowhow_items_direct(
     processing raised an exception, never inspects the returned list's
     length or contents, so an empty return is safe (confirmed by reading
     that function before this was written)."""
+    # 2026-10 fix (PDF2-M3): cost_accumulator is shared and cumulative
+    # across a whole document's processing — a document that routes
+    # through BOTH builders (uncovered-pages routing, or the mixed-shape
+    # secondary pass) used to have each builder's append_event log the
+    # accumulator's FULL running total, not just its own share, double-
+    # (or more-) counting the same spend in the dashboard's activity log.
+    # Snapshot on entry and log only the delta accrued during this call.
+    _cost_at_entry = cost_accumulator.total_cost_usd if cost_accumulator is not None else 0.0
     # Content-hash cache check (2026-10) — see utils/pdf_draft_cache.py. An
     # exact re-upload of a document whose pages extract to the identical
     # text skips this LLM call entirely; a cache miss behaves exactly as
@@ -560,10 +568,14 @@ def _build_knowhow_items_direct(
     # utils/pdf_ingestion_log.py. Never blocks/raises; a logging failure
     # here must not affect the real ingestion work above.
     _high_count, _high_examples = _high_severity_flag_summary(pages)
+    # 2026-10 fix (PDF2-M3): log only this builder's own delta since entry,
+    # not the shared accumulator's full running total — see the matching
+    # comment at this function's top.
+    _cost_delta = max(0.0, (cost_accumulator.total_cost_usd if cost_accumulator is not None else 0.0) - _cost_at_entry)
     append_event(conf.PDF_INGESTION_S3_BUCKET, {
         "filename": filename, "shape": "know_how",
         "new_count": new_count, "update_count": update_count, "duplicate_count": duplicate_count,
-        "cost_usd": cost_accumulator.total_cost_usd if cost_accumulator is not None else 0.0,
+        "cost_usd": _cost_delta,
         "error": write_error,
         "high_severity_flags": _high_count,
         "high_severity_flag_examples": _high_examples,
@@ -589,6 +601,10 @@ def _build_license_items_direct(
     because entity-injection/2-pass retrieval/exact-match chapter-fetch in
     persona_supervisor.py key off these exact 13 fields + topic_group +
     entity_type_normalized directly, not just semantic similarity."""
+    # 2026-10 fix (PDF2-M3): see _build_knowhow_items_direct's matching
+    # comment — log only this builder's own cost delta, not the shared
+    # accumulator's full running total.
+    _cost_at_entry = cost_accumulator.total_cost_usd if cost_accumulator is not None else 0.0
     # Content-hash cache check — see the identical pattern/rationale in
     # _build_knowhow_items_direct above.
     _topic_split_cache_key = f"license_topics:{TOPIC_SPLIT_PROMPT_VERSION}:{content_hash(chr(10).join(page_markdowns))}"
@@ -718,10 +734,11 @@ def _build_license_items_direct(
     # Activity log for the admin dashboard (2026-10) — see the identical
     # pattern/rationale in _build_knowhow_items_direct above.
     _high_count, _high_examples = _high_severity_flag_summary(pages)
+    _cost_delta = max(0.0, (cost_accumulator.total_cost_usd if cost_accumulator is not None else 0.0) - _cost_at_entry)
     append_event(conf.PDF_INGESTION_S3_BUCKET, {
         "filename": filename, "shape": "structured_license",
         "new_count": new_count, "update_count": update_count, "duplicate_count": duplicate_count,
-        "cost_usd": cost_accumulator.total_cost_usd if cost_accumulator is not None else 0.0,
+        "cost_usd": _cost_delta,
         "error": write_error,
         "high_severity_flags": _high_count,
         "high_severity_flag_examples": _high_examples,
