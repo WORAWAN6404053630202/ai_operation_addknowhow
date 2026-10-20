@@ -63,6 +63,15 @@ class TestApprovalGateOnFailurePlaceholders:
         assert resp.status_code == 400
         mock_mgr.save.assert_not_called()
 
+    async def test_approving_vectorstore_write_failed_item_is_rejected(self):
+        """PDF-M11 (2026-10): this tier (saved by sqs_consumer.py's
+        _save_vectorstore_write_failure) also has no real drafted content —
+        same gate as extraction_failed/not_relevant."""
+        item = _item(tier="vectorstore_write_failed")
+        resp, mock_mgr = await self._decide(item)
+        assert resp.status_code == 400
+        mock_mgr.save.assert_not_called()
+
     async def test_rejecting_an_extraction_failed_item_is_still_allowed(self):
         """Rejection (dismissing the placeholder) must stay available even
         though approval is blocked — this is the normal triage action."""

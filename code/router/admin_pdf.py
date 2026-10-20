@@ -7,14 +7,20 @@ reaches this queue — sqs_consumer.py's _build_knowhow_items/_build_license_
 items (the old human-review builders that used to populate it for every
 document) are no longer called at all (kept in the file per explicit
 instruction, not deleted — see that file's own comment at the point they
-stopped being wired in). This queue now ONLY receives two kinds of item:
+stopped being wired in). This queue now ONLY receives three kinds of item:
 a Lambda-era legacy skip-marker ("not_relevant", can no longer be produced
-by anything but kept for historical items) and a give-up-after-N-attempts
-failure placeholder ("extraction_failed", pages=[]/llm_drafted_fields=None).
-Both have no real drafted content — /decision rejects an "approved" attempt
-on either (see that endpoint). An empty or near-empty queue means the
-pipeline is working, not that nothing has happened; check router/admin_pdf.
-py's /api/pdf-status or the dashboard for real ingestion activity instead.
+by anything but kept for historical items), a give-up-after-N-attempts
+failure placeholder ("extraction_failed", pages=[]/llm_drafted_fields=None),
+and (2026-10, PDF-M11) a vectorstore-write-failure recovery placeholder
+("vectorstore_write_failed" — saved when OCR/topic-splitting/drafting all
+succeeded but the final Chroma write failed, so that billed work isn't
+silently thrown away with no recovery path; see sqs_consumer.py's
+_save_vectorstore_write_failure). None of the three have real drafted
+content — /decision rejects an "approved" attempt on any of them (see
+that endpoint); use /reprocess instead to retry from the original PDF.
+An empty or near-empty queue means the pipeline is working, not that
+nothing has happened; check router/admin_pdf.py's /api/pdf-status or the
+dashboard for real ingestion activity instead.
 
 Split off from the old router/admin.py (2026-09) into its own file,
 originally meant to be served by a separate app/process/port (see
@@ -175,17 +181,21 @@ async def pdf_queue_decide(item_id: str, decision: PdfReviewDecision):
         return JSONResponse({"error": "decision_type is required when approving"}, status_code=400)
     if decision.decision_type not in (None, "new", "duplicate", "update", "new_category"):
         return JSONResponse({"error": "invalid decision_type"}, status_code=400)
-    # 2026-10 fix (PDF-M8): since the direct-ingest pivot, every item that
-    # reaches this queue is either a Lambda-era legacy skip-marker
-    # ("not_relevant") or a give-up-after-N-attempts failure placeholder
-    # ("extraction_failed", pages=[] / llm_drafted_fields=None — see
-    # sqs_consumer.py's give-up branches) — real successful content now goes
-    # straight to Chroma and never reaches this queue at all. Approving one
-    # of these would write an item with NO real drafted content as a new
-    # Sheet row. The only sensible actions on these are "reprocess" (retry
-    # extraction) or "rejected" (acknowledge and drop).
+    # 2026-10 fix (PDF-M8, extended for PDF-M11): since the direct-ingest
+    # pivot, every item that reaches this queue is one of: a Lambda-era
+    # legacy skip-marker ("not_relevant"), a give-up-after-N-attempts
+    # failure placeholder ("extraction_failed", pages=[] /
+    # llm_drafted_fields=None — see sqs_consumer.py's give-up branches), or
+    # a vectorstore-write-failure recovery placeholder
+    # ("vectorstore_write_failed" — see _save_vectorstore_write_failure,
+    # saved when OCR/drafting succeeded but the final Chroma write failed).
+    # Real successful content now goes straight to Chroma and never
+    # reaches this queue at all. Approving any of these would write an
+    # item with NO real drafted content as a new Sheet row. The only
+    # sensible actions are "reprocess" (retry extraction) or "rejected"
+    # (acknowledge and drop).
     _tier = (item.relevance_check or {}).get("tier")
-    if decision.review_status == "approved" and _tier in ("extraction_failed", "not_relevant"):
+    if decision.review_status == "approved" and _tier in ("extraction_failed", "not_relevant", "vectorstore_write_failed"):
         return JSONResponse(
             {"error": f"Cannot approve a {_tier!r} item — it has no real drafted content to write. Use /reprocess to retry extraction, or reject to dismiss it."},
             status_code=400,

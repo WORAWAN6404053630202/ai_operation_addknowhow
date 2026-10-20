@@ -96,6 +96,66 @@ class TestLicenseItemsDirectSupersedeWiring:
         assert call_order == ["add", "archive"]
         mock_archive.assert_called_once_with(["old-a-1"], reason="superseded by updated_law.pdf")
 
+    def test_vectorstore_write_failure_saves_a_recovery_placeholder(self):
+        """PDF-M11 (2026-10): before this fix, a failed final Chroma write
+        (after OCR/topic-splitting/drafting all succeeded — real billed
+        work) was just logged and discarded, with nothing preserved to
+        recover from except manually re-uploading the original PDF. Now
+        saves a ReviewItem pointing at s3_raw_pdf_path so a human can
+        /reprocess from the same original file."""
+        pages, markdowns = _make_pages(2)
+
+        def fake_identify_license_topics(page_markdowns, cost_accumulator=None):
+            return [{"department": "Dept A", "license_type": "License A", "page_ranges": [(1, 2)]}]
+
+        def fake_draft_fields_from_pages(topic_markdowns, cost_accumulator=None):
+            return {"แนวคำตอบ": "เนื้อหาคำตอบ"}
+
+        def fake_resolve(merged, source_file, cost_accumulator=None):
+            return SupersedeDecision("new")
+
+        with patch.object(sqs_consumer, "identify_license_topics", side_effect=fake_identify_license_topics), \
+             patch.object(sqs_consumer, "draft_fields_from_pages", side_effect=fake_draft_fields_from_pages), \
+             patch.object(sqs_consumer.pdf_supersede_resolver, "resolve_regulatory_topic", side_effect=fake_resolve), \
+             patch.object(sqs_consumer, "_add_documents_to_vectorstore", side_effect=RuntimeError("Chroma connection refused")), \
+             patch.object(sqs_consumer, "_queue_manager") as mock_queue_manager:
+            sqs_consumer._build_license_items_direct(
+                "crashed.pdf", "s3://bucket/crashed.pdf", pages, markdowns,
+                relevance_check=None, content_shape={"shape": "structured_license"},
+            )
+
+        mock_queue_manager.save.assert_called_once()
+        saved_item = mock_queue_manager.save.call_args[0][0]
+        assert saved_item.filename == "crashed.pdf"
+        assert saved_item.s3_raw_pdf_path == "s3://bucket/crashed.pdf"
+        assert saved_item.relevance_check["tier"] == "vectorstore_write_failed"
+        assert "Chroma connection refused" in saved_item.relevance_check["reasoning"]
+
+    def test_recovery_placeholder_save_failure_does_not_raise(self):
+        """Best-effort: if saving the recovery placeholder ITSELF fails,
+        that must not compound the original failure or crash the pipeline."""
+        pages, markdowns = _make_pages(2)
+
+        def fake_identify_license_topics(page_markdowns, cost_accumulator=None):
+            return [{"department": "Dept A", "license_type": "License A", "page_ranges": [(1, 2)]}]
+
+        def fake_draft_fields_from_pages(topic_markdowns, cost_accumulator=None):
+            return {"แนวคำตอบ": "เนื้อหาคำตอบ"}
+
+        def fake_resolve(merged, source_file, cost_accumulator=None):
+            return SupersedeDecision("new")
+
+        with patch.object(sqs_consumer, "identify_license_topics", side_effect=fake_identify_license_topics), \
+             patch.object(sqs_consumer, "draft_fields_from_pages", side_effect=fake_draft_fields_from_pages), \
+             patch.object(sqs_consumer.pdf_supersede_resolver, "resolve_regulatory_topic", side_effect=fake_resolve), \
+             patch.object(sqs_consumer, "_add_documents_to_vectorstore", side_effect=RuntimeError("Chroma connection refused")), \
+             patch.object(sqs_consumer, "_queue_manager") as mock_queue_manager:
+            mock_queue_manager.save.side_effect = RuntimeError("disk full")
+            sqs_consumer._build_license_items_direct(  # must not raise
+                "crashed2.pdf", "s3://bucket/crashed2.pdf", pages, markdowns,
+                relevance_check=None, content_shape={"shape": "structured_license"},
+            )
+
     def test_resolver_exception_falls_back_to_writing_as_new(self):
         pages, markdowns = _make_pages(2)
 

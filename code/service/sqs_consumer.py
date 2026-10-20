@@ -97,6 +97,36 @@ def _high_severity_flag_summary(pages: list[PageExtractionRecord]) -> tuple[int,
     return count, examples[:5]
 
 
+def _save_vectorstore_write_failure(filename: str, s3_raw_pdf_path: str, error: Exception) -> None:
+    """2026-10 fix (PDF-M11): the direct-ingest vectorstore write is the
+    LAST step after OCR + topic-splitting + field-drafting (all billed LLM
+    work already spent) — if it fails, that whole investment used to just
+    get logged and discarded with no recovery path: the caller
+    (_build_knowhow_items_direct/_build_license_items_direct) returns []
+    either way, which process_extraction_result treats identically to a
+    real success, so the SQS message is deleted and never retried, and
+    nothing preserved enough to resume without re-uploading the original
+    PDF from scratch. Saves a ReviewItem recovery placeholder (same shape
+    as the give-up-after-N-attempts case, see process_extraction_result)
+    pointing at s3_raw_pdf_path, so a human checking the admin queue can
+    click /reprocess to retry extraction from the SAME original file
+    instead of needing to track down and re-upload it. Best-effort — a
+    failure here must not compound the original failure."""
+    try:
+        item = ReviewItem(
+            filename=filename, s3_raw_pdf_path=s3_raw_pdf_path, extraction_completed_at=time.time(),
+            pages=[],
+            relevance_check={
+                "tier": "vectorstore_write_failed",
+                "reasoning": f"ประมวลผลเอกสารสำเร็จ (OCR + แบ่งหัวข้อ + กรอกข้อมูล) แต่เขียนเข้า vectorstore ไม่สำเร็จ ไม่มีข้อมูลถูกบันทึกสำหรับเอกสารนี้ — กดส่งประมวลผลใหม่เพื่อลองอีกครั้ง: {error}",
+            },
+        )
+        _queue_manager.save(item)
+        logger.info(f"[SQSConsumer] Saved vectorstore-write-failure recovery item {item.id} for {filename} — use /reprocess to retry from the original PDF")
+    except Exception as _save_err:
+        logger.error(f"[SQSConsumer] Failed to save vectorstore-write-failure recovery item for {filename} (best-effort, not fatal): {_save_err}")
+
+
 def _slice_by_ranges(
     pages: list[PageExtractionRecord], page_markdowns: list[str], ranges: list[tuple[int, int]]
 ) -> tuple[list[PageExtractionRecord], list[str]]:
@@ -490,6 +520,7 @@ def _build_knowhow_items_direct(
     except Exception as e:
         logger.error(f"[SQSConsumer] Direct vectorstore write failed for {filename} (know-how), nothing written for this slice: {e}")
         write_error = str(e)
+        _save_vectorstore_write_failure(filename, s3_raw_pdf_path, e)
 
     # Activity log for the admin dashboard (2026-10) — display-only, see
     # utils/pdf_ingestion_log.py. Never blocks/raises; a logging failure
@@ -634,6 +665,7 @@ def _build_license_items_direct(
         except Exception as e:
             logger.error(f"[SQSConsumer] Direct vectorstore write failed for {filename} (regulatory), nothing written: {e}")
             write_error = str(e)
+            _save_vectorstore_write_failure(filename, s3_raw_pdf_path, e)
 
     # Activity log for the admin dashboard (2026-10) — see the identical
     # pattern/rationale in _build_knowhow_items_direct above.
