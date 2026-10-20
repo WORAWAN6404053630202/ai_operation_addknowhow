@@ -339,7 +339,16 @@ def _resolve(
                 "candidate_id": doc_id,
                 "preview": f"{preview} | diff={diff}" if diff else preview,
             })
-        judgments.update(_llm_judge(comparison_text, candidates_for_llm, model, cost_accumulator=cost_accumulator))
+        # 2026-10 fix (PDF2-N1): no membership check against the ids
+        # actually sent in THIS batch — a later batch's response echoing
+        # an id from an earlier batch (or any other id) used to be
+        # accepted and could overwrite that id's real verdict. archive_
+        # and_remove no-ops on a nonexistent id, so blast radius was
+        # limited, but a genuine id from a different batch overwriting an
+        # already-judged verdict was a real (if narrow) risk.
+        _batch_ids = {doc_id for doc_id, _ in batch}
+        _batch_judgments = _llm_judge(comparison_text, candidates_for_llm, model, cost_accumulator=cost_accumulator)
+        judgments.update({k: v for k, v in _batch_judgments.items() if k in _batch_ids})
 
     update_ids = [doc_id for doc_id, j in judgments.items() if j["is_same_topic"] and j.get("content_status") == "update"]
     duplicate_ids = [doc_id for doc_id, j in judgments.items() if j["is_same_topic"] and j.get("content_status") == "duplicate"]

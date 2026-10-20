@@ -392,6 +392,39 @@ class TestExhaustiveCandidateJudging:
 
 
 @pytest.mark.unit
+class TestLlmJudgeResponseFilteredToSentBatch:
+    """PDF2-N1 (2026-10): _llm_judge's response used to be merged in with
+    no check that each candidate_id was actually one of the ids sent in
+    THAT batch — a batch's response echoing an id from a DIFFERENT batch
+    (model error, or an adversarial/malformed response) could overwrite
+    that other id's real verdict."""
+
+    def test_judgment_for_an_id_outside_the_sent_batch_is_discarded(self):
+        pool = {
+            "doc-real": {"score": 0.9, "metadata": {"department": "X", "license_type": "Y"}, "content": ""},
+        }
+
+        def fake_llm_judge(new_summary, candidates, model, cost_accumulator=None):
+            # Echoes back a verdict for "doc-not-sent", which was never in
+            # `candidates` — must never be accepted into the final judgments.
+            return {
+                "doc-not-sent": {"is_same_topic": True, "content_status": "update", "reasoning": "bogus"},
+            }
+
+        with patch.object(resolver, "_embedding_candidates", return_value=pool), \
+             patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
+             patch.object(resolver, "_llm_judge", side_effect=fake_llm_judge):
+            decision = resolver.resolve_regulatory_topic(
+                {"department": "X", "license_type": "Y", "answer_guideline": "z"}, "f.pdf",
+            )
+
+        # "doc-not-sent" must never surface as a matched/retired id — it
+        # was never part of this document's real candidate pool.
+        assert "doc-not-sent" not in decision.matched_doc_ids
+        assert decision.decision == "new"  # doc-real got no verdict at all, so no match either
+
+
+@pytest.mark.unit
 class TestPoolMergePreservesEmbeddingScore:
     def test_doc_matched_by_both_signals_keeps_embedding_score(self):
         with patch.object(resolver, "_embedding_candidates", return_value={
