@@ -616,7 +616,15 @@ async def chat(request: ChatRequest, http_request: Request):
         )
         _merge_branch_fields(state, request.branch_id, request.branch_name)
 
-        # Session-level token budget: monitor-only (no blocking).
+        # Session-level token budget.
+        # 2026-10 fix (core2-M6): conf.py's own comment has always said
+        # "Requests that would exceed this limit are rejected with HTTP
+        # 429" — the code only ever logged a WARNING and let the turn
+        # through regardless. An operator who set this after the project's
+        # $78 cost-runaway incident, believing it capped runaway per-session
+        # spend, got no actual protection. Now enforced as documented,
+        # matching the sibling TOKEN_RATE_LIMIT_PER_WINDOW check right below
+        # (which already raises 429 correctly).
         _pre_prompt = getattr(state, "total_prompt_tokens", 0) or 0
         _pre_completion = getattr(state, "total_completion_tokens", 0) or 0
         _pre_cost = getattr(state, "total_cost", 0.0) or 0.0
@@ -624,8 +632,12 @@ async def chat(request: ChatRequest, http_request: Request):
         _session_budget = int(getattr(conf, "TOKEN_BUDGET_PER_SESSION", 0) or 0)
         if _session_budget > 0 and _pre_tokens >= _session_budget:
             logger.warning(
-                "[%s] Session token budget alert: used=%d limit=%d (continuing — monitoring only)",
+                "[%s] Session token budget exceeded: used=%d limit=%d — rejecting with 429",
                 session_id, _pre_tokens, _session_budget,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="This session has reached its token budget. Please start a new session.",
             )
 
         # Per-window token rate check (burst protection).
@@ -820,7 +832,10 @@ async def _stream_reply(
         )
         _merge_branch_fields(state, branch_id, branch_name)
 
-        # Session-level token budget: monitor-only (no blocking).
+        # Session-level token budget — see the matching comment/fix (core2-M6)
+        # in the non-streaming /chat handler above. Goes through the existing
+        # _stream_error path (same as the token-rate-limit check below) since
+        # a generator can't raise HTTPException directly.
         _pre_prompt_st = getattr(state, "total_prompt_tokens", 0) or 0
         _pre_completion_st = getattr(state, "total_completion_tokens", 0) or 0
         _pre_cost_st = getattr(state, "total_cost", 0.0) or 0.0
@@ -828,9 +843,10 @@ async def _stream_reply(
         _session_budget_st = int(getattr(conf, "TOKEN_BUDGET_PER_SESSION", 0) or 0)
         if _session_budget_st > 0 and _pre_tokens_st >= _session_budget_st:
             logger.warning(
-                "[%s] Session token budget alert (stream): used=%d limit=%d (continuing — monitoring only)",
+                "[%s] Session token budget exceeded (stream): used=%d limit=%d — rejecting",
                 session_id, _pre_tokens_st, _session_budget_st,
             )
+            _stream_error = "This session has reached its token budget. Please start a new session."
 
         # Per-window token rate check (burst protection).
         _window_token_limit_st = int(getattr(conf, "TOKEN_RATE_LIMIT_PER_WINDOW", 0) or 0)
