@@ -50,6 +50,18 @@ services:
       retries: 3         # fail 3 ครั้งติดกันถึงจะ unhealthy
       start_period: 40s  # รอ 40 วิก่อน check ครั้งแรก (โหลด e5-large ~20 วิ)
     restart: unless-stopped
+    # 2026-10 fix (Infra2-C5): no logging driver config meant Docker's
+    # default json-file driver kept stdout with NO ceiling at all — and
+    # env.properties sets LOG_LEVEL=DEBUG, which sends everything to
+    # stdout (the 30MB ceiling on the separate rotating FILE handler,
+    # see Infra-M10, never applied to this). An unbounded DEBUG stream
+    # could fill the EC2 root volume, taking down both containers plus
+    # session-state writes together with no warning.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
   # PDF ingestion review dashboard — split into its own service (2026-09) so a
   # PDF-only dependency crash (see the boto3 incident, 2026-09-06/07) can never
@@ -71,6 +83,13 @@ services:
       # an optional follow-up if secret isolation is wanted later).
       - /home/ec2-user/env.properties:/app/env.properties
       - /home/ec2-user/credentials.json:/app/credentials.json
+      # 2026-10 fix (Infra2-C2): env.properties sets LOG_FILE=/app/logs/app.log
+      # globally — without this mount (and the matching `RUN mkdir -p /app/logs`
+      # added to the prod-pdf stage), app_pdf.py's setup_logging() call opens a
+      # RotatingFileHandler against a path that doesn't exist, crash-looping
+      # this service. Same uid:gid 1000:1000 ownership requirement as the
+      # `serve` service's /opt/restbiz-logs mount above.
+      - /opt/restbiz-pdf-logs:/app/logs
     environment:
       - PYTHONPATH=/app/code
     env_file:
@@ -82,6 +101,13 @@ services:
       retries: 3
       start_period: 10s  # no embedding model to load — ready almost immediately
     restart: unless-stopped
+    # 2026-10 fix (Infra2-C5) — see the matching comment on `serve` above;
+    # same unbounded-stdout risk applies to this service too.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
 networks:
   default:

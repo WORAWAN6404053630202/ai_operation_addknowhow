@@ -152,7 +152,16 @@ RUN uv pip install --system --no-cache -r requirements-pdf.txt
 COPY code/ /app/code/
 COPY pyproject.toml /app/
 
-RUN chown -R appuser:appuser /app
+# 2026-10 fix (Infra2-C2): env.properties sets LOG_FILE=/app/logs/app.log
+# globally (added for the `prod` stage's rotating file log), but this
+# lean stage never created that directory — app_pdf.py's setup_logging()
+# call would open a RotatingFileHandler against a path that doesn't exist,
+# raising FileNotFoundError before the app object is even constructed, and
+# crash-loop docker-compose.prod.yaml's pdf-serve service. The `prod` stage
+# right above creates /app/code/sessions /app/chroma_db /app/logs together;
+# this stage only needs /app/logs since it has neither sessions nor chroma_db.
+RUN mkdir -p /app/logs && \
+    chown -R appuser:appuser /app
 
 USER appuser
 

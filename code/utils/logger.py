@@ -5,6 +5,7 @@ Provides structured logging with request tracking, performance metrics, and debu
 
 import logging
 import logging.handlers
+import os
 import sys
 import time
 import json
@@ -173,15 +174,29 @@ def setup_logging(
     # File handler (optional) — size-based rotation, see log_file_level's
     # docstring above for why this stays small and WARNING-only by default.
     if log_file:
-        file_handler = logging.handlers.RotatingFileHandler(
-            log_file,
-            maxBytes=log_file_max_bytes,
-            backupCount=log_file_backup_count,
-            encoding="utf-8",
-        )
-        file_handler.setFormatter(formatter)
-        file_handler.setLevel(getattr(logging, log_file_level.upper()))
-        root_logger.addHandler(file_handler)
+        # 2026-10 fix (Infra2-C2): a missing parent directory (e.g. a Docker
+        # stage/compose service that doesn't create/mount it — this exact
+        # gap was found on the lean prod-pdf stage) used to make
+        # RotatingFileHandler raise FileNotFoundError here, crashing the
+        # whole app before it could even start — a log-path problem taking
+        # down the service it was meant to help diagnose. Best-effort
+        # directory creation, then fall back to console-only on any
+        # remaining failure rather than letting this be a hard startup crash.
+        try:
+            log_dir = os.path.dirname(log_file)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            file_handler = logging.handlers.RotatingFileHandler(
+                log_file,
+                maxBytes=log_file_max_bytes,
+                backupCount=log_file_backup_count,
+                encoding="utf-8",
+            )
+            file_handler.setFormatter(formatter)
+            file_handler.setLevel(getattr(logging, log_file_level.upper()))
+            root_logger.addHandler(file_handler)
+        except OSError as e:
+            root_logger.warning("Failed to set up file logging at %r (%s) — continuing with console-only logging", log_file, e)
 
     # Silence noisy libraries
     logging.getLogger("httpx").setLevel(logging.WARNING)
