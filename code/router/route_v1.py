@@ -276,6 +276,29 @@ async def _release_session_lock_after_deferred_work(
         lock.release()
 
 
+async def _finish_cancelled_stream_turn_in_background(session_id: str, lock: asyncio.Lock, future) -> None:
+    """2026-10 fix (core2-M11): spawned from _stream_reply's `finally` when
+    the generator is unwinding (client disconnected) while its
+    supervisor.handle() call is still in flight on `future` — see that
+    function's comment for the full scenario. `future` keeps running
+    regardless of what happens to the generator that created it (it's tied
+    to the event loop, not to that coroutine), so awaiting it here still
+    lets the already-billed answer get persisted instead of silently
+    discarded. Nothing is left to stream the answer to, but at least the
+    turn isn't lost and double-charged on the user's next identical ask."""
+    try:
+        state, _bot_reply = await future
+        await _save_state_async(session_id, state)
+        logger.info(
+            "[%s] Stream was cancelled (client disconnected) but the in-flight "
+            "turn finished and was saved in the background", session_id,
+        )
+    except Exception:
+        logger.warning("[%s] Cancelled stream's background finish failed", session_id, exc_info=True)
+    finally:
+        lock.release()
+
+
 def _merge_branch_fields(state: ConversationState, branch_id: str, branch_name: str) -> None:
     """The caller sends branch_id/branch_name on every /chat turn (may be "").
     A non-empty value updates the session's stored branch identity; "" is a no-op
@@ -304,7 +327,20 @@ def _cleanup_old_sessions():
     # Remove locks for sessions that are no longer in state_manager to prevent unbounded growth.
     try:
         active_ids: set = set(state_manager.list_session_ids()) if hasattr(state_manager, "list_session_ids") else set()
-        stale_locks = [sid for sid in list(_session_locks) if sid not in active_ids]
+        # 2026-10 fix (core2-M10): this used to pop ANY lock whose session_id
+        # wasn't yet in active_ids, with no check that the lock was currently
+        # held. A brand-new session's .json file doesn't exist until its
+        # first save, so a request mid-flight on one (load→handle→save) had
+        # its lock popped out from under it by this hourly sweep — a
+        # concurrent retry for the same session_id then got a FRESH lock,
+        # acquired it immediately, and ran in parallel with the original
+        # request. Whichever save won, the other turn's messages/slots/cost
+        # were silently lost. Skip any lock currently held; it'll still be
+        # swept next run once it's released and genuinely idle.
+        stale_locks = [
+            sid for sid in list(_session_locks)
+            if sid not in active_ids and not _session_locks[sid].locked()
+        ]
         for sid in stale_locks:
             _session_locks.pop(sid, None)
         if stale_locks:
@@ -766,6 +802,10 @@ async def _stream_reply(
     await lock.acquire()
     _lock_deferred = False
     state: Optional[ConversationState] = None
+    # 2026-10 fix (core2-M11): referenced in `finally` below to detect a
+    # client disconnect mid-turn — must exist even if cancellation happens
+    # before the line that actually assigns it (e.g. during state load).
+    future = None
     try:
         saved = await _load_state_async(session_id)
         # 2026-10 fix: same ownership gap as /chat — see the matching
@@ -894,18 +934,37 @@ async def _stream_reply(
         yield f"data: {json.dumps({'type': 'error', 'message': 'Stream failed. Please try again.'})}\n\n"
         return
     finally:
-        # If the turn's answer call crossed the session token budget, run the
-        # deferred summarize/trim (see llm_call.py's run_pending_token_budget_check)
-        # in the background, holding the lock until it's done, instead of adding
-        # its latency here. See _release_session_lock_after_deferred_work.
-        _needs_defer_st = False
-        try:
-            _needs_defer_st = bool(state is not None and (state.context or {}).get("_needs_token_budget_check"))
-        except Exception:
-            pass
-        if _needs_defer_st:
+        # 2026-10 fix (core2-M11): a client disconnect mid-stream (refresh,
+        # navigate, tab close) raises CancelledError/GeneratorExit at the
+        # point this generator is awaiting the in-flight supervisor.handle()
+        # call — a BaseException the `except Exception` above doesn't catch,
+        # so the lines that would await the future's result and save state
+        # were simply never reached as the generator unwound. The executor
+        # thread backing `future` keeps running to completion regardless
+        # (every LLM call already dispatched still bills and accumulates
+        # cost), so without this, the finished answer and updated state
+        # were both silently dropped — the user saw no record of their
+        # question and would re-ask, paying twice for identical work with
+        # nothing in the logs distinguishing this from a normal turn.
+        # `finally` runs for every exception type (unlike a plain `except`
+        # clause list), so this check alone covers that path without
+        # needing to catch CancelledError/GeneratorExit explicitly.
+        if future is not None and not future.done():
             _lock_deferred = True
-            _spawn_background(_release_session_lock_after_deferred_work(session_id, lock, state))
+            _spawn_background(_finish_cancelled_stream_turn_in_background(session_id, lock, future))
+        else:
+            # If the turn's answer call crossed the session token budget, run the
+            # deferred summarize/trim (see llm_call.py's run_pending_token_budget_check)
+            # in the background, holding the lock until it's done, instead of adding
+            # its latency here. See _release_session_lock_after_deferred_work.
+            _needs_defer_st = False
+            try:
+                _needs_defer_st = bool(state is not None and (state.context or {}).get("_needs_token_budget_check"))
+            except Exception:
+                pass
+            if _needs_defer_st:
+                _lock_deferred = True
+                _spawn_background(_release_session_lock_after_deferred_work(session_id, lock, state))
         if not _lock_deferred:
             lock.release()
     # lock released (or handed off to the deferred task) — now stream the reply
