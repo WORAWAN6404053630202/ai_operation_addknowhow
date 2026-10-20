@@ -43,8 +43,11 @@ class StateManager:
         self.dir = base
         self.dir.mkdir(parents=True, exist_ok=True)
 
-        self._lock_timeout_s = float(getattr(conf, "STATE_LOCK_TIMEOUT_S", 2.0) if conf is not None else 2.0)
-        self._lock_poll_s = float(getattr(conf, "STATE_LOCK_POLL_S", 0.05) if conf is not None else 0.05)
+        # Fallback defaults (conf import failed) must stay consistent with
+        # conf.py's own defaults — see STATE_LOCK_STALE_S's comment there
+        # for why timeout must comfortably exceed staleness (core-M10 fix).
+        self._lock_timeout_s = float(getattr(conf, "STATE_LOCK_TIMEOUT_S", 6.0) if conf is not None else 6.0)
+        self._lock_poll_s = float(getattr(conf, "STATE_LOCK_POLL_S", 0.02) if conf is not None else 0.02)
 
         self._default_max_recent = int(getattr(conf, "MAX_RECENT_MESSAGES_SAVE", 18) if conf is not None else 18)
         self._default_max_internal = int(getattr(conf, "MAX_INTERNAL_MESSAGES_SAVE", 40) if conf is not None else 40)
@@ -77,7 +80,7 @@ class StateManager:
                 try:
                     stat = lock_path.stat()
                     age = time.time() - float(stat.st_mtime)
-                    stale_after = float(getattr(conf, "STATE_LOCK_STALE_S", 15.0) if conf is not None else 15.0)
+                    stale_after = float(getattr(conf, "STATE_LOCK_STALE_S", 5.0) if conf is not None else 5.0)
                     if age > stale_after:
                         lock_path.unlink(missing_ok=True)
                         continue
@@ -102,7 +105,7 @@ class StateManager:
         are accepted. Returns the number of lock files removed.
         """
         stale_after = float(
-            getattr(conf, "STATE_LOCK_STALE_S", 15.0) if conf is not None else 15.0
+            getattr(conf, "STATE_LOCK_STALE_S", 5.0) if conf is not None else 5.0
         )
         removed = 0
         try:

@@ -637,9 +637,25 @@ MAX_REQUEST_BODY_BYTES = _safe_int("MAX_REQUEST_BODY_BYTES", 1_000_000)
 
 # State manager configuration
 STATE_DIR = os.getenv("STATE_DIR") or None
-STATE_LOCK_TIMEOUT_S = _safe_float("STATE_LOCK_TIMEOUT_S", 0.5)
+# 2026-10 fix (core-M10): STATE_LOCK_TIMEOUT_S (0.5s) used to be FAR shorter
+# than STATE_LOCK_STALE_S (90s) — any session whose lock was orphaned by a
+# process crash/kill mid-save (e.g. a redeploy landing exactly mid-write)
+# left every request for that one session_id failing for up to ~89.5s
+# straight: state_manager.save()'s _acquire_lock() gives up with an
+# uncaught TimeoutError well before the lock becomes reclaimable, which
+# route_v1.py's chat() turns into "Chat failed. Please try again." AFTER
+# supervisor.handle() already ran (and was billed) — so the user loses
+# both the answer and the money spent generating it, repeatedly, on every
+# retry within that window. A real JSON state write is a few KB and
+# completes in milliseconds even under load, so a 90s staleness grace
+# period was never buying real protection, just extending the outage
+# window. Lowered staleness to 5s (generous for an actual file write) and
+# raised the per-request timeout to comfortably exceed it, so a request
+# that hits a genuinely orphaned lock always waits long enough to
+# successfully reclaim it instead of giving up prematurely.
+STATE_LOCK_TIMEOUT_S = _safe_float("STATE_LOCK_TIMEOUT_S", 6.0)
 STATE_LOCK_POLL_S = _safe_float("STATE_LOCK_POLL_S", 0.02)
-STATE_LOCK_STALE_S = _safe_float("STATE_LOCK_STALE_S", 90.0)
+STATE_LOCK_STALE_S = _safe_float("STATE_LOCK_STALE_S", 5.0)
 MAX_RECENT_MESSAGES_SAVE = _safe_int("MAX_RECENT_MESSAGES_SAVE", 18)
 MAX_INTERNAL_MESSAGES_SAVE = _safe_int("MAX_INTERNAL_MESSAGES_SAVE", 40)
 
