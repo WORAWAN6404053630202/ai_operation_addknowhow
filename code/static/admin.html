@@ -617,7 +617,17 @@
   }
 
   function escHtml(t) {
-    return String(t || "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
+    // 2026-10 fix (core2-C4): used to skip quotes entirely, which was fine
+    // for text nodes but not for the attribute position this is also used
+    // in (see renderSessionList's data-sid) — an unescaped `"`/`'` there
+    // let a crafted session_id break out of the attribute and run JS that
+    // reads the admin key out of localStorage.
+    return String(t || "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#39;");
   }
 
   function getAdminKey() {
@@ -690,9 +700,19 @@
       el.innerHTML = '<div style="padding:20px;color:var(--muted);text-align:center">ยังไม่มี session</div>';
       return;
     }
+    // 2026-10 fix (core2-C4): this used to build the click handler via
+    // onclick="selectSession('${s.session_id}')" — session_id is
+    // attacker-influenceable (client-supplied, leaks through this very
+    // page's response and through logs) and was interpolated raw into an
+    // HTML attribute/JS-string-literal position with no escaping at all,
+    // unlike the s-id text node 2 lines below which DID escape it — a
+    // crafted id could break out and run JS reading the admin key out of
+    // localStorage. A data-sid attribute (still escaped, since it's still
+    // an attribute position) read via delegated click handler removes the
+    // string-building entirely.
     el.innerHTML = allSessions.map(s => `
       <div class="session-item ${s.session_id === activeSession ? 'active' : ''}"
-           onclick="selectSession('${s.session_id}')">
+           data-sid="${escHtml(s.session_id)}">
         <div class="s-id">${escHtml(s.session_id)}</div>
         <div class="s-preview">${escHtml(s.preview || "—")}</div>
         <div class="s-meta">
@@ -1358,6 +1378,15 @@
       "อัพเดท " + new Date().toLocaleTimeString("th-TH");
     await Promise.all([loadStats(), loadSessions(), loadPdfQueue()]);
   }
+
+  // Delegated click handler for renderSessionList's rows — attached once to
+  // the container rather than re-attached per row, and reads data-sid
+  // instead of the old onclick="selectSession('${sid}')" string-building
+  // (see core2-C4 fix in renderSessionList).
+  document.getElementById("sessionList").addEventListener("click", (e) => {
+    const row = e.target.closest(".session-item");
+    if (row && row.dataset.sid) selectSession(row.dataset.sid);
+  });
 
   loadAll();
   // Auto-refresh ทุก 30 วินาที

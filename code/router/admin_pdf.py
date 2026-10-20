@@ -68,7 +68,6 @@ from pydantic import BaseModel
 
 from model.pdf_review_queue_manager import PdfReviewQueueManager
 from service import pdf_status_tracker
-from service.local_vector_store import list_archived_docs
 from utils.admin_auth import require_admin_key
 from utils.logger import get_logger
 from utils.page_ranges import format_page_ranges
@@ -384,8 +383,17 @@ async def pdf_status():
         except Exception as e:
             _LOG.warning(f"[pdf_status] Failed to read recent ingestion activity: {e}")
 
+    # 2026-10 fix (Infra2-C1): list_archived_docs pulls in langchain_core/
+    # langchain_openai/langchain_community → chromadb — none of which are in
+    # requirements-pdf.txt (the lean PDF-only image deliberately excludes
+    # them). A module-level import of this name used to make importing
+    # admin_pdf.py itself crash on that image with ModuleNotFoundError
+    # before this handler's own try/except ever got a chance to run —
+    # moved to a lazy import here so the only consequence of the dependency
+    # being absent is this one section of the dashboard degrading to [].
     recent_archived = []
     try:
+        from service.local_vector_store import list_archived_docs
         since_epoch = time.time() - 7 * 86400
         recent_archived = [
             {"id": d["id"], "metadata": d["metadata"]}
@@ -499,7 +507,14 @@ function fmtTime(ts) {
 function escapeHtml(value) {
   const div = document.createElement("div");
   div.textContent = value == null ? "" : String(value);
-  return div.innerHTML;
+  // 2026-10 fix (Infra2-C4/PDF2-M2): the textContent→innerHTML round-trip
+  // escapes &, <, > but NOT quote characters — browsers only escape quotes
+  // inside attribute-value serialization, never inside a text node. The
+  // `examples` tooltip below lands in title="${examples}" (an attribute
+  // position), so an unescaped `"` in a crafted PDF's flag text could break
+  // out of the attribute and run JS reading the admin key out of
+  // sessionStorage. Escape both quote characters explicitly.
+  return div.innerHTML.replaceAll('"', "&quot;").replaceAll("'", "&#39;");
 }
 
 async function apiGet(path) {
