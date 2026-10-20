@@ -6462,6 +6462,14 @@ Rules:
                 "Write 'ติดต่อ [ชื่อหน่วยงาน] โดยตรง' without a number."
             )
 
+        # 2026-10 fix (core2-M3): `getattr(conf, "MAX_ROUNDS", 7) or 7` below
+        # used to silently turn a deliberate MAX_ROUNDS=0 (the documented way
+        # to disable the round cap, see persona_supervisor.py's matching fix)
+        # back into 7, since `0 or 7` evaluates to 7 in Python — this ROUND:
+        # X/Y display text would keep showing a cap that no longer applies.
+        _raw_max_rounds_pr = getattr(conf, "MAX_ROUNDS", 7)
+        _max_rounds_pr = 7 if _raw_max_rounds_pr is None else int(_raw_max_rounds_pr)
+
         prompt = f"""USER INPUT:
 {user_input}
 
@@ -6478,7 +6486,7 @@ CONTEXT_MEMORY:
 
 DOCUMENTS ({len(docs_json)} found):
 {json.dumps(docs_json, ensure_ascii=False)}
-ROUND: {int(getattr(state, "round", 0) or 0)}/{int(getattr(conf, "MAX_ROUNDS", 7) or 7)}{_entity_filter_hint}{_topic_hint}{_multi_license_instruction}{_fee_info_instruction}{_info_q_instruction}{_broad_instruction}{_tc_instruction}{_chapter_overview_instruction}{_phone_guard_instruction}
+ROUND: {int(getattr(state, "round", 0) or 0)}/{_max_rounds_pr}{_entity_filter_hint}{_topic_hint}{_multi_license_instruction}{_fee_info_instruction}{_info_q_instruction}{_broad_instruction}{_tc_instruction}{_chapter_overview_instruction}{_phone_guard_instruction}
 
 Your JSON response:
 """

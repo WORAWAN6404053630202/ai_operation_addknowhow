@@ -14145,7 +14145,14 @@ class PersonaSupervisor:
         # MAX_ROUNDS enforcement: hard ceiling on conversation turns per session.
         # Checked after _add_user so the user's final message is preserved in history
         # before the limit reply is returned. Set MAX_ROUNDS=0 in env.properties to disable.
-        _max_rounds = int(getattr(conf, "MAX_ROUNDS", 15) or 15)
+        # 2026-10 fix (core2-M3): `getattr(conf, "MAX_ROUNDS", 15) or 15` silently
+        # turned a deliberate MAX_ROUNDS=0 (the documented way to disable the cap)
+        # back into 15, since `0 or 15` evaluates to 15 in Python — the escape
+        # hatch this comment describes never actually worked. `or` only belongs
+        # here for the "attribute truly absent" case, which getattr's default
+        # already handles; a real (possibly 0) value must pass through untouched.
+        _raw_max_rounds = getattr(conf, "MAX_ROUNDS", 15)
+        _max_rounds = 15 if _raw_max_rounds is None else int(_raw_max_rounds)
         _cur_round = int(getattr(state, "round", 0) or 0)
         if _max_rounds > 0 and _cur_round >= _max_rounds:
             _LOG.info(
