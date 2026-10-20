@@ -13,7 +13,22 @@ WORKDIR /app
 # uv is what generated requirements*.txt's hashes (see file header) — plain pip
 # fails on this lockfile's `uvicorn[standard]` extra under --require-hashes mode
 # even though the file itself is correct; installing with uv avoids that entirely.
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+#
+# 2026-10 fix (Infra2-M5): pinned by digest instead of the mutable `:latest`
+# tag — a build tool that can silently change between builds is a supply-chain
+# risk (an upstream push could land unreviewed between two otherwise-identical
+# deploys). Digest resolved from `:latest` on 2026-10-20; bump deliberately
+# (re-resolve + re-test) rather than letting it drift silently.
+COPY --from=ghcr.io/astral-sh/uv:latest@sha256:637bbca55303e5c6abee80ec3ef86c89f487e118e45b8d693a4a8889cee2bfe4 /uv /uvx /bin/
+
+# 2026-10 fix (Infra2-M2): requirements-dev.txt deliberately excludes torch itself
+# (--no-emit-package torch, see header) but sentence-transformers still pulls it
+# in transitively — without this pre-install, that pull picks the default PyPI
+# build (CUDA-enabled, ~2.5 GB) since nothing here already satisfies the
+# constraint, unlike the `prod` stage below which has always had this line.
+# Pinned (Infra2-M4) to the version currently resolved unpinned from this same
+# CPU index, so this is a reproducibility fix only — no behavior change.
+RUN pip install --no-cache-dir torch==2.6.0+cpu --index-url https://download.pytorch.org/whl/cpu
 
 # Copy requirements ก่อนเพื่อใช้ Docker cache
 COPY requirements.txt requirements-dev.txt /app/
@@ -51,7 +66,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:latest@sha256:637bbca55303e5c6abee80ec3ef86c89f487e118e45b8d693a4a8889cee2bfe4 /uv /uvx /bin/  # Infra2-M5: pinned by digest, see develop stage comment above
+
+# 2026-10 fix (Infra2-M2/M4): same CPU-only, pinned torch pre-install as the
+# develop stage above — otherwise sentence-transformers' transitive pull picks
+# the default CUDA-enabled build here too.
+RUN pip install --no-cache-dir torch==2.6.0+cpu --index-url https://download.pytorch.org/whl/cpu
 
 COPY requirements.txt /app/
 RUN uv pip install --system --no-cache -r requirements.txt
@@ -83,10 +103,15 @@ RUN useradd -m -u 1000 appuser
 
 WORKDIR /app
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:latest@sha256:637bbca55303e5c6abee80ec3ef86c89f487e118e45b8d693a4a8889cee2bfe4 /uv /uvx /bin/  # Infra2-M5: pinned by digest, see develop stage comment above
 
 # Install CPU-only PyTorch first to avoid pulling in the GPU build (~2.5 GB → ~500 MB)
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+# 2026-10 fix (Infra2-M4): pinned to an exact version — was unpinned, so a
+# rebuild weeks apart could silently resolve a different torch release with
+# no record of which one actually got tested. 2.6.0 is the version this
+# same unpinned install currently resolves to on this CPU index (verified
+# 2026-10-20), so this is a reproducibility fix only, not a version change.
+RUN pip install --no-cache-dir torch==2.6.0+cpu --index-url https://download.pytorch.org/whl/cpu
 
 # Copy and install requirements (torch already installed above, so sentence-transformers skips it)
 COPY requirements.txt /app/
@@ -141,7 +166,7 @@ RUN useradd -m -u 1000 appuser
 
 WORKDIR /app
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:latest@sha256:637bbca55303e5c6abee80ec3ef86c89f487e118e45b8d693a4a8889cee2bfe4 /uv /uvx /bin/  # Infra2-M5: pinned by digest, see develop stage comment above
 
 COPY requirements-pdf.txt /app/
 RUN uv pip install --system --no-cache -r requirements-pdf.txt
@@ -196,14 +221,21 @@ CMD ["uvicorn", "app_pdf:app", "--host", "0.0.0.0", "--port", "3001", "--workers
 #
 # Version note: typhoon-ocr==0.4.1 was confirmed working against
 # openai==3.8.0 on the old instance's venv — requirements.txt currently
-# pins openai==2.53.0 for the base bot. Installed unpinned below on
-# purpose to let uv resolve compatible versions together; re-pin explicitly
-# in a requirements file if this ever needs reproducible-build guarantees
-# (deferred: this is a single dedicated internal instance, not a fleet).
+# pins openai==2.53.0 for the base bot.
+#
+# 2026-10 fix (Infra2-M3): was fully unpinned ("let uv resolve compatible
+# versions together") — pinning typhoon-ocr exactly to the one version this
+# comment already calls out as confirmed-working. Left pymupdf's minor/patch
+# floating (uv still resolves it freely against openai/typhoon-ocr) but
+# capped below the just-released pymupdf 2.0 — a major-version jump with an
+# unknown API surface that was never run against this codebase's actual
+# PyMuPDF usage (fitz.open/page extraction in service/pdf_*.py), so letting
+# a routine rebuild silently pick it up is the real risk being closed here,
+# not reproducibility down to the exact patch.
 FROM prod AS prod-pdf-full
 
 USER root
-RUN pip install --no-cache-dir pymupdf typhoon-ocr
+RUN pip install --no-cache-dir "pymupdf>=1.28,<2" typhoon-ocr==0.4.1
 USER appuser
 
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "3000", "--workers", "1", "--loop", "uvloop", "--http", "httptools"]

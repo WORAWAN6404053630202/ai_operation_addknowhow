@@ -23,8 +23,17 @@ services:
       # Google service-account key for Sheets feedback logging — never baked into the
       # image (see .gitignore), must exist on the host at this path before `up`
       - /home/ec2-user/credentials.json:/app/credentials.json
-      # Persist HuggingFace model cache across container restarts/redeploys
-      - /opt/huggingface-cache:/root/.cache/huggingface
+      # Persist HuggingFace model cache across container restarts/redeploys.
+      # 2026-10 fix (Infra2-M1): was mounted at /root/.cache/huggingface, but
+      # the `prod` stage's Dockerfile runs as non-root `appuser` (uid 1000,
+      # home /home/appuser) — transformers/sentence-transformers resolve the
+      # cache dir from the real $HOME, so every container actually read/wrote
+      # /home/appuser/.cache/huggingface and this mount was never hit at all,
+      # silently re-downloading the embedding model on every redeploy (see
+      # the healthcheck's "~20s to load e5-large" comment below — that cost
+      # was paid every single time, not just on a cold cache). Host dir needs
+      # the same uid:gid 1000:1000 ownership as /opt/restbiz-data above.
+      - /opt/huggingface-cache:/home/appuser/.cache/huggingface
       # Persist session state (data/states/*.json) across redeploys — without this,
       # every `docker-compose up` after a new image pull starts from an empty
       # writable layer and silently wipes all conversations before the claimed
@@ -62,6 +71,15 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
+    # 2026-10 fix (Infra2-M8, partial): pids_limit guards against an
+    # unbounded fork/thread runaway in either container starving the other
+    # — safe to set without knowing the instance's real capacity. Did NOT
+    # add mem_limit/cpus here: guessing a ceiling without knowing the real
+    # EC2 instance's actual RAM/vCPU would risk OOM-killing a live
+    # production container under normal load instead of preventing an
+    # incident — needs the real instance type's numbers before setting
+    # those two specifically.
+    pids_limit: 512
 
   # PDF ingestion review dashboard — split into its own service (2026-09) so a
   # PDF-only dependency crash (see the boto3 incident, 2026-09-06/07) can never
@@ -108,6 +126,9 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
+    # 2026-10 fix (Infra2-M8, partial) — see the matching comment on `serve`
+    # above; same reasoning (pids_limit safe to set blind, mem_limit/cpus not).
+    pids_limit: 256
 
 networks:
   default:
