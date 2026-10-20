@@ -3,6 +3,7 @@ Admin Dashboard Router
 Endpoints for monitoring bot usage, sessions, and logs.
 """
 
+import asyncio
 import os
 import time
 from pathlib import Path
@@ -43,44 +44,47 @@ async def admin_dashboard():
 
 @router.get("/api/sessions", dependencies=[_auth])
 async def admin_sessions(limit: int = Query(default=50, le=200)):
-    """List all sessions with message count and preview."""
-    sessions = _state_manager.list_sessions(limit=limit)
+    """List all sessions with message count and preview.
+
+    2026-10 fix (core2-M5): this used to be `async def` doing real
+    synchronous disk I/O directly on the single-threaded asyncio event
+    loop — `list_sessions` globs + opens + json.load's every session file,
+    then this function used to ALSO call `_state_manager.load(sid)` per
+    row (N+1: re-opening and re-parsing the exact same file list_sessions
+    had already fully parsed, just to re-extract token/cost fields it
+    already had in hand). Opening this page with a few hundred real
+    sessions could block the event loop for seconds — stalling every
+    concurrent user's /chat/stream SSE connection, which route_v1.py
+    documents extensively and already guards against for the exact same
+    reason. list_sessions now returns the token/cost/message-count fields
+    directly (see model/state_manager.py), and the whole call goes through
+    run_in_executor so the blocking work runs on a worker thread instead.
+    """
+    loop = asyncio.get_running_loop()
+    sessions = await loop.run_in_executor(None, _state_manager.list_sessions, limit)
 
     result = []
     for s in sessions:
-        sid = s["session_id"]
-        state = _state_manager.load(sid)
-        messages = state.messages if state else []
-
-        user_msgs = [m for m in messages if m.get("role") == "user"]
-        bot_msgs  = [m for m in messages if m.get("role") == "assistant"]
-
-        prompt_tokens     = getattr(state, "total_prompt_tokens", 0) or 0
-        completion_tokens = getattr(state, "total_completion_tokens", 0) or 0
-        total_tokens      = prompt_tokens + completion_tokens
-        # Real accumulated cost (see model/conversation_state.py's total_cost field) —
-        # NOT re-estimated from token counts. The old code here re-derived cost from
-        # total_prompt_tokens/total_completion_tokens (which blend every model used in
-        # the session — Sonnet/GPT-5.1 AND cheap Haiku classifier calls) priced at a
-        # single assumed model for the whole persona. That overcounted every session
-        # (Haiku tokens billed at Sonnet/GPT-5.1 rates) and carried its own separate,
-        # already-stale pricing table. total_cost is accumulated per-call at the
-        # correct model's rate at the source (llm_call.py) and is not subject to
-        # either problem.
-        total_cost        = round(getattr(state, "total_cost", 0.0) or 0.0, 6)
-
+        prompt_tokens = s.get("prompt_tokens", 0)
+        completion_tokens = s.get("completion_tokens", 0)
         result.append({
-            "session_id": sid,
+            "session_id": s["session_id"],
             "persona_id": s.get("persona_id", "practical"),
             "preview": s.get("preview", ""),
             "updated_at": s.get("updated_at"),
-            "total_messages": len(messages),
-            "user_messages": len(user_msgs),
-            "bot_messages": len(bot_msgs),
+            "total_messages": s.get("total_messages", 0),
+            "user_messages": s.get("user_messages", 0),
+            "bot_messages": s.get("bot_messages", 0),
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
-            "total_cost": total_cost,
+            "total_tokens": prompt_tokens + completion_tokens,
+            # Real accumulated cost (see model/conversation_state.py's total_cost
+            # field) — NOT re-estimated from token counts. Re-deriving cost from
+            # prompt/completion tokens would blend every model used in the session
+            # (Sonnet/GPT-5.1 AND cheap Haiku classifier calls) priced at a single
+            # assumed model for the whole persona — total_cost is accumulated
+            # per-call at the correct model's rate at the source (llm_call.py).
+            "total_cost": s.get("total_cost", 0.0),
         })
 
     return JSONResponse({"sessions": result, "total": len(result)})
@@ -88,8 +92,13 @@ async def admin_sessions(limit: int = Query(default=50, le=200)):
 
 @router.get("/api/session/{session_id}", dependencies=[_auth])
 async def admin_session_detail(session_id: str):
-    """Full message history for a session."""
-    state = _state_manager.load(session_id)
+    """Full message history for a session.
+
+    2026-10 fix (core2-M5): see admin_sessions' matching comment — this
+    does the same real blocking disk I/O directly on the event loop.
+    """
+    loop = asyncio.get_running_loop()
+    state = await loop.run_in_executor(None, _state_manager.load, session_id)
     if state is None:
         return JSONResponse({"error": "Session not found"}, status_code=404)
 
@@ -118,8 +127,12 @@ async def admin_session_detail(session_id: str):
 
 @router.get("/api/stats", dependencies=[_auth])
 async def admin_stats():
-    """Overall stats: session count, cache, log summary."""
-    all_sessions = _state_manager.list_sessions(limit=500)
+    """Overall stats: session count, cache, log summary.
+
+    2026-10 fix (core2-M5): see admin_sessions' matching comment.
+    """
+    loop = asyncio.get_running_loop()
+    all_sessions = await loop.run_in_executor(None, _state_manager.list_sessions, 500)
 
     now = time.time()
     today_cutoff   = now - 86400
@@ -141,16 +154,14 @@ async def admin_stats():
     })
 
 
-@router.get("/api/logs", dependencies=[_auth])
-async def admin_logs(lines: int = Query(default=100, le=500)):
-    """Return last N lines from the server log file."""
+def _read_log_tail(lines: int) -> dict:
     if not _LOG_FILE.exists():
         # Try relative path (when running from code/ dir)
         alt = Path(__file__).resolve().parent.parent.parent / "uvicorn.log"
         if alt.exists():
             log_path = alt
         else:
-            return JSONResponse({"lines": [], "error": f"Log file not found: {_LOG_FILE}"})
+            return {"lines": [], "error": f"Log file not found: {_LOG_FILE}"}
     else:
         log_path = _LOG_FILE
 
@@ -158,9 +169,21 @@ async def admin_logs(lines: int = Query(default=100, le=500)):
         with open(log_path, "r", encoding="utf-8", errors="replace") as f:
             all_lines = f.readlines()
         tail = all_lines[-lines:]
-        return JSONResponse({"lines": [l.rstrip() for l in tail], "total_lines": len(all_lines)})
+        return {"lines": [l.rstrip() for l in tail], "total_lines": len(all_lines)}
     except Exception as e:
-        return JSONResponse({"lines": [], "error": str(e)})
+        return {"lines": [], "error": str(e)}
+
+
+@router.get("/api/logs", dependencies=[_auth])
+async def admin_logs(lines: int = Query(default=100, le=500)):
+    """Return last N lines from the server log file.
+
+    2026-10 fix (core2-M5): see admin_sessions' matching comment — reading
+    (up to 500 lines of) a log file is real blocking disk I/O too.
+    """
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, _read_log_tail, lines)
+    return JSONResponse(result)
 
 
 # PDF review queue (feature/pdf-ingestion) — REMOVED 2026-10, this was a

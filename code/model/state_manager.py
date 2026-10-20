@@ -280,10 +280,16 @@ class StateManager:
                 messages = data.get("messages") or []
 
                 first_user = ""
+                user_msg_count = 0
+                bot_msg_count = 0
                 for m in messages:
-                    if m.get("role") == "user" and (m.get("content") or "").strip():
-                        first_user = (m.get("content") or "").strip()
-                        break
+                    role = m.get("role")
+                    if role == "user":
+                        user_msg_count += 1
+                        if not first_user and (m.get("content") or "").strip():
+                            first_user = (m.get("content") or "").strip()
+                    elif role == "assistant":
+                        bot_msg_count += 1
 
                 preview = first_user[:80] if first_user else f"Session {session_id}"
                 updated_at = path.stat().st_mtime
@@ -294,6 +300,17 @@ class StateManager:
                         "persona_id": persona_id,
                         "preview": preview,
                         "updated_at": updated_at,
+                        # 2026-10 fix (core2-M5): added so admin.py's
+                        # admin_sessions() doesn't need to re-open and
+                        # re-parse every single one of these same files a
+                        # second time just to get token/cost counts — this
+                        # function already has `data` fully parsed in hand.
+                        "total_messages": len(messages),
+                        "user_messages": user_msg_count,
+                        "bot_messages": bot_msg_count,
+                        "prompt_tokens": int(data.get("total_prompt_tokens") or 0),
+                        "completion_tokens": int(data.get("total_completion_tokens") or 0),
+                        "total_cost": round(float(data.get("total_cost") or 0.0), 6),
                     }
                 )
             except Exception:
