@@ -1010,6 +1010,20 @@ def lambda_handler(event, context):
             # covered anyway by _extract_page_native_text()'s free text-layer
             # skip and _extract_one_page()'s salient-token check on the EC2
             # side, both of which apply regardless of topic relevance.
+            # 2026-10 fix (PDF2-M5): this branch used to have no attempt
+            # counter and no status write at all, unlike both sibling
+            # paths (the normal extraction path below, and EC2's own
+            # handoff-processing step) — a misconfigured/unset
+            # SQS_QUEUE_URL made _notify_sqs raise on every single large
+            # upload, relying entirely on Lambda's own async-invoke retry
+            # count/DLQ config (which may or may not be set, and which
+            # this repo has no visibility into either way — the same
+            # "retry forever with no visibility" risk already fixed on
+            # the normal path). A handed-off document also showed nothing
+            # in the admin in-flight list between upload and EC2 pickup
+            # until this write_status call — the original 634-page blind
+            # spot this Lambda was built to close.
+            handoff_attempt = _attempt_counter.increment_and_get(filename, stage="lambda_handoff")
             handoff = {
                 "filename": filename,
                 "s3_raw_pdf_path": key,
@@ -1017,13 +1031,27 @@ def lambda_handler(event, context):
                 "page_count": num_pages,
             }
             handoff_key = f"{HANDOFF_S3_PREFIX}{filename}.json"
-            s3.put_object(
-                Bucket=bucket, Key=handoff_key,
-                Body=json.dumps(handoff, ensure_ascii=False).encode("utf-8"),
-                ContentType="application/json",
-            )
-            logger.info(f"{filename}: {num_pages} pages exceeds MAX_PAGES_FOR_LAMBDA={MAX_PAGES_FOR_LAMBDA} — handed off to EC2 via {handoff_key}, not processed in Lambda")
-            _notify_sqs(bucket, handoff_key)
+            try:
+                s3.put_object(
+                    Bucket=bucket, Key=handoff_key,
+                    Body=json.dumps(handoff, ensure_ascii=False).encode("utf-8"),
+                    ContentType="application/json",
+                )
+                logger.info(f"{filename}: {num_pages} pages exceeds MAX_PAGES_FOR_LAMBDA={MAX_PAGES_FOR_LAMBDA} — handed off to EC2 via {handoff_key}, not processed in Lambda")
+                _notify_sqs(bucket, handoff_key)
+                _write_status(bucket, filename, stage="queued", pages_total=num_pages, attempt=handoff_attempt)
+                _attempt_counter.clear(filename, stage="lambda_handoff")
+            except Exception as e:
+                _write_status(bucket, filename, stage="failed", pages_total=num_pages, attempt=handoff_attempt, error=str(e))
+                if handoff_attempt >= _MAX_ATTEMPTS:
+                    logger.error(
+                        f"{filename}: giving up on handoff after {handoff_attempt} failed attempts, "
+                        f"leaving a failed status for manual review instead of retrying again: {e}"
+                    )
+                    results.append({"input_key": key, "page_count": num_pages, "gave_up_after_attempts": handoff_attempt, "error": str(e)})
+                    _attempt_counter.clear(filename, stage="lambda_handoff")
+                    continue
+                raise
             results.append({"input_key": key, "handoff_key": handoff_key, "page_count": num_pages, "handed_off": True})
             continue
 

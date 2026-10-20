@@ -22,6 +22,7 @@ s3/sqs/_attempt_counter are all patched per-test; no real AWS calls.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -135,3 +136,70 @@ class TestFilenameDerivationAvoidsBasenameCollision:
         output_key = self._run_small_pdf("dev/raw/report.pdf")
         assert "report.pdf" in output_key
         assert "dev" in output_key and "raw" in output_key
+
+
+@pytest.mark.unit
+class TestHandoffBranchHasBoundedGiveUpAndStatus:
+    """PDF2-M5 (2026-10): the large-document handoff branch (num_pages >
+    MAX_PAGES_FOR_LAMBDA) used to have no attempt counter and no status
+    write at all, unlike the normal extraction path below it — a
+    misconfigured/unset SQS_QUEUE_URL made _notify_sqs raise on every
+    single large upload, relying entirely on Lambda's own retry/DLQ
+    config with zero visibility in the admin dashboard's in-flight list."""
+
+    def _large_pdf_event(self, key: str = "restbiz/raw/big_report.pdf"):
+        return _s3_event(key)
+
+    def test_successful_handoff_writes_queued_status_and_clears_counter(self):
+        event = self._large_pdf_event()
+        with patch.object(handler, "TYPHOON_OCR_API_KEY", "x"), \
+             patch.object(handler, "OPENROUTER_API_KEY", "x"), \
+             patch.object(handler, "s3") as mock_s3, \
+             patch.object(handler, "_notify_sqs") as mock_notify, \
+             patch.object(handler, "_attempt_counter") as mock_counter, \
+             patch.object(handler, "_write_status") as mock_write_status, \
+             patch("pymupdf.open", return_value=_fake_doc(handler.MAX_PAGES_FOR_LAMBDA + 1)):
+            mock_s3.get_object.return_value = {"Body": MagicMock(read=MagicMock(return_value=b"%PDF-fake"))}
+            mock_counter.increment_and_get.return_value = 1
+            result = handler.lambda_handler(event, None)
+
+        mock_notify.assert_called_once()
+        mock_write_status.assert_called_once()
+        assert mock_write_status.call_args.kwargs["stage"] == "queued"
+        mock_counter.clear.assert_called_once_with("restbiz__raw__big_report.pdf", stage="lambda_handoff")
+        body = json.loads(result["body"])
+        assert body[0]["handed_off"] is True
+
+    def test_handoff_failure_writes_failed_status_and_retries_below_max_attempts(self):
+        event = self._large_pdf_event()
+        with patch.object(handler, "TYPHOON_OCR_API_KEY", "x"), \
+             patch.object(handler, "OPENROUTER_API_KEY", "x"), \
+             patch.object(handler, "s3") as mock_s3, \
+             patch.object(handler, "_notify_sqs", side_effect=RuntimeError("SQS_QUEUE_URL not set")), \
+             patch.object(handler, "_attempt_counter") as mock_counter, \
+             patch.object(handler, "_write_status") as mock_write_status, \
+             patch("pymupdf.open", return_value=_fake_doc(handler.MAX_PAGES_FOR_LAMBDA + 1)):
+            mock_s3.get_object.return_value = {"Body": MagicMock(read=MagicMock(return_value=b"%PDF-fake"))}
+            mock_counter.increment_and_get.return_value = 1  # below _MAX_ATTEMPTS
+            with pytest.raises(RuntimeError):
+                handler.lambda_handler(event, None)
+
+        assert mock_write_status.call_args.kwargs["stage"] == "failed"
+        mock_counter.clear.assert_not_called()  # must not clear — this attempt is still live
+
+    def test_handoff_gives_up_after_max_attempts_instead_of_raising_forever(self):
+        event = self._large_pdf_event()
+        with patch.object(handler, "TYPHOON_OCR_API_KEY", "x"), \
+             patch.object(handler, "OPENROUTER_API_KEY", "x"), \
+             patch.object(handler, "s3") as mock_s3, \
+             patch.object(handler, "_notify_sqs", side_effect=RuntimeError("SQS_QUEUE_URL not set")), \
+             patch.object(handler, "_attempt_counter") as mock_counter, \
+             patch.object(handler, "_write_status") as mock_write_status, \
+             patch("pymupdf.open", return_value=_fake_doc(handler.MAX_PAGES_FOR_LAMBDA + 1)):
+            mock_s3.get_object.return_value = {"Body": MagicMock(read=MagicMock(return_value=b"%PDF-fake"))}
+            mock_counter.increment_and_get.return_value = handler._MAX_ATTEMPTS  # at the cap
+            result = handler.lambda_handler(event, None)  # must not raise
+
+        body = json.loads(result["body"])
+        assert body[0]["gave_up_after_attempts"] == handler._MAX_ATTEMPTS
+        mock_counter.clear.assert_called_once_with("restbiz__raw__big_report.pdf", stage="lambda_handoff")
