@@ -261,45 +261,6 @@ class ConversationState(BaseModel):
         if len(self.display_messages) > 200:
             self.display_messages = self.display_messages[-200:]
     
-    def summarize_old_messages(self, summary: str, keep_last: int = 5) -> None:
-        """
-        🎯 Conversation Summarization: สรุปข้อความเก่าๆ เป็น summary เดียว
-        
-        แทนที่จะเก็บ history ยาวๆ (10-20 messages = 5,000-10,000 tokens)
-        → สรุปเป็น 1 message สั้นๆ (200-500 tokens)
-        
-        Args:
-            summary: ข้อความสรุปจาก LLM
-            keep_last: เก็บ message ล่าสุดกี่ข้อความ
-        
-        Example:
-            # Before: 15 messages (8,000 tokens)
-            [msg1, msg2, msg3, ... msg15]
-            
-            # After: 1 summary + 5 recent (2,000 tokens)
-            [summary, msg11, msg12, msg13, msg14, msg15]
-        """
-        if len(self.messages) <= keep_last:
-            return
-        
-        system_msgs = [m for m in self.messages if m.get("role") == "system"]
-        non_system = [m for m in self.messages if m.get("role") != "system"]
-        
-        if len(non_system) <= keep_last:
-            return
-        
-        # เก็บแค่ message ล่าสุด
-        recent_messages = non_system[-keep_last:]
-        
-        # สร้าง summary message
-        summary_msg = {
-            "role": "system",
-            "content": f"📝 สรุปการสนทนาก่อนหน้า:\n{summary}"
-        }
-        
-        # เก็บ system messages + summary + recent messages
-        self.messages = system_msgs + [summary_msg] + recent_messages
-
     # Round / docs helpers
     def reset_round(self) -> None:
         self.round = 0

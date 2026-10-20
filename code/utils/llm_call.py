@@ -148,11 +148,12 @@ except ImportError:
     _STRUCTURED_LOG = False
 
 # Token Management: session-level cumulative token threshold.
-# When session_total exceeds this value after an LLM call, auto-summarize or trim is triggered.
+# When session_total exceeds this value after an LLM call, a deferred trim is triggered
+# (see run_pending_token_budget_check below — summarize was removed entirely, core2-M7).
 # The practical system prompt alone is ~15K tokens per call. A threshold of 20K fires on the
 # first LLM call in a fresh session — useless and adds latency. Raised to 80K so that
-# summarize/trim only kicks in after ~4-5 full Q&A rounds of real message accumulation.
-_TOKEN_WARN_THRESHOLD = 80_000  # trigger summarize/trim when session total exceeds this
+# trim only kicks in after ~4-5 full Q&A rounds of real message accumulation.
+_TOKEN_WARN_THRESHOLD = 80_000  # trigger a deferred trim when session total exceeds this
 
 
 def _handle_post_call_token_budget(
@@ -195,7 +196,7 @@ def _handle_post_call_token_budget(
             return
 
         log.warning(
-            "[%s] Session token budget exceeded %d (total=%d) — flagging for deferred summarize",
+            "[%s] Session token budget exceeded %d (total=%d) — flagging for deferred trim",
             label, _TOKEN_WARN_THRESHOLD, session_total,
         )
         try:
@@ -212,50 +213,40 @@ def run_pending_token_budget_check(
     label: str = "TokenBudget",
     log: Optional[logging.Logger] = None,
 ) -> None:
-    """Runs the actual summarize-or-trim work that _handle_post_call_token_budget
-    used to run inline. Identical logic/thresholds, just relocated.
+    """Runs the deferred trim work that _handle_post_call_token_budget used
+    to run inline (see that function's docstring for why it's deferred to a
+    background thread instead).
 
     Safe to call from a background thread ONLY while the caller still holds the
     per-session lock for `state`'s session — this mutates state.messages wholesale
-    (via auto_summarize_if_needed → state.summarize_old_messages, or trim_messages),
-    which would race with a concurrent turn for the same session appending its own
-    messages. route_v1.py enforces this by not releasing the session lock until
-    this function returns.
+    (via trim_messages), which would race with a concurrent turn for the same
+    session appending its own messages. route_v1.py enforces this by not
+    releasing the session lock until this function returns.
+
+    2026-10 fix (core2-M7): this used to try auto_summarize_if_needed()
+    first (a real paid Haiku call) and fall back to trim_messages only if
+    that produced nothing. Removed entirely — every consumer of
+    state.messages across all 3 personas either filters to the last N
+    messages by a fixed slice (e.g. persona_practical.py's
+    `state.messages[-4:]`) or filters on role in {"user","assistant"},
+    and summarize_old_messages always places its summary message BEFORE
+    the kept-recent slice. Since the slice size and the summarizer's own
+    keep_recent were the same number, the summary message could never
+    land inside what any persona's prompt-building code actually read —
+    it paid for an LLM call, held the session lock across it (delaying the
+    user's next message), and persisted a result to disk that nothing
+    downstream ever consulted. trim_messages alone (no LLM call, same
+    message-count bound) achieves the actual goal this function exists
+    for — keeping state.messages from growing unboundedly — without the
+    wasted cost.
     """
     log = log or _ROOT_LOG
     try:
-        _academic_stage = (
-            (getattr(state, "context", None) or {})
-            .get("_academic_flow", {})
-            .get("stage", "")
-        )
-        _skip_summarize = _academic_stage in ("awaiting_slots", "awaiting_sections", "awaiting_topic")
-
-        try:
-            from utils.conversation_summarizer import auto_summarize_if_needed
-
-            if _skip_summarize:
-                log.info("[%s] Academic stage=%r — skipping summarize, using trim only", label, _academic_stage)
-                summarized = False
-            else:
-                summarized = auto_summarize_if_needed(
-                    state,
-                    threshold=6,   # summarize when 6+ messages (~3 Q&A turns)
-                    keep_recent=4  # keep last 4 messages (2 Q&A turns) + summary
-                )
-
-            if summarized:
-                log.info("[%s] Auto-summarized old messages → token reduced", label)
-            else:
-                log.info("[%s] Summarization not needed, using trim instead", label)
-                if hasattr(state, "trim_messages"):
-                    state.trim_messages(keep_last=4)
-        except Exception as e:
-            log.warning("[%s] Summarization failed: %s, falling back to trim", label, e)
-            if hasattr(state, "trim_messages"):
-                state.trim_messages(keep_last=4)
+        if hasattr(state, "trim_messages"):
+            state.trim_messages(keep_last=4)
+            log.info("[%s] Trimmed old messages to bound session size", label)
     except Exception:
-        pass
+        log.warning("[%s] Trim failed (non-blocking)", label, exc_info=True)
 
 
 # Import metrics if available
