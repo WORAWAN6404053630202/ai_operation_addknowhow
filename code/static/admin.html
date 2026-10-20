@@ -630,38 +630,64 @@
       .replaceAll("'", "&#39;");
   }
 
-  function getAdminKey() {
-    let key = localStorage.getItem("admin_key");
-    if (!key) {
-      key = window.prompt("กรอก Admin API Key (X-Admin-Key):") || "";
-      if (key) localStorage.setItem("admin_key", key);
-    }
+  // 2026-10 fix: this used to prompt for the admin key unconditionally,
+  // before the first API call ever went out — fully decoupled from whether
+  // the server actually requires one (conf.ADMIN_AUTH_DISABLED, an existing
+  // per-deployment opt-in for internal-team-only instances). A deployment
+  // with auth disabled still showed the prompt every time, since the
+  // frontend had no way to know the server didn't need it. Now the first
+  // request always goes out with whatever's cached (possibly empty) and the
+  // prompt only appears reactively, after a real 401 — so a deployment that
+  // doesn't require a key never shows one, and a deployment that does still
+  // works exactly as before, just one request later.
+  function getCachedAdminKey() {
+    return localStorage.getItem("admin_key") || "";
+  }
+
+  function promptForAdminKey() {
+    const key = window.prompt("กรอก Admin API Key (X-Admin-Key):") || "";
+    if (key) localStorage.setItem("admin_key", key);
     return key;
   }
 
   async function apiGet(url) {
-    const key = getAdminKey();
-    if (!key) return {};
-    const r = await fetch(url, { headers: { "X-Admin-Key": key } });
+    let key = getCachedAdminKey();
+    let r = await fetch(url, { headers: { "X-Admin-Key": key } });
     if (r.status === 401) {
       localStorage.removeItem("admin_key");
-      alert("Admin key ไม่ถูกต้อง กรุณาโหลดหน้านี้ใหม่แล้วกรอกใหม่อีกครั้ง");
-      return {};
+      key = promptForAdminKey();
+      if (!key) return {};
+      r = await fetch(url, { headers: { "X-Admin-Key": key } });
+      if (r.status === 401) {
+        localStorage.removeItem("admin_key");
+        alert("Admin key ไม่ถูกต้อง กรุณาโหลดหน้านี้ใหม่แล้วกรอกใหม่อีกครั้ง");
+        return {};
+      }
     }
     return r.json();
   }
 
   async function apiPost(url, body) {
-    const key = getAdminKey();
-    if (!key) return { ok: false, status: 401, json: async () => ({}) };
-    const r = await fetch(url, {
+    let key = getCachedAdminKey();
+    let r = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Admin-Key": key },
       body: JSON.stringify(body || {}),
     });
     if (r.status === 401) {
       localStorage.removeItem("admin_key");
-      alert("Admin key ไม่ถูกต้อง กรุณาโหลดหน้านี้ใหม่แล้วกรอกใหม่อีกครั้ง");
+      key = promptForAdminKey();
+      if (key) {
+        r = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Admin-Key": key },
+          body: JSON.stringify(body || {}),
+        });
+      }
+      if (r.status === 401) {
+        localStorage.removeItem("admin_key");
+        alert("Admin key ไม่ถูกต้อง กรุณาโหลดหน้านี้ใหม่แล้วกรอกใหม่อีกครั้ง");
+      }
     }
     return r;
   }
