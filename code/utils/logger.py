@@ -187,6 +187,18 @@ def setup_logging(
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("openai").setLevel(logging.WARNING)
+    # 2026-10 fix: at DEBUG level (the default LOG_LEVEL in every env file),
+    # botocore.auth logs the full StringToSign and Signature, and
+    # botocore.endpoint logs the complete outgoing request including the
+    # Authorization header and x-amz-security-token — i.e. live AWS
+    # credentials, verbatim, to stdout and therefore to `docker logs` and
+    # anything that scrapes it. Live-reproduced: a plain `docker logs` on
+    # the PDF consumer during a routine deploy check showed a real STS
+    # session token. Always kept at WARNING regardless of LOG_LEVEL —
+    # there is no legitimate reason to want this at DEBUG verbosity.
+    logging.getLogger("botocore").setLevel(logging.WARNING)
+    logging.getLogger("boto3").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("chromadb").setLevel(logging.WARNING)
 
