@@ -84,6 +84,7 @@ class TestLicenseItemsDirectSupersedeWiring:
              patch.object(sqs_consumer, "draft_fields_from_pages", side_effect=fake_draft_fields_from_pages), \
              patch.object(sqs_consumer.pdf_supersede_resolver, "resolve_regulatory_topic", side_effect=fake_resolve), \
              patch.object(sqs_consumer, "_add_documents_to_vectorstore") as mock_add, \
+             patch.object(sqs_consumer, "_filter_to_pdf_auto_ids", side_effect=lambda ids, filename: ids), \
              patch.object(sqs_consumer, "_archive_and_remove_in_vectorstore") as mock_archive:
             mock_add.side_effect = lambda docs: (call_order.append("add"), 1)[1]
             mock_archive.side_effect = lambda ids, reason: call_order.append("archive")
@@ -183,6 +184,105 @@ class TestLicenseItemsDirectSupersedeWiring:
 
 
 @pytest.mark.unit
+class TestFailedDraftingFallsThroughToKnowhowRescue:
+    """PDF2-C4 (2026-10): covered_local used to be marked BEFORE the
+    drafting try/except — so a topic whose draft_fields_from_pages call
+    failed had its pages already marked "covered", and the uncovered-pages
+    fallback at the bottom of _build_license_items_direct (which routes
+    unclaimed pages through _build_knowhow_items_direct) never saw them.
+    Those pages vanished entirely: no vectorstore doc, no ReviewItem, no
+    vectorstore-write-failure placeholder — just one log line. Pages whose
+    drafting succeeds, or whose topic was resolved as a confirmed
+    duplicate, must still NOT be rescued (they were legitimately handled)."""
+
+    def test_topic_whose_drafting_fails_is_routed_to_knowhow_rescue(self):
+        pages, markdowns = _make_pages(4)
+
+        def fake_identify_license_topics(page_markdowns, cost_accumulator=None):
+            return [
+                {"department": "Dept A", "license_type": "License A", "page_ranges": [(1, 2)]},
+                {"department": "Dept B", "license_type": "License B", "page_ranges": [(3, 4)]},
+            ]
+
+        def fake_draft_fields_from_pages(topic_markdowns, cost_accumulator=None):
+            if "page 1" in topic_markdowns:
+                raise RuntimeError("provider 5xx")
+            return {"แนวคำตอบ": "เนื้อหาคำตอบ"}
+
+        def fake_resolve(merged, source_file, cost_accumulator=None):
+            return SupersedeDecision("new")
+
+        with patch.object(sqs_consumer, "identify_license_topics", side_effect=fake_identify_license_topics), \
+             patch.object(sqs_consumer, "draft_fields_from_pages", side_effect=fake_draft_fields_from_pages), \
+             patch.object(sqs_consumer.pdf_supersede_resolver, "resolve_regulatory_topic", side_effect=fake_resolve), \
+             patch.object(sqs_consumer, "_add_documents_to_vectorstore", return_value=1), \
+             patch.object(sqs_consumer, "_build_knowhow_items_direct") as mock_knowhow_rescue:
+            sqs_consumer._build_license_items_direct(
+                "test.pdf", "s3://bucket/test.pdf", pages, markdowns,
+                relevance_check=None, content_shape={"shape": "structured_license"},
+            )
+
+        # Topic A (pages 1-2) failed drafting — its pages must be rescued.
+        mock_knowhow_rescue.assert_called_once()
+        rescued_pages = mock_knowhow_rescue.call_args[0][2]
+        assert [p.page_num for p in rescued_pages] == [1, 2]
+
+    def test_topic_whose_drafting_succeeds_is_not_rescued(self):
+        """Control case: with no drafting failure, every page is covered
+        and the knowhow rescue must never be invoked."""
+        pages, markdowns = _make_pages(2)
+
+        def fake_identify_license_topics(page_markdowns, cost_accumulator=None):
+            return [{"department": "Dept A", "license_type": "License A", "page_ranges": [(1, 2)]}]
+
+        def fake_draft_fields_from_pages(topic_markdowns, cost_accumulator=None):
+            return {"แนวคำตอบ": "เนื้อหาคำตอบ"}
+
+        def fake_resolve(merged, source_file, cost_accumulator=None):
+            return SupersedeDecision("new")
+
+        with patch.object(sqs_consumer, "identify_license_topics", side_effect=fake_identify_license_topics), \
+             patch.object(sqs_consumer, "draft_fields_from_pages", side_effect=fake_draft_fields_from_pages), \
+             patch.object(sqs_consumer.pdf_supersede_resolver, "resolve_regulatory_topic", side_effect=fake_resolve), \
+             patch.object(sqs_consumer, "_add_documents_to_vectorstore", return_value=1), \
+             patch.object(sqs_consumer, "_build_knowhow_items_direct") as mock_knowhow_rescue:
+            sqs_consumer._build_license_items_direct(
+                "test.pdf", "s3://bucket/test.pdf", pages, markdowns,
+                relevance_check=None, content_shape={"shape": "structured_license"},
+            )
+
+        mock_knowhow_rescue.assert_not_called()
+
+    def test_topic_resolved_as_duplicate_is_not_rescued(self):
+        """A topic whose drafting succeeded but was then resolved as a
+        confirmed duplicate was legitimately handled (correctly recognized
+        as already-covered content) — it must not be re-routed to the
+        knowhow rescue, which would create noisy duplicate content."""
+        pages, markdowns = _make_pages(2)
+
+        def fake_identify_license_topics(page_markdowns, cost_accumulator=None):
+            return [{"department": "Dept A", "license_type": "License A", "page_ranges": [(1, 2)]}]
+
+        def fake_draft_fields_from_pages(topic_markdowns, cost_accumulator=None):
+            return {"แนวคำตอบ": "เนื้อหาคำตอบ"}
+
+        def fake_resolve(merged, source_file, cost_accumulator=None):
+            return SupersedeDecision("duplicate", matched_doc_ids=["old-a"])
+
+        with patch.object(sqs_consumer, "identify_license_topics", side_effect=fake_identify_license_topics), \
+             patch.object(sqs_consumer, "draft_fields_from_pages", side_effect=fake_draft_fields_from_pages), \
+             patch.object(sqs_consumer.pdf_supersede_resolver, "resolve_regulatory_topic", side_effect=fake_resolve), \
+             patch.object(sqs_consumer, "_add_documents_to_vectorstore", return_value=1), \
+             patch.object(sqs_consumer, "_build_knowhow_items_direct") as mock_knowhow_rescue:
+            sqs_consumer._build_license_items_direct(
+                "test.pdf", "s3://bucket/test.pdf", pages, markdowns,
+                relevance_check=None, content_shape={"shape": "structured_license"},
+            )
+
+        mock_knowhow_rescue.assert_not_called()
+
+
+@pytest.mark.unit
 class TestKnowhowItemsDirectSupersedeWiring:
     def test_duplicate_knowhow_topic_is_dropped_before_write(self):
         pages, markdowns = _make_pages(2)
@@ -229,6 +329,7 @@ class TestKnowhowItemsDirectSupersedeWiring:
              patch.object(sqs_consumer.pdf_supersede_resolver, "expand_knowhow_matches_to_full_chunks",
                            return_value=["old-kh-chunk-1", "old-kh-chunk-2"]) as mock_expand, \
              patch.object(sqs_consumer, "_add_documents_to_vectorstore") as mock_add, \
+             patch.object(sqs_consumer, "_filter_to_pdf_auto_ids", side_effect=lambda ids, filename: ids), \
              patch.object(sqs_consumer, "_archive_and_remove_in_vectorstore") as mock_archive:
             mock_add.return_value = 1
             sqs_consumer._build_knowhow_items_direct(
@@ -263,6 +364,7 @@ class TestKnowhowItemsDirectSupersedeWiring:
              patch.object(sqs_consumer.pdf_supersede_resolver, "expand_knowhow_matches_to_full_chunks",
                            side_effect=RuntimeError("chroma unreachable")), \
              patch.object(sqs_consumer, "_add_documents_to_vectorstore") as mock_add, \
+             patch.object(sqs_consumer, "_filter_to_pdf_auto_ids", side_effect=lambda ids, filename: ids), \
              patch.object(sqs_consumer, "_archive_and_remove_in_vectorstore") as mock_archive:
             mock_add.return_value = 1
             result = sqs_consumer._build_knowhow_items_direct(
@@ -576,3 +678,36 @@ class TestDraftCacheWiring:
             )
 
         assert expected_key in fake_cache.get_calls
+
+
+@pytest.mark.unit
+class TestFilterToPdfAutoIds:
+    """2026-10 fix (PDF2-C1): second line of defense alongside the
+    ingested_via="pdf_auto" scoping added to pdf_supersede_resolver.py
+    itself — this is the actual call site that retires documents, so it
+    re-checks directly. Any id that isn't pdf_auto must be dropped, never
+    passed through to archive_and_remove."""
+
+    def test_empty_input_short_circuits_without_querying_chroma(self):
+        with patch.object(sqs_consumer, "get_vs_manager") as mock_vs_mgr:
+            result = sqs_consumer._filter_to_pdf_auto_ids([], "f.pdf")
+        assert result == []
+        mock_vs_mgr.assert_not_called()
+
+    def test_keeps_only_pdf_auto_ids(self):
+        mock_vectorstore = MagicMock()
+        mock_vectorstore._collection.get.return_value = {
+            "ids": ["pdf-doc-1", "sheet-doc-2"],
+            "metadatas": [{"ingested_via": "pdf_auto"}, {"ingested_via": None}],
+        }
+        with patch.object(sqs_consumer, "get_vs_manager") as mock_vs_mgr:
+            mock_vs_mgr.return_value.vectorstore = mock_vectorstore
+            result = sqs_consumer._filter_to_pdf_auto_ids(["pdf-doc-1", "sheet-doc-2"], "f.pdf")
+        assert result == ["pdf-doc-1"]
+
+    def test_vectorstore_unavailable_returns_empty_rather_than_risking_a_bad_retire(self):
+        with patch.object(sqs_consumer, "get_vs_manager") as mock_vs_mgr:
+            mock_vs_mgr.return_value.vectorstore = None
+            mock_vs_mgr.return_value.connect_to_existing.return_value = None
+            result = sqs_consumer._filter_to_pdf_auto_ids(["doc-1"], "f.pdf")
+        assert result == []

@@ -43,6 +43,7 @@ from service.pdf_knowhow_drafting import identify_knowhow_topics, KNOWHOW_TOPIC_
 from service.pdf_large_extraction import extract_full_document
 from service.local_vector_store import add_documents as _add_documents_to_vectorstore
 from service.local_vector_store import archive_and_remove as _archive_and_remove_in_vectorstore
+from service.local_vector_store import get_vs_manager
 from service import pdf_status_tracker
 from utils.llm_cost_logging import CostAccumulator
 from utils.logger import get_logger
@@ -64,6 +65,37 @@ _queue_manager = PdfReviewQueueManager()
 # resolve on their own without letting a permanently-broken document
 # (e.g. out-of-credits, a malformed PDF) retry indefinitely.
 _MAX_HANDOFF_ATTEMPTS = 3
+
+
+def _filter_to_pdf_auto_ids(doc_ids: list[str], filename: str) -> list[str]:
+    """2026-10 fix (PDF2-C1): second line of defense alongside the
+    ingested_via="pdf_auto" scoping added to pdf_supersede_resolver.py's
+    own candidate filters — this is the actual call site that retires
+    documents, so it re-checks directly rather than trusting the resolver
+    never to hand back a non-pdf_auto id (defense in depth, not duplicate
+    work: a resolver regression here would otherwise retire a Sheet-sourced
+    doc with no safety net at all). Any id that isn't pdf_auto is dropped
+    and logged loudly — that would mean the resolver matched something it
+    should never have been able to see."""
+    if not doc_ids:
+        return []
+    vectorstore = get_vs_manager().vectorstore
+    if vectorstore is None:
+        get_vs_manager().connect_to_existing(fail_if_empty=False)
+        vectorstore = get_vs_manager().vectorstore
+    if vectorstore is None:
+        return []
+    raw = vectorstore._collection.get(ids=doc_ids, include=["metadatas"])
+    kept = []
+    for doc_id, meta in zip(raw.get("ids") or [], raw.get("metadatas") or []):
+        if (meta or {}).get("ingested_via") == "pdf_auto":
+            kept.append(doc_id)
+        else:
+            logger.error(
+                f"[SQSConsumer] {filename}: supersede resolver matched non-pdf_auto "
+                f"doc {doc_id!r} — refusing to retire it (resolver scoping bug?)"
+            )
+    return kept
 
 
 def _assert_dev_environment() -> None:
@@ -511,7 +543,9 @@ def _build_knowhow_items_direct(
         # identical comment above.
         if retire_doc_ids:
             try:
-                _archive_and_remove_in_vectorstore(retire_doc_ids, reason=f"superseded by {filename}")
+                _archive_and_remove_in_vectorstore(
+                    _filter_to_pdf_auto_ids(retire_doc_ids, filename), reason=f"superseded by {filename}",
+                )
             except Exception as e:
                 logger.error(
                     f"[SQSConsumer] Archiving superseded doc(s) failed for {filename} "
@@ -584,8 +618,6 @@ def _build_license_items_direct(
     new_count = update_count = duplicate_count = 0
     for topic in topic_bounds:
         topic_pages, topic_markdowns = _slice_by_ranges(pages, page_markdowns, topic["page_ranges"])
-        for s, e in topic["page_ranges"]:
-            covered_local.update(range(s, e + 1))
         _draft_cache_key = f"license_draft:{DRAFT_FIELDS_PROMPT_VERSION}:{content_hash(chr(10).join(topic_markdowns))}"
         drafted = get_draft_cache().get(_draft_cache_key)
         if drafted is not None:
@@ -604,6 +636,20 @@ def _build_license_items_direct(
             # one field actually drafted to something.
             if any(str(v).strip() for v in (drafted or {}).values()):
                 get_draft_cache().put(_draft_cache_key, drafted)
+        # 2026-10 fix (PDF2-C4): this used to be marked BEFORE the drafting
+        # try/except above, right after slicing — so a topic whose drafting
+        # call failed (the `continue` 2 lines up) had its pages already
+        # marked "covered", and the uncovered-pages fallback below (which
+        # routes unclaimed pages through _build_knowhow_items_direct) never
+        # saw them. Unlike the review-queue sibling (which keeps a
+        # llm_drafted_fields=None placeholder), this direct-ingest path had
+        # nothing left for those pages at all: no vectorstore doc, no
+        # ReviewItem, no vectorstore-write-failure placeholder — just this
+        # one log line. Only mark pages covered once drafting has actually
+        # succeeded (cache hit or fresh call), so a failed topic's pages
+        # fall through to the know-how rescue instead of vanishing.
+        for s, e in topic["page_ranges"]:
+            covered_local.update(range(s, e + 1))
         merged = pdf_direct_ingest.merge_drafted_fields(topic, drafted)
         merged["page_range"] = format_page_ranges([p.page_num for p in topic_pages])
         merged["_raw_text"] = "\n\n".join(topic_markdowns)
@@ -656,7 +702,9 @@ def _build_license_items_direct(
             # coverage of a topic.
             if retire_doc_ids:
                 try:
-                    _archive_and_remove_in_vectorstore(retire_doc_ids, reason=f"superseded by {filename}")
+                    _archive_and_remove_in_vectorstore(
+                        _filter_to_pdf_auto_ids(retire_doc_ids, filename), reason=f"superseded by {filename}",
+                    )
                 except Exception as e:
                     logger.error(
                         f"[SQSConsumer] Archiving superseded doc(s) failed for {filename} "

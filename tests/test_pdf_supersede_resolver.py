@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -173,6 +173,77 @@ class TestFieldDiffUsesContentAppropriateKeys:
 
 
 @pytest.mark.unit
+class TestKnowhowMetadataKeyAliasing:
+    """PDF2-C2 (2026-10): service.pdf_direct_ingest.build_knowhow_documents
+    never writes "summary"/"category" metadata keys at all — it writes the
+    same logical fields under "answer_guideline"/"content_type" (the real
+    field names retrieval/prompt-building code elsewhere depends on, so the
+    writer wasn't changed). Before this fix, existing_values["summary"]/
+    ["category"] were always None for every real live know-how doc, so a
+    byte-identical re-upload's diff spuriously showed both fields as
+    "added" every time, biasing the LLM judge toward "update" instead of
+    "duplicate". The regression test below uses the REAL metadata shape
+    (answer_guideline/content_type), unlike TestFieldDiffUsesContentAppropriateKeys
+    above which predates this fix and uses literal "summary"/"category" keys
+    that don't occur in real Chroma data — that test would have passed even
+    with the bug present."""
+
+    def test_identical_reupload_against_real_metadata_shape_shows_no_diff(self):
+        pool = {"doc-9": {"score": 0.95, "metadata": {
+            "main_topic": "การตลาดออนไลน์", "sub_topic": "โปรโมชั่น",
+            "answer_guideline": "เนื้อหาเดิมเป๊ะ", "content_type": "กลยุทธ์การตลาด",
+        }, "content": "c"}}
+        captured = {}
+
+        def fake_llm_judge(new_summary, candidates, model, cost_accumulator=None):
+            captured["candidates"] = candidates
+            return {"doc-9": {"is_same_topic": True, "content_status": "duplicate", "reasoning": "r"}}
+
+        with patch.object(resolver, "_embedding_candidates", return_value=pool), \
+             patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
+             patch.object(resolver, "_llm_judge", side_effect=fake_llm_judge):
+            resolver.resolve_knowhow_topic(
+                {
+                    "main_topic": "การตลาดออนไลน์", "sub_topic": "โปรโมชั่น",
+                    "summary": "เนื้อหาเดิมเป๊ะ", "category": "กลยุทธ์การตลาด",
+                    "full_text": "เนื้อหาเต็ม",
+                },
+                "f.pdf",
+            )
+        preview = captured["candidates"][0]["preview"]
+        assert "diff=" not in preview, (
+            f"A byte-identical re-upload must show no diff once summary/category "
+            f"are read from their real metadata keys (answer_guideline/content_type): {preview!r}"
+        )
+
+    def test_changed_reupload_against_real_metadata_shape_shows_diff(self):
+        pool = {"doc-10": {"score": 0.95, "metadata": {
+            "main_topic": "การตลาดออนไลน์", "sub_topic": "โปรโมชั่น",
+            "answer_guideline": "เนื้อหาเดิม", "content_type": "กลยุทธ์การตลาด",
+        }, "content": "c"}}
+        captured = {}
+
+        def fake_llm_judge(new_summary, candidates, model, cost_accumulator=None):
+            captured["candidates"] = candidates
+            return {"doc-10": {"is_same_topic": True, "content_status": "update", "reasoning": "r"}}
+
+        with patch.object(resolver, "_embedding_candidates", return_value=pool), \
+             patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
+             patch.object(resolver, "_llm_judge", side_effect=fake_llm_judge):
+            resolver.resolve_knowhow_topic(
+                {
+                    "main_topic": "การตลาดออนไลน์", "sub_topic": "โปรโมชั่น",
+                    "summary": "เนื้อหาใหม่ที่เปลี่ยนไปจริง", "category": "กลยุทธ์การตลาด",
+                    "full_text": "เนื้อหาเต็ม",
+                },
+                "f.pdf",
+            )
+        preview = captured["candidates"][0]["preview"]
+        assert "'change_type': 'changed'" in preview
+        assert "'field': 'summary'" in preview
+
+
+@pytest.mark.unit
 class TestKnowhowCatchAllExemption:
     def test_catchall_topic_is_always_new_without_touching_chroma(self):
         with patch.object(resolver, "_embedding_candidates") as mock_emb:
@@ -303,3 +374,46 @@ class TestPoolMergePreservesEmbeddingScore:
         # inspect the call args directly rather than via kwargs.
         candidates_arg = mock_judge.call_args[0][1]
         assert len(candidates_arg) == 1  # doc-1 appears once, not duplicated by the merge
+
+
+@pytest.mark.unit
+class TestIngestedViaScoping:
+    """2026-10 fix (PDF2-C1): resolve_regulatory_topic/resolve_knowhow_topic
+    used to scope candidates by data_type alone — Sheet-sourced docs share
+    the same data_type/main_topic/sub_topic shape as PDF-sourced ones, so a
+    PDF re-upload whose topic happened to match a real Sheet row's topic
+    could get judged "update" and archive that Sheet doc. Every
+    data_type_filter passed to the candidate-signal functions must now also
+    scope to ingested_via="pdf_auto"."""
+
+    def test_regulatory_topic_filter_scopes_to_pdf_auto(self):
+        with patch.object(resolver, "_embedding_candidates", return_value={}) as mock_emb, \
+             patch.object(resolver, "_identity_fuzzy_candidates", return_value={}) as mock_fuzzy:
+            resolver.resolve_regulatory_topic(
+                {"department": "X", "license_type": "Y", "answer_guideline": "z"}, "f.pdf",
+            )
+        emb_filter = mock_emb.call_args[0][1]
+        fuzzy_filter = mock_fuzzy.call_args[0][1]
+        assert {"ingested_via": "pdf_auto"} in emb_filter["$and"]
+        assert {"ingested_via": "pdf_auto"} in fuzzy_filter["$and"]
+
+    def test_knowhow_topic_filter_scopes_to_pdf_auto(self):
+        with patch.object(resolver, "_embedding_candidates", return_value={}) as mock_emb, \
+             patch.object(resolver, "_identity_fuzzy_candidates", return_value={}) as mock_fuzzy:
+            resolver.resolve_knowhow_topic(
+                {"main_topic": "A", "sub_topic": "B", "summary": "s", "category": "c"}, "f.pdf",
+            )
+        emb_filter = mock_emb.call_args[0][1]
+        fuzzy_filter = mock_fuzzy.call_args[0][1]
+        assert {"ingested_via": "pdf_auto"} in emb_filter["$and"]
+        assert {"ingested_via": "pdf_auto"} in fuzzy_filter["$and"]
+
+    def test_collect_full_sibling_chunk_ids_scopes_to_pdf_auto(self):
+        mock_vectorstore = MagicMock()
+        mock_vectorstore._collection.get.return_value = {"ids": ["a", "b"]}
+        with patch.object(resolver, "get_vs_manager") as mock_vs_mgr:
+            mock_vs_mgr.return_value.vectorstore = mock_vectorstore
+            result = resolver.collect_full_sibling_chunk_ids("Main", "Sub")
+        where = mock_vectorstore._collection.get.call_args.kwargs["where"]
+        assert {"ingested_via": "pdf_auto"} in where["$and"]
+        assert result == ["a", "b"]

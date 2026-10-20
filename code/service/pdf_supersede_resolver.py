@@ -67,6 +67,16 @@ _KNOWHOW_COMPARISON_KEYS = ("main_topic", "sub_topic", "summary", "category")
 _REGULATORY_DIFF_KEYS = _PROCEDURAL_FIELD_KEYS
 _KNOWHOW_DIFF_KEYS = ["summary", "category"]
 
+# 2026-10 fix (PDF2-C2): pdf_direct_ingest.build_knowhow_documents never
+# writes "summary"/"category" metadata keys — it writes the same logical
+# fields under "answer_guideline"/"content_type" instead (the real field
+# names retrieval/prompt-building code elsewhere depends on). Maps the
+# logical names used in _KNOWHOW_COMPARISON_KEYS/_KNOWHOW_DIFF_KEYS above
+# to the actual Chroma metadata keys when reading an EXISTING live doc back
+# (see _resolve's metadata_key_aliases param) — new_values (freshly drafted,
+# not yet written) already uses the logical names directly.
+_KNOWHOW_METADATA_KEY_ALIASES = {"summary": "answer_guideline", "category": "content_type"}
+
 # Know-how's deterministic catch-all topic (see sqs_consumer.py's
 # _build_knowhow_items_direct) — its main_topic/sub_topic are fixed generic
 # strings reused across every document that has any uncovered pages, so
@@ -244,7 +254,21 @@ def _resolve(
     data_type_filter: dict,
     source_file: str,
     cost_accumulator: Optional[CostAccumulator] = None,
+    metadata_key_aliases: Optional[dict[str, str]] = None,
 ) -> SupersedeDecision:
+    # 2026-10 fix (PDF2-C2): comparison_keys/diff_keys are logical field
+    # names used throughout this module (and sent to the LLM judge as the
+    # new/candidate "shape"), but a stored live doc's actual Chroma metadata
+    # key can differ — e.g. know-how topics are drafted with "summary"/
+    # "category", but pdf_direct_ingest.build_knowhow_documents writes them
+    # under "answer_guideline"/"content_type" (the real field names the
+    # retrieval/prompt-building code elsewhere already depends on, so the
+    # writer isn't changed). Without this mapping, meta.get("summary") and
+    # meta.get("category") were always None for every existing know-how
+    # doc — every re-upload's diff showed both as spuriously "added",
+    # biasing the LLM judge toward "update" instead of "duplicate" even on
+    # a byte-identical re-upload.
+    metadata_key_aliases = metadata_key_aliases or {}
     comparison_text = _comparison_text(new_values, comparison_keys)
     if not comparison_text.strip():
         return SupersedeDecision("new", reasoning="no comparable text drafted")
@@ -291,7 +315,9 @@ def _resolve(
         candidates_for_llm = []
         for doc_id, info in batch:
             meta = info.get("metadata") or {}
-            existing_values = {k: meta.get(k) for k in set(comparison_keys) | set(diff_keys)}
+            existing_values = {
+                k: meta.get(metadata_key_aliases.get(k, k)) for k in set(comparison_keys) | set(diff_keys)
+            }
             diff = _field_diff(new_values, existing_values, diff_keys=diff_keys)
             preview = _comparison_text(existing_values, comparison_keys)[:300]
             candidates_for_llm.append({
@@ -322,7 +348,15 @@ def resolve_regulatory_topic(
         identity_keys=_REGULATORY_IDENTITY_KEYS,
         comparison_keys=_REGULATORY_COMPARISON_KEYS,
         diff_keys=_REGULATORY_DIFF_KEYS,
-        data_type_filter={"data_type": "regulatory"},
+        # 2026-10 fix (PDF2-C1): used to filter on data_type alone, with no
+        # ingested_via scoping — Sheet-sourced docs share the same
+        # data_type/main_topic/sub_topic shape, so a PDF re-upload whose
+        # topic happened to match a real Sheet row's topic could get
+        # judged "update" and archive that Sheet doc via
+        # expand_knowhow_matches_to_full_chunks/collect_full_sibling_chunk_ids
+        # below. This resolver must only ever retire docs this same
+        # pdf_auto pipeline wrote.
+        data_type_filter={"$and": [{"data_type": "regulatory"}, {"ingested_via": "pdf_auto"}]},
         source_file=source_file,
         cost_accumulator=cost_accumulator,
     )
@@ -345,9 +379,15 @@ def resolve_knowhow_topic(
         identity_keys=_KNOWHOW_IDENTITY_KEYS,
         comparison_keys=_KNOWHOW_COMPARISON_KEYS,
         diff_keys=_KNOWHOW_DIFF_KEYS,
-        data_type_filter={"data_type": {"$in": ["business_guide", "marketing"]}},
+        # 2026-10 fix (PDF2-C1): see the matching comment in
+        # resolve_regulatory_topic above — same Sheet/PDF isolation gap.
+        data_type_filter={"$and": [{"data_type": {"$in": ["business_guide", "marketing"]}}, {"ingested_via": "pdf_auto"}]},
         source_file=source_file,
         cost_accumulator=cost_accumulator,
+        # 2026-10 fix (PDF2-C2): see _resolve's docstring comment on
+        # metadata_key_aliases — build_knowhow_documents writes these
+        # logical fields under different real metadata keys.
+        metadata_key_aliases=_KNOWHOW_METADATA_KEY_ALIASES,
     )
 
 
@@ -395,6 +435,10 @@ def collect_full_sibling_chunk_ids(main_topic: str, sub_topic: str) -> list[str]
         vectorstore = get_vs_manager().vectorstore
     if vectorstore is None:
         return []
-    where = {"$and": [{"main_topic": main_topic}, {"sub_topic": sub_topic}]}
+    # 2026-10 fix (PDF2-C1): scoped to ingested_via="pdf_auto" so this can
+    # never expand into retiring a Sheet-sourced sibling that happens to
+    # share the same main_topic/sub_topic pair — see the matching comment
+    # in resolve_regulatory_topic/resolve_knowhow_topic above.
+    where = {"$and": [{"main_topic": main_topic}, {"sub_topic": sub_topic}, {"ingested_via": "pdf_auto"}]}
     raw = vectorstore._collection.get(where=where, include=[])
     return raw.get("ids") or []
