@@ -101,6 +101,51 @@ def _extract_token_counts(response: Any, log: logging.Logger, label: str) -> tup
         return 0, 0
 
 
+def _record_length_error_cost(
+    exc: Exception, state: Any, model_name: str, label: str, log: logging.Logger
+) -> None:
+    """2026-10 fix: a LengthFinishReasonError means the model hit max_tokens
+    before finishing — openai.LengthFinishReasonError.completion is a REAL
+    ChatCompletion the provider already generated and billed for (confirmed:
+    a live 64k-prompt/6000-completion-token call that hit this path was
+    billed ~$0.34 by OpenRouter), but llm_invoke used to re-raise immediately
+    without ever reaching the cost-calculation code below — so a persona
+    that retries with a bigger max_tokens and STILL truncates (see
+    persona_practical.py's _call_llm_json_with_truncation_retry) could burn
+    real money on 2 full LLM calls while state.total_cost — and anything
+    downstream of it, including the PDF project's daily cost guard — stayed
+    at $0, completely blind to it. Extracts usage from the exception's own
+    completion object and records it the same way a successful call would,
+    before the caller re-raises. Never raises itself — if extraction fails
+    for any reason, the caller's re-raise still happens untouched."""
+    try:
+        completion = getattr(exc, "completion", None)
+        usage = getattr(completion, "usage", None)
+        if usage is None:
+            return
+        u = usage.model_dump() if hasattr(usage, "model_dump") else dict(usage)
+        prompt_tokens = int(u.get("prompt_tokens") or 0)
+        completion_tokens = int(u.get("completion_tokens") or 0)
+        ptd = u.get("prompt_tokens_details") or {}
+        cache_read_tokens = int(ptd.get("cached_tokens") or 0)
+        cache_write_tokens = int(ptd.get("cache_write_tokens") or 0)
+        if prompt_tokens == 0 and completion_tokens == 0:
+            return
+        cost_usd = estimate_cost(model_name, prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens)
+        log.warning(
+            "[%s] Recording cost for a failed (length-truncated) call so it isn't silently lost: "
+            "$%.6f (in=%d out=%d)",
+            label, cost_usd, prompt_tokens, completion_tokens,
+        )
+        if state is not None:
+            _handle_post_call_token_budget(
+                state, prompt_tokens, completion_tokens, label, log,
+                cache_read_tokens, cache_write_tokens, cost_usd,
+            )
+    except Exception:
+        log.debug("[%s] Could not record cost for a length-truncated call", label, exc_info=True)
+
+
 def _extract_cache_tokens(response: Any) -> tuple[int, int]:
     """Extract (cache_read_tokens, cache_write_tokens) if present, else (0, 0).
     Kept as permanent lightweight observability — this is the only signal that shows
@@ -508,6 +553,7 @@ def llm_invoke(
                     "[%s] LengthFinishReasonError — skip retries (token limit, same input = same result)",
                     label,
                 )
+                _record_length_error_cost(exc, state, model_name, label, log)
                 raise
 
             # Record failed attempt in metrics
@@ -650,6 +696,7 @@ async def llm_invoke_async(
                     "[%s] LengthFinishReasonError — skip retries (token limit, same input = same result)",
                     label,
                 )
+                _record_length_error_cost(exc, state, model_name, label, log)
                 raise
 
             # Record failed attempt in metrics
