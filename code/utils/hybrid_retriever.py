@@ -364,6 +364,19 @@ def hybrid_scored_search(
             break
         except Exception as e:
             if _attempt < _dense_max_attempts:
+                # 2026-10 fix (live-reproduced): a Pydantic "Document page_content must be a
+                # valid string [input_value=None]" failure — distinct from the stateless
+                # OpenRouter-422 case this retry loop was originally built for (see this
+                # block's header comment) — was observed exactly overlapping in time with
+                # sqs_consumer.py writing a new doc into the SAME local (SQLite-backed) Chroma
+                # file this query was reading from: a cross-process read/write race on the
+                # on-disk index, not provider flakiness. The original loop retried with zero
+                # delay, which only helps the stateless-API case; a concurrent writer's
+                # transaction needs real wall-clock time to land before a retry has any better
+                # chance of seeing consistent data. Small growing backoff (0.15s × attempt)
+                # costs nothing in the common zero-failure case and gives the writer a
+                # realistic window to finish before the next attempt.
+                time.sleep(0.15 * _attempt)
                 _LOG.info("[Hybrid] Dense search attempt %d/%d failed: %s — retrying", _attempt, _dense_max_attempts, e)
             else:
                 _dense_fully_failed = True

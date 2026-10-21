@@ -4150,7 +4150,21 @@ class PracticalPersonaService:
                 # When score=0 (no license name in query), doc-count dominance is unreliable —
                 # skip filtering and let LLM decide from all retrieved docs.
                 _dominant_lt = _best_lt if (_best_lt and _best_score > 0) else None
-                _focused_docs = [d for d in _all_docs if (d.get("metadata") or {}).get("license_type", "").strip() == _dominant_lt] if _dominant_lt else []
+                # 2026-10 fix (live-reproduced, PDF-only DBD Biz Regist content): docs with no
+                # license_type (know-how/business_guide docs, license_type="") were dropped as
+                # "noise" alongside non-dominant regulatory license_types — "" never equals a
+                # non-empty _dominant_lt. Same root cause already documented above for the
+                # broad-tax-query case ("license_type='' never matches a non-empty dominant_lt")
+                # but that fix was scoped narrowly to tax queries only (_is_broad_tax_query).
+                # Generalized here: a know-how doc already passed similarity/reranking to reach
+                # this point in _all_docs — FOCUS FILTER's whole job is resolving ambiguity
+                # BETWEEN REGULATORY license_types specifically (its scoring only ever compares
+                # license_type strings), so it has no basis to judge know-how relevance and must
+                # not discard it as a side effect of narrowing to one regulatory license_type.
+                _focused_docs = [
+                    d for d in _all_docs
+                    if (d.get("metadata") or {}).get("license_type", "").strip() in (_dominant_lt, "")
+                ] if _dominant_lt else []
                 if _focused_docs:
                     _LOG.info(
                         "[Practical] FOCUS FILTER: multi-license %s → keeping only %r (score=%.1f, %d docs, dropped %d)",
