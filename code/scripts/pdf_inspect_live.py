@@ -75,6 +75,7 @@ def main() -> None:
         print(f"  operation_topic: {meta.get('operation_topic') or ''}")
         print(f"  content_type:  {meta.get('content_type') or ''}")
         print(f"  chunk:         {meta.get('chunk_index')}/{meta.get('chunk_total')}")
+        print(f"  page_range:    {meta.get('research_reference') or ''}")
         print(f"  ingested_via:  {meta.get('ingested_via') or ''}")
         preview = content if args.full else (content[:300] + ("..." if len(content or "") > 300 else ""))
         print(f"  content:\n    {preview}\n")
