@@ -4478,7 +4478,27 @@ class PersonaSupervisor:
                     mt for mt in _matched_mts
                     if topic_label_matches_query(mt, _q_lower_sv, _last_raw_human, strong_only=True)
                 ]
-                _target_mt_sv = max(_strong_mts or _matched_mts, key=len)
+                # 2026-10 fix, round 2 (live-reproduced, see the identical fix and
+                # its comment in the sub_topic/operation_topic block below): when
+                # NO candidate matched strongly and 2+ DISTINCT main_topics all
+                # matched only weakly (ASCII-token-only, e.g. a shared product/
+                # system name), picking one by length is an unresolved coin flip,
+                # not a decision — leave _target_mt_sv empty so this exact-match
+                # shortcut is skipped entirely (the lookup below then naturally
+                # finds 0 docs and falls through to normal retrieval, exactly as
+                # if main_topic chapter-fetch had never matched at all). No-op for
+                # the single-weak-match case.
+                if _strong_mts:
+                    _target_mt_sv = max(_strong_mts, key=len)
+                elif len(set(_matched_mts)) >= 2:
+                    _LOG.info(
+                        "[Supervisor] main_topic chapter retrieval: %d weak (ASCII-only) matches "
+                        "with no strong competitor — ambiguous, skipping exact-match shortcut for %s",
+                        len(set(_matched_mts)), _matched_mts,
+                    )
+                    _target_mt_sv = ""
+                else:
+                    _target_mt_sv = max(_matched_mts, key=len)
                 # Regulatory-dominance guard (2026-09, live-reproduced — a THIRD independent
                 # duplicate of the same exact-match-hijack shape as the op_topic/sub_topic
                 # sites earlier in this method; see _nonreg_chapter_semantic_check's docstring
@@ -4603,8 +4623,37 @@ class PersonaSupervisor:
                     _best_st = max(_strong_sts, key=len) if _strong_sts else ""
                     _best_ot = max(_strong_ots, key=len) if _strong_ots else ""
                 else:
-                    _best_st = max(_matched_sts, key=len) if _matched_sts else ""
-                    _best_ot = max(_matched_ots, key=len) if _matched_ots else ""
+                    # 2026-10 fix, round 2 (live-reproduced): the strong/weak split
+                    # above only helps when a strong match exists to prefer — it did
+                    # nothing for "ยื่นรายงานการชำระบัญชี ลช.3 ผ่านระบบ DBD Biz Regist
+                    # ต้องทำยังไง", where the CORRECT chapter's label itself (parens/
+                    # wording differ from the query) never substring-matches either,
+                    # so BOTH the correct chapter and the unrelated "dissolve the
+                    # company" chapter end up weak-matched via the same shared
+                    # "DBD Biz Regist" tokens — max(key=len) then picked the wrong
+                    # one by a 2-character length margin (82 vs 80), live-confirmed
+                    # via a direct query against the running collection. When 2+
+                    # DISTINCT labels all matched only weakly, the shared token
+                    # plainly isn't discriminating between them — picking one by
+                    # length is a coin flip, not a decision. Skip chapter retrieval
+                    # entirely in that case (leave _target_st_sv empty) and let
+                    # normal semantic/hybrid retrieval decide instead — confirmed
+                    # live (see this fix's commit) that plain embedding similarity
+                    # already ranks these candidates correctly; it's only this
+                    # exact-match shortcut that couldn't tell them apart. Still a
+                    # no-op for the single-weak-match case (e.g. a lone "B2B"
+                    # mention) — only fires when there's real ambiguity to resolve.
+                    _weak_pool = list(dict.fromkeys(_matched_sts + _matched_ots))
+                    if len(_weak_pool) >= 2:
+                        _LOG.info(
+                            "[Supervisor] chapter retrieval: %d weak (ASCII-only) matches with no "
+                            "strong competitor — ambiguous, skipping exact-match shortcut for %s",
+                            len(_weak_pool), _weak_pool,
+                        )
+                        _best_st = _best_ot = ""
+                    else:
+                        _best_st = max(_matched_sts, key=len) if _matched_sts else ""
+                        _best_ot = max(_matched_ots, key=len) if _matched_ots else ""
                 if len(_best_ot) > len(_best_st):
                     _target_st_sv = _best_ot
                     _use_op_topic_filter = True

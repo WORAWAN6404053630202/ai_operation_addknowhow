@@ -54,16 +54,16 @@ class TestMainTopicChapterRetrievalPrefersStrongMatch:
         source = _source()
         idx = source.find("if _matched_mts:")
         assert idx != -1, "main_topic matched-candidates block not found"
-        end = source.find("_target_mt_sv = max(", idx)
+        end = source.find("try:", idx)
         assert end != -1
-        # The final selection line must prefer the strong subset, falling back
-        # to the full lenient list only when the strong subset is empty.
-        line_end = source.find("\n", end)
-        selection_line = source[end:line_end]
-        assert "_strong_mts or _matched_mts" in selection_line
-        # The strong subset itself must be computed via strong_only=True.
         body = source[idx:end]
+        # The strong subset must be computed via strong_only=True...
         assert "strong_only=True" in body
+        # ...and preferred first: max(_strong_mts, ...) wins when non-empty.
+        assert "if _strong_mts:" in body
+        assert "_target_mt_sv = max(_strong_mts, key=len)" in body
+        # Falls back to the full lenient list only in the final else branch.
+        assert "_target_mt_sv = max(_matched_mts, key=len)" in body
 
 
 @pytest.mark.unit
@@ -81,3 +81,35 @@ class TestSubTopicOperationTopicChapterRetrievalPrefersStrongMatch:
         # Selection must branch on "any strong match exists" before falling
         # back to the original lenient max(key=len) behavior.
         assert "if _strong_sts or _strong_ots:" in body
+
+
+@pytest.mark.unit
+class TestChapterRetrievalSkipsAmbiguousWeakMatches:
+    """Round 2 (live-reproduced): the strong/weak split alone only helps when a
+    strong match exists to prefer. "ยื่นรายงานการชำระบัญชี ลช.3 ผ่านระบบ DBD Biz
+    Regist ต้องทำยังไง" had no strong match for EITHER the correct chapter (its
+    label's parens/wording differ from the query) or the unrelated "dissolve the
+    company" chapter — both matched only weakly via the shared "DBD Biz Regist"
+    tokens, and max(key=len) picked the wrong one by a 2-character margin. Fix:
+    when 2+ distinct labels all matched only weakly, skip the exact-match
+    shortcut entirely (leave the target empty) instead of guessing by length."""
+
+    def test_main_topic_ambiguous_weak_matches_skip_the_shortcut(self):
+        source = _source()
+        idx = source.find("if _matched_mts:")
+        assert idx != -1
+        end = source.find("try:", idx)
+        assert end != -1
+        body = source[idx:end]
+        assert "elif len(set(_matched_mts)) >= 2:" in body
+        assert '_target_mt_sv = ""' in body
+
+    def test_sub_operation_topic_ambiguous_weak_matches_skip_the_shortcut(self):
+        source = _source()
+        idx = source.find("if _matched_sts or _matched_ots:")
+        assert idx != -1
+        end = source.find("if len(_best_ot) > len(_best_st):", idx)
+        body = source[idx:end]
+        assert "_weak_pool = list(dict.fromkeys(_matched_sts + _matched_ots))" in body
+        assert "if len(_weak_pool) >= 2:" in body
+        assert "_best_st = _best_ot = \"\"" in body
