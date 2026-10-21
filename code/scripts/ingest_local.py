@@ -286,44 +286,56 @@ def main():
     parser.add_argument("--confirm", action="store_true", help="Actually wipe and rebuild the collection (omit for a dry run that only prints what would happen)")
     args = parser.parse_args()
 
+    # 2026-10: echo which collection this run is about to touch, before anything
+    # starts loading — with two live collections now in play (the merged
+    # Sheet+PDF instance and a genuinely PDF-only one), a wrong-env-file run
+    # was previously silent until the final summary. Cheap, high-value.
+    print(f"[Ingest] COLLECTION_NAME = {conf.COLLECTION_NAME!r}")
+    print(f"[Ingest] LOCAL_VECTOR_DIR = {conf.LOCAL_VECTOR_DIR!r}")
+    if conf.INGEST_SKIP_SHEETS:
+        print("[Ingest] INGEST_SKIP_SHEETS=true — Sources A-D (Sheets) will be skipped; only PDF-ingested content (Source E) carries forward.")
+
     all_docs: List[Document] = []
 
-    # ── Source A: Regulatory / government procedures ─────────────────────────
-    print("\n[Ingest] Loading Sheet A — Regulatory (กฎหมาย/ใบอนุญาต/ราชการ)...")
-    dl = DataLoader(config={})
-    dl.load_from_google_sheet(SHEET_URL_REGULATORY, source_name="regulatory")
-    all_docs.extend(dl.documents)
-    print(f"[Ingest]   → {len(dl.documents)} regulatory docs")
+    if not conf.INGEST_SKIP_SHEETS:
+        # ── Source A: Regulatory / government procedures ─────────────────────
+        print("\n[Ingest] Loading Sheet A — Regulatory (กฎหมาย/ใบอนุญาต/ราชการ)...")
+        dl = DataLoader(config={})
+        dl.load_from_google_sheet(SHEET_URL_REGULATORY, source_name="regulatory")
+        all_docs.extend(dl.documents)
+        print(f"[Ingest]   → {len(dl.documents)} regulatory docs")
 
-    # ── Source B: Marketing strategy / SOP ──────────────────────────────────
-    print("\n[Ingest] Loading Sheet B — Marketing (การตลาด/กลยุทธ์/SOP)...")
-    dl_mkt = GeneralDataLoader(data_type="marketing")
-    dl_mkt.load_from_google_sheet(SHEET_URL_MARKETING, source_name="marketing")
-    all_docs.extend(dl_mkt.documents)
-    print(f"[Ingest]   → {len(dl_mkt.documents)} marketing docs")
+        # ── Source B: Marketing strategy / SOP ────────────────────────────────
+        print("\n[Ingest] Loading Sheet B — Marketing (การตลาด/กลยุทธ์/SOP)...")
+        dl_mkt = GeneralDataLoader(data_type="marketing")
+        dl_mkt.load_from_google_sheet(SHEET_URL_MARKETING, source_name="marketing")
+        all_docs.extend(dl_mkt.documents)
+        print(f"[Ingest]   → {len(dl_mkt.documents)} marketing docs")
 
-    # ── Source C: Bakery / coffee-shop startup guide ─────────────────────────
-    print("\n[Ingest] Loading Sheet C — Business Guide (เบเกอรี่/คาเฟ่/เปิดร้าน)...")
-    dl_biz = GeneralDataLoader(data_type="business_guide")
-    dl_biz.load_from_google_sheet(SHEET_URL_BAKERY, source_name="business_guide")
-    all_docs.extend(dl_biz.documents)
-    print(f"[Ingest]   → {len(dl_biz.documents)} business_guide docs")
+        # ── Source C: Bakery / coffee-shop startup guide ──────────────────────
+        print("\n[Ingest] Loading Sheet C — Business Guide (เบเกอรี่/คาเฟ่/เปิดร้าน)...")
+        dl_biz = GeneralDataLoader(data_type="business_guide")
+        dl_biz.load_from_google_sheet(SHEET_URL_BAKERY, source_name="business_guide")
+        all_docs.extend(dl_biz.documents)
+        print(f"[Ingest]   → {len(dl_biz.documents)} business_guide docs")
 
-    # ── Source D: Know-how (from PDF ingestion review queue, feature/pdf-ingestion) ─
-    # Soft-optional: SHEET_URL_KNOWHOW is "" until someone points it at a real
-    # know_how tab (see conf.py) — skip cleanly rather than failing the whole
-    # ingest run over a feature most environments haven't set up yet.
-    if SHEET_URL_KNOWHOW:
-        print("\n[Ingest] Loading Sheet D — Know-how (จาก PDF ingestion)...")
-        try:
-            dl_kh = DataLoader(config={})
-            dl_kh.load_from_knowhow_sheet(SHEET_URL_KNOWHOW, source_name="know_how")
-            all_docs.extend(dl_kh.documents)
-            print(f"[Ingest]   → {len(dl_kh.documents)} know-how docs")
-        except Exception as e:
-            print(f"[Ingest]   ⚠️  Know-how sheet load failed, continuing without it: {e}")
+        # ── Source D: Know-how (from PDF ingestion review queue, feature/pdf-ingestion) ─
+        # Soft-optional: SHEET_URL_KNOWHOW is "" until someone points it at a real
+        # know_how tab (see conf.py) — skip cleanly rather than failing the whole
+        # ingest run over a feature most environments haven't set up yet.
+        if SHEET_URL_KNOWHOW:
+            print("\n[Ingest] Loading Sheet D — Know-how (จาก PDF ingestion)...")
+            try:
+                dl_kh = DataLoader(config={})
+                dl_kh.load_from_knowhow_sheet(SHEET_URL_KNOWHOW, source_name="know_how")
+                all_docs.extend(dl_kh.documents)
+                print(f"[Ingest]   → {len(dl_kh.documents)} know-how docs")
+            except Exception as e:
+                print(f"[Ingest]   ⚠️  Know-how sheet load failed, continuing without it: {e}")
+        else:
+            print("\n[Ingest] Sheet D — Know-how: SHEET_URL_KNOWHOW not set, skipping.")
     else:
-        print("\n[Ingest] Sheet D — Know-how: SHEET_URL_KNOWHOW not set, skipping.")
+        print("\n[Ingest] Sources A-D (Sheets) — skipped (INGEST_SKIP_SHEETS=true).")
 
     # ── Source E: PDF-auto-ingested content (feature/pdf-ingestion, 2026-09) ──
     # This rebuild (reset=True below) wipes and recreates the ENTIRE collection

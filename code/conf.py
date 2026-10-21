@@ -381,6 +381,17 @@ RERANKER_TOP_K = _safe_int("RERANKER_TOP_K", 10)
 # deployment (which relies on a dev-named file) is unaffected.
 PDF_CONSUMER_ACKNOWLEDGED_PRODUCTION = os.getenv("PDF_CONSUMER_ACKNOWLEDGED_PRODUCTION", "false").lower() == "true"
 
+# 2026-10: safety rail for a genuinely PDF-only deployment (zero Sheet data by
+# design) — set true in that instance's .properties file so a mistaken
+# `scripts/ingest_local.py --confirm` run (wrong terminal/directory, muscle
+# memory from the merged Sheet+PDF instance) can never pull Sheet content into
+# a collection that's supposed to stay PDF-only forever. Default false — every
+# existing Sheet+PDF deployment (the merged instance, this repo's main
+# env.properties) is completely unaffected; ingest_local.py's Source E
+# (PDF-content carry-forward across a reset) always runs regardless of this
+# flag — it's the only thing that lets PDF content survive a rebuild at all.
+INGEST_SKIP_SHEETS = os.getenv("INGEST_SKIP_SHEETS", "false").lower() == "true"
+
 # Reranker inference backend: "pytorch" (default, current behavior, sentence-transformers
 # CrossEncoder float32) or "onnx" (quantized INT8 via Hugging Face Optimum + ONNX Runtime,
 # ~2-3x faster on CPU per sbert.net docs). OFF by default pending live validation — same
