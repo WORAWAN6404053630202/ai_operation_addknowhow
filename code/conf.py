@@ -222,6 +222,18 @@ MAX_TOKENS_PRACTICAL = _safe_int("MAX_TOKENS_PRACTICAL", 4500)
 # cost/latency on every single call instead of only the rare truncated one.
 MAX_TOKENS_PRACTICAL_RETRY = _safe_int("MAX_TOKENS_PRACTICAL_RETRY", 8000)
 
+# 2026-10 fix: pre-flight guard for _call_llm_json_with_truncation_retry — if the
+# prompt is already this large when a truncation is detected, widening the output
+# budget (MAX_TOKENS_PRACTICAL_RETRY above) can't fix an input-side problem, so the
+# second billed call is skipped. Char-count proxy (no tiktoken-based counter exists
+# in utils/ today — matches the char-count-heuristic style already used by
+# LLM_DOC_CHARS_* below). 150,000 sits comfortably above any normal complete
+# prompt but below the reproduced incident's ~64k-token (~2.2-2.5 chars/token for
+# mixed Thai/English) prompt. Should rarely-to-never fire once the doc-count caps
+# upstream (persona_practical.py's sibling-completion gates, LLM_DOCS_MAX_FINAL_CEILING
+# above) are doing their job — that's the intended backstop role, not a sign it's unused.
+PRACTICAL_TRUNCATION_RETRY_MAX_PROMPT_CHARS = _safe_int("PRACTICAL_TRUNCATION_RETRY_MAX_PROMPT_CHARS", 150000)
+
 EMBEDDING_MODEL = os.getenv(
     "EMBEDDING_MODEL",
     "baai/bge-m3"
@@ -236,6 +248,17 @@ RETRIEVAL_TOP_K = _safe_int("RETRIEVAL_TOP_K", 20)
 LLM_DOCS_MAX_PRACTICAL = _safe_int("LLM_DOCS_MAX_PRACTICAL", 6)    # raised 4→6: more docs = richer, more complete answers
 LLM_DOCS_MAX_BROAD = _safe_int("LLM_DOCS_MAX_BROAD", 25)          # total docs cap for broad open-ended questions — covers multi-pass merged result (pass1=RETRIEVAL_TOP_K currently 15 + pass2=8 = up to 23 unique, before sweep/pass3). Was 20, sized for a stale pass1=10 assumption; raised so the simple-branch total cap doesn't silently truncate pass2 below its actual current yield.
 LLM_DOCS_MAX_ACADEMIC = _safe_int("LLM_DOCS_MAX_ACADEMIC", 12)    # raised: 5 → 12 (academic needs full coverage)
+
+# 2026-10 fix: final absolute ceiling on persona_practical.py's _docs_to_process,
+# applied AFTER every append path (multi-topic merge, sibling-completion,
+# guarantee-doc prepends) has run — a true no-op safety net, not a normal-path
+# cap. Set equal to the multi-topic merge's own existing cap
+# (persona_supervisor.py's LLM_DOCS_MAX_BROAD(25) × 2 = 50) so it never trims a
+# path that's already correctly capped elsewhere; it only catches a path that,
+# due to a bug rather than by design, exceeded what any single earlier stage
+# meant to allow (reproduced live: 51 docs → ~64k-token prompt → LLM truncation
+# failure on 2 full billed calls).
+LLM_DOCS_MAX_FINAL_CEILING = _safe_int("LLM_DOCS_MAX_FINAL_CEILING", 50)
 
 LLM_DOC_CHARS_PRACTICAL = _safe_int("LLM_DOC_CHARS_PRACTICAL", 700)   # reduced 1200→700: metadata fields carry key info
 LLM_DOC_CHARS_ACADEMIC = _safe_int("LLM_DOC_CHARS_ACADEMIC", 700)    # raised: 500 → 700 (need full metadata fields)

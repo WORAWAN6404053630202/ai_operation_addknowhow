@@ -2582,6 +2582,26 @@ class PracticalPersonaService:
             return result
 
         _retry_max_tokens = int(getattr(conf, "MAX_TOKENS_PRACTICAL_RETRY", 8000))
+
+        # 2026-10 fix: cheap pre-flight guard, not a prompt-rebuild (this function only
+        # receives an already-built prompt string, with no handle on the doc list — a
+        # real rebuild would need this function AND all 4 call sites to pass a
+        # doc-list + prompt-builder instead; deferred, since the actual doc-overflow
+        # root cause is fixed upstream in handle()'s sibling-completion/final-ceiling
+        # logic). If the prompt is already huge, widening the OUTPUT budget can't fix
+        # an INPUT-side problem — reproduced live: a ~64k-token (~170k-char) prompt
+        # truncated at both 6000 and 8000 max_tokens, burning two full billed calls
+        # (~$0.60) for a retry that was doomed before it started.
+        _max_retry_prompt_chars = int(getattr(conf, "PRACTICAL_TRUNCATION_RETRY_MAX_PROMPT_CHARS", 150000))
+        if len(prompt) > _max_retry_prompt_chars:
+            _LOG.warning(
+                "[Practical/json] First attempt looked truncated AND prompt is already %d chars "
+                "(> %d) — widening the output budget can't fix an input-side problem; skipping "
+                "the second billed call.",
+                len(prompt), _max_retry_prompt_chars,
+            )
+            return result
+
         _LOG.warning(
             "[Practical/json] First attempt looked truncated (analysis=%r) — "
             "retrying once with max_tokens=%d instead of the usual %s",
@@ -4905,9 +4925,20 @@ class PracticalPersonaService:
                 # sibling-completion only pollutes them with unrelated registration forms and links.
                 # Broad questions already have comprehensive coverage from two-pass retrieval.
                 # Sibling-completion on top causes token explosion (23 docs → 35+ docs, 60k+ tokens).
+                # 2026-10 fix: the multi-topic merge (persona_supervisor.py's
+                # _ensure_practical_retrieval_for_legal) returns early and never sets
+                # _broad_question, so a multi-topic-merged result (already comprehensive,
+                # same reasoning as the _broad_question case above) fell through this gate
+                # unguarded — reproduced live: 39 merged docs + 46 unguarded sibling docs =
+                # 51 total, ~64k-token prompt, LengthFinishReasonError on both the base and
+                # widened-budget retry. _multi_topic_retrieval is the narrowly-scoped flag
+                # already set for exactly this path — deliberately NOT reusing
+                # _broad_question itself here, since that single variable drives ~15 other
+                # unrelated behaviors elsewhere in this method.
                 _skip_sib = (
                     bool((state.context or {}).get("_direct_topic_match"))
                     or bool((state.context or {}).get("_broad_question"))
+                    or bool((state.context or {}).get("_multi_topic_retrieval"))
                     or _multi_requested_kept  # skip when FOCUS FILTER already kept all license types
                 )
                 _vs_for_sib = getattr(self.retriever, "vectorstore", None)
@@ -5133,6 +5164,21 @@ class PracticalPersonaService:
                                 if len(_sib_new) > _SIBLING_CAP:
                                     _LOG.info("[Practical] sibling cap: %d → %d docs", len(_sib_new), _SIBLING_CAP)
                                     _sib_new = _sib_new[:_SIBLING_CAP]
+                        # 2026-10 fix: unconditional fallback cap. The cap just above only
+                        # ran inside `if _sib_new and _sib_reg:` (5073) → `if _excl_pats:`
+                        # (5092) — both skipped whenever _sib_reg (registration_type slot)
+                        # is empty, which is normal on any first-turn question with no
+                        # established entity/registration sub-type yet. That left
+                        # sibling-completion completely uncapped in exactly that case
+                        # (reproduced live: 46 docs added, no cap applied). Additive only —
+                        # a no-op whenever the branch above already capped it.
+                        _SIBLING_CAP_FALLBACK = int(getattr(conf, "SIBLING_DOCS_CAP", 10))
+                        if len(_sib_new) > _SIBLING_CAP_FALLBACK:
+                            _LOG.info(
+                                "[Practical] sibling cap (fallback, no _sib_reg): %d → %d docs",
+                                len(_sib_new), _SIBLING_CAP_FALLBACK,
+                            )
+                            _sib_new = _sib_new[:_SIBLING_CAP_FALLBACK]
                         if _sib_new:
                             _LOG.info(
                                 "[Practical] sibling-completion: added %d doc(s) for op_by_dept(s)=%r",
@@ -5529,6 +5575,24 @@ class PracticalPersonaService:
                             )
         except Exception as _e_guarantee_ent:
             _LOG.warning("[Practical] established-topic guarantee (entity) failed: %s", _e_guarantee_ent)
+
+        # 2026-10 fix: final absolute ceiling on _docs_to_process, after every append
+        # path above (multi-topic merge, sibling-completion, guarantee-doc prepends)
+        # has run. Set equal to the multi-topic merge's own cap
+        # (persona_supervisor.py's 25/topic × 2 = 50) so this is a true no-op for
+        # every path already correctly capped at or below 50 — it only trims a path
+        # that, due to a bug rather than by design, exceeded what any single earlier
+        # stage meant to allow. Trims from the end: guarantee-docs are prepended
+        # (highest priority, sit first), so only late-appended overflow is at risk.
+        _FINAL_DOCS_CEILING = int(getattr(conf, "LLM_DOCS_MAX_FINAL_CEILING", 50))
+        if len(_docs_to_process) > _FINAL_DOCS_CEILING:
+            _LOG.warning(
+                "[Practical] FINAL doc ceiling triggered: %d → %d docs — should be rare; "
+                "if it recurs often, fix a cap upstream of this point instead of raising this one.",
+                len(_docs_to_process), _FINAL_DOCS_CEILING,
+            )
+            _docs_to_process = _docs_to_process[:_FINAL_DOCS_CEILING]
+            state.current_docs = _docs_to_process
 
         # Pass 1: classify research_reference + restaurant_ai_document links → SERVICE / FORM / GUIDE / REF
         # Same _classify_link logic as Academic — hybrid desc+URL classification, no URL pattern rules in prompt

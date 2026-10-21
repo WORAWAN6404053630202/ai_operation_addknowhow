@@ -103,6 +103,39 @@ class TestTruncationRetryOrchestration:
 
 
 @pytest.mark.unit
+class TestTruncationRetryPromptSizeGuard:
+    """2026-10 fix: a ~64k-token (~170k-char) prompt truncated at BOTH the base
+    (6000) and widened-retry (8000) max_tokens budgets, burning two full billed
+    LLM calls (~$0.60) for a retry that was doomed before it started — widening
+    the OUTPUT budget can't fix an INPUT-side problem. The retry now skips
+    entirely when the prompt is already larger than
+    conf.PRACTICAL_TRUNCATION_RETRY_MAX_PROMPT_CHARS."""
+
+    def test_oversized_prompt_skips_the_retry_call(self, practical, monkeypatch):
+        import conf
+        monkeypatch.setattr(conf, "PRACTICAL_TRUNCATION_RETRY_MAX_PROMPT_CHARS", 100, raising=False)
+        truncated = {"analysis": "json_repair", "answer": "partial"}
+        practical._call_llm_json = MagicMock(return_value=truncated)
+
+        out = practical._call_llm_json_with_truncation_retry("x" * 101)
+
+        assert out == truncated
+        practical._call_llm_json.assert_called_once()  # no second (retry) call
+
+    def test_prompt_under_the_limit_still_retries_normally(self, practical, monkeypatch):
+        import conf
+        monkeypatch.setattr(conf, "PRACTICAL_TRUNCATION_RETRY_MAX_PROMPT_CHARS", 100, raising=False)
+        truncated = {"analysis": "json_repair", "answer": "partial"}
+        complete = {"analysis": "ok", "answer": "full"}
+        practical._call_llm_json = MagicMock(side_effect=[truncated, complete])
+
+        out = practical._call_llm_json_with_truncation_retry("x" * 99)
+
+        assert out == complete
+        assert practical._call_llm_json.call_count == 2
+
+
+@pytest.mark.unit
 class TestBoostFieldsIncludesDepartment:
     """
     Regression pin for the 2026-09 fix: 'department' added to the metadata
