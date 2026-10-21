@@ -4465,8 +4465,20 @@ class PersonaSupervisor:
             # E.g. query "การบริหารจัดการพนักงานภายในร้านอาหาร" matches both
             # "การฝึกอบรมพนักงาน" and "การบริหารจัดการพนักงานภายในร้านอาหาร" —
             # longest match is the correct chapter the user is asking about.
+            # 2026-10 fix (live-reproduced, see topic_label_matches_query's
+            # strong_only docstring and the identical fix just above in the
+            # sub_topic/operation_topic block): same vulnerability here — if any
+            # candidate matched via a strong (literal/nominalizer-stripped
+            # substring) signal, restrict to strong candidates before picking the
+            # longest, so a weak ASCII-token-only match on a shared product/
+            # system name can't out-rank a genuinely on-topic shorter match
+            # purely by string length. No-op when nothing matched strongly.
             if _matched_mts:
-                _target_mt_sv = max(_matched_mts, key=len)
+                _strong_mts = [
+                    mt for mt in _matched_mts
+                    if topic_label_matches_query(mt, _q_lower_sv, _last_raw_human, strong_only=True)
+                ]
+                _target_mt_sv = max(_strong_mts or _matched_mts, key=len)
                 # Regulatory-dominance guard (2026-09, live-reproduced — a THIRD independent
                 # duplicate of the same exact-match-hijack shape as the op_topic/sub_topic
                 # sites earlier in this method; see _nonreg_chapter_semantic_check's docstring
@@ -4559,8 +4571,40 @@ class PersonaSupervisor:
             _target_st_sv = ""
             _use_op_topic_filter = False
             if _matched_sts or _matched_ots:
-                _best_st = max(_matched_sts, key=len) if _matched_sts else ""
-                _best_ot = max(_matched_ots, key=len) if _matched_ots else ""
+                # 2026-10 fix (live-reproduced, see topic_label_matches_query's
+                # strong_only docstring): when ANY candidate matched via a strong
+                # signal (literal/nominalizer-stripped substring — specific to
+                # THIS label), restrict selection to strong candidates only,
+                # ignoring weak ASCII-token-only matches entirely regardless of
+                # length. Without this, a query merely mentioning a shared
+                # product/system name (e.g. "DBD Biz Regist", present on most
+                # chapters of a PDF-ingested manual) ASCII-matches every chapter
+                # about it, and max(key=len) below handed the win to whichever
+                # unrelated chapter happened to have the longest label — live-
+                # reproduced: "สมัครสมาชิกผู้ใช้งานระบบ DBD Biz Regist ต้องทำยังไง"
+                # ASCII-matched an unrelated "dissolve the company" chapter
+                # (also tagged "(DBD Biz Regist)") whose label was simply
+                # longer than the correct, literally-substring-matched
+                # "สมัครสมาชิกผู้ใช้งานระบบ" chapter. Falls back to the original
+                # lenient (ASCII-inclusive) behavior, completely unchanged,
+                # whenever nothing matched strongly — the heavily-tested
+                # restaurant-domain ASCII-fallback cases (VAT, EDC, QR, B2B,
+                # etc.) are untouched since those still have no strong
+                # competitor to be out-ranked by.
+                _strong_sts = [
+                    st for st in _matched_sts
+                    if topic_label_matches_query(st, _q_lower_sv, _last_raw_human, strong_only=True)
+                ]
+                _strong_ots = [
+                    ot for ot in _matched_ots
+                    if topic_label_matches_query(ot, _q_lower_sv, _last_raw_human, strong_only=True)
+                ]
+                if _strong_sts or _strong_ots:
+                    _best_st = max(_strong_sts, key=len) if _strong_sts else ""
+                    _best_ot = max(_strong_ots, key=len) if _strong_ots else ""
+                else:
+                    _best_st = max(_matched_sts, key=len) if _matched_sts else ""
+                    _best_ot = max(_matched_ots, key=len) if _matched_ots else ""
                 if len(_best_ot) > len(_best_st):
                     _target_st_sv = _best_ot
                     _use_op_topic_filter = True

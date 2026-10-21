@@ -74,3 +74,50 @@ class TestTopicLabelMatchesQuery:
         assert topic_label_matches_query(
             "การตลาดแบบ b2b", query_lower="b2b คืออะไร", raw_human_lower=""
         )
+
+
+@pytest.mark.unit
+class TestTopicLabelMatchesQueryStrongOnly:
+    """2026-10 fix (live-reproduced): a corpus where many topics are all
+    chapters of the same product/system (PDF-ingested manuals tagged
+    "(DBD Biz Regist)" on nearly every chapter) made the ASCII-identifier
+    fallback match far too broadly — the shared product name ASCII-matched
+    every chapter about it, not just the one the user actually meant.
+    strong_only=True restricts to checks (1)-(3) (literal/nominalizer-
+    stripped substring, specific to THIS label), skipping the ASCII
+    fallback entirely — callers use it to avoid letting a weak, corpus-
+    wide ASCII match out-compete a genuine substring match in a
+    max(label, key=len) tie-break.
+    """
+
+    def test_strong_only_still_matches_literal_substring(self):
+        assert topic_label_matches_query(
+            "สมัครสมาชิกผู้ใช้งานระบบ",
+            query_lower="สมัครสมาชิกผู้ใช้งานระบบ dbd biz regist ต้องทำยังไง",
+            raw_human_lower="",
+            strong_only=True,
+        )
+
+    def test_strong_only_rejects_ascii_only_match(self):
+        # Live-reproduced shape: label only shares the generic product-name
+        # ASCII tokens with the query, nothing else — strong_only must reject
+        # this even though the lenient (default) call accepts it.
+        label = "จดทะเบียนเลิกบริษัท/ห้างหุ้นส่วนผ่านระบบจดทะเบียนนิติบุคคลดิจิทัล (DBD Biz Regist)"
+        query = "สมัครสมาชิกผู้ใช้งานระบบ dbd biz regist ต้องทำยังไง"
+        assert topic_label_matches_query(label, query, "")  # lenient: still True
+        assert not topic_label_matches_query(label, query, "", strong_only=True)
+
+    def test_strong_only_still_rejects_when_lenient_also_rejects(self):
+        assert not topic_label_matches_query(
+            "กลยุทธ์ด้านการสื่อสาร", "ขอใบอนุญาตขายสุราหน่อยค่ะ", "", strong_only=True,
+        )
+
+    def test_strong_only_still_matches_nominalizer_stripped_form(self):
+        # Check (3) — nominalizer-stripped substring — must still work under
+        # strong_only, since it's specific to THIS label, not a shared token.
+        assert topic_label_matches_query(
+            "การจดทะเบียนพาณิชย์",
+            query_lower="อยากจดทะเบียนพาณิชย์ต้องทำยังไง",
+            raw_human_lower="",
+            strong_only=True,
+        )

@@ -360,7 +360,9 @@ def _strip_thai_nominalizer(label_lower: str) -> str:
     return ""
 
 
-def topic_label_matches_query(label: str, query_lower: str, raw_human_lower: str = "") -> bool:
+def topic_label_matches_query(
+    label: str, query_lower: str, raw_human_lower: str = "", strong_only: bool = False,
+) -> bool:
     """True if `label` (a main_topic/sub_topic/operation_topic value) should be
     treated as explicitly named by the user's current turn.
 
@@ -380,6 +382,30 @@ def topic_label_matches_query(label: str, query_lower: str, raw_human_lower: str
     matching too broadly — that threshold is corpus-specific, not part of
     this function's contract.
 
+    `strong_only` (2026-10 fix, live-reproduced): skips check (4) — the
+    ASCII-identifier fallback assumes a shared ASCII token is a distinctive
+    identifier (its own docstring's example: "B2B"), but when a corpus has
+    many topics that are all chapters of the same product/system (PDF-ingested
+    manuals tagged "(DBD Biz Regist)" on nearly every chapter, in the case
+    this was found in), that "distinctive" token is actually the shared
+    product name — present on MOST labels in the corpus, not a specific one.
+    A query merely mentioning the product name then ASCII-matches every
+    chapter about it, and callers that pick among several `True` results by
+    `max(label, key=len)` (several call sites in persona_supervisor.py) end
+    up preferring whichever unrelated chapter happens to have the longest
+    label — live-reproduced: "สมัครสมาชิกผู้ใช้งานระบบ DBD Biz Regist ต้องทำยังไง"
+    ASCII-matched a totally unrelated "dissolve the company" chapter (also
+    tagged "(DBD Biz Regist)") whose label was simply longer than the
+    correct, literally-substring-matched "สมัครสมาชิกผู้ใช้งานระบบ" chapter,
+    and the longer-but-wrong one won the tie-break. Callers facing this
+    exact "pick the best among several matches" shape should compute BOTH
+    the normal (lenient) match list and a `strong_only=True` list from the
+    same candidates, and prefer picking from the strong list when it's
+    non-empty — restricting to checks (1)-(3), which all require some form
+    of literal (or Thai-nominalizer-stripped) textual overlap specific to
+    THIS label, not a token shared across many labels. Checks (1)-(3) are
+    unaffected and keep their full existing behavior either way.
+
     Callers must lowercase `query_lower`/`raw_human_lower` themselves (and
     should reuse the same lowercased strings across all label checks in a
     loop, rather than re-lowercasing per call).
@@ -395,6 +421,8 @@ def topic_label_matches_query(label: str, query_lower: str, raw_human_lower: str
             return True
         if raw_human_lower and stripped in raw_human_lower:
             return True
+    if strong_only:
+        return False
     tokens = _ASCII_ID_RE.findall(label)
     if not tokens:
         return False
