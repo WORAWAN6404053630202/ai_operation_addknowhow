@@ -20,6 +20,7 @@ could dedupe on s3_raw_pdf_path if that becomes a real problem)."""
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import asdict
 from typing import Optional
@@ -1138,6 +1139,48 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
     return items
 
 
+def _start_visibility_heartbeat(
+    sqs, queue_url: str, receipt_handle: str, interval_s: int = 300, extend_s: int = 600,
+) -> threading.Event:
+    """2026-10 fix (live-reproduced): poll_and_process_forever only ever
+    extended a message's visibility implicitly by finishing fast — nothing
+    here ever called change_message_visibility. A single large-document OCR
+    pass (pdf_large_extraction.py, no per-page checkpoint) can run well past
+    the queue's VisibilityTimeout: individual page OCR calls were observed
+    taking up to ~70s, and a 270-page document took over an hour end to end.
+    Once the timeout lapses mid-processing, SQS redelivers the SAME message
+    to this SAME consumer, which starts a second, fully independent run of
+    the identical file concurrently with the first — both racing to write
+    the same filename's progress/doc into the SQLite-backed Chroma store,
+    with no exception raised on either side (confirmed live: ~70% of a real
+    upload batch vanished this way, zero error logged anywhere). Bumping the
+    queue's static VisibilityTimeout only buys headroom up to whatever that
+    number is; this heartbeat has no ceiling — it keeps resetting the clock
+    for as long as processing is still genuinely running, regardless of
+    document size. interval_s (5 min) stays safely under even the queue's
+    un-bumped 600s default, so this alone is sufficient without relying on
+    the console-side timeout value at all.
+
+    Runs in a daemon thread so it can never block process exit; failures to
+    extend are logged and swallowed — worst case for one missed beat is
+    falling back to the queue's own base timeout for that cycle, not a
+    crash of the real work this message represents."""
+    stop_event = threading.Event()
+
+    def _beat() -> None:
+        while not stop_event.wait(interval_s):
+            try:
+                sqs.change_message_visibility(
+                    QueueUrl=queue_url, ReceiptHandle=receipt_handle, VisibilityTimeout=extend_s,
+                )
+                logger.debug(f"[SQSConsumer] Visibility-timeout heartbeat: extended by {extend_s}s")
+            except Exception as e:
+                logger.warning(f"[SQSConsumer] Visibility-timeout heartbeat failed (processing continues regardless): {e}")
+
+    threading.Thread(target=_beat, daemon=True, name="sqs-visibility-heartbeat").start()
+    return stop_event
+
+
 def process_sqs_message(message_body: str) -> Optional[list[ReviewItem]]:
     """Parses one SQS message body (the raw S3 event notification JSON S3
     sends directly to SQS — same Records[].s3.bucket/object shape as the
@@ -1180,9 +1223,17 @@ def poll_and_process_forever(queue_url: str, use_llm_comparison: bool = False) -
         )
         for message in resp.get("Messages", []):
             receipt_handle = message["ReceiptHandle"]
+            # See _start_visibility_heartbeat's docstring — keeps this
+            # message's visibility timeout from lapsing mid-processing on a
+            # large document, regardless of the queue's own configured
+            # timeout value. Always stopped in `finally` so the background
+            # thread never outlives this message, success or failure.
+            stop_heartbeat = _start_visibility_heartbeat(sqs, queue_url, receipt_handle)
             try:
                 process_sqs_message(message["Body"])
                 sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
                 logger.info("[SQSConsumer] Message processed and deleted.")
             except Exception as e:
                 logger.error(f"[SQSConsumer] Processing failed, leaving message for retry: {e}")
+            finally:
+                stop_heartbeat.set()
