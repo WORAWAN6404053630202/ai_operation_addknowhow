@@ -711,3 +711,40 @@ class TestFilterToPdfAutoIds:
             mock_vs_mgr.return_value.connect_to_existing.return_value = None
             result = sqs_consumer._filter_to_pdf_auto_ids(["doc-1"], "f.pdf")
         assert result == []
+
+    def test_duplicate_ids_are_deduplicated_before_querying_chroma(self):
+        """2026-10 fix (live-reproduced): a multi-topic document where
+        several NEW topics each independently resolve to "update" against
+        the SAME old doc produces a retire-list with repeats — Chroma's
+        collection.get(ids=...) raises "Expected IDs to be unique" on a
+        list with duplicates, which previously aborted retiring the WHOLE
+        batch (7 docs stuck live in the real incident), not just the
+        duplicated entry. Assert Chroma is queried with each id only once,
+        regardless of how many times it appeared in the input."""
+        mock_vectorstore = MagicMock()
+        mock_vectorstore._collection.get.return_value = {
+            "ids": ["doc-1", "doc-2"],
+            "metadatas": [{"ingested_via": "pdf_auto"}, {"ingested_via": "pdf_auto"}],
+        }
+        with patch.object(sqs_consumer, "get_vs_manager") as mock_vs_mgr:
+            mock_vs_mgr.return_value.vectorstore = mock_vectorstore
+            result = sqs_consumer._filter_to_pdf_auto_ids(
+                ["doc-1", "doc-2", "doc-1", "doc-2", "doc-1"], "f.pdf",
+            )
+        mock_vectorstore._collection.get.assert_called_once_with(
+            ids=["doc-1", "doc-2"], include=["metadatas"],
+        )
+        assert result == ["doc-1", "doc-2"]
+
+    def test_duplicate_ids_preserve_first_occurrence_order(self):
+        mock_vectorstore = MagicMock()
+        mock_vectorstore._collection.get.return_value = {
+            "ids": ["doc-b", "doc-a"],
+            "metadatas": [{"ingested_via": "pdf_auto"}, {"ingested_via": "pdf_auto"}],
+        }
+        with patch.object(sqs_consumer, "get_vs_manager") as mock_vs_mgr:
+            mock_vs_mgr.return_value.vectorstore = mock_vectorstore
+            sqs_consumer._filter_to_pdf_auto_ids(["doc-b", "doc-a", "doc-b"], "f.pdf")
+        mock_vectorstore._collection.get.assert_called_once_with(
+            ids=["doc-b", "doc-a"], include=["metadatas"],
+        )

@@ -77,9 +77,24 @@ def _filter_to_pdf_auto_ids(doc_ids: list[str], filename: str) -> list[str]:
     work: a resolver regression here would otherwise retire a Sheet-sourced
     doc with no safety net at all). Any id that isn't pdf_auto is dropped
     and logged loudly — that would mean the resolver matched something it
-    should never have been able to see."""
+    should never have been able to see.
+
+    2026-10 fix (live-reproduced): doc_ids can contain the same id more than
+    once — a multi-topic document's topics are resolved against live Chroma
+    independently (see _build_knowhow_items_direct/_build_license_items_direct),
+    so two or more NEW topics legitimately end up matching and retiring the
+    SAME old doc when that old doc's topic boundaries don't line up 1:1 with
+    the new ones. Chroma's collection.get(ids=...) rejects a list with
+    duplicates outright ("Expected IDs to be unique"), which previously threw
+    out of this whole function — the caller's broad except logged it as
+    "Archiving superseded doc(s) failed" and gave up on retiring ANY of the
+    ids in the batch, not just the duplicated one, leaving every superseded
+    doc (7 of them, in the live case that caught this) stuck live alongside
+    the new replacement. Deduplicating here, at the one chokepoint both
+    builders funnel through, fixes both call sites at once."""
     if not doc_ids:
         return []
+    doc_ids = list(dict.fromkeys(doc_ids))
     vectorstore = get_vs_manager().vectorstore
     if vectorstore is None:
         get_vs_manager().connect_to_existing(fail_if_empty=False)
