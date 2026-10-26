@@ -67,6 +67,23 @@ _KNOWHOW_COMPARISON_KEYS = ("main_topic", "sub_topic", "summary", "category")
 _REGULATORY_DIFF_KEYS = _PROCEDURAL_FIELD_KEYS
 _KNOWHOW_DIFF_KEYS = ["summary", "category"]
 
+# 2026-10 (PDF ingestion schema unification): every topic now goes through
+# ONE merged pipeline (sqs_consumer._build_items_direct →
+# pdf_direct_ingest.build_merged_documents) instead of being pre-classified
+# into a "structured_license" or "know_how" shape — main_topic/sub_topic is
+# ALWAYS populated now (every topic gets one), while department/license_type
+# are populated only when the content genuinely is a government/legal
+# matter. main_topic+sub_topic is therefore the primary identity for every
+# candidate match; department+license_type is checked as an ADDITIONAL,
+# stronger confirming signal — _identity_fuzzy_candidates already behaves
+# correctly as a no-op for this second check when new_values lacks
+# department/license_type (requires a truthy new_v before counting a
+# match), so no new "only when both sides have it" branching is needed —
+# it falls out of the existing per-field match logic for free.
+_MERGED_IDENTITY_KEY_TUPLES = [_KNOWHOW_IDENTITY_KEYS, _REGULATORY_IDENTITY_KEYS]
+_MERGED_COMPARISON_KEYS = ("main_topic", "sub_topic", "department", "license_type", "operation_topic", "answer_guideline")
+_MERGED_DIFF_KEYS = _REGULATORY_DIFF_KEYS + _KNOWHOW_DIFF_KEYS
+
 # 2026-10 fix (PDF2-C2): pdf_direct_ingest.build_knowhow_documents never
 # writes "summary"/"category" metadata keys — it writes the same logical
 # fields under "answer_guideline"/"content_type" instead (the real field
@@ -117,8 +134,14 @@ def _embedding_candidates(comparison_text: str, data_type_filter: dict) -> dict[
     floor = float(getattr(conf, "PDF_SUPERSEDE_EMBEDDING_FLOOR", 0.70))
     min_gap = float(getattr(conf, "PDF_SUPERSEDE_EMBEDDING_MIN_GAP", 0.05))
     max_candidates = int(getattr(conf, "PDF_SUPERSEDE_EMBEDDING_MAX_CANDIDATES", 10))
+    # 2026-10 fix (data-integrity audit): widened from a fixed 2x to a
+    # configurable multiplier (default 5x) — see
+    # conf.PDF_SUPERSEDE_EMBEDDING_QUERY_OVERSAMPLE's comment. A corpus with
+    # more than 2x max_candidates genuinely-similar live docs for one topic
+    # used to never even have the rest fetched from Chroma at all.
+    oversample = int(getattr(conf, "PDF_SUPERSEDE_EMBEDDING_QUERY_OVERSAMPLE", 5))
     hits = get_vs_manager().query_live_with_ids(
-        comparison_text, k=max_candidates * 2, filter=data_type_filter,
+        comparison_text, k=max_candidates * oversample, filter=data_type_filter,
     )
     # 2026-10 bug fix: this previously kept EVERY hit above the floor (up to
     # 2x max_candidates, since that's only used to size the Chroma query k=)
@@ -261,9 +284,115 @@ def _llm_judge(
         return {}
 
 
+_COMPLETENESS_CHECK_PROMPT = """คุณกำลังช่วยตรวจสอบว่าการแทนที่เอกสารเก่าด้วยเอกสารใหม่ (ระบบตัดสินแล้วว่าเป็นเรื่องเดียวกันและเนื้อหามีการเปลี่ยนแปลง) จะทำให้ข้อมูลสำคัญที่มีอยู่ในเอกสารเก่าหายไปหรือไม่ — การตัดสินใจนี้จะถูกนำไปใช้จริงทันทีโดยไม่มีคนตรวจสอบ
+
+วิธีตรวจ: แยกเนื้อหาของเอกสารเก่าแต่ละ field ด้านล่างออกเป็น "ข้อเท็จจริงย่อย" (claim) ทีละข้อที่แยกจากกันได้ แล้วเช็คว่าแต่ละข้อเท็จจริงยังปรากฏอยู่ในเนื้อหาเอกสารใหม่ทั้งหมดหรือไม่ (ไม่ต้องคำต่อคำ ความหมายเดียวกันถือว่า "ยังมี") ระบุเฉพาะข้อเท็จจริงที่หายไปจริงๆ ไม่ใช่แค่เปลี่ยนคำพูด/จัดรูปแบบใหม่
+
+""" + INJECTION_GUARD + """
+
+เอกสารเก่า (field: เนื้อหา):
+{old_fields_block}
+
+เนื้อหาเอกสารใหม่ทั้งหมด (จะมาแทนที่เอกสารเก่า):
+{new_content}
+
+ตอบเป็น JSON เท่านั้น ระบุเฉพาะข้อเท็จจริงที่หายไปจริง (ไม่ใช่แค่เปลี่ยนคำพูด):
+{{"missing_claims": [{{"field": "<ชื่อ field ของเอกสารเก่า>", "claim": "<ข้อเท็จจริงที่หายไป>"}}]}}
+ถ้าไม่มีข้อเท็จจริงไหนหายไปเลย ตอบ {{"missing_claims": []}}
+"""
+
+
+def _new_content_blob(new_values: dict[str, str]) -> str:
+    """Every non-empty, user-facing value in the new topic — not just
+    diff_keys/comparison_keys — since a genuine replacement might carry an
+    old field's information inside a DIFFERENT field's prose instead of the
+    same-named one. Excludes internal bookkeeping keys (leading underscore,
+    e.g. regulatory's "_raw_text") since those aren't what retrieval/prompt-
+    building actually surfaces to a user — checking against what's really
+    retrievable, not against the raw source text, is the point."""
+    parts = [
+        str(v).strip() for k, v in new_values.items()
+        if not k.startswith("_") and str(v or "").strip()
+    ]
+    return "\n".join(parts)
+
+
+def _check_content_completeness(
+    old_values_by_id: dict[str, dict], new_values: dict[str, str], diff_keys: list[str], model: str,
+    cost_accumulator: Optional[CostAccumulator] = None,
+) -> dict[str, list[dict]]:
+    """Second-stage check, layered on top of _resolve's deterministic blank-
+    field guard — catches the case that guard CAN'T (old field non-empty,
+    new field also non-empty, but the new field's content is narrower/
+    missing specific detail the old one had). Claim-level decomposition,
+    not a single holistic "does this cover it" judgment — research on LLM-
+    as-judge evaluation documents "omission blindness" (judges are reliable
+    at verifying what IS present, much less reliable at noticing what's
+    ABSENT when asked to assess coverage as one holistic question); RAGAS's
+    Context Recall metric and NLI-based factual-consistency checkers
+    (SummaC/FactCC) converge on the same mitigation — decompose into atomic
+    claims, verify each independently, rather than asking once "is this
+    complete?".
+
+    Returns {doc_id: [{"field", "claim"}, ...]} — only ids with 1+ missing
+    claims. Only called for candidates that already passed the blank-field
+    guard (i.e. a non-empty vs non-empty comparison is actually meaningful
+    here) — deliberately NOT run for every candidate, keeping this
+    additional LLM cost scoped to the one case the cheaper deterministic
+    check structurally cannot see. Never raises — a failed call means "no
+    claims flagged" (nothing EXTRA caught by this layer), never "block
+    everything"; the blank-field guard already ran and stands regardless."""
+    if not old_values_by_id:
+        return {}
+    new_content = _new_content_blob(new_values)
+    if not new_content.strip():
+        return {}
+    out: dict[str, list[dict]] = {}
+    for doc_id, existing_values in old_values_by_id.items():
+        old_fields_block = "\n".join(
+            f"- {key}: {existing_values[key]}"
+            for key in diff_keys
+            if str(existing_values.get(key) or "").strip()
+        )
+        if not old_fields_block.strip():
+            continue
+        prompt = _COMPLETENESS_CHECK_PROMPT.format(
+            old_fields_block=old_fields_block, new_content=new_content[:4000],
+        )
+        try:
+            client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
+            _call_start = time.monotonic()
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1200,
+                response_format={"type": "json_object"},
+                extra_body={"reasoning": {"enabled": False}},
+            )
+            log_llm_cost(
+                logger, "SupersedeResolver/CompletenessCheck", model, resp,
+                time.monotonic() - _call_start, accumulator=cost_accumulator, cost_guard=get_cost_guard(),
+            )
+            raw = (resp.choices[0].message.content or "{}").strip()
+            raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            parsed = json.loads(raw)
+            missing = [
+                m for m in parsed.get("missing_claims", [])
+                if isinstance(m, dict) and m.get("claim")
+            ]
+            if missing:
+                out[doc_id] = missing
+        except Exception as e:
+            logger.error(
+                f"[SupersedeResolver] Completeness check failed for {doc_id!r}, no extra claims flagged "
+                f"(blank-field guard result, if any, still stands): {e}"
+            )
+    return out
+
+
 def _resolve(
     new_values: dict[str, str],
-    identity_keys: tuple,
+    identity_key_tuples: list[tuple],
     comparison_keys: tuple,
     diff_keys: list[str],
     data_type_filter: dict,
@@ -296,9 +425,14 @@ def _resolve(
         # second used to silently overwrite a doc's real embedding score
         # with None whenever both signals matched the same doc; cosmetic
         # only, never affected the decision, but fixed alongside the
-        # truncation bug below since it's the same block).
-        for doc_id, info in _identity_fuzzy_candidates(new_values, data_type_filter, identity_keys).items():
-            pool.setdefault(doc_id, info)
+        # truncation bug below since it's the same block). Runs the
+        # identity-fuzzy check once per key-tuple (2026-10, schema
+        # unification) — e.g. main_topic+sub_topic always, department+
+        # license_type as an additional signal — ORing every tuple's hits
+        # into the same pool.
+        for identity_keys in identity_key_tuples:
+            for doc_id, info in _identity_fuzzy_candidates(new_values, data_type_filter, identity_keys).items():
+                pool.setdefault(doc_id, info)
     except Exception as e:
         logger.error(f"[SupersedeResolver] Candidate pool fetch failed for {source_file!r}, defaulting to new: {e}")
         return SupersedeDecision("new", reasoning=f"candidate fetch failed: {e}")
@@ -325,6 +459,7 @@ def _resolve(
         )
     model = str(getattr(conf, "OPENROUTER_MODEL_PDF_SUPERSEDE", conf.OPENROUTER_MODEL_PDF_MATCHING))
     judgments: dict[str, dict] = {}
+    existing_values_by_id: dict[str, dict] = {}
     for i in range(0, len(pool_items), batch_size):
         batch = pool_items[i:i + batch_size]
         candidates_for_llm = []
@@ -333,6 +468,7 @@ def _resolve(
             existing_values = {
                 k: meta.get(metadata_key_aliases.get(k, k)) for k in set(comparison_keys) | set(diff_keys)
             }
+            existing_values_by_id[doc_id] = existing_values
             diff = _field_diff(new_values, existing_values, diff_keys=diff_keys)
             preview = _comparison_text(existing_values, comparison_keys)[:300]
             candidates_for_llm.append({
@@ -353,6 +489,67 @@ def _resolve(
     update_ids = [doc_id for doc_id, j in judgments.items() if j["is_same_topic"] and j.get("content_status") == "update"]
     duplicate_ids = [doc_id for doc_id, j in judgments.items() if j["is_same_topic"] and j.get("content_status") == "duplicate"]
 
+    # 2026-10 fix (live incident): the LLM's "update" verdict only judges
+    # topic-identity + "did the content change", never whether the NEW
+    # doc's drafted fields are a superset of what the OLD doc being retired
+    # actually covers. Live-confirmed: "สถานที่ และ กำหนดเวลาการยื่นแจ้ง...pdf"
+    # (a doc specifically about WHERE/WHEN to file) got judged "update" by
+    # a broader, newer doc that covers the same regulatory topic in general
+    # but left service_channel/operation_duration blank — archive_and_remove
+    # then deleted the only place that WHERE/WHEN info lived, live, with no
+    # human review to catch it (8 such cases found across one real
+    # collection on first audit). Deterministic safety net, independent of
+    # the LLM's judgment: for each doc_id the LLM says to retire, if the OLD
+    # doc has a non-empty diff_keys field that the NEW doc leaves blank,
+    # refuse to retire THAT doc — both stay live. Matches this module's own
+    # stated philosophy ("Default-to-NEW on any ambiguity... a redundant doc
+    # costs almost nothing to carry; a wrongly-retired live doc costs real
+    # answer quality") applied at the per-field level, not just per-document.
+    blocked_lost_fields: dict[str, list[str]] = {}
+    for doc_id in update_ids:
+        existing_values = existing_values_by_id.get(doc_id, {})
+        lost = [
+            key for key in diff_keys
+            if str(existing_values.get(key) or "").strip() and not str(new_values.get(key) or "").strip()
+        ]
+        if lost:
+            blocked_lost_fields[doc_id] = lost
+    if blocked_lost_fields:
+        for doc_id, lost in blocked_lost_fields.items():
+            logger.warning(
+                f"[SupersedeResolver] {source_file!r}: LLM judged {doc_id!r} as 'update' but the new "
+                f"doc leaves field(s) {lost} blank that the OLD doc has content for — refusing to "
+                f"retire it to avoid silently losing that data; both will stay live until manually "
+                f"reviewed."
+            )
+        update_ids = [doc_id for doc_id in update_ids if doc_id not in blocked_lost_fields]
+
+    # 2026-10 follow-up: the blank-field guard above only catches a field
+    # going from populated to fully empty — it can't see a field that's
+    # non-empty on BOTH sides but narrower/missing specific detail on the
+    # new side (research-backed design: see _check_content_completeness's
+    # docstring on claim decomposition vs. holistic LLM judgment). Scoped
+    # to ONLY the update_ids that survived the free guard above, so this
+    # extra LLM cost is paid only for the one case the deterministic check
+    # structurally cannot see — not for every candidate.
+    if update_ids:
+        completeness_candidates = {
+            doc_id: existing_values_by_id.get(doc_id, {}) for doc_id in update_ids
+        }
+        missing_claims = _check_content_completeness(
+            completeness_candidates, new_values, diff_keys, model, cost_accumulator=cost_accumulator,
+        )
+        if missing_claims:
+            for doc_id, claims in missing_claims.items():
+                logger.warning(
+                    f"[SupersedeResolver] {source_file!r}: LLM judged {doc_id!r} as 'update', and its "
+                    f"fields aren't fully blank in the new doc, but a claim-level completeness check "
+                    f"flagged {len(claims)} specific detail(s) that don't appear to carry over "
+                    f"(e.g. {claims[0]['field']!r}: {claims[0]['claim']!r}) — refusing to retire it; "
+                    f"both will stay live until manually reviewed."
+                )
+            update_ids = [doc_id for doc_id in update_ids if doc_id not in missing_claims]
+
     if duplicate_ids and not update_ids:
         return SupersedeDecision("duplicate", matched_doc_ids=duplicate_ids, reasoning="LLM confirmed duplicate")
     if update_ids:
@@ -360,109 +557,57 @@ def _resolve(
     return SupersedeDecision("new", reasoning="no candidate confirmed as same-topic by LLM")
 
 
-def resolve_regulatory_topic(
+def resolve_topic(
     merged_topic: dict[str, Any], source_file: str, cost_accumulator: Optional[CostAccumulator] = None,
 ) -> SupersedeDecision:
     """merged_topic: output of pdf_direct_ingest.merge_drafted_fields() —
-    department/license_type/operation_topic/answer_guideline/etc. keyed by
-    internal snake_case names. Scoped to data_type="regulatory" candidates
-    only."""
-    return _resolve(
-        new_values=merged_topic,
-        identity_keys=_REGULATORY_IDENTITY_KEYS,
-        comparison_keys=_REGULATORY_COMPARISON_KEYS,
-        diff_keys=_REGULATORY_DIFF_KEYS,
-        # 2026-10 fix (PDF2-C1): used to filter on data_type alone, with no
-        # ingested_via scoping — Sheet-sourced docs share the same
-        # data_type/main_topic/sub_topic shape, so a PDF re-upload whose
-        # topic happened to match a real Sheet row's topic could get
-        # judged "update" and archive that Sheet doc via
-        # expand_knowhow_matches_to_full_chunks/collect_full_sibling_chunk_ids
-        # below. This resolver must only ever retire docs this same
-        # pdf_auto pipeline wrote.
-        data_type_filter={"$and": [{"data_type": "regulatory"}, {"ingested_via": "pdf_auto"}]},
-        source_file=source_file,
-        cost_accumulator=cost_accumulator,
-    )
+    main_topic/sub_topic/summary/category (always populated) plus
+    department/license_type/operation_topic/answer_guideline/fees/etc.
+    (populated only when the topic is genuinely a government/legal
+    matter). Replaces the old resolve_regulatory_topic/resolve_knowhow_topic
+    split (2026-10, PDF ingestion schema unification) — every topic now
+    goes through this one function regardless of whether it ended up
+    "regulatory" or "business_guide"-shaped after drafting.
 
-
-def resolve_knowhow_topic(
-    topic_dict: dict[str, Any], source_file: str, cost_accumulator: Optional[CostAccumulator] = None,
-) -> SupersedeDecision:
-    """topic_dict: a knowhow_topics entry (main_topic/sub_topic/summary/
-    category/full_text/...) from sqs_consumer.py's _build_knowhow_items_direct.
     The deterministic catch-all topic is always NEW (see
-    KNOWHOW_CATCHALL_MAIN_TOPIC's docstring above) — never matched, since its
-    main_topic/sub_topic are generic placeholder strings shared across every
-    document. Scoped to business_guide/marketing candidates only (the shapes
-    both Sheet-sourced and PDF-sourced know-how content use)."""
-    if str(topic_dict.get("main_topic") or "") == KNOWHOW_CATCHALL_MAIN_TOPIC:
+    KNOWHOW_CATCHALL_MAIN_TOPIC's docstring above) — never matched, since
+    its main_topic/sub_topic are generic placeholder strings shared across
+    every document.
+
+    Scoped to regulatory/business_guide/marketing candidates (every shape
+    the pdf_auto pipeline can produce), deliberately NOT split by data_type
+    — a topic that was previously mis-ingested under the OLD two-path
+    pipeline as the wrong data_type (e.g. a law ingested as business_guide
+    because it wasn't phrased as a license-application procedure) must
+    still be findable and supersedable once a re-upload correctly resolves
+    it as regulatory. Splitting the candidate pool by data_type would make
+    that cross-shape correction impossible."""
+    if str(merged_topic.get("main_topic") or "") == KNOWHOW_CATCHALL_MAIN_TOPIC:
         return SupersedeDecision("new", reasoning="catch-all topic, never matched")
     return _resolve(
-        new_values=topic_dict,
-        identity_keys=_KNOWHOW_IDENTITY_KEYS,
-        comparison_keys=_KNOWHOW_COMPARISON_KEYS,
-        diff_keys=_KNOWHOW_DIFF_KEYS,
-        # 2026-10 fix (PDF2-C1): see the matching comment in
-        # resolve_regulatory_topic above — same Sheet/PDF isolation gap.
-        data_type_filter={"$and": [{"data_type": {"$in": ["business_guide", "marketing"]}}, {"ingested_via": "pdf_auto"}]},
+        new_values=merged_topic,
+        identity_key_tuples=_MERGED_IDENTITY_KEY_TUPLES,
+        comparison_keys=_MERGED_COMPARISON_KEYS,
+        diff_keys=_MERGED_DIFF_KEYS,
+        # 2026-10 fix (PDF2-C1): scoped to ingested_via="pdf_auto" so this
+        # can never match/retire a Sheet-sourced doc that happens to share
+        # an identity signal — Sheet-sourced docs use the same data_type/
+        # main_topic/sub_topic shape, so without this a PDF re-upload could
+        # get judged "update" and archive a real Sheet row. This resolver
+        # must only ever retire docs this same pdf_auto pipeline wrote.
+        data_type_filter={"$and": [
+            {"data_type": {"$in": ["regulatory", "business_guide", "marketing"]}},
+            {"ingested_via": "pdf_auto"},
+        ]},
         source_file=source_file,
         cost_accumulator=cost_accumulator,
-        # 2026-10 fix (PDF2-C2): see _resolve's docstring comment on
-        # metadata_key_aliases — build_knowhow_documents writes these
-        # logical fields under different real metadata keys.
+        # 2026-10 fix (PDF2-C2): build_merged_documents now writes real
+        # summary/category metadata keys directly on every new document,
+        # but pre-merge live docs (ingested under the old know_how-only
+        # path) only ever got them under answer_guideline/content_type —
+        # kept for backward-compatible reads of those older docs until the
+        # corpus fully turns over.
         metadata_key_aliases=_KNOWHOW_METADATA_KEY_ALIASES,
     )
 
 
-def expand_knowhow_matches_to_full_chunks(matched_doc_ids: list[str]) -> list[str]:
-    """A know-how UPDATE match's matched_doc_ids come from whichever single
-    chunk(s) the embedding/identity signal happened to surface — a long
-    topic can be split across several chunk_index/chunk_total sub-documents
-    (pdf_direct_ingest.build_knowhow_documents), and retiring only the
-    surfaced chunk(s) would leave its siblings live, orphaned, and
-    confusing (same main_topic/sub_topic, no replacement reference).
-    Fetches each matched doc's own main_topic/sub_topic, then expands to
-    every sibling chunk sharing that exact pair. Deduped, order not
-    significant (caller passes this straight to archive_and_remove)."""
-    if not matched_doc_ids:
-        return []
-    vectorstore = get_vs_manager().vectorstore
-    if vectorstore is None:
-        get_vs_manager().connect_to_existing(fail_if_empty=False)
-        vectorstore = get_vs_manager().vectorstore
-    if vectorstore is None:
-        return list(matched_doc_ids)
-    raw = vectorstore._collection.get(ids=matched_doc_ids, include=["metadatas"])
-    seen_pairs: set[tuple[str, str]] = set()
-    for meta in raw.get("metadatas") or []:
-        meta = meta or {}
-        pair = (str(meta.get("main_topic") or ""), str(meta.get("sub_topic") or ""))
-        if pair[0] or pair[1]:
-            seen_pairs.add(pair)
-
-    all_ids: set[str] = set(matched_doc_ids)
-    for main_topic, sub_topic in seen_pairs:
-        all_ids.update(collect_full_sibling_chunk_ids(main_topic, sub_topic))
-    return list(all_ids)
-
-
-def collect_full_sibling_chunk_ids(main_topic: str, sub_topic: str) -> list[str]:
-    """A know-how UPDATE match must retire EVERY chunk of the old topic, not
-    just whichever single chunk the embedding/identity signal happened to
-    surface (a long topic can be split across several chunk_index/
-    chunk_total sub-documents — see pdf_direct_ingest.build_knowhow_documents).
-    Exact metadata lookup, not a similarity search."""
-    vectorstore = get_vs_manager().vectorstore
-    if vectorstore is None:
-        get_vs_manager().connect_to_existing(fail_if_empty=False)
-        vectorstore = get_vs_manager().vectorstore
-    if vectorstore is None:
-        return []
-    # 2026-10 fix (PDF2-C1): scoped to ingested_via="pdf_auto" so this can
-    # never expand into retiring a Sheet-sourced sibling that happens to
-    # share the same main_topic/sub_topic pair — see the matching comment
-    # in resolve_regulatory_topic/resolve_knowhow_topic above.
-    where = {"$and": [{"main_topic": main_topic}, {"sub_topic": sub_topic}, {"ingested_via": "pdf_auto"}]}
-    raw = vectorstore._collection.get(where=where, include=[])
-    return raw.get("ids") or []

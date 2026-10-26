@@ -24,7 +24,7 @@ class TestResolveDecision:
     def test_empty_pool_is_new(self):
         with patch.object(resolver, "_embedding_candidates", return_value={}), \
              patch.object(resolver, "_identity_fuzzy_candidates", return_value={}):
-            decision = resolver.resolve_regulatory_topic(
+            decision = resolver.resolve_topic(
                 {"department": "สำนักงานประกันสังคม", "license_type": "ทะเบียนนายจ้าง", "answer_guideline": "เนื้อหา"},
                 "new_law.pdf",
             )
@@ -33,7 +33,7 @@ class TestResolveDecision:
 
     def test_no_comparable_text_is_new_without_calling_chroma(self):
         with patch.object(resolver, "_embedding_candidates") as mock_emb:
-            decision = resolver.resolve_regulatory_topic({"department": "", "license_type": ""}, "x.pdf")
+            decision = resolver.resolve_topic({"department": "", "license_type": ""}, "x.pdf")
         assert decision.decision == "new"
         mock_emb.assert_not_called()
 
@@ -44,7 +44,7 @@ class TestResolveDecision:
              patch.object(resolver, "_llm_judge", return_value={
                  "doc-1": {"is_same_topic": True, "content_status": "duplicate", "reasoning": "same"},
              }):
-            decision = resolver.resolve_regulatory_topic(
+            decision = resolver.resolve_topic(
                 {"department": "สำนักงานประกันสังคม", "license_type": "ทะเบียนนายจ้าง", "answer_guideline": "เนื้อหาใหม่"},
                 "reupload.pdf",
             )
@@ -58,7 +58,7 @@ class TestResolveDecision:
              patch.object(resolver, "_llm_judge", return_value={
                  "doc-2": {"is_same_topic": True, "content_status": "update", "reasoning": "fee changed"},
              }):
-            decision = resolver.resolve_regulatory_topic(
+            decision = resolver.resolve_topic(
                 {"department": "สำนักงานประกันสังคม", "license_type": "ทะเบียนนายจ้าง", "answer_guideline": "ค่าธรรมเนียมใหม่"},
                 "updated_law.pdf",
             )
@@ -74,7 +74,7 @@ class TestResolveDecision:
         with patch.object(resolver, "_embedding_candidates", return_value=pool), \
              patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
              patch.object(resolver, "_llm_judge", return_value={}):
-            decision = resolver.resolve_regulatory_topic(
+            decision = resolver.resolve_topic(
                 {"department": "X", "license_type": "Y", "answer_guideline": "z"}, "f.pdf",
             )
         assert decision.decision == "new"
@@ -86,7 +86,7 @@ class TestResolveDecision:
              patch.object(resolver, "_llm_judge", return_value={
                  "doc-4": {"is_same_topic": False, "content_status": None, "reasoning": "actually different"},
              }):
-            decision = resolver.resolve_regulatory_topic(
+            decision = resolver.resolve_topic(
                 {"department": "X", "license_type": "Y", "answer_guideline": "z"}, "f.pdf",
             )
         assert decision.decision == "new"
@@ -94,17 +94,19 @@ class TestResolveDecision:
     def test_identity_only_match_still_reaches_llm_judgment(self):
         """A candidate surfaced ONLY by the identity-fuzzy signal (not
         embedding) must still be sent to the LLM for judgment — signals are
-        unioned, not intersected."""
+        unioned, not intersected. resolve_topic calls _identity_fuzzy_candidates
+        once per identity key-tuple (main_topic+sub_topic, then department+
+        license_type) — twice total, not once."""
         pool = {"doc-5": {"score": None, "metadata": {"department": "X", "license_type": "Y"}, "content": "c"}}
         with patch.object(resolver, "_embedding_candidates", return_value={}), \
              patch.object(resolver, "_identity_fuzzy_candidates", return_value=pool) as mock_id, \
              patch.object(resolver, "_llm_judge", return_value={
                  "doc-5": {"is_same_topic": True, "content_status": "update", "reasoning": "r"},
              }) as mock_llm:
-            decision = resolver.resolve_regulatory_topic(
+            decision = resolver.resolve_topic(
                 {"department": "X", "license_type": "Y", "answer_guideline": "z"}, "f.pdf",
             )
-        mock_id.assert_called_once()
+        assert mock_id.call_count == 2
         mock_llm.assert_called_once()
         assert decision.decision == "update"
 
@@ -133,7 +135,7 @@ class TestFieldDiffUsesContentAppropriateKeys:
         with patch.object(resolver, "_embedding_candidates", return_value=pool), \
              patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
              patch.object(resolver, "_llm_judge", side_effect=fake_llm_judge):
-            resolver.resolve_knowhow_topic(
+            resolver.resolve_topic(
                 {
                     "main_topic": "การตลาดออนไลน์", "sub_topic": "โปรโมชั่น",
                     "summary": "สรุปใหม่ที่เปลี่ยนไป", "category": "กลยุทธ์การตลาด",
@@ -161,7 +163,7 @@ class TestFieldDiffUsesContentAppropriateKeys:
         with patch.object(resolver, "_embedding_candidates", return_value=pool), \
              patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
              patch.object(resolver, "_llm_judge", side_effect=fake_llm_judge):
-            resolver.resolve_regulatory_topic(
+            resolver.resolve_topic(
                 {"department": "X", "license_type": "Y", "answer_guideline": "z", "fees": "200 บาท"},
                 "f.pdf",
             )
@@ -202,7 +204,7 @@ class TestKnowhowMetadataKeyAliasing:
         with patch.object(resolver, "_embedding_candidates", return_value=pool), \
              patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
              patch.object(resolver, "_llm_judge", side_effect=fake_llm_judge):
-            resolver.resolve_knowhow_topic(
+            resolver.resolve_topic(
                 {
                     "main_topic": "การตลาดออนไลน์", "sub_topic": "โปรโมชั่น",
                     "summary": "เนื้อหาเดิมเป๊ะ", "category": "กลยุทธ์การตลาด",
@@ -230,7 +232,7 @@ class TestKnowhowMetadataKeyAliasing:
         with patch.object(resolver, "_embedding_candidates", return_value=pool), \
              patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
              patch.object(resolver, "_llm_judge", side_effect=fake_llm_judge):
-            resolver.resolve_knowhow_topic(
+            resolver.resolve_topic(
                 {
                     "main_topic": "การตลาดออนไลน์", "sub_topic": "โปรโมชั่น",
                     "summary": "เนื้อหาใหม่ที่เปลี่ยนไปจริง", "category": "กลยุทธ์การตลาด",
@@ -285,7 +287,7 @@ class TestIdentityFuzzyCandidatesSkipsDocumentBodies:
 class TestKnowhowCatchAllExemption:
     def test_catchall_topic_is_always_new_without_touching_chroma(self):
         with patch.object(resolver, "_embedding_candidates") as mock_emb:
-            decision = resolver.resolve_knowhow_topic(
+            decision = resolver.resolve_topic(
                 {
                     "main_topic": resolver.KNOWHOW_CATCHALL_MAIN_TOPIC,
                     "sub_topic": "ตรวจสอบและจัดหมวดหมู่ด้วยตนเอง",
@@ -334,6 +336,37 @@ class TestEmbeddingCandidatesCap:
             result = resolver._embedding_candidates("some comparison text", {"data_type": "regulatory"})
         assert len(result) <= 10
 
+    def test_query_requests_configurable_oversample_not_a_fixed_2x(self):
+        """2026-10 fix: a corpus with more than 2x max_candidates genuinely-
+        similar live docs used to never even have the rest fetched from
+        Chroma — widened to a configurable multiplier (default 5x)."""
+        captured_kwargs = {}
+
+        def fake_query(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return []
+
+        fake_vs_manager = type("FakeVS", (), {"query_live_with_ids": staticmethod(fake_query)})()
+        with patch.object(resolver, "get_vs_manager", return_value=fake_vs_manager), \
+             patch.object(resolver.conf, "PDF_SUPERSEDE_EMBEDDING_MAX_CANDIDATES", 10), \
+             patch.object(resolver.conf, "PDF_SUPERSEDE_EMBEDDING_QUERY_OVERSAMPLE", 5):
+            resolver._embedding_candidates("some comparison text", {"data_type": "regulatory"})
+        assert captured_kwargs.get("k") == 50
+
+    def test_oversample_multiplier_is_actually_configurable(self):
+        captured_kwargs = {}
+
+        def fake_query(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return []
+
+        fake_vs_manager = type("FakeVS", (), {"query_live_with_ids": staticmethod(fake_query)})()
+        with patch.object(resolver, "get_vs_manager", return_value=fake_vs_manager), \
+             patch.object(resolver.conf, "PDF_SUPERSEDE_EMBEDDING_MAX_CANDIDATES", 10), \
+             patch.object(resolver.conf, "PDF_SUPERSEDE_EMBEDDING_QUERY_OVERSAMPLE", 3):
+            resolver._embedding_candidates("some comparison text", {"data_type": "regulatory"})
+        assert captured_kwargs.get("k") == 30
+
 
 @pytest.mark.unit
 class TestExhaustiveCandidateJudging:
@@ -359,7 +392,7 @@ class TestExhaustiveCandidateJudging:
              patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
              patch.object(resolver, "_llm_judge", side_effect=fake_llm_judge) as mock_judge, \
              patch.object(resolver.conf, "PDF_SUPERSEDE_LLM_BATCH_SIZE", 2):
-            resolver.resolve_regulatory_topic(
+            resolver.resolve_topic(
                 {"department": "X", "license_type": "Y", "answer_guideline": "z"}, "f.pdf",
             )
 
@@ -383,7 +416,7 @@ class TestExhaustiveCandidateJudging:
              patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
              patch.object(resolver, "_llm_judge", side_effect=fake_llm_judge), \
              patch.object(resolver.conf, "PDF_SUPERSEDE_LLM_BATCH_SIZE", 2):
-            decision = resolver.resolve_regulatory_topic(
+            decision = resolver.resolve_topic(
                 {"department": "X", "license_type": "Y", "answer_guideline": "z"}, "f.pdf",
             )
 
@@ -414,7 +447,7 @@ class TestLlmJudgeResponseFilteredToSentBatch:
         with patch.object(resolver, "_embedding_candidates", return_value=pool), \
              patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
              patch.object(resolver, "_llm_judge", side_effect=fake_llm_judge):
-            decision = resolver.resolve_regulatory_topic(
+            decision = resolver.resolve_topic(
                 {"department": "X", "license_type": "Y", "answer_guideline": "z"}, "f.pdf",
             )
 
@@ -435,7 +468,7 @@ class TestPoolMergePreservesEmbeddingScore:
              }), \
              patch.object(resolver, "_llm_judge") as mock_judge:
             mock_judge.return_value = {}
-            resolver.resolve_regulatory_topic(
+            resolver.resolve_topic(
                 {"department": "X", "license_type": "Y", "answer_guideline": "z"}, "f.pdf",
             )
         # The pool passed into judging must have kept the real score, not
@@ -448,43 +481,324 @@ class TestPoolMergePreservesEmbeddingScore:
 
 
 @pytest.mark.unit
-class TestIngestedViaScoping:
-    """2026-10 fix (PDF2-C1): resolve_regulatory_topic/resolve_knowhow_topic
-    used to scope candidates by data_type alone — Sheet-sourced docs share
-    the same data_type/main_topic/sub_topic shape as PDF-sourced ones, so a
-    PDF re-upload whose topic happened to match a real Sheet row's topic
-    could get judged "update" and archive that Sheet doc. Every
-    data_type_filter passed to the candidate-signal functions must now also
-    scope to ingested_via="pdf_auto"."""
+class TestFieldLossGuardBlocksRetirement:
+    """Live incident (2026-10): the LLM's 'update' verdict only judges
+    topic-identity + 'did content change' — it never checks whether the new
+    doc's drafted fields actually cover what the old doc being retired has.
+    Confirmed live: a doc specifically about WHERE/WHEN to file a VAT change
+    got judged 'update' by a broader doc that left service_channel/
+    operation_duration blank; archive_and_remove then deleted the only place
+    that WHERE/WHEN info lived. These pin the deterministic safety net added
+    in _resolve: per matched doc_id, if the OLD doc has a non-empty
+    diff_keys field the NEW doc leaves blank, that doc_id must never reach
+    matched_doc_ids, regardless of what the LLM said."""
 
-    def test_regulatory_topic_filter_scopes_to_pdf_auto(self):
+    def test_update_blocked_when_new_doc_is_missing_a_field_the_old_doc_has(self):
+        pool = {"doc-old": {"score": 0.91, "metadata": {
+            "department": "กรมสรรพากร", "license_type": "การแจ้งเปลี่ยนแปลงทะเบียนภาษีมูลค่าเพิ่ม",
+            "service_channel": "ที่หน่วยจดทะเบียน สถานประกอบการ", "operation_duration": "ภายใน 15 วัน",
+        }, "content": "เดิม"}}
+        with patch.object(resolver, "_embedding_candidates", return_value=pool), \
+             patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
+             patch.object(resolver, "_llm_judge", return_value={
+                 "doc-old": {"is_same_topic": True, "content_status": "update", "reasoning": "same topic, broader doc"},
+             }):
+            decision = resolver.resolve_topic(
+                {
+                    "department": "กรมสรรพากร", "license_type": "การแจ้งเปลี่ยนแปลงทะเบียนภาษีมูลค่าเพิ่ม",
+                    "answer_guideline": "เอกสารที่ต้องใช้ยื่นแจ้งแก้ไขเปลี่ยนแปลง",
+                    # service_channel / operation_duration left blank on purpose —
+                    # the exact live failure shape.
+                },
+                "broader_doc.pdf",
+            )
+        assert decision.decision == "new", (
+            "the only 'update' candidate had its retirement blocked by the field-loss "
+            "guard, so with nothing left to retire this must fall back to 'new', never "
+            "silently retire doc-old"
+        )
+        assert "doc-old" not in decision.matched_doc_ids
+
+    def test_update_not_blocked_when_new_doc_covers_every_old_field(self):
+        """Regression guard the other direction: a genuine, fully-covering
+        update must NOT be blocked just because the guard exists."""
+        pool = {"doc-old": {"score": 0.91, "metadata": {
+            "department": "X", "license_type": "Y", "fees": "100 บาท",
+        }, "content": "เดิม"}}
+        with patch.object(resolver, "_embedding_candidates", return_value=pool), \
+             patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
+             patch.object(resolver, "_llm_judge", return_value={
+                 "doc-old": {"is_same_topic": True, "content_status": "update", "reasoning": "fee changed"},
+             }), \
+             patch.object(resolver, "_check_content_completeness", return_value={}):
+            decision = resolver.resolve_topic(
+                {"department": "X", "license_type": "Y", "answer_guideline": "z", "fees": "200 บาท"},
+                "updated_law.pdf",
+            )
+        assert decision.decision == "update"
+        assert decision.matched_doc_ids == ["doc-old"]
+
+    def test_mixed_batch_blocks_only_the_lossy_doc_keeps_the_safe_one(self):
+        pool = {
+            "doc-lossy": {"score": 0.9, "metadata": {
+                "department": "X", "license_type": "Y", "service_channel": "สถานที่เดิม",
+            }, "content": ""},
+            "doc-safe": {"score": 0.9, "metadata": {
+                "department": "X", "license_type": "Y", "fees": "100 บาท",
+            }, "content": ""},
+        }
+        with patch.object(resolver, "_embedding_candidates", return_value=pool), \
+             patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
+             patch.object(resolver, "_llm_judge", return_value={
+                 "doc-lossy": {"is_same_topic": True, "content_status": "update", "reasoning": "r1"},
+                 "doc-safe": {"is_same_topic": True, "content_status": "update", "reasoning": "r2"},
+             }), \
+             patch.object(resolver, "_check_content_completeness", return_value={}):
+            decision = resolver.resolve_topic(
+                {"department": "X", "license_type": "Y", "answer_guideline": "z", "fees": "200 บาท"},
+                "f.pdf",
+            )
+        assert decision.decision == "update"
+        assert decision.matched_doc_ids == ["doc-safe"]
+        assert "doc-lossy" not in decision.matched_doc_ids
+
+    def test_duplicate_verdict_on_another_doc_still_wins_as_fallback_once_update_is_fully_blocked(self):
+        pool = {
+            "doc-update-lossy": {"score": 0.9, "metadata": {
+                "department": "X", "license_type": "Y", "service_channel": "สถานที่เดิม",
+            }, "content": ""},
+            "doc-duplicate": {"score": 0.9, "metadata": {"department": "X", "license_type": "Y"}, "content": ""},
+        }
+        with patch.object(resolver, "_embedding_candidates", return_value=pool), \
+             patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
+             patch.object(resolver, "_llm_judge", return_value={
+                 "doc-update-lossy": {"is_same_topic": True, "content_status": "update", "reasoning": "r1"},
+                 "doc-duplicate": {"is_same_topic": True, "content_status": "duplicate", "reasoning": "r2"},
+             }):
+            decision = resolver.resolve_topic(
+                {"department": "X", "license_type": "Y", "answer_guideline": "z"},
+                "f.pdf",
+            )
+        assert decision.decision == "duplicate"
+        assert decision.matched_doc_ids == ["doc-duplicate"]
+        assert "doc-update-lossy" not in decision.matched_doc_ids
+
+    def test_knowhow_path_also_uses_the_guard_with_its_own_diff_keys(self):
+        """Same guard, applied through resolve_topic's merged diff_keys
+        (which includes summary/category) and its real metadata-key
+        aliasing (answer_guideline/content_type)."""
+        pool = {"doc-old": {"score": 0.9, "metadata": {
+            "main_topic": "A", "sub_topic": "B",
+            "answer_guideline": "สรุปเดิมที่มีรายละเอียด", "content_type": "",
+        }, "content": ""}}
+        with patch.object(resolver, "_embedding_candidates", return_value=pool), \
+             patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
+             patch.object(resolver, "_llm_judge", return_value={
+                 "doc-old": {"is_same_topic": True, "content_status": "update", "reasoning": "r"},
+             }):
+            decision = resolver.resolve_topic(
+                {"main_topic": "A", "sub_topic": "B", "summary": "", "category": "หมวดใหม่", "full_text": "f"},
+                "f.pdf",
+            )
+        assert decision.decision == "new"
+        assert "doc-old" not in decision.matched_doc_ids
+
+
+@pytest.mark.unit
+class TestContentCompletenessCheckCatchesNonBlankDilution:
+    """Follow-up to TestFieldLossGuardBlocksRetirement: the blank-field
+    guard only catches a field going from populated to fully empty. This
+    second-stage, claim-level completeness check (research-backed design —
+    see _check_content_completeness's docstring) catches the harder case:
+    a field that's non-empty on BOTH sides, but the new side has dropped a
+    specific detail the old side had. Scoped to run only on update_ids that
+    already survived the free blank-field guard, so these tests mock
+    _check_content_completeness directly rather than the real LLM call."""
+
+    def test_flagged_missing_claim_blocks_retirement_despite_nonblank_fields(self):
+        pool = {"doc-old": {"score": 0.9, "metadata": {
+            "department": "X", "license_type": "Y", "service_channel": "ที่หน่วยจดทะเบียนสถานประกอบการ",
+        }, "content": ""}}
+        with patch.object(resolver, "_embedding_candidates", return_value=pool), \
+             patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
+             patch.object(resolver, "_llm_judge", return_value={
+                 "doc-old": {"is_same_topic": True, "content_status": "update", "reasoning": "r"},
+             }), \
+             patch.object(resolver, "_check_content_completeness", return_value={
+                 "doc-old": [{"field": "service_channel", "claim": "ยื่นได้ที่สำนักงานใหญ่กรณีมีสาขา"}],
+             }):
+            decision = resolver.resolve_topic(
+                {
+                    "department": "X", "license_type": "Y", "answer_guideline": "z",
+                    # non-empty but narrower than the old field — the exact
+                    # case the blank-field guard can't see.
+                    "service_channel": "ที่หน่วยจดทะเบียน",
+                },
+                "f.pdf",
+            )
+        assert decision.decision == "new"
+        assert "doc-old" not in decision.matched_doc_ids
+
+    def test_no_missing_claims_does_not_block_a_genuine_update(self):
+        pool = {"doc-old": {"score": 0.9, "metadata": {"department": "X", "license_type": "Y", "fees": "100 บาท"}, "content": ""}}
+        with patch.object(resolver, "_embedding_candidates", return_value=pool), \
+             patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
+             patch.object(resolver, "_llm_judge", return_value={
+                 "doc-old": {"is_same_topic": True, "content_status": "update", "reasoning": "r"},
+             }), \
+             patch.object(resolver, "_check_content_completeness", return_value={}) as mock_check:
+            decision = resolver.resolve_topic(
+                {"department": "X", "license_type": "Y", "answer_guideline": "z", "fees": "200 บาท"},
+                "f.pdf",
+            )
+        mock_check.assert_called_once()
+        assert decision.decision == "update"
+        assert decision.matched_doc_ids == ["doc-old"]
+
+    def test_completeness_check_never_called_when_blank_field_guard_already_blocked_everything(self):
+        """Cost discipline: if update_ids is already empty after the free
+        blank-field guard, the extra LLM call must not fire at all."""
+        pool = {"doc-old": {"score": 0.9, "metadata": {
+            "department": "X", "license_type": "Y", "service_channel": "ที่เดิม",
+        }, "content": ""}}
+        with patch.object(resolver, "_embedding_candidates", return_value=pool), \
+             patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
+             patch.object(resolver, "_llm_judge", return_value={
+                 "doc-old": {"is_same_topic": True, "content_status": "update", "reasoning": "r"},
+             }), \
+             patch.object(resolver, "_check_content_completeness") as mock_check:
+            resolver.resolve_topic(
+                {"department": "X", "license_type": "Y", "answer_guideline": "z"},  # service_channel left blank
+                "f.pdf",
+            )
+        mock_check.assert_not_called()
+
+    def test_completeness_check_failure_does_not_block_retirement(self):
+        """_check_content_completeness's own contract: a failed LLM call
+        returns {} (no claims flagged), never raises — confirming the
+        caller treats an empty result as 'nothing extra caught', not as a
+        reason to block."""
+        pool = {"doc-old": {"score": 0.9, "metadata": {"department": "X", "license_type": "Y", "fees": "100 บาท"}, "content": ""}}
+        with patch.object(resolver, "_embedding_candidates", return_value=pool), \
+             patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
+             patch.object(resolver, "_llm_judge", return_value={
+                 "doc-old": {"is_same_topic": True, "content_status": "update", "reasoning": "r"},
+             }), \
+             patch.object(resolver, "_check_content_completeness", return_value={}):
+            decision = resolver.resolve_topic(
+                {"department": "X", "license_type": "Y", "answer_guideline": "z", "fees": "200 บาท"},
+                "f.pdf",
+            )
+        assert decision.decision == "update"
+        assert decision.matched_doc_ids == ["doc-old"]
+
+
+@pytest.mark.unit
+class TestCheckContentCompletenessUnit:
+    """Direct unit coverage of _check_content_completeness itself (not
+    through _resolve) — the real OpenAI client call is mocked."""
+
+    def test_empty_old_values_returns_empty_without_calling_llm(self):
+        with patch.object(resolver, "OpenAI") as mock_openai:
+            result = resolver._check_content_completeness({}, {"answer_guideline": "z"}, ["fees"], "m")
+        assert result == {}
+        mock_openai.assert_not_called()
+
+    def test_blank_new_content_returns_empty_without_calling_llm(self):
+        with patch.object(resolver, "OpenAI") as mock_openai:
+            result = resolver._check_content_completeness(
+                {"doc-1": {"fees": "100 บาท"}}, {"answer_guideline": "", "fees": ""}, ["fees"], "m",
+            )
+        assert result == {}
+        mock_openai.assert_not_called()
+
+    def test_parses_missing_claims_from_response(self):
+        mock_client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.choices[0].message.content = (
+            '{"missing_claims": [{"field": "fees", "claim": "ค่าธรรมเนียม 100 บาท"}]}'
+        )
+        mock_client.chat.completions.create.return_value = mock_resp
+        with patch.object(resolver, "OpenAI", return_value=mock_client):
+            result = resolver._check_content_completeness(
+                {"doc-1": {"fees": "100 บาท"}}, {"answer_guideline": "เนื้อหาใหม่"}, ["fees"], "m",
+            )
+        assert result == {"doc-1": [{"field": "fees", "claim": "ค่าธรรมเนียม 100 บาท"}]}
+
+    def test_empty_missing_claims_list_excludes_doc_from_result(self):
+        mock_client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.choices[0].message.content = '{"missing_claims": []}'
+        mock_client.chat.completions.create.return_value = mock_resp
+        with patch.object(resolver, "OpenAI", return_value=mock_client):
+            result = resolver._check_content_completeness(
+                {"doc-1": {"fees": "100 บาท"}}, {"answer_guideline": "เนื้อหาใหม่ที่ครบ"}, ["fees"], "m",
+            )
+        assert result == {}
+
+    def test_llm_failure_returns_empty_not_raise(self):
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = RuntimeError("network error")
+        with patch.object(resolver, "OpenAI", return_value=mock_client):
+            result = resolver._check_content_completeness(
+                {"doc-1": {"fees": "100 บาท"}}, {"answer_guideline": "z"}, ["fees"], "m",
+            )
+        assert result == {}
+
+    def test_doc_with_no_nonempty_diff_fields_is_skipped_without_llm_call(self):
+        """A doc_id present in old_values_by_id but with nothing in
+        diff_keys populated shouldn't burn an LLM call — there's nothing to
+        decompose into claims."""
+        with patch.object(resolver, "OpenAI") as mock_openai:
+            result = resolver._check_content_completeness(
+                {"doc-1": {"fees": "", "service_channel": ""}}, {"answer_guideline": "z"}, ["fees", "service_channel"], "m",
+            )
+        assert result == {}
+        mock_openai.assert_not_called()
+
+
+@pytest.mark.unit
+class TestIngestedViaScoping:
+    """2026-10 fix (PDF2-C1): the candidate pool used to be scoped by
+    data_type alone — Sheet-sourced docs share the same data_type/
+    main_topic/sub_topic shape as PDF-sourced ones, so a PDF re-upload
+    whose topic happened to match a real Sheet row's topic could get
+    judged "update" and archive that Sheet doc. Every data_type_filter
+    passed to the candidate-signal functions must scope to
+    ingested_via="pdf_auto".
+
+    2026-10 (schema unification): resolve_topic no longer splits the
+    filter by data_type at all (regulatory vs business_guide/marketing) —
+    a topic that was previously mis-ingested under one data_type must
+    still be findable once a re-upload resolves it under the other, so
+    the filter now covers all three data_types in one $in clause,
+    regardless of what the new topic itself drafted to."""
+
+    def test_filter_scopes_to_pdf_auto_and_covers_every_data_type(self):
         with patch.object(resolver, "_embedding_candidates", return_value={}) as mock_emb, \
              patch.object(resolver, "_identity_fuzzy_candidates", return_value={}) as mock_fuzzy:
-            resolver.resolve_regulatory_topic(
+            resolver.resolve_topic(
                 {"department": "X", "license_type": "Y", "answer_guideline": "z"}, "f.pdf",
             )
         emb_filter = mock_emb.call_args[0][1]
-        fuzzy_filter = mock_fuzzy.call_args[0][1]
         assert {"ingested_via": "pdf_auto"} in emb_filter["$and"]
-        assert {"ingested_via": "pdf_auto"} in fuzzy_filter["$and"]
+        assert {"data_type": {"$in": ["regulatory", "business_guide", "marketing"]}} in emb_filter["$and"]
+        # _identity_fuzzy_candidates is called once per identity key-tuple
+        # (main_topic+sub_topic, then department+license_type) — every
+        # call must carry the same scoped filter.
+        assert mock_fuzzy.call_count == 2
+        for call in mock_fuzzy.call_args_list:
+            assert {"ingested_via": "pdf_auto"} in call[0][1]["$and"]
 
-    def test_knowhow_topic_filter_scopes_to_pdf_auto(self):
+    def test_knowhow_shaped_topic_gets_the_same_scoping(self):
+        """Same filter regardless of which fields the topic actually
+        drafted — there's no shape-specific filter anymore."""
         with patch.object(resolver, "_embedding_candidates", return_value={}) as mock_emb, \
              patch.object(resolver, "_identity_fuzzy_candidates", return_value={}) as mock_fuzzy:
-            resolver.resolve_knowhow_topic(
+            resolver.resolve_topic(
                 {"main_topic": "A", "sub_topic": "B", "summary": "s", "category": "c"}, "f.pdf",
             )
         emb_filter = mock_emb.call_args[0][1]
-        fuzzy_filter = mock_fuzzy.call_args[0][1]
         assert {"ingested_via": "pdf_auto"} in emb_filter["$and"]
-        assert {"ingested_via": "pdf_auto"} in fuzzy_filter["$and"]
+        assert mock_fuzzy.call_count == 2
 
-    def test_collect_full_sibling_chunk_ids_scopes_to_pdf_auto(self):
-        mock_vectorstore = MagicMock()
-        mock_vectorstore._collection.get.return_value = {"ids": ["a", "b"]}
-        with patch.object(resolver, "get_vs_manager") as mock_vs_mgr:
-            mock_vs_mgr.return_value.vectorstore = mock_vectorstore
-            result = resolver.collect_full_sibling_chunk_ids("Main", "Sub")
-        where = mock_vectorstore._collection.get.call_args.kwargs["where"]
-        assert {"ingested_via": "pdf_auto"} in where["$and"]
-        assert result == ["a", "b"]

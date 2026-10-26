@@ -152,6 +152,43 @@ def _aggregate_non_reg_docs(
     return result
 
 
+def _cap_docs_with_nonreg_aggregation(
+    docs: List[Dict[str, Any]], max_docs: int,
+) -> List[Dict[str, Any]]:
+    """Partitions `docs` into regulatory (has license_type) / non-regulatory
+    subsets and runs _aggregate_non_reg_docs on only the non-regulatory one
+    before the caller applies its final [:max_docs] slice — regulatory docs
+    need no sub_topic aggregation and keep their own slots unchanged.
+
+    2026-10 fix (data-integrity audit): the inline version of this logic
+    used to gate aggregation on ALL of the first 20 docs lacking
+    license_type — one mixed-in regulatory doc (a realistic, common
+    Academic-mode case: a broad query legitimately pulling both a
+    regulatory row and several marketing/business_guide rows) disabled the
+    safety net entirely, and the plain slice then silently truncated the
+    non-reg sub_topic with no warning — the exact failure this safety net
+    exists to prevent, just gated on a stricter condition than the actual
+    risk. Extracted to a standalone function (same rationale as
+    _aggregate_non_reg_docs above) so the partition decision itself is
+    directly unit-testable without needing the surrounding method's state.
+
+    No-ops (returns `docs` unchanged) when there's no non-regulatory,
+    sub_topic-groupable content at all, or when the count doesn't exceed
+    max_docs — the caller's own cap-slice handles everything else exactly
+    as it always did for the pure-regulatory case."""
+    has_nonreg_marketing_signal = any(
+        str((d.get("metadata") or {}).get("data_type") or "").strip() in ("marketing", "business_guide")
+        for d in docs[:5]
+    )
+    if not has_nonreg_marketing_signal or len(docs) <= max_docs:
+        return docs
+    reg_docs = [d for d in docs if str((d.get("metadata") or {}).get("license_type") or "").strip()]
+    nonreg_docs = [d for d in docs if not str((d.get("metadata") or {}).get("license_type") or "").strip()]
+    if not nonreg_docs:
+        return docs
+    return reg_docs + _aggregate_non_reg_docs(nonreg_docs)
+
+
 class AcademicPersonaService:
     """
     Academic Persona (REQUIRED FLOW)
@@ -4434,7 +4471,7 @@ class AcademicPersonaService:
         # independent copy of the answer_guideline=1500 cap, never audited
         # alongside the other two. Academic mode explicitly aggregates and
         # answers from business_guide/marketing docs with no license_type
-        # (_ac_is_non_reg below) — the exact shape PDF book chunks take — so a
+        # (the non-reg aggregation below) — the exact shape PDF book chunks take — so a
         # user in Academic (deep-dive) mode asking the same question that was
         # already fixed for Practical mode would hit the identical truncation
         # here, silently, with no error. Same fix: PDF-book chunks (chunk_max
@@ -4449,28 +4486,18 @@ class AcademicPersonaService:
         _ACADEMIC_LONG_FIELDS = {"operation_steps"}
         _academic_long_sent_hashes: set = set()
 
-        # Non-regulatory aggregation: if ALL current_docs are marketing/business_guide (no license_type)
-        # group them by sub_topic into combined docs before applying the _MAX_DOCS_ACADEMIC cap.
-        # Without this, a sub_topic with >12 rows is silently truncated and the LLM cannot correctly
-        # enumerate all content_type items or answer "มีทั้งหมดกี่แบบ" accurately.
-        _docs_for_ac_llm = list(state.current_docs or [])
-        _ac_is_non_reg = (
-            bool(_docs_for_ac_llm)
-            and all(
-                not str((d.get("metadata") or {}).get("license_type") or "").strip()
-                for d in _docs_for_ac_llm[:20]
-            )
-            and any(
-                str((d.get("metadata") or {}).get("data_type") or "").strip()
-                in ("marketing", "business_guide")
-                for d in _docs_for_ac_llm[:5]
-            )
-        )
-        if _ac_is_non_reg and len(_docs_for_ac_llm) > _MAX_DOCS_ACADEMIC:
-            _docs_for_ac_llm = _aggregate_non_reg_docs(_docs_for_ac_llm)
+        # Non-regulatory aggregation: group the non-regulatory (no license_type)
+        # subset by sub_topic into combined docs before applying the
+        # _MAX_DOCS_ACADEMIC cap. Without this, a sub_topic with >12 rows is
+        # silently truncated and the LLM cannot correctly enumerate all
+        # content_type items or answer "มีทั้งหมดกี่แบบ" accurately. See
+        # _cap_docs_with_nonreg_aggregation's docstring (2026-10 fix) — a
+        # mixed-in regulatory doc no longer disables this safety net.
+        _docs_for_ac_llm = _cap_docs_with_nonreg_aggregation(list(state.current_docs or []), _MAX_DOCS_ACADEMIC)
+        if len(_docs_for_ac_llm) != len(state.current_docs or []):
             _LOG.info(
-                "[Academic] Non-reg aggregation: %d docs → %d combined for LLM",
-                len(state.current_docs), len(_docs_for_ac_llm),
+                "[Academic] Non-reg aggregation: %d docs → %d for LLM",
+                len(state.current_docs or []), len(_docs_for_ac_llm),
             )
 
         docs_json = []
@@ -4502,7 +4529,18 @@ class AcademicPersonaService:
                     cap = _ACADEMIC_FIELD_CAPS.get(k)
                 filtered_md[k] = v_str[:cap] if cap and len(v_str) > cap else v_str
             _ac_content = d.get("content", "") or ""
-            if _ac_is_non_reg:
+            if _ac_is_bg_doc:
+                # 2026-10 fix (data-integrity audit): was gated on the
+                # batch-level _ac_is_non_reg flag (true only when ALL docs
+                # in the batch lacked license_type) — one regulatory doc
+                # mixed into the batch silently disabled this cleanup for
+                # EVERY doc, including genuinely non-regulatory ones,
+                # leaving their reference-link block un-stripped. Gated
+                # per-document on _ac_is_bg_doc (already computed above,
+                # same per-doc license_type check) instead — correct at the
+                # individual-document granularity this decision actually
+                # operates at.
+                #
                 # Strip "อ้างอิง: Website...\nhttps://..." appended at ingest time.
                 # Marketing/bakery reference links shown only when user explicitly asks.
                 _ac_content = re.sub(r'\nอ้างอิง:.*', '', _ac_content, flags=re.DOTALL).strip()

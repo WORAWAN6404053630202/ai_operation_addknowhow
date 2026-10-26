@@ -43,6 +43,15 @@ def _manager_with_mocked_stores():
         "embeddings": np.array([[0.1, 0.2, 0.3]]),
     }
     archive_store = MagicMock()
+    # 2026-10 fix (data-integrity audit): archive_and_remove/restore_from_
+    # archive now upsert() instead of add() (Chroma's own docs: add() is
+    # unreliable on a duplicate id — silently keeps the FIRST value, never
+    # raises; confirmed empirically), and verify with a real get() before
+    # deleting the other side. Both mocked stores' .get() default to
+    # reporting "doc-1" present, matching the happy-path fixture above —
+    # tests that want to exercise the "verification failed" branch override
+    # this explicitly.
+    archive_store._collection.get.return_value = {"ids": ["doc-1"]}
     mgr._archive_store = archive_store
     return mgr, archive_store
 
@@ -52,13 +61,13 @@ class TestArchiveAndRemove:
     def test_empty_ids_is_noop(self):
         mgr, archive_store = _manager_with_mocked_stores()
         assert mgr.archive_and_remove([], reason="test") == 0
-        archive_store._collection.add.assert_not_called()
+        archive_store._collection.upsert.assert_not_called()
         mgr.vectorstore._collection.delete.assert_not_called()
 
     def test_archive_add_happens_before_live_delete(self):
         mgr, archive_store = _manager_with_mocked_stores()
         call_order = []
-        archive_store._collection.add.side_effect = lambda **kw: call_order.append("archive_add")
+        archive_store._collection.upsert.side_effect = lambda **kw: call_order.append("archive_add")
         mgr.vectorstore._collection.delete.side_effect = lambda **kw: call_order.append("live_delete")
 
         moved = mgr.archive_and_remove(["doc-1"], reason="superseded by new_law.pdf")
@@ -70,7 +79,7 @@ class TestArchiveAndRemove:
         mgr, archive_store = _manager_with_mocked_stores()
         mgr.archive_and_remove(["doc-1"], reason="superseded by new_law.pdf")
 
-        _, kwargs = archive_store._collection.add.call_args
+        _, kwargs = archive_store._collection.upsert.call_args
         stamped = kwargs["metadatas"][0]
         assert stamped["superseded_reason"] == "superseded by new_law.pdf"
         assert "superseded_at" in stamped
@@ -79,7 +88,7 @@ class TestArchiveAndRemove:
 
     def test_archive_add_failure_aborts_without_deleting_live(self):
         mgr, archive_store = _manager_with_mocked_stores()
-        archive_store._collection.add.side_effect = RuntimeError("archive write failed")
+        archive_store._collection.upsert.side_effect = RuntimeError("archive write failed")
 
         with pytest.raises(RuntimeError):
             mgr.archive_and_remove(["doc-1"], reason="test")
@@ -90,7 +99,7 @@ class TestArchiveAndRemove:
         mgr, archive_store = _manager_with_mocked_stores()
         mgr.archive_and_remove(["doc-1"], reason="test")
         mgr.embedding_model.embed_documents.assert_not_called()
-        _, kwargs = archive_store._collection.add.call_args
+        _, kwargs = archive_store._collection.upsert.call_args
         # kwargs["embeddings"] is a list of 1D ndarrays (see
         # _materialize_embeddings) — a direct `==` against a nested plain
         # list hits the exact numpy-truthiness ValueError this whole fix is
@@ -102,7 +111,41 @@ class TestArchiveAndRemove:
         mgr, archive_store = _manager_with_mocked_stores()
         mgr.vectorstore._collection.get.return_value = {"ids": [], "documents": [], "metadatas": [], "embeddings": []}
         assert mgr.archive_and_remove(["missing-id"], reason="test") == 0
-        archive_store._collection.add.assert_not_called()
+        archive_store._collection.upsert.assert_not_called()
+
+    def test_upsert_not_raising_is_not_trusted_alone_skips_live_delete_if_unverified(self):
+        """The actual point of the 2026-10 fix: upsert() not raising is NOT
+        by itself treated as proof the write landed in archive — only a
+        real get()-verified presence authorizes deleting from live. Chroma's
+        own add() used to produce exactly this failure mode silently
+        (confirmed empirically: a duplicate-id add() keeps the FIRST value
+        and never raises); this test pins that even a non-raising upsert()
+        still goes through the same verification gate, so an analogous
+        future surprise can't silently delete a doc with zero copy left."""
+        mgr, archive_store = _manager_with_mocked_stores()
+        archive_store._collection.get.return_value = {"ids": []}  # verification finds nothing
+
+        moved = mgr.archive_and_remove(["doc-1"], reason="test")
+
+        assert moved == 0
+        mgr.vectorstore._collection.delete.assert_not_called()
+
+    def test_partial_verification_only_deletes_the_confirmed_subset(self):
+        """2 ids requested; only 1 verifies as present in archive afterward
+        — the live delete must cover ONLY that 1, never the unverified one."""
+        mgr, archive_store = _manager_with_mocked_stores()
+        mgr.vectorstore._collection.get.return_value = {
+            "ids": ["doc-1", "doc-2"],
+            "documents": ["a", "b"],
+            "metadatas": [{"license_type": "X"}, {"license_type": "Y"}],
+            "embeddings": np.array([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]),
+        }
+        archive_store._collection.get.return_value = {"ids": ["doc-1"]}  # doc-2 never verified
+
+        moved = mgr.archive_and_remove(["doc-1", "doc-2"], reason="test")
+
+        assert moved == 1
+        mgr.vectorstore._collection.delete.assert_called_once_with(ids=["doc-1"])
 
 
 @pytest.mark.unit
@@ -123,7 +166,7 @@ class TestRestoreFromArchive:
         restored = mgr.restore_from_archive(["doc-1"])
 
         assert restored == 1
-        _, kwargs = mgr.vectorstore._collection.add.call_args
+        _, kwargs = mgr.vectorstore._collection.upsert.call_args
         restored_meta = kwargs["metadatas"][0]
         assert "superseded_at" not in restored_meta
         assert "superseded_reason" not in restored_meta
@@ -134,7 +177,26 @@ class TestRestoreFromArchive:
         mgr, archive_store = _manager_with_mocked_stores()
         archive_store._collection.get.return_value = {"ids": [], "documents": [], "metadatas": [], "embeddings": []}
         assert mgr.restore_from_archive(["missing-id"]) == 0
-        mgr.vectorstore._collection.add.assert_not_called()
+        mgr.vectorstore._collection.upsert.assert_not_called()
+
+    def test_upsert_not_raising_is_not_trusted_alone_skips_archive_delete_if_unverified(self):
+        """Mirror of archive_and_remove's analogous test — this is the
+        WORSE-failure-mode direction the audit flagged: before this fix,
+        restore_from_archive unconditionally deleted from archive regardless
+        of whether the live add() actually took effect, so an unverified
+        restore could leave the doc with zero surviving copy anywhere."""
+        mgr, archive_store = _manager_with_mocked_stores()
+        archive_store._collection.get.return_value = {
+            "ids": ["doc-1"], "documents": ["เนื้อหาเดิม"],
+            "metadatas": [{"license_type": "X"}],
+            "embeddings": np.array([[0.1, 0.2, 0.3]]),
+        }
+        mgr.vectorstore._collection.get.return_value = {"ids": []}  # verification finds nothing in live
+
+        restored = mgr.restore_from_archive(["doc-1"])
+
+        assert restored == 0
+        archive_store._collection.delete.assert_not_called()
 
 
 @pytest.mark.unit
@@ -293,7 +355,7 @@ class TestSnapshotAndRestoreArchive:
     def test_restore_empty_snapshot_is_noop(self):
         mgr, archive_store = _manager_with_mocked_stores()
         assert mgr.restore_archive_snapshot({"ids": []}) == 0
-        archive_store._collection.add.assert_not_called()
+        archive_store._collection.upsert.assert_not_called()
 
     def test_restore_writes_snapshot_back_into_archive_collection(self):
         mgr, archive_store = _manager_with_mocked_stores()
@@ -309,7 +371,7 @@ class TestSnapshotAndRestoreArchive:
         }
         restored = mgr.restore_archive_snapshot(snapshot)
         assert restored == 1
-        call_kwargs = archive_store._collection.add.call_args.kwargs
+        call_kwargs = archive_store._collection.upsert.call_args.kwargs
         assert call_kwargs["ids"] == ["archived-1"]
         assert call_kwargs["documents"] == ["เนื้อหาที่ถูก archive"]
         assert call_kwargs["metadatas"] == [{"superseded_at": 123.0, "superseded_reason": "test"}]

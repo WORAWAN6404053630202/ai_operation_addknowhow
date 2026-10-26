@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Optional, TypedDict
+from typing import Optional
 
 from openai import OpenAI
 
@@ -39,8 +39,6 @@ from utils.llm_cost_logging import CostAccumulator, log_llm_cost
 from utils.pdf_cost_guard import get_cost_guard
 from utils.llm_json_parse import parse_leading_json
 from utils.logger import get_logger
-from utils.page_ranges import fuzzy_ratio as _fuzzy_ratio
-from utils.page_ranges import group_into_ranges, merge_topic_chunks
 from utils.prompt_safety import INJECTION_GUARD
 
 logger = get_logger(__name__)
@@ -120,27 +118,63 @@ _IDENTITY_LIKE_HEADER_KEYS = {
 }
 
 
+# 2026-10 fix (data-integrity audit): this call had NO retry/escalation at
+# all, unlike its sibling identify_license_topics/identify_knowhow_topics
+# in this same pipeline — both of which were bumped (1500→4000→6000,
+# 2500→8000) after live-reproduced truncation on verbose Thai JSON output,
+# and both now also retry. This drafts a full prose value for ALL 13
+# fields per topic — strictly MORE content than a topic-boundary entry —
+# so nothing structurally protected it from hitting the exact same ceiling;
+# on truncation this used to just log an error and silently return every
+# field blank, permanently, with no retry. finish_reason=="length" is
+# checked explicitly (OpenAI/OpenRouter's own documented, authoritative
+# truncation signal — a response can in principle still look like
+# complete-but-wrong JSON at the exact truncation boundary, which a
+# parse-error-only check would miss entirely) alongside the existing
+# JSONDecodeError catch, which still covers the (much more common
+# in practice) case where truncation lands mid-string/mid-object.
+_DRAFT_FIELDS_MAX_TOKENS_ATTEMPTS = (3000, 6000)
+
+
 def _draft_fields_single_batch(combined_text: str, cost_accumulator: Optional[CostAccumulator] = None) -> dict[str, str]:
     """One LLM call over already-combined text, returning a dict keyed by the
     REAL Sheet header text (via DRAFTABLE_FIELDS, 13 fields). Fields the LLM
-    couldn't find are empty strings, not omitted."""
+    couldn't find are empty strings, not omitted. Retries once at a larger
+    max_tokens if the first attempt was truncated (see
+    _DRAFT_FIELDS_MAX_TOKENS_ATTEMPTS's comment) — if the retry ALSO
+    truncates, returns whatever the retry parsed (empty dict if that too
+    failed to parse) rather than looping forever on a document whose
+    content genuinely doesn't fit."""
     client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
-
     prompt = _PROMPT_TEMPLATE.format(combined_text=combined_text)
-    _call_start = time.monotonic()
-    resp = client.chat.completions.create(
-        model=conf.OPENROUTER_MODEL_PDF_DRAFTING,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=3000,
-    )
-    log_llm_cost(logger, "FieldDrafting/DraftFields", conf.OPENROUTER_MODEL_PDF_DRAFTING, resp, time.monotonic() - _call_start, accumulator=cost_accumulator, cost_guard=get_cost_guard())
-    raw = resp.choices[0].message.content or "{}"
 
-    try:
-        drafted = parse_leading_json(raw)
-    except json.JSONDecodeError as e:
-        logger.error(f"[pdf_field_drafting] LLM returned invalid JSON: {e} — raw: {raw[:200]}")
-        drafted = {}
+    drafted: dict = {}
+    for attempt, max_tokens in enumerate(_DRAFT_FIELDS_MAX_TOKENS_ATTEMPTS, start=1):
+        _call_start = time.monotonic()
+        resp = client.chat.completions.create(
+            model=conf.OPENROUTER_MODEL_PDF_DRAFTING,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+        )
+        log_llm_cost(logger, "FieldDrafting/DraftFields", conf.OPENROUTER_MODEL_PDF_DRAFTING, resp, time.monotonic() - _call_start, accumulator=cost_accumulator, cost_guard=get_cost_guard())
+        raw = resp.choices[0].message.content or "{}"
+        truncated_by_finish_reason = getattr(resp.choices[0], "finish_reason", None) == "length"
+
+        try:
+            drafted = parse_leading_json(raw)
+            parse_failed = False
+        except json.JSONDecodeError as e:
+            logger.error(f"[pdf_field_drafting] LLM returned invalid JSON (attempt {attempt}/{len(_DRAFT_FIELDS_MAX_TOKENS_ATTEMPTS)}, max_tokens={max_tokens}): {e} — raw: {raw[:200]}")
+            drafted = {}
+            parse_failed = True
+
+        if not (truncated_by_finish_reason or parse_failed):
+            break
+        if attempt < len(_DRAFT_FIELDS_MAX_TOKENS_ATTEMPTS):
+            logger.warning(
+                f"[pdf_field_drafting] Draft looked truncated (finish_reason=length={truncated_by_finish_reason}, "
+                f"parse_failed={parse_failed}) at max_tokens={max_tokens} — retrying with a larger budget"
+            )
 
     # Key by the primary header text (DRAFTABLE_FIELDS[key][0]), always present
     # (empty string if missing), and silently ignore any key the LLM invented
@@ -205,54 +239,6 @@ def draft_fields_from_pages(pages_markdown: list[str], cost_accumulator: Optiona
     return result
 
 
-class LicenseTopicBounds(TypedDict):
-    department: str
-    license_type: str
-    page_ranges: list[tuple[int, int]]
-
-
-# Same purpose as DRAFT_FIELDS_PROMPT_VERSION above, for _TOPIC_SPLIT_PROMPT
-# specifically — bump when that prompt changes.
-TOPIC_SPLIT_PROMPT_VERSION = "v1"
-
-_TOPIC_SPLIT_PROMPT = """เอกสารต่อไปนี้ (มีทั้งหมด {num_pages} หน้า) ถูกจัดว่าเป็นเอกสารเกี่ยวกับใบอนุญาต/
-ขั้นตอนราชการ ซึ่งอาจพูดถึงใบอนุญาตหรือขั้นตอนมากกว่า 1 เรื่องปนกันอยู่ในไฟล์เดียวก็ได้ (เช่น เอกสารรวม
-ประกาศหลายฉบับ) หรืออาจไม่เกี่ยวกับใบอนุญาต/ขั้นตอนราชการเลยก็ได้
-
-""" + INJECTION_GUARD + """
-
-หน้าที่ของคุณ: **ระบุว่าเอกสารนี้พูดถึงใบอนุญาต/ขั้นตอนราชการกี่เรื่อง แต่ละเรื่องอยู่หน้าไหนถึงหน้าไหน**
-(ไม่ต้องกรอกรายละเอียดฟิลด์ทั้งหมดตรงนี้ แค่ระบุหน่วยงาน+ประเภทใบอนุญาตคร่าวๆ พอให้แยกเรื่องออกจากกันได้)
-
-- ถ้าทั้งเอกสารพูดถึงเรื่องเดียวต่อเนื่องกัน ให้ตอบมาแค่ 1 รายการที่ครอบคลุมทุกหน้า
-- ถ้าเอกสารไม่เกี่ยวกับใบอนุญาต/ขั้นตอนราชการเลย ให้ตอบ list ว่างเปล่า [] ห้ามฝืนสร้างรายการที่ไม่มีจริง
-- แต่ละหน้าควรอยู่ในเรื่องใดเรื่องหนึ่งเท่านั้น ห้ามข้ามหน้าหรือซ้อนทับกันโดยไม่จำเป็น
-- **สำคัญ**: ถ้าเรื่องเดียวกันปรากฏอีกครั้งหลังถูกคั่นด้วยเรื่องอื่น (เช่น หน้า 1 กับหน้า 3 เป็นเรื่อง
-  เดียวกัน แต่หน้า 2 เป็นเรื่องอื่นคั่นอยู่) ให้ตอบเป็น**คนละรายการที่แยกกัน**ได้ตามปกติ (แต่ละรายการ
-  ยังต้องเป็นช่วงหน้าต่อเนื่อง) แต่ต้องใช้ค่า "department" และ "license_type" เป็น**ข้อความเดียวกันเป๊ะๆ**
-  กับรายการแรกที่พูดถึงเรื่องนี้ — **ห้ามเติมคำต่อท้ายเช่น "(ต่อ)" หรือเปลี่ยนคำแม้เล็กน้อย** เพราะระบบ
-  จะรวมรายการที่ department+license_type ตรงกันเป๊ะให้เป็นเรื่องเดียวโดยอัตโนมัติในภายหลัง
-- **สำคัญมาก**: ถ้าเอกสารมีใบอนุญาต/เรื่องหลายรายการที่ชื่อคล้ายกันมากแต่จริงๆ เป็นคนละเรื่องกัน
-  (เช่น "ใบอนุญาตประกอบกิจการโรงงานจำพวกที่ 1" กับ "จำพวกที่ 2", หรือมีรหัส/หมายเลข/ประเภทย่อย
-  กำกับไว้ต่อท้ายเพื่อแยกความแตกต่าง) **ต้องคงคำหรือรหัสที่แยกความแตกต่างนั้นไว้ใน "license_type" เสมอ
-  ห้ามตัดออกแม้จะทำให้ข้อความสั้นลง** — การตัดรายละเอียดที่แยกความแตกต่างออกจะทำให้ระบบเข้าใจผิดว่า
-  เป็นเรื่องเดียวกันแล้วรวมเข้าด้วยกันโดยไม่ตั้งใจ
-
-ตอบเป็น JSON array เท่านั้น ไม่ต้องมีข้อความอื่น:
-[
-  {{
-    "department": "หน่วยงานที่รับผิดชอบเรื่องนี้",
-    "license_type": "ประเภทใบอนุญาต/เรื่องนี้สั้นๆ",
-    "start_page": 1,
-    "end_page": 3
-  }}
-]
-
-=== เนื้อหาเอกสารทุกหน้า (มีเลขหน้ากำกับแต่ละส่วน) ===
-{combined_text}
-"""
-
-
 # Real-world evidence (2026-09): a 242-page real document's full combined
 # OCR text made this same style of call fail outright — "prompt is too long:
 # 227142 tokens > 200000 maximum", reproduced live. Same fix as
@@ -262,7 +248,6 @@ _TOPIC_SPLIT_PROMPT = """เอกสารต่อไปนี้ (มีท�
 # merge exactly as multiple chunks from one call already were. See that
 # module for the token/char ratio this budget is based on.
 _MAX_BATCH_CHARS = 100_000
-_BATCH_MAX_ATTEMPTS = 2  # one retry — batching multiplies how many calls can hit a lone transient failure
 
 
 def _split_into_batches(pages_markdown: list[str], max_chars: int) -> list[tuple[int, list[str]]]:
@@ -287,292 +272,3 @@ def _split_into_batches(pages_markdown: list[str], max_chars: int) -> list[tuple
     return batches
 
 
-def _identify_license_topics_batch(batch_pages_markdown: list[str], page_offset: int, cost_accumulator: Optional[CostAccumulator] = None) -> tuple[list[dict], bool]:
-    """Runs the single-call topic-split prompt on ONE batch, retried once on
-    failure. Returns (chunks, failed) with department/license_type/
-    start_page/end_page already remapped to GLOBAL document page numbers —
-    never raises. `failed` distinguishes "the call itself broke" from "the
-    LLM legitimately found 0 topics" — see _identify_license_topics_batch_adaptive,
-    which only shrinks-and-retries on a real failure."""
-    numbered_pages = [f"[หน้า {i + 1}]\n{md}" for i, md in enumerate(batch_pages_markdown)]
-    combined_text = "\n\n---\n\n".join(numbered_pages)
-
-    parsed = None
-    for attempt in range(1, _BATCH_MAX_ATTEMPTS + 1):
-        try:
-            client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
-            _call_start = time.monotonic()
-            resp = client.chat.completions.create(
-                model=conf.OPENROUTER_MODEL_PDF_TOPIC_SPLIT,
-                messages=[{
-                    "role": "user",
-                    "content": _TOPIC_SPLIT_PROMPT.format(num_pages=len(batch_pages_markdown), combined_text=combined_text),
-                }],
-                # 6000 (raised from 1500, then 4000, then 6000 — all 2026-08-25):
-                # live-tested a 45-topic combined bulletin and reproduced a real
-                # JSONDecodeError from output getting cut off mid-string at 1500 —
-                # the caller's except-clause fallback (treat the whole slice as one
-                # topic) meant this degraded gracefully rather than crashing, but
-                # silently produced a garbled single row blending 45 departments
-                # together, not a clean split. 4000 fixed that, but then the SAME
-                # sweep found the prompt instruction below (preserve distinguishing
-                # codes/classes so similarly-named-but-different topics don't get
-                # merge_topic_chunks'd together) makes each entry longer, which
-                # itself re-hit the ceiling at 45 topics — 6000 covers both.
-                max_tokens=6000,
-                # Live-tested 2026-08-25 (same finding as pdf_content_shape.py):
-                # default sampling temperature made a borderline topic-boundary call
-                # flip run-to-run; temperature=0 made repeated identical calls
-                # consistent. Topic splitting is a classification task, not a
-                # creative one — determinism matters more than variety here.
-                temperature=0,
-                # qwen3.7-flash defaults reasoning ON — without disabling it, the
-                # model's own chain-of-thought can consume the token budget before
-                # ever writing the JSON answer (message.content=None, finish_reason
-                # "length"). Found live 2026-08-25 switching this call off
-                # OPENROUTER_MODEL_PRACTICAL.
-                extra_body={"reasoning": {"enabled": False}},
-            )
-            log_llm_cost(logger, "FieldDrafting/IdentifyLicenseTopics", conf.OPENROUTER_MODEL_PDF_TOPIC_SPLIT, resp, time.monotonic() - _call_start, accumulator=cost_accumulator, cost_guard=get_cost_guard())
-            raw = resp.choices[0].message.content or "[]"
-            parsed = parse_leading_json(raw)
-            if not isinstance(parsed, list):
-                raise ValueError(f"LLM returned non-list JSON: {type(parsed)}")
-            break
-        except Exception as e:
-            logger.error(f"[pdf_field_drafting] License topic-split failed for batch starting at page {page_offset + 1} (attempt {attempt}/{_BATCH_MAX_ATTEMPTS}): {e}")
-            parsed = None
-
-    if parsed is None:
-        return [], True
-
-    num_local_pages = len(batch_pages_markdown)
-    chunks: list[dict] = []
-    for raw_topic in parsed:
-        try:
-            start_page = int(raw_topic["start_page"])
-            end_page = int(raw_topic["end_page"])
-        except (KeyError, TypeError, ValueError):
-            logger.warning(f"[pdf_field_drafting] Skipping license topic with invalid page bounds: {raw_topic!r}")
-            continue
-
-        start_page = max(1, start_page)
-        end_page = min(num_local_pages, end_page)
-        if start_page > end_page or start_page > num_local_pages or end_page < 1:
-            logger.warning(f"[pdf_field_drafting] Skipping license topic with out-of-range pages {raw_topic.get('start_page')}-{raw_topic.get('end_page')} (batch has {num_local_pages} pages)")
-            continue
-
-        chunks.append({
-            "department": str(raw_topic.get("department", "")).strip(),
-            "license_type": str(raw_topic.get("license_type", "")).strip(),
-            "start_page": start_page + page_offset,
-            "end_page": end_page + page_offset,
-        })
-    return chunks, False
-
-
-def _identify_license_topics_batch_adaptive(batch_pages_markdown: list[str], page_offset: int, cost_accumulator: Optional[CostAccumulator] = None) -> list[dict]:
-    """Wraps _identify_license_topics_batch with shrink-and-retry on a real
-    failure — same rationale/mechanics as pdf_knowhow_drafting.py's
-    identify_knowhow_topics adaptive wrapper (live-reproduced there: a
-    same-size retry can't out-run a deterministic empty-response failure,
-    but a smaller/simpler batch is more likely to actually complete).
-    Bounded by construction: halves every recursion."""
-    chunks, failed = _identify_license_topics_batch(batch_pages_markdown, page_offset, cost_accumulator=cost_accumulator)
-    if not failed or len(batch_pages_markdown) <= 1:
-        return chunks
-
-    mid = len(batch_pages_markdown) // 2
-    logger.warning(f"[pdf_field_drafting] License batch at page {page_offset + 1} ({len(batch_pages_markdown)} pages) failed outright even after retry — splitting in half and trying again")
-    left = _identify_license_topics_batch_adaptive(batch_pages_markdown[:mid], page_offset, cost_accumulator=cost_accumulator)
-    right = _identify_license_topics_batch_adaptive(batch_pages_markdown[mid:], page_offset + mid, cost_accumulator=cost_accumulator)
-    return left + right
-
-
-def identify_license_topics(pages_markdown: list[str], cost_accumulator: Optional[CostAccumulator] = None) -> list[LicenseTopicBounds]:
-    """Splits a structured_license-shaped PDF into 0..N distinct license/
-    procedure topics, mirroring pdf_knowhow_drafting.py's
-    identify_knowhow_topics() — a single PDF is not guaranteed to be exactly
-    one license (could be several combined announcements, or none at all).
-    Each topic's page_ranges gets sliced (all ranges, joined) and passed to
-    draft_fields_from_pages() independently by the caller (sqs_consumer.py),
-    producing one fully-independent ReviewItem per topic — reuses the
-    existing single-topic review/candidate-matching/decision UI unchanged
-    rather than needing a new nested per-topic decision flow.
-
-    page_ranges (plural, list of (start,end) tuples) rather than a single
-    start_page/end_page — REVISED 2026-08-24: the same topic can legitimately
-    appear in non-contiguous chunks (interrupted by an unrelated topic), and
-    forcing that into one contiguous range would either wrongly include the
-    interrupting pages' content or silently drop pages; see
-    utils/page_ranges.py's merge_topic_chunks() for how same-topic chunks
-    (identified by department+license_type, fuzzy-matched so an LLM wording
-    slip like appending "(ต่อ)" still merges) get combined.
-
-    Large documents (see _MAX_BATCH_CHARS) are split into sequential batches
-    first — same rationale/mechanics as identify_knowhow_topics's batching.
-
-    Returns [] (never raises) on failure OR on a genuine "0 topics" verdict —
-    the caller must not assume [] always means an error; see sqs_consumer.py
-    for how a truly-empty result is distinguished (falls back to treating the
-    whole document as one topic only when this call raised/failed outright,
-    not when the LLM legitimately found nothing license-related)."""
-    total_chars = sum(len(md) for md in pages_markdown)
-    if total_chars <= _MAX_BATCH_CHARS:
-        batches = [(0, pages_markdown)]
-    else:
-        batches = _split_into_batches(pages_markdown, _MAX_BATCH_CHARS)
-        logger.warning(f"[pdf_field_drafting] {len(pages_markdown)}-page document ({total_chars} chars) exceeds the single-call budget — splitting into {len(batches)} batch(es)")
-
-    chunks: list[dict] = []
-    for offset, batch in batches:
-        chunks.extend(_identify_license_topics_batch_adaptive(batch, offset, cost_accumulator=cost_accumulator))
-
-    num_pages = len(pages_markdown)
-    topics: list[LicenseTopicBounds] = merge_topic_chunks(chunks, ("department", "license_type"), _fuzzy_ratio)
-    topics = _resolve_page_overlaps(topics, pages_markdown, cost_accumulator=cost_accumulator)
-    logger.info(f"[pdf_field_drafting] Identified {len(topics)} license topic(s) (from {len(chunks)} chunk(s) across {len(batches)} batch(es)) across {num_pages} page(s)")
-    return topics
-
-
-# 2026-10 security fix: this prompt embeds raw PDF page text (combined_text
-# below, straight from OCR output) and was missing INJECTION_GUARD despite
-# every other PDF-text-embedding prompt in this file having it — an
-# oversight against this module's own stated intent (see
-# utils/prompt_safety.py's docstring: "applied everywhere uniformly"). Its
-# output directly controls which topic wins a disputed page, so a
-# successful injection here has a real, concrete effect (page content
-# silently reassigned), not just a cosmetic one — closing this gap mirrors
-# the exact pattern already proven on every other call site in this file.
-_OVERLAP_RESOLUTION_PROMPT = """หน้าต่อไปนี้ถูกระบบแบ่งหัวข้อจัดให้อยู่ใน 2 เรื่องพร้อมกันโดยผิดพลาด (ห้ามเกิดขึ้น
-แต่เกิดขึ้นจริง) ต้องเลือกว่าเนื้อหาหน้านี้ควรอยู่เรื่องไหนมากกว่ากัน — เลือกแค่ 1 เรื่อง
-
-""" + INJECTION_GUARD + """
-
-เรื่อง A: หน่วยงาน "{department_a}" — ประเภทใบอนุญาต "{license_type_a}"
-เรื่อง B: หน่วยงาน "{department_b}" — ประเภทใบอนุญาต "{license_type_b}"
-
-=== เนื้อหาหน้าที่มีปัญหา (หน้า {page_nums}) ===
-{combined_text}
-
-ตอบเป็น JSON เท่านั้น: {{"winner": "A" หรือ "B"}}
-"""
-
-
-def _resolve_page_overlaps(
-    topics: list[LicenseTopicBounds], pages_markdown: list[str], cost_accumulator: Optional[CostAccumulator] = None,
-) -> list[LicenseTopicBounds]:
-    """Same fix as pdf_knowhow_drafting.py's _resolve_page_overlaps (not
-    imported — this checks a different topic shape: department/license_type
-    instead of main_topic/sub_topic, and the two functions' prompts need
-    different label text, not worth a shared abstraction over 2 small call
-    sites). See that function's docstring for the full reasoning: merge_topic_
-    chunks() above can still leave an overlap if the LLM's raw page_ranges
-    answer claimed the same page for 2+ topics, despite the main prompt
-    already saying "ห้ามข้ามหน้าหรือซ้อนทับกัน" — this was a real, reproduced
-    failure mode for identify_knowhow_topics() (adjacent topics claiming
-    pages 6-7 in common, 2026-08/09) and there's no reason identify_license_
-    topics() is structurally immune to the identical LLM behavior, even
-    though it hasn't been separately reproduced here yet.
-
-    Resolves each contiguous run of pages overlapping between exactly 2
-    topics with one small targeted follow-up call (just those pages' text +
-    the 2 competing topic descriptions), falling back to first-topic-wins
-    only if that follow-up call itself fails — bounded, can never hang or
-    retry indefinitely."""
-    def _page_set(t: LicenseTopicBounds) -> set[int]:
-        s: set[int] = set()
-        for a, b in t["page_ranges"]:
-            s.update(range(a, b + 1))
-        return s
-
-    page_owners: dict[int, list[int]] = {}
-    for idx, t in enumerate(topics):
-        for p in _page_set(t):
-            page_owners.setdefault(p, []).append(idx)
-
-    overlapping = sorted(p for p, owners in page_owners.items() if len(owners) > 1)
-    if not overlapping:
-        return topics
-
-    # 2026-10 fix (PDF2-N3): `owners` used to be truncated to the first 2
-    # (sorted(page_owners[p])[:2]) — a genuine 3-way claim on one page
-    # still left 2 owners after "resolution" (the loser of the LLM
-    # pairwise call between owners #1/#2 was removed, but owner #3 was
-    # never considered at all, so its own page_ranges still included that
-    # page untouched). Grouped runs now keep the FULL owner set per page.
-    runs: list[tuple[list[int], tuple[int, ...]]] = []
-    for p in overlapping:
-        owners = tuple(sorted(page_owners[p]))
-        if runs and runs[-1][1] == owners and runs[-1][0][-1] == p - 1:
-            runs[-1][0].append(p)
-        else:
-            runs.append(([p], owners))
-
-    losers: dict[int, set[int]] = {}
-    client: OpenAI | None = None
-    for pages, owners in runs:
-        if len(owners) > 2:
-            # 3+-way: no bespoke multi-way prompt (rare enough not to
-            # warrant one) — deterministically keep the lowest-index
-            # owner and drop ALL others, guaranteeing exactly one owner
-            # remains for these pages (unlike the old 2-of-N truncation,
-            # which could leave 2 owners standing after "resolution").
-            winner_idx = min(owners)
-            for loser_idx in owners:
-                if loser_idx != winner_idx:
-                    losers.setdefault(loser_idx, set()).update(pages)
-            logger.warning(
-                f"[pdf_field_drafting] {len(owners)}-way page overlap at {pages} (topics {owners}) — "
-                f"no multi-way resolution prompt, deterministically assigning to topic {winner_idx}"
-            )
-            continue
-
-        idx_a, idx_b = owners
-        winner_idx, loser_idx = idx_a, idx_b  # safe default if the resolution call below fails
-        try:
-            if client is None:
-                client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
-            combined = "\n\n---\n\n".join(f"[หน้า {p}]\n{pages_markdown[p - 1]}" for p in pages)
-            prompt = _OVERLAP_RESOLUTION_PROMPT.format(
-                department_a=topics[idx_a]["department"], license_type_a=topics[idx_a]["license_type"],
-                department_b=topics[idx_b]["department"], license_type_b=topics[idx_b]["license_type"],
-                page_nums=", ".join(str(p) for p in pages),
-                combined_text=combined,
-            )
-            _call_start = time.monotonic()
-            resp = client.chat.completions.create(
-                model=conf.OPENROUTER_MODEL_PDF_TOPIC_SPLIT,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=50,
-                temperature=0,
-            )
-            log_llm_cost(logger, "FieldDrafting/ResolveOverlap", conf.OPENROUTER_MODEL_PDF_TOPIC_SPLIT, resp, time.monotonic() - _call_start, accumulator=cost_accumulator, cost_guard=get_cost_guard())
-            raw = resp.choices[0].message.content or "{}"
-            winner = parse_leading_json(raw).get("winner", "A")
-            # Fail-closed (2026-10 security fix): only an EXPLICIT "B" flips
-            # the pre-set safe default above — the old `else` branch treated
-            # any non-"A" value (malformed JSON, an injected response trying
-            # to return something unexpected, anything) as an affirmative
-            # "B" vote, which is the opposite of fail-closed. "A" and
-            # anything else now both keep the deterministic default.
-            if winner == "B":
-                winner_idx, loser_idx = idx_b, idx_a
-        except Exception as e:
-            logger.warning(f"[pdf_field_drafting] Overlap resolution call failed for pages {pages}, defaulting to first-topic-wins: {e}")
-
-        losers.setdefault(loser_idx, set()).update(pages)
-
-    resolved: list[LicenseTopicBounds] = []
-    for idx, t in enumerate(topics):
-        if idx not in losers:
-            resolved.append(t)
-            continue
-        remaining_pages = sorted(_page_set(t) - losers[idx])
-        if not remaining_pages:
-            logger.info(f"[pdf_field_drafting] Topic {t['department']!r}/{t['license_type']!r} lost all its pages to overlap resolution, dropping it")
-            continue
-        resolved.append({**t, "page_ranges": group_into_ranges(remaining_pages)})
-
-    logger.info(f"[pdf_field_drafting] Resolved {len(overlapping)} overlapping page(s) across {len(runs)} dispute(s)")
-    return resolved

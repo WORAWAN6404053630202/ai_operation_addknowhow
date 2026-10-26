@@ -1,8 +1,15 @@
 # code/service/pdf_knowhow_drafting.py
-"""Topic-identification for know-how-shaped PDFs (feature/pdf-ingestion) — for
-documents pdf_content_shape.py routed away from the structured 13-field path
-(advisory content, multi-topic documents, anything that doesn't have a single
-clean license-procedure shape).
+"""Topic-identification for PDFs (feature/pdf-ingestion).
+
+2026-10 schema-unification: this is now the universal topic-splitter, run
+unconditionally on EVERY ingested document (sqs_consumer.py's
+_build_items_direct) — the pdf_content_shape.py classification step that
+used to gate this module to only the "know_how"-shaped documents (and route
+everything else to pdf_field_drafting.py's own, now-deleted,
+identify_license_topics) was removed. Every topic this produces then always
+goes through pdf_field_drafting.py's draft_fields_from_pages — data_type is
+DERIVED from whether that drafting call found a department/license_type, not
+pre-classified. See pdf_direct_ingest.py's build_merged_documents.
 
 REVISED 2026-08-24: originally wrote to a brand-new "know_how" tab invented
 for this feature — turned out the real Sheet already has 2 established

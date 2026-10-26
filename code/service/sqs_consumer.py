@@ -32,14 +32,8 @@ from model.pdf_review_item import PageExtractionRecord, ReviewItem
 from model.pdf_review_queue_manager import PdfReviewQueueManager
 from service import pdf_direct_ingest
 from service import pdf_supersede_resolver
-from service.pdf_candidate_matching import check_category_fit, find_candidate_matches
-from service.pdf_content_shape import classify_content_shape
 from service.pdf_extraction_validation import validate_extraction
-from service.pdf_field_drafting import (
-    draft_fields_from_pages, identify_license_topics,
-    DRAFT_FIELDS_PROMPT_VERSION, TOPIC_SPLIT_PROMPT_VERSION,
-)
-from service.pdf_knowhow_candidate_matching import find_knowhow_candidate_matches
+from service.pdf_field_drafting import draft_fields_from_pages, DRAFT_FIELDS_PROMPT_VERSION
 from service.pdf_knowhow_drafting import identify_knowhow_topics, KNOWHOW_TOPIC_SPLIT_PROMPT_VERSION
 from service.pdf_large_extraction import extract_full_document
 from service.local_vector_store import add_documents as _add_documents_to_vectorstore
@@ -50,7 +44,7 @@ from utils.llm_cost_logging import CostAccumulator
 from utils.logger import get_logger
 from utils.page_ranges import format_page_ranges, group_into_ranges
 from utils.pdf_attempt_counter import get_attempt_counter
-from utils.pdf_draft_cache import content_hash, get_draft_cache
+from utils.pdf_draft_cache import LOGIC_VERSION as _DRAFT_CACHE_LOGIC_VERSION, content_hash, get_draft_cache
 from utils.pdf_ingestion_log import append_event
 
 logger = get_logger(__name__)
@@ -212,500 +206,100 @@ def _slice_by_ranges(
     return sliced_pages, sliced_markdowns
 
 
-def _build_knowhow_items(
+def _build_items_direct(
     filename: str, s3_raw_pdf_path: str, pages: list[PageExtractionRecord], page_markdowns: list[str],
-    relevance_check: Optional[dict], content_shape: dict,
-    cost_accumulator: Optional[CostAccumulator] = None, extraction_started_at: Optional[float] = None,
-) -> list[ReviewItem]:
-    """Builds ONE bundled ReviewItem (multiple knowhow_topics inside) from
-    this pages/page_markdowns slice. Safe to call on the full document OR a
-    secondary sub-slice of a mixed-shape document (see
-    _build_and_save_review_item) — identify_knowhow_topics()'s returned
-    page_ranges are always local to whatever page_markdowns was passed in,
-    and _slice_by_ranges resolves them against the SAME pages/page_markdowns
-    given here, so nesting composes correctly regardless of depth.
-
-    cost_accumulator/extraction_started_at (added 2026-09) are threaded
-    through from process_extraction_result() so the resulting ReviewItem can
-    show a document-level total cost/wall-clock time in the admin UI — see
-    model/pdf_review_item.py."""
-    item = ReviewItem(
-        filename=filename, s3_raw_pdf_path=s3_raw_pdf_path, extraction_completed_at=time.time(),
-        pages=pages, relevance_check=relevance_check, content_shape=content_shape,
-        extraction_started_at=extraction_started_at,
-    )
-    try:
-        topic_bounds = identify_knowhow_topics(page_markdowns, cost_accumulator=cost_accumulator)
-        knowhow_topics = []
-        covered_local: set[int] = set()
-        for t in topic_bounds:
-            topic_pages, topic_markdowns = _slice_by_ranges(pages, page_markdowns, t["page_ranges"])
-            for s, e in t["page_ranges"]:
-                covered_local.update(range(s, e + 1))
-            topic_dict = {
-                "document_title": t["document_title"],
-                "source_type": t["source_type"],
-                "main_topic": t["main_topic"],
-                "sub_topic": t["sub_topic"],
-                "summary": t["summary"],
-                "category": t["category"],
-                "page_range": format_page_ranges([p.page_num for p in topic_pages]),
-                "full_text": "\n\n---\n\n".join(topic_markdowns),
-            }
-            # 2026-09: know-how items previously had NO duplicate-detection at
-            # all (unlike the regulatory path's find_candidate_matches below)
-            # — admin_pdf.py always submitted decision_type="new" for this
-            # path as a direct consequence. candidate_matches lives INSIDE
-            # each topic dict (not on ReviewItem.candidate_matches, which is
-            # a single field designed for the regulatory model's one-item-
-            # per-topic shape) because one know-how ReviewItem holds MULTIPLE
-            # topics, each needing its own independent candidate check.
-            try:
-                topic_dict["candidate_matches"] = find_knowhow_candidate_matches(
-                    topic_dict, cost_accumulator=cost_accumulator
-                )
-            except Exception as e:
-                logger.error(f"[SQSConsumer] Know-how candidate matching failed for {filename} ({t['main_topic']!r}/{t['sub_topic']!r}), continuing without it: {e}")
-            knowhow_topics.append(topic_dict)
-
-        # Defensive: the prompt REQUIRES every page land in some topic, and
-        # live-testing confirms it reliably does — but an LLM not perfectly
-        # following an instruction is exactly the kind of thing that must not
-        # silently lose content if it ever happens (see the sibling gap this
-        # same sweep found in _build_license_items, where exclusion is
-        # actually the INTENDED behavior). No second LLM call here — just a
-        # deterministic catch-all topic over whatever local page_markdowns
-        # index wasn't claimed by anything, verbatim, so nothing vanishes.
-        uncovered_local = sorted(set(range(1, len(page_markdowns) + 1)) - covered_local)
-        if uncovered_local:
-            logger.warning(f"[SQSConsumer] {filename}: know-how splitting left {len(uncovered_local)} page(s) uncovered ({uncovered_local}), adding a catch-all topic")
-            uncovered_ranges = group_into_ranges(uncovered_local)
-            leftover_pages, leftover_markdowns = _slice_by_ranges(pages, page_markdowns, uncovered_ranges)
-            fallback_doc_title = topic_bounds[0]["document_title"] if topic_bounds else filename
-            fallback_source_type = topic_bounds[0]["source_type"] if topic_bounds else "document"
-            knowhow_topics.append({
-                "document_title": fallback_doc_title,
-                "source_type": fallback_source_type,
-                "main_topic": "เนื้อหาที่เหลือ (ไม่ถูกจัดหมวดหมู่โดยอัตโนมัติ)",
-                "sub_topic": "ตรวจสอบและจัดหมวดหมู่ด้วยตนเอง",
-                "summary": "",
-                "category": "",
-                "page_range": format_page_ranges([p.page_num for p in leftover_pages]),
-                "full_text": "\n\n---\n\n".join(leftover_markdowns),
-            })
-
-        item.knowhow_topics = knowhow_topics
-        logger.info(f"[SQSConsumer] {filename}: know-how path, {len(knowhow_topics)} topic(s) identified")
-    except Exception as e:
-        logger.error(f"[SQSConsumer] Know-how topic-splitting failed for {filename}, item saved with no topics for manual handling: {e}")
-
-    if cost_accumulator is not None:
-        item.total_cost = cost_accumulator.total_cost_usd
-    _queue_manager.save(item)
-    logger.info(f"[SQSConsumer] Saved review item {item.id} for {filename} ({len(pages)} pages, shape=know_how)")
-    return [item]
-
-
-def _build_license_items(
-    filename: str, s3_raw_pdf_path: str, pages: list[PageExtractionRecord], page_markdowns: list[str],
-    relevance_check: Optional[dict], content_shape: dict,
-    cost_accumulator: Optional[CostAccumulator] = None, extraction_started_at: Optional[float] = None,
-) -> list[ReviewItem]:
-    """Builds 0..N independent ReviewItems (own candidate-matching, own
-    decision each) from this pages/page_markdowns slice — a single slice is
-    not guaranteed to be exactly one regulatory topic (could be several
-    combined announcements, or none at all). Safe to call on the full
-    document OR a secondary sub-slice of a mixed-shape document; see
-    _build_knowhow_items for why nesting composes correctly.
-
-    cost_accumulator/extraction_started_at — see _build_knowhow_items's
-    docstring, same purpose."""
-    try:
-        topic_bounds = identify_license_topics(page_markdowns, cost_accumulator=cost_accumulator)
-    except Exception as e:
-        logger.error(
-            f"[SQSConsumer] License topic-splitting failed for {filename}, falling back to treating "
-            f"this slice as one topic (old single-topic behavior): {e}"
-        )
-        topic_bounds = [{"department": "", "license_type": "", "page_ranges": [(1, len(page_markdowns))]}]
-
-    if not topic_bounds:
-        # Genuinely 0 license topics found (not a failure) — save the whole-
-        # slice item anyway with no drafted fields, so it's still visible in
-        # the queue for a human to look at/reject rather than vanishing
-        # silently. Distinguishing this from the exception fallback above
-        # matters: an LLM failure must not look identical to "confirmed
-        # nothing here".
-        logger.info(f"[SQSConsumer] {filename}: no license topics identified in this slice — saving unlabeled item for manual review")
-        item = ReviewItem(
-            filename=filename, s3_raw_pdf_path=s3_raw_pdf_path, extraction_completed_at=time.time(),
-            pages=pages, relevance_check=relevance_check, content_shape=content_shape,
-            extraction_started_at=extraction_started_at,
-        )
-        if cost_accumulator is not None:
-            item.total_cost = cost_accumulator.total_cost_usd
-        _queue_manager.save(item)
-        logger.info(f"[SQSConsumer] Saved review item {item.id} for {filename} ({len(pages)} pages, shape=structured_license, 0 topics)")
-        return [item]
-
-    items: list[ReviewItem] = []
-    covered_local: set[int] = set()
-    for topic in topic_bounds:
-        topic_pages, topic_markdowns = _slice_by_ranges(pages, page_markdowns, topic["page_ranges"])
-        for s, e in topic["page_ranges"]:
-            covered_local.update(range(s, e + 1))
-
-        topic_item = ReviewItem(
-            filename=filename, s3_raw_pdf_path=s3_raw_pdf_path, extraction_completed_at=time.time(),
-            pages=topic_pages, relevance_check=relevance_check, content_shape=content_shape,
-            extraction_started_at=extraction_started_at,
-        )
-        # Was unwrapped until 2026-08-28 — the one call in this function
-        # without error handling, unlike every sibling call around it. When
-        # draft_fields_from_pages() escalates to Sonnet for an oversized
-        # field (max_tokens=6000, the largest in the PDF pipeline) and that
-        # call fails, the exception used to propagate all the way up through
-        # process_extraction_result(), so the SQS message was never deleted
-        # and SQS redelivered it for a full-cost retry from page 1 — 47
-        # times over ~24h on one document, ~$78-80 in OpenRouter spend
-        # before anyone noticed. Matching the candidate_matches/
-        # category_fit_check pattern below: log and leave the item
-        # (llm_drafted_fields stays None) for manual review instead of
-        # losing the whole item to one field-drafting failure.
-        try:
-            topic_item.llm_drafted_fields = draft_fields_from_pages(topic_markdowns, cost_accumulator=cost_accumulator)
-        except Exception as e:
-            logger.error(f"[SQSConsumer] Field drafting failed for {filename} ({topic['department']!r}/{topic['license_type']!r}), continuing without it: {e}")
-        page_str = format_page_ranges([p.page_num for p in topic_pages])
-        try:
-            topic_item.candidate_matches = find_candidate_matches(topic_item, cost_accumulator=cost_accumulator)
-        except Exception as e:
-            logger.error(f"[SQSConsumer] Candidate matching failed for {filename} ({topic['department']!r}/{topic['license_type']!r}), continuing without it: {e}")
-        try:
-            topic_item.category_fit_check = check_category_fit(topic_item, cost_accumulator=cost_accumulator)
-        except Exception as e:
-            logger.error(f"[SQSConsumer] Category-fit check failed for {filename} ({topic['department']!r}/{topic['license_type']!r}), continuing without it: {e}")
-
-        _queue_manager.save(topic_item)
-        logger.info(
-            f"[SQSConsumer] Saved review item {topic_item.id} for {filename} "
-            f"(pages {page_str}, dept={topic['department']!r}, license_type={topic['license_type']!r})"
-        )
-        items.append(topic_item)
-
-    # Live-testing found a real gap here: identify_license_topics() correctly
-    # (by design) excludes pages that don't describe a license procedure —
-    # but those pages must not just vanish. Route them through the know-how
-    # pipeline instead (one hop, not recursive — _build_knowhow_items has its
-    # own deterministic no-LLM fallback for ITS uncovered pages, so this
-    # can't chain indefinitely even in a pathological case).
-    uncovered_local = sorted(set(range(1, len(page_markdowns) + 1)) - covered_local)
-    if uncovered_local:
-        logger.info(f"[SQSConsumer] {filename}: pages {uncovered_local} weren't part of any license topic, routing through know-how instead")
-        uncovered_ranges = group_into_ranges(uncovered_local)
-        leftover_pages, leftover_markdowns = _slice_by_ranges(pages, page_markdowns, uncovered_ranges)
-        items.extend(_build_knowhow_items(
-            filename, s3_raw_pdf_path, leftover_pages, leftover_markdowns, relevance_check, content_shape,
-            cost_accumulator=cost_accumulator, extraction_started_at=extraction_started_at,
-        ))
-
-    # Stamped here, once, after everything above (all topics' drafting/
-    # matching + any uncovered-pages know-how routing) has had its chance to
-    # add to cost_accumulator — stamping earlier (e.g. inside the per-topic
-    # loop) would give earlier topics a falsely-low total that doesn't
-    # include cost incurred processing LATER topics. Every item from this
-    # one document-level accumulator gets the same final total — see
-    # _build_knowhow_items's docstring for why per-item cost isn't
-    # meaningfully separable. Re-save is safe/cheap: PdfReviewQueueManager
-    # upserts by id, this isn't creating duplicates.
-    if cost_accumulator is not None:
-        for it in items:
-            it.total_cost = cost_accumulator.total_cost_usd
-            _queue_manager.save(it)
-
-    return items
-
-
-def _build_knowhow_items_direct(
-    filename: str, s3_raw_pdf_path: str, pages: list[PageExtractionRecord], page_markdowns: list[str],
-    relevance_check: Optional[dict], content_shape: dict,
     cost_accumulator: Optional[CostAccumulator] = None, extraction_started_at: Optional[float] = None,
 ) -> list:
-    """No-human-review counterpart to _build_knowhow_items (2026-09,
-    feature/pdf-ingestion architectural pivot) — writes chunked know-how
-    topics straight into the live vectorstore instead of a ReviewItem, no
-    candidate-matching/Sheet write-back. Mirrors _build_knowhow_items's
-    topic-splitting + uncovered-pages catch-all exactly (same fault-isolation
-    philosophy — one bad topic/page range must not lose the rest of the
-    document). s3_raw_pdf_path/relevance_check/content_shape/
-    extraction_started_at are accepted only so this matches
-    _build_knowhow_items's call signature 1:1 for the primary_builder/
-    secondary_builder swap in _build_and_save_review_item — unused here,
-    since there's no ReviewItem to attach them to.
+    """No-human-review, unified direct-ingest builder (2026-10, PDF
+    ingestion schema unification) — replaces _build_knowhow_items_direct +
+    _build_license_items_direct and the upfront classify_content_shape()
+    call that used to choose between them.
+
+    Every document now goes through ONE pipeline: topic-split
+    (identify_knowhow_topics — main_topic/sub_topic is general enough to
+    describe any content, regulatory or not) → for EVERY resulting topic,
+    always field-draft (draft_fields_from_pages — department/license_type/
+    fees/etc., already tolerant of coming back empty). data_type is
+    DERIVED per topic (see pdf_direct_ingest.build_merged_documents) from
+    whether department/license_type ended up drafted non-empty — never
+    pre-classified. This is what fixes the misclassification bug class
+    this merge exists for: a law with real penalties but no application-
+    procedure phrasing (e.g. "กำหนดเวลาห้ามขายเครื่องดื่มแอลกอฮอล์.pdf")
+    now correctly resolves to regulatory once its department/
+    legal_regulatory get drafted, regardless of how it's phrased — while a
+    commercial how-to with no government agency involved (e.g. QR-payment/
+    EDC setup guides) still correctly stays business_guide, since nothing
+    sweeps content into regulatory based on having procedural steps alone.
 
     Always returns [] — poll_and_process_forever() only checks whether
     processing raised an exception, never inspects the returned list's
-    length or contents, so an empty return is safe (confirmed by reading
-    that function before this was written)."""
+    length or contents."""
     # 2026-10 fix (PDF2-M3): cost_accumulator is shared and cumulative
-    # across a whole document's processing — a document that routes
-    # through BOTH builders (uncovered-pages routing, or the mixed-shape
-    # secondary pass) used to have each builder's append_event log the
-    # accumulator's FULL running total, not just its own share, double-
-    # (or more-) counting the same spend in the dashboard's activity log.
-    # Snapshot on entry and log only the delta accrued during this call.
+    # across a whole document's processing — snapshot on entry and log
+    # only the delta accrued during this call, not the accumulator's full
+    # running total (relevant again once a document's processing spans
+    # more than one append_event call elsewhere in the pipeline).
     _cost_at_entry = cost_accumulator.total_cost_usd if cost_accumulator is not None else 0.0
+
     # Content-hash cache check (2026-10) — see utils/pdf_draft_cache.py. An
     # exact re-upload of a document whose pages extract to the identical
-    # text skips this LLM call entirely; a cache miss behaves exactly as
-    # before. Never blocks the pipeline — any cache error falls through to
-    # the real call below.
-    _topic_split_cache_key = f"knowhow_topics:{KNOWHOW_TOPIC_SPLIT_PROMPT_VERSION}:{content_hash(chr(10).join(page_markdowns))}"
+    # text skips this LLM call entirely. Never blocks the pipeline — any
+    # cache error falls through to the real call below.
+    _topic_split_cache_key = f"topics:{KNOWHOW_TOPIC_SPLIT_PROMPT_VERSION}:{_DRAFT_CACHE_LOGIC_VERSION}:{content_hash(chr(10).join(page_markdowns))}"
     topic_bounds = get_draft_cache().get(_topic_split_cache_key)
     if topic_bounds is not None:
-        logger.info(f"[SQSConsumer] {filename}: know-how topic-split cache HIT — skipped LLM call")
+        logger.info(f"[SQSConsumer] {filename}: topic-split cache HIT — skipped LLM call")
     else:
         try:
             topic_bounds = identify_knowhow_topics(page_markdowns, cost_accumulator=cost_accumulator)
         except Exception as e:
-            logger.error(f"[SQSConsumer] Know-how topic-splitting failed for {filename}, nothing written for this slice: {e}")
+            logger.error(f"[SQSConsumer] Topic-splitting failed for {filename}, nothing written: {e}")
             return []
         # 2026-10 fix (PDF-M1): identify_knowhow_topics never raises by design
         # (degrades to [] on a real LLM failure, same as "0 topics found" —
         # see its own docstring) — only cache a non-empty result, so a
-        # transient outage can't get permanently cached as "no topics here"
-        # (this cache has no TTL; only the prompt-version segment in the key
-        # invalidates it). Recomputing an empty result costs nothing extra.
+        # transient outage can't get permanently cached as "no topics here".
         if topic_bounds:
             get_draft_cache().put(_topic_split_cache_key, topic_bounds)
-
-    knowhow_topics = []
-    retire_doc_ids: list[str] = []
-    covered_local: set[int] = set()
-    new_count = update_count = duplicate_count = 0
-    for t in topic_bounds:
-        topic_pages, topic_markdowns = _slice_by_ranges(pages, page_markdowns, t["page_ranges"])
-        for s, e in t["page_ranges"]:
-            covered_local.update(range(s, e + 1))
-        topic_dict = {
-            "document_title": t["document_title"],
-            "source_type": t["source_type"],
-            "main_topic": t["main_topic"],
-            "sub_topic": t["sub_topic"],
-            "summary": t["summary"],
-            "category": t["category"],
-            "page_range": format_page_ranges([p.page_num for p in topic_pages]),
-            "full_text": "\n\n---\n\n".join(topic_markdowns),
-        }
-
-        # Automated supersede resolution — see _build_license_items_direct's
-        # identical pattern above and pdf_supersede_resolver.py's docstring.
-        try:
-            decision = pdf_supersede_resolver.resolve_knowhow_topic(
-                topic_dict, filename, cost_accumulator=cost_accumulator,
-            )
-        except Exception as e:
-            logger.error(
-                f"[SQSConsumer] Supersede resolution failed for {filename} "
-                f"({t['main_topic']!r}/{t['sub_topic']!r}), defaulting to new: {e}"
-            )
-            decision = None
-
-        if decision is not None and decision.decision == "duplicate":
-            logger.info(
-                f"[SQSConsumer] {filename} topic ({t['main_topic']!r}/{t['sub_topic']!r}): "
-                f"duplicate of {decision.matched_doc_ids} — skipping, nothing added"
-            )
-            duplicate_count += 1
-            continue
-        if decision is not None and decision.decision == "update":
-            # A know-how topic can span multiple chunk_index/chunk_total
-            # sub-documents — retiring only the surfaced chunk(s) would
-            # orphan its siblings. Expand to the full set sharing the
-            # matched doc's own main_topic/sub_topic before retiring.
-            #
-            # 2026-10 fix: this call used to be the ONE unwrapped fallible
-            # call in this whole function (every sibling call below —
-            # vectorstore write, archive/retire, activity log — already
-            # catches its own failures) — a transient Chroma error here
-            # would raise straight out of this function with no attempt cap
-            # backing it up on this code path, unlike the handoff path's
-            # _MAX_HANDOFF_ATTEMPTS. Falls back to retiring just the
-            # directly-matched ids (pre-expansion behavior) rather than
-            # losing the whole document's processing to one lookup failure —
-            # may orphan a sibling chunk in the rare failure case, self-heals
-            # on the next upload of this topic, same as every other
-            # degraded-but-safe path in this pipeline.
-            try:
-                expanded = pdf_supersede_resolver.expand_knowhow_matches_to_full_chunks(decision.matched_doc_ids)
-            except Exception as e:
-                logger.error(
-                    f"[SQSConsumer] {filename} topic ({t['main_topic']!r}/{t['sub_topic']!r}): "
-                    f"expand_knowhow_matches_to_full_chunks failed, retiring only the directly-matched "
-                    f"id(s) instead of the full sibling set: {e}"
-                )
-                expanded = decision.matched_doc_ids
-            logger.info(
-                f"[SQSConsumer] {filename} topic ({t['main_topic']!r}/{t['sub_topic']!r}): "
-                f"update — will retire {expanded} after the new doc(s) are written"
-            )
-            retire_doc_ids.extend(expanded)
-            update_count += 1
-        else:
-            new_count += 1
-
-        knowhow_topics.append(topic_dict)
-
-    # Same deterministic catch-all as _build_knowhow_items — see its comment
-    # for why this exists even though the prompt requires full coverage.
-    # Always treated as NEW by the resolver (see
-    # pdf_supersede_resolver.KNOWHOW_CATCHALL_MAIN_TOPIC), so no resolution
-    # call is needed for it.
-    uncovered_local = sorted(set(range(1, len(page_markdowns) + 1)) - covered_local)
-    if uncovered_local:
-        logger.warning(f"[SQSConsumer] {filename}: know-how splitting left {len(uncovered_local)} page(s) uncovered ({uncovered_local}), adding a catch-all topic")
-        uncovered_ranges = group_into_ranges(uncovered_local)
-        leftover_pages, leftover_markdowns = _slice_by_ranges(pages, page_markdowns, uncovered_ranges)
-        fallback_doc_title = topic_bounds[0]["document_title"] if topic_bounds else filename
-        fallback_source_type = topic_bounds[0]["source_type"] if topic_bounds else "document"
-        knowhow_topics.append({
-            "document_title": fallback_doc_title,
-            "source_type": fallback_source_type,
-            "main_topic": "เนื้อหาที่เหลือ (ไม่ถูกจัดหมวดหมู่โดยอัตโนมัติ)",
-            "sub_topic": "ตรวจสอบและจัดหมวดหมู่ด้วยตนเอง",
-            "summary": "",
-            "category": "",
-            "page_range": format_page_ranges([p.page_num for p in leftover_pages]),
-            "full_text": "\n\n---\n\n".join(leftover_markdowns),
-        })
-
-    write_error: Optional[str] = None
-    try:
-        docs = pdf_direct_ingest.build_knowhow_documents(knowhow_topics, filename)
-        added = _add_documents_to_vectorstore(docs)
-        logger.info(f"[SQSConsumer] {filename}: wrote {added} know-how doc(s) directly to vectorstore ({len(knowhow_topics)} topic(s) identified)")
-        # Write-new-before-retire-old — see _build_license_items_direct's
-        # identical comment above.
-        if retire_doc_ids:
-            try:
-                _archive_and_remove_in_vectorstore(
-                    _filter_to_pdf_auto_ids(retire_doc_ids, filename), reason=f"superseded by {filename}",
-                )
-            except Exception as e:
-                logger.error(
-                    f"[SQSConsumer] Archiving superseded doc(s) failed for {filename} "
-                    f"— old doc(s) remain live alongside the new one(s): {e}"
-                )
-    except Exception as e:
-        logger.error(f"[SQSConsumer] Direct vectorstore write failed for {filename} (know-how), nothing written for this slice: {e}")
-        write_error = str(e)
-        _save_vectorstore_write_failure(filename, s3_raw_pdf_path, e)
-
-    # Activity log for the admin dashboard (2026-10) — display-only, see
-    # utils/pdf_ingestion_log.py. Never blocks/raises; a logging failure
-    # here must not affect the real ingestion work above.
-    _high_count, _high_examples = _high_severity_flag_summary(pages)
-    # 2026-10 fix (PDF2-M3): log only this builder's own delta since entry,
-    # not the shared accumulator's full running total — see the matching
-    # comment at this function's top.
-    _cost_delta = max(0.0, (cost_accumulator.total_cost_usd if cost_accumulator is not None else 0.0) - _cost_at_entry)
-    append_event(conf.PDF_INGESTION_S3_BUCKET, {
-        "filename": filename, "shape": "know_how",
-        "new_count": new_count, "update_count": update_count, "duplicate_count": duplicate_count,
-        "cost_usd": _cost_delta,
-        "error": write_error,
-        "high_severity_flags": _high_count,
-        "high_severity_flag_examples": _high_examples,
-    })
-
-    return []
-
-
-def _build_license_items_direct(
-    filename: str, s3_raw_pdf_path: str, pages: list[PageExtractionRecord], page_markdowns: list[str],
-    relevance_check: Optional[dict], content_shape: dict,
-    cost_accumulator: Optional[CostAccumulator] = None, extraction_started_at: Optional[float] = None,
-) -> list:
-    """No-human-review counterpart to _build_license_items (2026-09) — see
-    _build_knowhow_items_direct's docstring for the shared rationale/return
-    contract. Uses the 13-field schema
-    (pdf_direct_ingest.build_regulatory_documents_full), the empirically-
-    proven winner over the simple main_topic/sub_topic shape for regulatory
-    content: a 2026-09 real schema A/B test (2 real labor-law topics, 4 real
-    questions through the actual PersonaSupervisor) found the simple schema
-    answered "ยังไม่พบข้อมูลในเอกสารครับ" on a real penalty/legal-consequence
-    question that the 13-field schema answered correctly and specifically —
-    because entity-injection/2-pass retrieval/exact-match chapter-fetch in
-    persona_supervisor.py key off these exact 13 fields + topic_group +
-    entity_type_normalized directly, not just semantic similarity."""
-    # 2026-10 fix (PDF2-M3): see _build_knowhow_items_direct's matching
-    # comment — log only this builder's own cost delta, not the shared
-    # accumulator's full running total.
-    _cost_at_entry = cost_accumulator.total_cost_usd if cost_accumulator is not None else 0.0
-    # Content-hash cache check — see the identical pattern/rationale in
-    # _build_knowhow_items_direct above.
-    _topic_split_cache_key = f"license_topics:{TOPIC_SPLIT_PROMPT_VERSION}:{content_hash(chr(10).join(page_markdowns))}"
-    topic_bounds = get_draft_cache().get(_topic_split_cache_key)
-    if topic_bounds is not None:
-        logger.info(f"[SQSConsumer] {filename}: license topic-split cache HIT — skipped LLM call")
-    else:
-        try:
-            topic_bounds = identify_license_topics(page_markdowns, cost_accumulator=cost_accumulator)
-        except Exception as e:
-            logger.error(f"[SQSConsumer] License topic-splitting failed for {filename}, nothing written for this slice: {e}")
-            return []
-        # 2026-10 fix (PDF-M1): same rationale as _build_knowhow_items_direct's
-        # identical guard above — identify_license_topics never raises by
-        # design, so a real failure degrades to [] indistinguishable from a
-        # genuine "0 topics" verdict; only cache it when non-empty.
-        if topic_bounds:
-            get_draft_cache().put(_topic_split_cache_key, topic_bounds)
-
-    if not topic_bounds:
-        logger.info(f"[SQSConsumer] {filename}: no license topics identified in this slice, nothing written")
-        return []
 
     merged_topics = []
     retire_doc_ids: list[str] = []
     covered_local: set[int] = set()
     new_count = update_count = duplicate_count = 0
-    for topic in topic_bounds:
-        topic_pages, topic_markdowns = _slice_by_ranges(pages, page_markdowns, topic["page_ranges"])
-        _draft_cache_key = f"license_draft:{DRAFT_FIELDS_PROMPT_VERSION}:{content_hash(chr(10).join(topic_markdowns))}"
+    regulatory_count = business_guide_count = 0
+
+    for t in topic_bounds:
+        topic_pages, topic_markdowns = _slice_by_ranges(pages, page_markdowns, t["page_ranges"])
+
+        _draft_cache_key = f"draft:{DRAFT_FIELDS_PROMPT_VERSION}:{_DRAFT_CACHE_LOGIC_VERSION}:{content_hash(chr(10).join(topic_markdowns))}"
         drafted = get_draft_cache().get(_draft_cache_key)
         if drafted is not None:
-            logger.info(f"[SQSConsumer] {filename} topic ({topic['department']!r}/{topic['license_type']!r}): field-draft cache HIT — skipped LLM call")
+            logger.info(f"[SQSConsumer] {filename} topic ({t['main_topic']!r}/{t['sub_topic']!r}): field-draft cache HIT — skipped LLM call")
         else:
             try:
                 drafted = draft_fields_from_pages(topic_markdowns, cost_accumulator=cost_accumulator)
             except Exception as e:
-                logger.error(f"[SQSConsumer] Field drafting failed for {filename} ({topic['department']!r}/{topic['license_type']!r}), nothing written for this topic: {e}")
+                logger.error(f"[SQSConsumer] Field drafting failed for {filename} ({t['main_topic']!r}/{t['sub_topic']!r}), nothing written for this topic: {e}")
                 continue
             # 2026-10 fix (PDF-M1): draft_fields_from_pages also never raises
-            # on a malformed/empty LLM response (swallows json.JSONDecodeError
-            # internally, returns all-13-fields-blank — see its own try/except)
-            # — same risk as the topic-split caches above, just shaped as "all
-            # values empty" instead of "empty list". Only cache when at least
+            # on a malformed/empty LLM response — only cache when at least
             # one field actually drafted to something.
             if any(str(v).strip() for v in (drafted or {}).values()):
                 get_draft_cache().put(_draft_cache_key, drafted)
-        # 2026-10 fix (PDF2-C4): this used to be marked BEFORE the drafting
-        # try/except above, right after slicing — so a topic whose drafting
-        # call failed (the `continue` 2 lines up) had its pages already
-        # marked "covered", and the uncovered-pages fallback below (which
-        # routes unclaimed pages through _build_knowhow_items_direct) never
-        # saw them. Unlike the review-queue sibling (which keeps a
-        # llm_drafted_fields=None placeholder), this direct-ingest path had
-        # nothing left for those pages at all: no vectorstore doc, no
-        # ReviewItem, no vectorstore-write-failure placeholder — just this
-        # one log line. Only mark pages covered once drafting has actually
-        # succeeded (cache hit or fresh call), so a failed topic's pages
-        # fall through to the know-how rescue instead of vanishing.
-        for s, e in topic["page_ranges"]:
+
+        # 2026-10 fix (PDF2-C4): mark pages covered only once drafting has
+        # actually succeeded (cache hit or fresh call) — a topic whose
+        # drafting call failed (the `continue` above) falls through to the
+        # catch-all below instead of silently vanishing with no vectorstore
+        # doc and no recovery placeholder.
+        for s, e in t["page_ranges"]:
             covered_local.update(range(s, e + 1))
-        merged = pdf_direct_ingest.merge_drafted_fields(topic, drafted)
+
+        merged = pdf_direct_ingest.merge_drafted_fields(t, drafted)
         merged["page_range"] = format_page_ranges([p.page_num for p in topic_pages])
-        merged["_raw_text"] = "\n\n".join(topic_markdowns)
+        full_text = "\n\n---\n\n".join(topic_markdowns)
+        merged["full_text"] = full_text
+        merged["_raw_text"] = full_text
 
         # Automated supersede resolution (2026-10, no-human-review pipeline) —
         # decide against LIVE Chroma whether this topic is new/update/
@@ -714,41 +308,82 @@ def _build_license_items_direct(
         # infers a retirement from a failed call — see
         # pdf_supersede_resolver.py's module docstring.
         try:
-            decision = pdf_supersede_resolver.resolve_regulatory_topic(
+            decision = pdf_supersede_resolver.resolve_topic(
                 merged, filename, cost_accumulator=cost_accumulator,
             )
         except Exception as e:
             logger.error(
                 f"[SQSConsumer] Supersede resolution failed for {filename} "
-                f"({topic['department']!r}/{topic['license_type']!r}), defaulting to new: {e}"
+                f"({merged.get('main_topic')!r}/{merged.get('sub_topic')!r}), defaulting to new: {e}"
             )
             decision = None
 
         if decision is not None and decision.decision == "duplicate":
             logger.info(
-                f"[SQSConsumer] {filename} topic ({topic['department']!r}/{topic['license_type']!r}): "
+                f"[SQSConsumer] {filename} topic ({merged.get('main_topic')!r}/{merged.get('sub_topic')!r}): "
                 f"duplicate of {decision.matched_doc_ids} — skipping, nothing added"
             )
             duplicate_count += 1
             continue
         if decision is not None and decision.decision == "update":
+            # 2026-10 fix (live incident follow-up): retiring only what the
+            # resolver itself directly confirmed (matched_doc_ids) — NOT
+            # expanded to every sibling chunk sharing a topic identity
+            # (that mechanism, expand_knowhow_matches_to_full_chunks, was
+            # removed earlier this same audit: it assumed the new topic's
+            # chunk set was a complete replacement for the whole old topic,
+            # never actually verified — the exact "full cleanup" anti-
+            # pattern LangChain's own indexing-API docs warn against). An
+            # unmatched sibling chunk can be left live looking "redundant"
+            # rather than silently deleted — the accepted, cheaper-to-carry
+            # risk per this module's own stated default-to-new philosophy.
             logger.info(
-                f"[SQSConsumer] {filename} topic ({topic['department']!r}/{topic['license_type']!r}): "
-                f"update — will retire {decision.matched_doc_ids} after the new doc is written"
+                f"[SQSConsumer] {filename} topic ({merged.get('main_topic')!r}/{merged.get('sub_topic')!r}): "
+                f"update — will retire {decision.matched_doc_ids} after the new doc(s) are written"
             )
             retire_doc_ids.extend(decision.matched_doc_ids)
             update_count += 1
         else:
             new_count += 1
 
+        if merged.get("department") or merged.get("license_type"):
+            regulatory_count += 1
+        else:
+            business_guide_count += 1
         merged_topics.append(merged)
+
+    # Deterministic catch-all for uncovered pages — the single remaining
+    # fallback now that there's only one builder (the old recursive hop
+    # between two separate builders no longer exists by construction).
+    # Always treated as NEW by the resolver (see
+    # pdf_supersede_resolver.KNOWHOW_CATCHALL_MAIN_TOPIC), so no resolution
+    # call is needed for it.
+    uncovered_local = sorted(set(range(1, len(page_markdowns) + 1)) - covered_local)
+    if uncovered_local:
+        logger.warning(f"[SQSConsumer] {filename}: topic-splitting left {len(uncovered_local)} page(s) uncovered ({uncovered_local}), adding a catch-all topic")
+        uncovered_ranges = group_into_ranges(uncovered_local)
+        leftover_pages, leftover_markdowns = _slice_by_ranges(pages, page_markdowns, uncovered_ranges)
+        fallback_doc_title = topic_bounds[0]["document_title"] if topic_bounds else filename
+        fallback_source_type = topic_bounds[0]["source_type"] if topic_bounds else "document"
+        merged_topics.append({
+            "document_title": fallback_doc_title,
+            "source_type": fallback_source_type,
+            "main_topic": pdf_supersede_resolver.KNOWHOW_CATCHALL_MAIN_TOPIC,
+            "sub_topic": "ตรวจสอบและจัดหมวดหมู่ด้วยตนเอง",
+            "page_range": format_page_ranges([p.page_num for p in leftover_pages]),
+            "full_text": "\n\n---\n\n".join(leftover_markdowns),
+        })
+        business_guide_count += 1
 
     write_error: Optional[str] = None
     if merged_topics:
         try:
-            docs = pdf_direct_ingest.build_regulatory_documents_full(merged_topics, filename)
+            docs = pdf_direct_ingest.build_merged_documents(merged_topics, filename)
             added = _add_documents_to_vectorstore(docs)
-            logger.info(f"[SQSConsumer] {filename}: wrote {added} regulatory doc(s) directly to vectorstore ({len(merged_topics)} topic(s))")
+            logger.info(
+                f"[SQSConsumer] {filename}: wrote {added} doc(s) directly to vectorstore "
+                f"({len(merged_topics)} topic(s): {regulatory_count} regulatory, {business_guide_count} business_guide)"
+            )
             # Write-new-before-retire-old, deliberately: a crash between
             # these two steps leaves both versions momentarily live (self-
             # heals on the next upload of that topic), never zero live
@@ -764,36 +399,27 @@ def _build_license_items_direct(
                         f"— old doc(s) remain live alongside the new one(s): {e}"
                     )
         except Exception as e:
-            logger.error(f"[SQSConsumer] Direct vectorstore write failed for {filename} (regulatory), nothing written: {e}")
+            logger.error(f"[SQSConsumer] Direct vectorstore write failed for {filename}, nothing written: {e}")
             write_error = str(e)
             _save_vectorstore_write_failure(filename, s3_raw_pdf_path, e)
 
-    # Activity log for the admin dashboard (2026-10) — see the identical
-    # pattern/rationale in _build_knowhow_items_direct above.
+    # Activity log for the admin dashboard (2026-10) — display-only, see
+    # utils/pdf_ingestion_log.py. Never blocks/raises; a logging failure
+    # here must not affect the real ingestion work above. "shape" (structured_
+    # license|know_how) no longer exists as a document-level concept — logs
+    # the regulatory/business_guide topic-count breakdown instead, more
+    # informative since one document can now genuinely produce a mix.
     _high_count, _high_examples = _high_severity_flag_summary(pages)
     _cost_delta = max(0.0, (cost_accumulator.total_cost_usd if cost_accumulator is not None else 0.0) - _cost_at_entry)
     append_event(conf.PDF_INGESTION_S3_BUCKET, {
-        "filename": filename, "shape": "structured_license",
+        "filename": filename,
+        "regulatory_count": regulatory_count, "business_guide_count": business_guide_count,
         "new_count": new_count, "update_count": update_count, "duplicate_count": duplicate_count,
         "cost_usd": _cost_delta,
         "error": write_error,
         "high_severity_flags": _high_count,
         "high_severity_flag_examples": _high_examples,
     })
-
-    # Same routing-gap fix as _build_license_items — pages that don't
-    # describe a license procedure go through the know-how direct path
-    # instead of vanishing (one hop, not recursive — see original for why
-    # this can't chain indefinitely).
-    uncovered_local = sorted(set(range(1, len(page_markdowns) + 1)) - covered_local)
-    if uncovered_local:
-        logger.info(f"[SQSConsumer] {filename}: pages {uncovered_local} weren't part of any license topic, routing through know-how instead")
-        uncovered_ranges = group_into_ranges(uncovered_local)
-        leftover_pages, leftover_markdowns = _slice_by_ranges(pages, page_markdowns, uncovered_ranges)
-        _build_knowhow_items_direct(
-            filename, s3_raw_pdf_path, leftover_pages, leftover_markdowns, relevance_check, content_shape,
-            cost_accumulator=cost_accumulator, extraction_started_at=extraction_started_at,
-        )
 
     return []
 
@@ -802,33 +428,30 @@ def _build_and_save_review_item(
     filename: str, s3_raw_pdf_path: str, raw_pages: list[dict], use_llm_comparison: bool = False,
     extraction_cost_usd: float = 0.0, extraction_started_at: Optional[float] = None,
 ) -> list[ReviewItem]:
-    """Shared tail end of the pipeline (validate → classify → draft/split →
-    candidate matching → save) — identical regardless of whether raw_pages
-    came from Lambda's normal-size path or
-    pdf_large_extraction.extract_full_document()'s oversized-document path.
-    Keeping this as one function is what makes the handoff path "free" from
-    downstream code's perspective: nothing past this point needs to know or
-    care which extractor produced the pages.
+    """Shared tail end of the pipeline (validate → topic-split/draft → save)
+    — identical regardless of whether raw_pages came from Lambda's normal-
+    size path or pdf_large_extraction.extract_full_document()'s oversized-
+    document path. Keeping this as one function is what makes the handoff
+    path "free" from downstream code's perspective: nothing past this point
+    needs to know or care which extractor produced the pages.
 
     extraction_cost_usd/extraction_started_at (added 2026-09) come from
     whichever extractor ran BEFORE this function — Lambda includes them in
     its S3 JSON output, extract_full_document() returns them directly (see
     process_extraction_result()). Seeds this document's CostAccumulator so
     the OCR/vision-verify spend that already happened is included in the
-    total shown in the admin UI, not just the build-phase (classify/draft/
-    match) cost this function's own calls add on top.
+    total shown in the admin UI, not just the build-phase cost this
+    function's own calls add on top.
 
-    Returns a LIST of ReviewItems, not one:
-      - structured_license content splits into 0..N independent topics
-        (identify_license_topics) — a PDF isn't guaranteed to be exactly one
-        license, could be several combined announcements or none at all.
-      - REVISED 2026-08-24: a document can also genuinely MIX both shapes
-        (live-tested and confirmed — e.g. a clean license procedure followed
-        by unrelated general business advice). classify_content_shape()'s
-        secondary_pages flags a substantial chunk of the OTHER shape when
-        present; that chunk is run through the OTHER pipeline too, producing
-        additional sibling item(s) alongside the primary one, instead of
-        silently dropping whichever shape didn't win the primary classification."""
+    Always returns [] — _build_items_direct writes straight to the
+    vectorstore and never produces a ReviewItem on this path (2026-09
+    architectural pivot: PDFs write directly, no human review/candidate-
+    matching/Sheet write-back). 2026-10 (schema unification): the upfront
+    classify_content_shape() call and the primary/secondary mixed-shape
+    routing this function used to do are both gone — every document now
+    goes through the one unified builder, which handles a genuine mix of
+    regulatory/business_guide content per-topic internally instead of
+    needing a document-level shape decision at all."""
     # Cost tracking (2026-10) — see utils/pdf_cost_guard.py. No longer a
     # blocking ceiling here either — see pdf_large_extraction.py's
     # extract_full_document for why (a calendar-day auto-block penalized
@@ -837,9 +460,8 @@ def _build_and_save_review_item(
     # handler.py's _MAX_ATTEMPTS, a bounded per-document retry cap — this
     # function itself has no retry-loop risk of its own: every stage below
     # already catches and logs its own failures rather than raising (see
-    # each try/except in _build_license_items_direct/_build_knowhow_items_
-    # direct), so there was never an uncontrolled-loop path through here to
-    # begin with.
+    # each try/except in _build_items_direct), so there was never an
+    # uncontrolled-loop path through here to begin with.
     cost_accumulator = CostAccumulator()
     cost_accumulator.add(extraction_cost_usd)
     pages: list[PageExtractionRecord] = []
@@ -874,85 +496,11 @@ def _build_and_save_review_item(
 
     page_markdowns = [p["typhoon_markdown"] for p in raw_pages]
 
-    # Removed 2026-09: check_relevance() judged relevance against a fixed
-    # topic list that was already found too narrow (real case: a general tax
-    # guide flagged "uncertain"/"not_relevant" for not being restaurant-
-    # specific, when Restbiz's actual scope is much broader — HR, labor law,
-    # back-office, tax, not just food-specific licenses) and would keep
-    # needing manual updates for every new law/topic area. Every document
-    # entering this pipeline is already curated by whoever uploaded it —
-    # there's no real "is this in scope" decision left for the bot to make.
-    # relevance_check stays on ReviewItem (pdf_review_item.py) only so
-    # already-processed items from before this change keep displaying
-    # correctly in the admin UI; nothing sets it for new items anymore.
-    relevance_check = None
-
-    # Routing decision: does this document fit the structured 13-field Sheet
-    # schema, or is it know-how/multi-topic content that would lose most of
-    # its substance forced into that shape? classify_content_shape() itself
-    # never raises (fails toward "structured_license", the longer-proven
-    # path) — no try/except needed here, unlike the calls above/below that
-    # wrap genuinely-fallible external services.
-    shape_check = classify_content_shape(page_markdowns, cost_accumulator=cost_accumulator)
-
-    # 2026-09 architectural pivot: PDF content now writes directly to the
-    # vectorstore with no human review/candidate-matching/Sheet write-back
-    # (user-approved — see plan iridescent-strolling-penguin.md). The OLD
-    # _build_knowhow_items/_build_license_items (review-queue path) are
-    # deliberately left completely untouched above and are no longer called
-    # from here — kept in the file per explicit instruction, not deleted.
-    if shape_check["shape"] == "know_how":
-        primary_builder, secondary_builder = _build_knowhow_items_direct, _build_license_items_direct
-    else:
-        primary_builder, secondary_builder = _build_license_items_direct, _build_knowhow_items_direct
-
-    secondary_pages = shape_check.get("secondary_pages", [])
-
-    # Exclude secondary-shape pages from the PRIMARY pass — without this, a
-    # license procedure classified as "secondary" would ALSO get re-picked-up
-    # as its own topic inside the primary know_how bundle (confirmed live:
-    # this happened before this exclusion was added), redundantly describing
-    # the same content twice across 2 different tabs/sheets — a reviewer
-    # approving both would write near-duplicate data into 2 places. Each
-    # page is handled by exactly one builder.
-    excluded_page_nums = {n for start, end in secondary_pages for n in range(start, end + 1)}
-    primary_indices = [i for i, p in enumerate(pages) if p.page_num not in excluded_page_nums]
-    primary_pages = [pages[i] for i in primary_indices]
-    primary_markdowns = [page_markdowns[i] for i in primary_indices]
-
-    items: list[ReviewItem] = []
-    if primary_pages:
-        items.extend(primary_builder(
-            filename, s3_raw_pdf_path, primary_pages, primary_markdowns, relevance_check, shape_check,
-            cost_accumulator=cost_accumulator, extraction_started_at=extraction_started_at,
-        ))
-    else:
-        logger.info(f"[SQSConsumer] {filename}: entire document was flagged as secondary-shape content, nothing left for the primary pass")
-
-    for start, end in secondary_pages:
-        secondary_shape = "structured_license" if shape_check["shape"] == "know_how" else "know_how"
-        logger.info(f"[SQSConsumer] {filename}: processing secondary {secondary_shape} content at pages {start}-{end}")
-        sub_pages, sub_markdowns = pages[start - 1 : end], page_markdowns[start - 1 : end]
-        items.extend(secondary_builder(
-            filename, s3_raw_pdf_path, sub_pages, sub_markdowns, relevance_check, shape_check,
-            cost_accumulator=cost_accumulator, extraction_started_at=extraction_started_at,
-        ))
-
-    # Each builder call above already re-saves ITS OWN items with the
-    # accumulator's total at the time IT finished — but if both primary and
-    # secondary builders ran (mixed-shape document), the primary items were
-    # saved before the secondary pass added more cost to the same shared
-    # accumulator. One more pass here guarantees EVERY item from this one
-    # document, regardless of which builder produced it, ends up showing
-    # the true final total — cheap (in-memory field set + upsert-by-id save).
-    if items:
-        final_cost = cost_accumulator.total_cost_usd
-        for it in items:
-            if it.total_cost != final_cost:
-                it.total_cost = final_cost
-                _queue_manager.save(it)
-
-    return items
+    _build_items_direct(
+        filename, s3_raw_pdf_path, pages, page_markdowns,
+        cost_accumulator=cost_accumulator, extraction_started_at=extraction_started_at,
+    )
+    return []
 
 
 def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = False) -> list[ReviewItem]:
@@ -1108,8 +656,8 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
     # individually try/except'd internally (see their own comments), so in
     # practice nothing currently escapes uncaught from here — but that's an
     # invariant of today's code, not a structural guarantee, and a 2026-10
-    # audit found exactly one call (expand_knowhow_matches_to_full_chunks,
-    # now fixed) that briefly broke it. This try/except is the same
+    # audit found exactly one call (a now-removed sibling-chunk expansion
+    # helper) that briefly broke it. This try/except is the same
     # defense-in-depth backstop _MAX_HANDOFF_ATTEMPTS/handler.py's
     # _MAX_ATTEMPTS already give the other two paths, so a FUTURE bug here
     # is bounded too, not an unbounded SQS-redelivery loop.

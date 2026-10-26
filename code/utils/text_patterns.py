@@ -690,6 +690,35 @@ def nonreg_chapter_semantic_check(retriever, q: str, log_prefix: str = "") -> Tu
         return "", 0.0, ""
 
 
+def nonreg_chapter_disagreement_should_reject(
+    sem_top_main_topic: str, exact_match_main_topic: str, sem_top_score: float,
+    min_score: float = NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE,
+) -> bool:
+    """2026-10 fix (data-integrity audit): persona_supervisor.py's sub_topic
+    exact-match site had this "disagreement" rejection with NO score floor
+    at all — reject whenever the semantic top hit's main_topic merely
+    DIFFERED from the exact match, regardless of how weak/coincidental that
+    top hit's score was. Its sibling check two lines above (the regulatory-
+    dominance guard) already carries a score floor for exactly this reason,
+    added after a live-reproduced false-positive (the SME income-tax-bracket
+    case, scored ~0.55-0.57 — a coincidental keyword overlap, not a
+    genuinely better answer) broke answer generation entirely. Selective-
+    prediction/reject-option research is consistent on this exact point:
+    gating a rejection on raw disagreement alone, with no confidence
+    threshold, is the known-unsafe degenerate case of that framework —
+    miscalibrated rejection throws away safe predictions along with
+    genuinely bad ones. The identical unfloored check was deliberately NOT
+    ported to the op_topic call site elsewhere in persona_supervisor.py
+    after live-testing showed it traded one failure for a worse one there;
+    gating THIS site with the same floor (rather than leaving it unfloored
+    or removing it outright) keeps its genuine catches while closing the
+    coincidental-weak-hit failure mode its sibling check was already fixed
+    for. Extracted here (same rationale as effective_min_similarity below)
+    so the condition is directly unit-testable without needing a live
+    retriever or the surrounding method's state."""
+    return bool(sem_top_main_topic) and sem_top_main_topic != exact_match_main_topic and sem_top_score >= min_score
+
+
 # ── PDF-book-aware similarity floor ─────────────────────────────────────────
 # Shared by persona_practical.py's and persona_academic.py's independently
 # re-implemented sim_filter steps (2026-09) — see conf.RETRIEVAL_MIN_SIMILARITY_PDF_BOOK
@@ -759,3 +788,53 @@ def extract_thai_keywords(text: str, min_len: int = 2) -> List[str]:
         _LOG.debug("[extract_thai_keywords] PyThaiNLP unavailable (%s) — using whitespace split", type(_e).__name__)
         _clean = re.sub(r'[^฀-๿a-zA-Z0-9]', ' ', t.lower())
         return [w for w in _clean.split() if len(w) >= max(min_len, 3)]
+
+
+def bowtie_reorder(ranked_items: list) -> list:
+    """Reorders an already best-to-worst RANKED list (index 0 = most
+    relevant) into a "bowtie"/zigzag arrangement that places the top-ranked
+    items at BOTH ends of the context, converging the least-relevant items
+    toward the true middle — 2026-10 fix (data-integrity audit).
+
+    Research: "Lost in the Middle: How Language Models Use Long Contexts"
+    (Liu et al., Stanford/UC Berkeley/Samaya AI) found LLMs retrieve/use
+    information from the start and end of a long context far more
+    reliably than information buried in the middle — performance degrades
+    >30% when the relevant item shifts from an edge position to the
+    middle. The paper's own practical recommendation is to place
+    high-confidence items at both the beginning AND the end.
+
+    Found live in this codebase: persona_practical.py's doc-reordering
+    step already names "lost in the middle" in its own comment, but only
+    sorts best-to-worst in a single pass — that protects the START of the
+    context only. Every item NOT ranked #1 ends up progressively deeper in
+    the unprotected middle/end, including rank #2 (often still a document
+    the answer genuinely needs), while the single WORST-ranked item
+    accidentally lands at the attention-favored end position purely as a
+    side effect of a plain sort — backwards from what the research
+    recommends. persona_supervisor.py's registration_type re-rank
+    (_rt_raw_docs.sort) has the identical plain-sort shape with no
+    awareness comment at all.
+
+    Algorithm: index 0 (best) → position 0; index 1 (2nd best) → the LAST
+    position; index 2 (3rd best) → position 1; index 3 (4th best) →
+    second-to-last; and so on, alternating inward from both ends. The
+    lowest-ranked item(s) land at or near the true middle — the position
+    research shows an LLM attends to least, which is exactly where the
+    least-important item belongs.
+
+    Pure, allocates a new list, never mutates `ranked_items`; a 0- or
+    1-item list is returned unchanged (nothing to reorder)."""
+    n = len(ranked_items)
+    if n <= 1:
+        return list(ranked_items)
+    result: list = [None] * n
+    left, right = 0, n - 1
+    for i, item in enumerate(ranked_items):
+        if i % 2 == 0:
+            result[left] = item
+            left += 1
+        else:
+            result[right] = item
+            right -= 1
+    return result

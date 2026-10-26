@@ -41,6 +41,37 @@ import time
 from typing import Any, Optional
 
 
+# 2026-10 fix (data-integrity audit): the cache key's version segment used
+# to be ONLY each prompt's own PROMPT_VERSION constant (DRAFT_FIELDS_
+# PROMPT_VERSION etc. in pdf_field_drafting.py/pdf_knowhow_drafting.py) —
+# covering the LLM call's input/instructions, but not any of the
+# deterministic code that runs on the result AFTER the LLM call returns
+# (merge_topic_chunks, _resolve_page_overlaps, _merge_drafted_batches). A
+# future fix to any of THAT code — the same class of fix this whole audit
+# has been making all session — would never invalidate an already-cached
+# result: a previously-cached document re-uploaded after such a fix would
+# silently keep serving the pre-fix, still-buggy drafted output forever,
+# logged only as an unremarkable cache hit. Research backing this: build
+# systems' content-addressable action caches (e.g. Bazel's Action Cache)
+# key on a hash of BOTH the inputs AND the action's own command/logic
+# definition — "if even one byte of either changes, the cache key changes"
+# — not inputs alone. LOGIC_VERSION is the "action definition" half of
+# that key for this cache: bump it whenever ANY downstream processing of a
+# cached topic-split/draft result changes, even when the LLM prompt itself
+# is untouched. Declared here (not per-prompt) since it covers logic
+# shared across all 3 cache key sites in sqs_consumer.py, not any one
+# prompt specifically.
+#
+# v2 (2026-10, PDF ingestion schema unification): the structured_license/
+# know_how classification step and its two parallel builder pipelines were
+# removed — every document now goes through one topic-split + field-draft
+# pipeline (see sqs_consumer.py's _build_items_direct, pdf_direct_ingest.
+# build_merged_documents, pdf_supersede_resolver.resolve_topic). Any
+# pre-v2 cached result reflects the old two-path logic and must not be
+# served as-is under the new pipeline's assumptions.
+LOGIC_VERSION = "v2"
+
+
 def content_hash(text: str) -> str:
     """SHA-256 of the RAW text, no normalization. Deliberately conservative
     (v1): guarantees two meaningfully-different inputs never collide into a

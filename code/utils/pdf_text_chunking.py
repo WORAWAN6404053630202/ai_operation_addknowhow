@@ -4,8 +4,9 @@
 
 Root cause this replaces: service/data_loader.py's `_build_page_content()`
 clamps everything to ~1,800-2,500 chars — sized for short Sheet-row content.
-service/pdf_direct_ingest.py's `build_knowhow_documents()` reused it unchanged
-for full book-chapter `full_text` (real topics measured up to 19,056 chars),
+service/pdf_direct_ingest.py's know-how builder (since 2026-10,
+`build_merged_documents()`; at the time of this fix, `build_knowhow_documents()`)
+reused it unchanged for full book-chapter `full_text` (real topics measured up to 19,056 chars),
 silently making everything past the first ~1,800 chars invisible to both
 embedding-based retrieval and the LLM's answer context.
 

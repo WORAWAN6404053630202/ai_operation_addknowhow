@@ -3,6 +3,7 @@ import json
 import logging
 import re
 from difflib import SequenceMatcher
+from types import SimpleNamespace
 from typing import Tuple, Dict, Any, List, Optional, Callable, FrozenSet
 
 from langchain_openai import ChatOpenAI
@@ -17,6 +18,7 @@ from utils.prompt_safety import INJECTION_GUARD
 from utils.phone_extraction import extract_thai_phone_numbers as _shared_extract_thai_phone_numbers
 from utils.prompts_supervisor import build_legal_q_detect_prompt, build_greeting_detect_prompt
 from utils.query_synonyms import SYNONYM_PATTERNS
+from utils.hybrid_retriever import _doc_id as _dedup_doc_id
 from utils.query_rewriter import enrich_query_for_retrieval, _needs_rewrite as _qr_needs_rewrite
 from utils.progress import emit_progress
 from utils.text_patterns import (
@@ -33,6 +35,7 @@ from utils.text_patterns import (
     topic_label_matches_query as _shared_topic_label_matches_query,
     is_fee_or_duration_info_query as _shared_is_fee_or_duration_info_query,
     effective_min_similarity as _shared_effective_min_similarity,
+    bowtie_reorder as _shared_bowtie_reorder,
 )
 
 # Import professional logging
@@ -2801,9 +2804,16 @@ class PracticalPersonaService:
                     if 0 < len(docs) < max(2, max_docs // 2):
                         # Got some but fewer than half requested — retry with 2× k to improve coverage
                         _extra = _scored_search(query, top_k * 2, metadata_filter)
-                        _seen_h = {hash((getattr(d, "page_content", "") or "")[:80]) for d in docs}
+                        # 2026-10 fix (data-integrity audit): was hash(page_content[:80]) —
+                        # the exact collision class hybrid_retriever._doc_id's own
+                        # docstring documents as a confirmed live incident (PDF book
+                        # chunks share a repeated header, so a fixed-length prefix
+                        # collides across genuinely different chunks/chapters once the
+                        # differentiating text falls past the cutoff). Reusing the same
+                        # proven full-content-hash id instead of re-truncating here too.
+                        _seen_h = {_dedup_doc_id(d) for d in docs}
                         for _xd in _extra:
-                            _xh = hash((getattr(_xd, "page_content", "") or "")[:80])
+                            _xh = _dedup_doc_id(_xd)
                             if _xh not in _seen_h:
                                 _seen_h.add(_xh)
                                 docs.append(_xd)
@@ -2875,10 +2885,10 @@ class PracticalPersonaService:
             if _r2_anchor:
                 _round2_q = expanded_query + " " + _r2_anchor
                 _round2_docs = _scored_search(_round2_q, min(top_k, 8))
-                _seen_r1 = {hash((getattr(d, "page_content", "") or "")[:120]) for d in docs}
+                _seen_r1 = {_dedup_doc_id(d) for d in docs}
                 _r2_added = 0
                 for _d2 in _round2_docs:
-                    _h2 = hash((getattr(_d2, "page_content", "") or "")[:120])
+                    _h2 = _dedup_doc_id(_d2)
                     if _h2 not in _seen_r1:
                         _seen_r1.add(_h2)
                         docs.append(_d2)
@@ -2900,10 +2910,10 @@ class PracticalPersonaService:
             if len(_missing_terms) >= _iter_min:
                 _round3_q = expanded_query + " " + " ".join(_missing_terms)
                 _round3_docs = _scored_search(_round3_q, min(top_k, 8))
-                _seen_r3 = {hash((getattr(d, "page_content", "") or "")[:120]) for d in docs}
+                _seen_r3 = {_dedup_doc_id(d) for d in docs}
                 _r3_added = 0
                 for _d3 in _round3_docs:
-                    _h3 = hash((getattr(_d3, "page_content", "") or "")[:120])
+                    _h3 = _dedup_doc_id(_d3)
                     if _h3 not in _seen_r3:
                         _seen_r3.add(_h3)
                         docs.append(_d3)
@@ -2959,7 +2969,7 @@ class PracticalPersonaService:
                         _coll_ch = getattr(vectorstore, "_collection", None)
                         if _coll_ch is not None:
                             _ch_result = _coll_ch.get(where={"main_topic": _r4_anchor}, include=["documents", "metadatas"])
-                            _seen_ch = {hash((getattr(d, "page_content", "") or "")[:120]) for d in docs}
+                            _seen_ch = {_dedup_doc_id(d) for d in docs}
                             # Group by sub_topic (fallback operation_topic) and round-robin
                             # pick across groups, capped at max_docs — same "bounded fetch,
                             # not the whole chapter" shape as persona_supervisor.py's
@@ -2974,7 +2984,12 @@ class PracticalPersonaService:
                             for _ch_content, _ch_meta in zip(
                                 _ch_result.get("documents") or [], _ch_result.get("metadatas") or []
                             ):
-                                _ch_h = hash((_ch_content or "")[:120])
+                                # Raw (content, metadata) pair, not yet a Document — same
+                                # full-content-hash identity as _dedup_doc_id, via a
+                                # lightweight shim so the two attribute lookups it does
+                                # (.metadata, .page_content) work without constructing a
+                                # real langchain Document just to hash it.
+                                _ch_h = _dedup_doc_id(SimpleNamespace(page_content=_ch_content, metadata=_ch_meta))
                                 if _ch_h in _seen_ch:
                                     continue
                                 _seen_ch.add(_ch_h)
@@ -3080,7 +3095,7 @@ class PracticalPersonaService:
         _seen_h: set = set()
         _deduped: list = []
         for _d in docs:
-            _h = hash((getattr(_d, "page_content", "") or "")[:120])
+            _h = _dedup_doc_id(_d)
             if _h not in _seen_h:
                 _seen_h.add(_h)
                 _deduped.append(_d)
@@ -3123,8 +3138,8 @@ class PracticalPersonaService:
                 # Use original query (Thai only) not expanded_query which may contain English synonyms
                 docs = _do_rerank(query, docs, model_name=_rr_model, top_k=_rr_top_k, backend=_rr_backend, onnx_file=_rr_onnx_file, min_score=_rr_min_score)
                 if _pin_before:
-                    _seen_after = {hash((getattr(d, "page_content", "") or "")[:120]) for d in docs}
-                    _re_add = [p for p in _pin_before if hash((getattr(p, "page_content", "") or "")[:120]) not in _seen_after]
+                    _seen_after = {_dedup_doc_id(d) for d in docs}
+                    _re_add = [p for p in _pin_before if _dedup_doc_id(p) not in _seen_after]
                     if _re_add:
                         docs = _re_add + docs
                         _LOG.info("[Practical] reranker dropped %d chapter-sweep pin(s) — re-admitted", len(_re_add))
@@ -3272,7 +3287,8 @@ class PracticalPersonaService:
         # Use a higher cap for business_guide docs so the full content reaches the LLM.
         _BG_ANSWER_GUIDELINE_CAP = int(getattr(conf, "LLM_DOC_CHARS_BUSINESS_GUIDE", 3500))
         # PDF book content (feature/pdf-ingestion, 2026-09 sub-chunking fix):
-        # service/pdf_direct_ingest.py's build_knowhow_documents() now emits
+        # service/pdf_direct_ingest.py's build_merged_documents() (formerly
+        # build_knowhow_documents(), merged into one builder 2026-10) emits
         # sub-chunks up to conf.PDF_KNOWHOW_CHUNK_MAX_CHARS (24000) so a whole
         # book chapter's content survives embedding untruncated — but without
         # a matching cap here, _BG_ANSWER_GUIDELINE_CAP (3500) would just
@@ -5358,9 +5374,24 @@ class PracticalPersonaService:
                     _docs_to_process = _refetch_pass
                     state.current_docs = _refetch_pass
 
-        # Re-sort _docs_to_process: richest docs first (has ops+idd+sc+od), specific registration_type
+        # Re-rank _docs_to_process: richest docs first (has ops+idd+sc+od), specific registration_type
         # before generic. Fixes "lost in the middle" — LLM pays more attention to early positions.
         # Only applies when multiple docs are present (no-op for single doc).
+        #
+        # 2026-10 fix (data-integrity audit): a plain best-to-worst sort only
+        # protects the START of the context — research ("Lost in the Middle",
+        # Liu et al.) shows LLMs attend to BOTH ends of a long context, not
+        # just the start, with the true middle attended to least. A simple
+        # sort buries rank #2 (often still a document the answer genuinely
+        # needs) progressively deeper toward the unprotected middle/end as
+        # the doc count grows, while the single WORST-ranked doc accidentally
+        # lands at the attention-favored end position as a side effect of
+        # the sort — backwards from what the research recommends.
+        # bowtie_reorder keeps this same rank (best-to-worst sort first,
+        # unchanged) but then places rank #1 at the start, rank #2 at the
+        # end, rank #3 next-from-start, rank #4 next-from-end, etc. — both
+        # ends hold genuinely high-relevance docs, and only the truly
+        # lowest-ranked ones converge on the real middle.
         if len(_docs_to_process) > 1:
             _collected_rt = (
                 state.get_collected_slot("registration_type")
@@ -5377,7 +5408,7 @@ class PracticalPersonaService:
                     + bool((_dm.get("operation_duration") or "").strip())
                 )
                 return (_rt_match, _richness)
-            _docs_to_process = sorted(_docs_to_process, key=_doc_rank)
+            _docs_to_process = _shared_bowtie_reorder(sorted(_docs_to_process, key=_doc_rank))
             state.current_docs = _docs_to_process
 
         # Established-topic guarantee: when the session already has a department locked in

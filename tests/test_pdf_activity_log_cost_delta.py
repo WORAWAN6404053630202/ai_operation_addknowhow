@@ -1,13 +1,14 @@
 """Test for the 2026-10 fix (PDF2-M3) to service/sqs_consumer.py's
-_build_knowhow_items_direct/_build_license_items_direct — the activity-log
-cost_usd field used to log the SHARED cost_accumulator's full running
-total, not this builder's own share. A document that routes through BOTH
-builders (uncovered-pages routing, or the mixed-shape secondary pass)
-shares one CostAccumulator across both calls — the second builder's
-append_event call used to report the FULL cumulative cost (including
-whatever the first builder already spent), double-counting that spend in
-the dashboard's activity log. Each builder now snapshots the accumulator
-at its own entry and logs only the delta since then.
+_build_items_direct (2026-10 schema-unification note: this used to be a
+pair of builders — _build_knowhow_items_direct/_build_license_items_direct
+— sharing one CostAccumulator when a document routed through both; now
+there is a single builder, but the same accumulator is still pre-loaded
+with the document's extraction_cost_usd before the builder ever runs — see
+_build_and_save_review_item's `cost_accumulator.add(extraction_cost_usd)`).
+The activity-log cost_usd field used to log the accumulator's full
+cumulative total, double-counting whatever was already spent before this
+builder started. The builder now snapshots the accumulator at its own
+entry and logs only the delta since then.
 """
 from __future__ import annotations
 
@@ -35,67 +36,41 @@ def _make_pages(n: int):
 
 @pytest.mark.unit
 class TestActivityLogCostIsPerBuilderDeltaNotCumulativeTotal:
-    def test_license_builder_logs_only_its_own_delta(self):
+    def test_builder_logs_only_its_own_delta_not_prior_extraction_cost(self):
         pages, markdowns = _make_pages(2)
         shared_accumulator = CostAccumulator()
-        shared_accumulator.total_cost_usd = 0.32  # simulates prior spend from a sibling builder call
+        shared_accumulator.total_cost_usd = 0.32  # simulates prior extraction-phase spend
 
         def fake_identify(page_markdowns, cost_accumulator=None):
             if cost_accumulator is not None:
-                cost_accumulator.total_cost_usd += 0.08  # this builder's OWN spend
-            return [{"department": "Dept A", "license_type": "License A", "page_ranges": [(1, 2)]}]
-
-        def fake_draft(topic_markdowns, cost_accumulator=None):
-            return {"แนวคำตอบ": "x"}
-
-        def fake_resolve(merged, source_file, cost_accumulator=None):
-            return SupersedeDecision("new")
-
-        with patch.object(sqs_consumer, "identify_license_topics", side_effect=fake_identify), \
-             patch.object(sqs_consumer, "draft_fields_from_pages", side_effect=fake_draft), \
-             patch.object(sqs_consumer.pdf_supersede_resolver, "resolve_regulatory_topic", side_effect=fake_resolve), \
-             patch.object(sqs_consumer, "_add_documents_to_vectorstore", return_value=1), \
-             patch.object(sqs_consumer, "append_event") as mock_append:
-            sqs_consumer._build_license_items_direct(
-                "test.pdf", "s3://bucket/test.pdf", pages, markdowns,
-                relevance_check=None, content_shape={"shape": "structured_license"},
-                cost_accumulator=shared_accumulator,
-            )
-
-        mock_append.assert_called_once()
-        event = mock_append.call_args[0][1]
-        assert event["cost_usd"] == pytest.approx(0.08), (
-            f"expected only this builder's own 0.08 delta, got {event['cost_usd']!r} "
-            f"(0.40 would mean the prior 0.32 from a sibling builder leaked in)"
-        )
-
-    def test_knowhow_builder_logs_only_its_own_delta(self):
-        pages, markdowns = _make_pages(2)
-        shared_accumulator = CostAccumulator()
-        shared_accumulator.total_cost_usd = 0.32
-
-        def fake_identify_knowhow(page_markdowns, cost_accumulator=None):
-            if cost_accumulator is not None:
-                cost_accumulator.total_cost_usd += 0.05
+                cost_accumulator.total_cost_usd += 0.05  # topic-split's own spend
             return [{
                 "document_title": "คู่มือ", "source_type": "book",
                 "main_topic": "การตลาด", "sub_topic": "โปรโมชั่น",
                 "summary": "สรุป", "category": "", "page_ranges": [(1, 2)],
             }]
 
-        def fake_resolve(topic_dict, source_file, cost_accumulator=None):
+        def fake_draft(topic_markdowns, cost_accumulator=None):
+            if cost_accumulator is not None:
+                cost_accumulator.total_cost_usd += 0.03  # field-drafting's own spend
+            return {"หน่วยงาน": "Dept A", "ใบอนุญาต": "License A"}
+
+        def fake_resolve(merged, source_file, cost_accumulator=None):
             return SupersedeDecision("new")
 
-        with patch.object(sqs_consumer, "identify_knowhow_topics", side_effect=fake_identify_knowhow), \
-             patch.object(sqs_consumer.pdf_supersede_resolver, "resolve_knowhow_topic", side_effect=fake_resolve), \
+        with patch.object(sqs_consumer, "identify_knowhow_topics", side_effect=fake_identify), \
+             patch.object(sqs_consumer, "draft_fields_from_pages", side_effect=fake_draft), \
+             patch.object(sqs_consumer.pdf_supersede_resolver, "resolve_topic", side_effect=fake_resolve), \
              patch.object(sqs_consumer, "_add_documents_to_vectorstore", return_value=1), \
              patch.object(sqs_consumer, "append_event") as mock_append:
-            sqs_consumer._build_knowhow_items_direct(
+            sqs_consumer._build_items_direct(
                 "test.pdf", "s3://bucket/test.pdf", pages, markdowns,
-                relevance_check=None, content_shape={"shape": "know_how"},
                 cost_accumulator=shared_accumulator,
             )
 
         mock_append.assert_called_once()
         event = mock_append.call_args[0][1]
-        assert event["cost_usd"] == pytest.approx(0.05)
+        assert event["cost_usd"] == pytest.approx(0.08), (
+            f"expected only this builder's own 0.05+0.03 delta, got {event['cost_usd']!r} "
+            f"(0.40 would mean the prior 0.32 extraction-phase spend leaked in)"
+        )

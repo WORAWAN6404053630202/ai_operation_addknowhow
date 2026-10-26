@@ -54,6 +54,24 @@ def main() -> None:
             return
         deleted = mgr.delete_by_source_file(args.delete)
         print(f"Deleted {deleted} doc(s) for source_file={args.delete!r}.")
+        # 2026-10 fix (data-integrity audit, TOCTOU): `n` above was counted
+        # in a SEPARATE, earlier call (often a separate CLI invocation
+        # entirely — a human reads the dry run, then re-runs with
+        # --confirm minutes later) — a concurrent SQS ingest adding more
+        # pdf_auto docs for this exact source_file in between would get
+        # silently swept into this delete without ever appearing in what
+        # the operator previewed. TOCTOU research is consistent that the
+        # real fix is eliminating the gap entirely (atomic check-and-use),
+        # which isn't possible across two independent human-triggered CLI
+        # runs — so this surfaces the mismatch loudly instead, since
+        # silently deleting more than what was previewed is the one part
+        # of this gap that's avoidable.
+        if deleted != n:
+            print(
+                f"NOTE: deleted count ({deleted}) differs from the dry-run preview ({n}) — "
+                f"more docs for this source_file were likely ingested between the preview and "
+                f"this run. If unexpected, check --list again before assuming this was intentional."
+            )
         return
 
     # Default / --list

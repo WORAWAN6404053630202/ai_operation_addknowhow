@@ -306,6 +306,22 @@ LLM_DOC_CHARS_PDF_BOOK = _safe_int("LLM_DOC_CHARS_PDF_BOOK", 24000)  # matches P
 PDF_SUPERSEDE_EMBEDDING_FLOOR = _safe_float("PDF_SUPERSEDE_EMBEDDING_FLOOR", 0.70)
 PDF_SUPERSEDE_EMBEDDING_MIN_GAP = _safe_float("PDF_SUPERSEDE_EMBEDDING_MIN_GAP", 0.05)
 PDF_SUPERSEDE_EMBEDDING_MAX_CANDIDATES = _safe_int("PDF_SUPERSEDE_EMBEDDING_MAX_CANDIDATES", 10)
+# 2026-10 fix (data-integrity audit): the Chroma HNSW query underlying
+# _embedding_candidates only ever requested n_results=MAX_CANDIDATES*2 — a
+# corpus with MORE than that many genuinely-similar live candidates for one
+# topic structurally never has the extra ones fetched at all (no amount of
+# the existing dynamic-cutoff logic can rescue a candidate never returned
+# by the query itself). Research on HNSW/ANN search (recall is approximate
+# by construction, "a number you own, not a guarantee the vector DB
+# provides") shows recall climbs sharply with a modest widening of search
+# breadth — e.g. one published benchmark found recall@10 jumping from ~78%
+# to ~97% between ef=10 and ef=32. This project's HNSW index doesn't expose
+# ef_search through the query path used here, so the lever actually
+# available is the oversample multiplier on n_results itself — widened from
+# 2x to 5x, still cheap on an O(log n) local index, with the existing
+# dynamic-gap-cutoff logic (_dynamic_cutoff_count) unchanged and still the
+# thing that keeps noise out, not this multiplier.
+PDF_SUPERSEDE_EMBEDDING_QUERY_OVERSAMPLE = _safe_int("PDF_SUPERSEDE_EMBEDDING_QUERY_OVERSAMPLE", 5)
 PDF_SUPERSEDE_IDENTITY_FUZZY_THRESHOLD = _safe_float("PDF_SUPERSEDE_IDENTITY_FUZZY_THRESHOLD", 0.82)
 PDF_SUPERSEDE_LLM_BATCH_SIZE = _safe_int("PDF_SUPERSEDE_LLM_BATCH_SIZE", 15)
 

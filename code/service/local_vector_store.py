@@ -1,10 +1,12 @@
 # code/service/local_vector_store.py
 from __future__ import annotations
 
+import fcntl
 import shutil
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import Generator, List, Dict, Optional
 
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
@@ -221,6 +223,51 @@ class LocalVectorStoreManager:
         except Exception:
             return 0
 
+    def _rebuild_lock_path(self) -> Path:
+        # Sibling of persist_dir (same naming style as create_vectorstore's
+        # own p_new/p_old temp dirs below), NOT a file inside it — a path
+        # INSIDE persist_dir would resolve to a DIFFERENT physical file
+        # before vs. after the reset swap's rename (the directory a given
+        # path points to changes identity mid-swap), breaking path-based
+        # lock coordination between whoever is holding the swap's lock and
+        # anyone opening the lock path fresh around the same time.
+        return Path(str(self._persist_dir()) + ".rebuild.lock")
+
+    @contextmanager
+    def _rebuild_lock(self, exclusive: bool) -> Generator[None, None, None]:
+        """2026-10 fix (data-integrity audit): nothing previously prevented
+        scripts/ingest_local.py's destructive create_vectorstore(reset=True)
+        rename-swap (below) from running WHILE the long-running SQS consumer
+        was mid add_documents()/archive_and_remove() against the SAME
+        LOCAL_VECTOR_DIR — the identical silent-SQLite-write-loss failure
+        class the visibility-timeout heartbeat fix closed for same-process
+        redelivery, just triggered by a different pair of concurrent
+        writers. SQLite (what local Chroma persists to) is a strict
+        single-writer store with no cross-process lock of its own — its own
+        docs recommend serializing writes in application code, which is
+        exactly what this advisory fcntl lock does: create_vectorstore
+        takes it EXCLUSIVE for the swap (blocks until no in-flight write is
+        holding it, then blocks every new write until the swap finishes);
+        every other mutating call takes it SHARED (any number of ordinary
+        writes can run concurrently with each other — SQLite itself still
+        serializes the actual disk I/O — but all of them block a pending
+        exclusive/rebuild acquisition until they finish, and none can start
+        once a rebuild has acquired it). Advisory-only (flock, not a
+        kernel-enforced mandatory lock) — only effective because every
+        destructive/mutating path in this module goes through it; a process
+        bypassing this method entirely (e.g. opening the sqlite file
+        directly) would not be protected, same caveat as any advisory lock.
+        Lock file lives next to the persist dir (not inside it) so it
+        survives the reset swap's rename unaffected."""
+        lock_path = self._rebuild_lock_path()
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "a+") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
     def _build_retriever(self, k: Optional[int] = None):
         kk = int(k or getattr(conf, "RETRIEVAL_TOP_K", 20))
         self.retriever = self.vectorstore.as_retriever(search_kwargs={"k": kk})
@@ -333,26 +380,34 @@ class LocalVectorStoreManager:
             pass
 
         if reset:
-            # Atomic swap: promote _new to live; keep _old briefly then delete
-            if p_old.exists():
-                _safe_rmtree(p_old)
-            if p.exists():
-                p.rename(p_old)
-            p_new.rename(p)
-            # Reconnect to the renamed live directory — self.vectorstore still
-            # points to the now-gone _new path after the rename
-            self.vectorstore = Chroma(
-                collection_name=collection_name,
-                embedding_function=self.embedding_model,
-                persist_directory=str(p),
-                collection_metadata={"hnsw:space": "cosine"},
-            )
-            print(f"[VectorStore] Atomic swap complete — new corpus is live")
-            try:
+            # Exclusive lock for the swap only — see _rebuild_lock's
+            # docstring. Writing the new corpus into p_new above never
+            # touches the live dir, so it needs no lock; only this section
+            # (destructively replacing what's live) does. Blocks until any
+            # in-flight add_documents()/archive_and_remove()/etc. holding
+            # the SHARED lock finishes, then blocks every new one of those
+            # until this swap completes.
+            with self._rebuild_lock(exclusive=True):
+                # Atomic swap: promote _new to live; keep _old briefly then delete
                 if p_old.exists():
                     _safe_rmtree(p_old)
-            except Exception:
-                pass  # best-effort cleanup of old backup
+                if p.exists():
+                    p.rename(p_old)
+                p_new.rename(p)
+                # Reconnect to the renamed live directory — self.vectorstore still
+                # points to the now-gone _new path after the rename
+                self.vectorstore = Chroma(
+                    collection_name=collection_name,
+                    embedding_function=self.embedding_model,
+                    persist_directory=str(p),
+                    collection_metadata={"hnsw:space": "cosine"},
+                )
+                print(f"[VectorStore] Atomic swap complete — new corpus is live")
+                try:
+                    if p_old.exists():
+                        _safe_rmtree(p_old)
+                except Exception:
+                    pass  # best-effort cleanup of old backup
 
         count = self._collection_count()
         print(f"[VectorStore] Created successfully | count={count}")
@@ -384,12 +439,46 @@ class LocalVectorStoreManager:
         if not docs:
             return 0
 
-        self.vectorstore.add_documents(docs)
-        _record_embedding_cost_estimate("VectorStore/embed_documents", [d.page_content for d in docs])
-        try:
-            self.vectorstore.persist()
-        except Exception:
-            pass
+        # Shared lock (see _rebuild_lock's docstring) — blocks only against
+        # a rebuild's exclusive swap, not against other ordinary writes.
+        with self._rebuild_lock(exclusive=False):
+            try:
+                self.vectorstore.add_documents(docs)
+            except Exception as e:
+                # 2026-10 fix, live-reproduced on a real PDF ingest: each
+                # individual Document here is already kept well under
+                # baai/bge-m3's 8192-token ceiling by its own callers (e.g.
+                # pdf_direct_ingest.py's _MAX_MERGED_PAGE_CONTENT_CHARS) —
+                # but initialize_embeddings()'s chunk_size=25 batches up to
+                # 25 documents into ONE OpenRouter request, and this
+                # provider applies the 8192-token ceiling to the SUM of the
+                # whole batch, not per-document (confirmed live: every doc
+                # in a failing batch individually measured under the
+                # per-document cap, yet the batch call still 400'd with the
+                # identical "8193 input tokens" message). A handful of
+                # large-but-individually-valid documents landing in the same
+                # batch is rare — most documents are far smaller — so retry
+                # once with chunk_size=1 (one document per request, the
+                # smallest ANY single already-capped document could ever
+                # need) rather than paying that overhead on every call.
+                if "maximum context length" not in str(e) and "context length" not in str(e):
+                    raise
+                _LOG.warning(
+                    f"[VectorStore] add_documents batch exceeded the embedding model's context "
+                    f"length (batch of {len(docs)} doc(s), chunk_size={self.embedding_model.chunk_size}) "
+                    f"— retrying with chunk_size=1 (one document per request): {e}"
+                )
+                original_chunk_size = self.embedding_model.chunk_size
+                self.embedding_model.chunk_size = 1
+                try:
+                    self.vectorstore.add_documents(docs)
+                finally:
+                    self.embedding_model.chunk_size = original_chunk_size
+            _record_embedding_cost_estimate("VectorStore/embed_documents", [d.page_content for d in docs])
+            try:
+                self.vectorstore.persist()
+            except Exception:
+                pass
 
         count = self._collection_count()
         print(f"[VectorStore] Added {len(docs)} doc(s) incrementally | collection count now={count}")
@@ -438,11 +527,12 @@ class LocalVectorStoreManager:
         if not ids:
             print(f"[VectorStore] delete_by_source_file({source_file!r}): nothing found, no-op")
             return 0
-        self.vectorstore._collection.delete(where=where)
-        try:
-            self.vectorstore.persist()
-        except Exception:
-            pass
+        with self._rebuild_lock(exclusive=False):
+            self.vectorstore._collection.delete(where=where)
+            try:
+                self.vectorstore.persist()
+            except Exception:
+                pass
         print(f"[VectorStore] Deleted {len(ids)} doc(s) for source_file={source_file!r} | collection count now={self._collection_count()}")
         self._bump_corpus_version()
         return len(ids)
@@ -471,11 +561,25 @@ class LocalVectorStoreManager:
         """Moves docs OUT of the live collection into the archive collection —
         soft-delete semantics: hidden from retrieval immediately, but
         recoverable via restore_from_archive (not a hard, permanent delete).
-        The archive-add happens BEFORE the live-delete and the live-delete is
-        skipped entirely if the archive-add raises — a confirmed copy must
-        exist elsewhere before anything disappears from the bot's searchable
-        corpus. Reuses the already-computed embeddings fetched from live, so
-        this costs zero extra OpenRouter embedding calls."""
+        The archive-add happens BEFORE the live-delete, and the live-delete
+        only runs for ids CONFIRMED actually present in archive afterward —
+        a confirmed copy must exist elsewhere before anything disappears from
+        the bot's searchable corpus. Reuses the already-computed embeddings
+        fetched from live, so this costs zero extra OpenRouter embedding calls.
+
+        2026-10 fix (data-integrity audit): this used to call
+        archive_store._collection.add(...) and trust that a non-raising call
+        meant the archive copy now existed — Chroma's own docs warn add()'s
+        behavior on a duplicate id is unreliable (silently keeps the FIRST
+        value, never raises; confirmed empirically against the installed
+        chromadb version here) and explicitly recommend upsert() instead,
+        since upsert() deterministically converges to "the id now holds
+        what was just written" whether it previously existed or not. Still
+        verifies with a real get() afterward rather than trusting upsert()
+        alone, and only deletes from live the subset actually confirmed in
+        archive — if upsert() itself failed for some id (e.g. a lost SQLite
+        write race under genuine concurrent access), that id now simply
+        stays live too, never silently vanishes with zero copy anywhere."""
         if not doc_ids:
             return 0
         if self.vectorstore is None:
@@ -500,28 +604,45 @@ class LocalVectorStoreManager:
             stamped_metadatas.append(_stringify_metadata(stamped))
 
         archive_store = self._archive_vectorstore()
-        # Archive-add BEFORE live-delete, deliberately not wrapped in a blanket
-        # try/except — if this raises, the function must stop here and the
-        # live docs must stay untouched, not be deleted anyway.
-        archive_store._collection.add(
-            ids=ids, documents=documents, metadatas=stamped_metadatas, embeddings=embeddings,
-        )
-        try:
-            archive_store.persist()
-        except Exception:
-            pass
+        # Shared lock around the whole upsert→verify→delete sequence (see
+        # _rebuild_lock's docstring) — a rebuild's exclusive swap must not
+        # land on the live dir in the middle of this, which spans 2 separate
+        # writes (archive, then live) that both need the SAME pre-swap
+        # directory still live to mean anything.
+        with self._rebuild_lock(exclusive=False):
+            # Archive-upsert BEFORE live-delete, deliberately not wrapped in a
+            # blanket try/except — if this raises, the function must stop here
+            # and the live docs must stay untouched, not be deleted anyway.
+            archive_store._collection.upsert(
+                ids=ids, documents=documents, metadatas=stamped_metadatas, embeddings=embeddings,
+            )
+            try:
+                archive_store.persist()
+            except Exception:
+                pass
 
-        self.vectorstore._collection.delete(ids=ids)
-        try:
-            self.vectorstore.persist()
-        except Exception:
-            pass
+            confirmed = set(archive_store._collection.get(ids=ids, include=[]).get("ids") or [])
+            missing = [doc_id for doc_id in ids if doc_id not in confirmed]
+            if missing:
+                print(
+                    f"[VectorStore] archive_and_remove: {len(missing)} of {len(ids)} id(s) did NOT verify as "
+                    f"present in archive after upsert — leaving those live rather than risking a zero-copy loss: {missing}"
+                )
+            to_delete = [doc_id for doc_id in ids if doc_id in confirmed]
+            if not to_delete:
+                return 0
+
+            self.vectorstore._collection.delete(ids=to_delete)
+            try:
+                self.vectorstore.persist()
+            except Exception:
+                pass
         print(
-            f"[VectorStore] archive_and_remove: moved {len(ids)} doc(s) to archive "
+            f"[VectorStore] archive_and_remove: moved {len(to_delete)} doc(s) to archive "
             f"(reason={reason!r}) | live collection count now={self._collection_count()}"
         )
         self._bump_corpus_version()
-        return len(ids)
+        return len(to_delete)
 
     def list_archived_docs(self, pattern: Optional[str] = None, since_epoch: Optional[float] = None) -> List[Dict]:
         """Audit/inspection helper — the periodic review mechanism that
@@ -569,7 +690,20 @@ class LocalVectorStoreManager:
         """Reverse of archive_and_remove — manual rollback path for a wrong
         automated supersede decision. Strips the superseded_at/
         superseded_reason stamp back off before re-adding to live, so a
-        restored doc is indistinguishable from one that was never archived."""
+        restored doc is indistinguishable from one that was never archived.
+
+        2026-10 fix (data-integrity audit): same class of bug as
+        archive_and_remove above, and a WORSE failure mode here specifically
+        — this used to .add() to live then unconditionally delete from
+        archive regardless of whether the live add actually took effect. If
+        that id already existed in live for any reason (a retried call, a
+        leftover from a prior partial failure), the old add() would
+        silently no-op (keeping whatever was already live, NOT this restored
+        copy) while the archive copy was deleted anyway — the only
+        surviving version of that doc could vanish with zero copy anywhere
+        and zero error. Now upserts (deterministically takes effect either
+        way) and only deletes from archive the subset VERIFIED present in
+        live afterward."""
         if not doc_ids:
             return 0
         archive_store = self._archive_vectorstore()
@@ -593,22 +727,36 @@ class LocalVectorStoreManager:
 
         if self.vectorstore is None:
             self.connect_to_existing(fail_if_empty=False)
-        self.vectorstore._collection.add(
-            ids=ids, documents=documents, metadatas=cleaned_metadatas, embeddings=embeddings,
-        )
-        try:
-            self.vectorstore.persist()
-        except Exception:
-            pass
+        # Shared lock around the whole upsert→verify→delete sequence — see
+        # archive_and_remove's identical rationale above.
+        with self._rebuild_lock(exclusive=False):
+            self.vectorstore._collection.upsert(
+                ids=ids, documents=documents, metadatas=cleaned_metadatas, embeddings=embeddings,
+            )
+            try:
+                self.vectorstore.persist()
+            except Exception:
+                pass
 
-        archive_store._collection.delete(ids=ids)
-        try:
-            archive_store.persist()
-        except Exception:
-            pass
-        print(f"[VectorStore] restore_from_archive: restored {len(ids)} doc(s) to live | live collection count now={self._collection_count()}")
+            confirmed = set(self.vectorstore._collection.get(ids=ids, include=[]).get("ids") or [])
+            missing = [doc_id for doc_id in ids if doc_id not in confirmed]
+            if missing:
+                print(
+                    f"[VectorStore] restore_from_archive: {len(missing)} of {len(ids)} id(s) did NOT verify as "
+                    f"present in live after upsert — leaving those in archive rather than risking a zero-copy loss: {missing}"
+                )
+            to_delete = [doc_id for doc_id in ids if doc_id in confirmed]
+            if not to_delete:
+                return 0
+
+            archive_store._collection.delete(ids=to_delete)
+            try:
+                archive_store.persist()
+            except Exception:
+                pass
+        print(f"[VectorStore] restore_from_archive: restored {len(to_delete)} doc(s) to live | live collection count now={self._collection_count()}")
         self._bump_corpus_version()
-        return len(ids)
+        return len(to_delete)
 
     def snapshot_archive(self) -> Dict:
         """2026-10 fix (PDF2-C3): the archive collection lives in the SAME
@@ -648,22 +796,29 @@ class LocalVectorStoreManager:
         if not ids:
             return 0
         archive_store = self._archive_vectorstore()
-        archive_store._collection.add(
-            ids=ids,
-            documents=snapshot.get("documents") or [],
-            metadatas=snapshot.get("metadatas") or [],
-            # _materialize_embeddings (not `snapshot.get("embeddings") or []`)
-            # — snapshot_archive() already stores a materialized plain list
-            # here, but a numpy ndarray triggers the exact "truth value of an
-            # array is ambiguous" crash this same sweep fixed in
-            # archive_and_remove/restore_from_archive if this is ever called
-            # with raw Chroma output directly.
-            embeddings=_materialize_embeddings(snapshot),
-        )
-        try:
-            archive_store.persist()
-        except Exception:
-            pass
+        # upsert, not add (2026-10 fix, same data-integrity audit as
+        # archive_and_remove/restore_from_archive above) — this writes into
+        # a freshly-recreated, empty archive collection in the normal case,
+        # but upsert costs nothing extra when there's no collision and
+        # removes any risk if this is ever re-run against a non-empty one
+        # (e.g. a retried carry-forward after a partial failure).
+        with self._rebuild_lock(exclusive=False):
+            archive_store._collection.upsert(
+                ids=ids,
+                documents=snapshot.get("documents") or [],
+                metadatas=snapshot.get("metadatas") or [],
+                # _materialize_embeddings (not `snapshot.get("embeddings") or []`)
+                # — snapshot_archive() already stores a materialized plain list
+                # here, but a numpy ndarray triggers the exact "truth value of an
+                # array is ambiguous" crash this same sweep fixed in
+                # archive_and_remove/restore_from_archive if this is ever called
+                # with raw Chroma output directly.
+                embeddings=_materialize_embeddings(snapshot),
+            )
+            try:
+                archive_store.persist()
+            except Exception:
+                pass
         print(f"[VectorStore] restore_archive_snapshot: carried forward {len(ids)} archived doc(s) across rebuild")
         return len(ids)
 

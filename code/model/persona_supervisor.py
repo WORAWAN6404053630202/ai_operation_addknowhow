@@ -116,6 +116,8 @@ from utils.text_patterns import (
     ACTION_INTENT_RE as _SHARED_ACTION_INTENT_RE,
     nonreg_chapter_semantic_check as _shared_nonreg_chapter_semantic_check,
     NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE as _SHARED_NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE,
+    nonreg_chapter_disagreement_should_reject as _shared_nonreg_chapter_disagreement_should_reject,
+    bowtie_reorder as _shared_bowtie_reorder,
 )
 from utils.prompts_supervisor import (
     build_topic_picker_prompt,
@@ -4747,11 +4749,17 @@ class PersonaSupervisor:
                                     _st_docs_raw = []
                                     _st_data_type = ""
                                     _st_parent_mt = ""
-                                elif _st_sem_top_mt and _st_sem_top_mt != _st_parent_mt:
+                                # Score floor added here too (2026-10, data-integrity audit) —
+                                # see utils.text_patterns.nonreg_chapter_disagreement_should_reject's
+                                # docstring for why this check needed the same floor its sibling
+                                # above already has.
+                                elif _shared_nonreg_chapter_disagreement_should_reject(
+                                    _st_sem_top_mt, _st_parent_mt, _st_sem_top_score,
+                                ):
                                     _LOG.info(
                                         "[Supervisor] sub_topic exact-match %r (chapter %r) rejected — "
-                                        "semantic top hit disagrees (chapter %r); falling back to normal retrieval",
-                                        _target_st_sv, _st_parent_mt, _st_sem_top_mt,
+                                        "semantic top hit disagrees (chapter %r, score=%.3f); falling back to normal retrieval",
+                                        _target_st_sv, _st_parent_mt, _st_sem_top_mt, _st_sem_top_score,
                                     )
                                     _st_docs_raw = []
                                     _st_data_type = ""
@@ -12746,6 +12754,13 @@ class PersonaSupervisor:
                                                 key=lambda _d: _rt_scored.get(_d["content"][:60], 0.0),
                                                 reverse=True,
                                             )
+                                            # 2026-10 fix (data-integrity audit): a plain best-to-
+                                            # worst sort only protects the START of the eventual
+                                            # LLM context — see utils.text_patterns.bowtie_reorder's
+                                            # docstring (same "Lost in the Middle" research already
+                                            # cited by persona_practical.py's own analogous re-rank
+                                            # step) for why this needed the same treatment.
+                                            _rt_raw_docs = _shared_bowtie_reorder(_rt_raw_docs)
                                             _LOG.info(
                                                 "[Supervisor] registration_type re-ranked %d docs by similarity",
                                                 len(_rt_raw_docs),
