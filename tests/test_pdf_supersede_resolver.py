@@ -112,6 +112,64 @@ class TestResolveDecision:
 
 
 @pytest.mark.unit
+class TestExcludeDocIds:
+    """2026-10 fix (live-confirmed on pdf_supersede_backfill.py's first real
+    --all-live dry run): exclude_doc_id alone only pops ONE id from the
+    candidate pool — a topic with chunk_total > 1 writes one Document per
+    sub-chunk, every sub-chunk sharing the exact same main_topic/sub_topic,
+    so a backfill representative's OWN other sub-chunks matched perfectly
+    on identity and got "confirmed" as if they were a genuinely different
+    stuck duplicate. exclude_doc_ids lets the caller pop its whole own
+    sibling-chunk-id set up front instead of just one id."""
+
+    def test_exclude_doc_ids_removes_every_listed_id_from_the_pool(self):
+        pool = {
+            "own-chunk-2": {"score": 1.0, "metadata": {"department": "สำนักงานประกันสังคม", "license_type": "ทะเบียนนายจ้าง"}, "content": ""},
+            "genuine-other-doc": {"score": 0.91, "metadata": {"department": "สำนักงานประกันสังคม", "license_type": "ทะเบียนนายจ้าง"}, "content": ""},
+        }
+        with patch.object(resolver, "_embedding_candidates", return_value=pool), \
+             patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
+             patch.object(resolver, "_llm_judge", return_value={
+                 "genuine-other-doc": {"is_same_topic": True, "content_status": "update", "reasoning": "x"},
+             }) as mock_judge:
+            decision = resolver.resolve_topic(
+                {"department": "สำนักงานประกันสังคม", "license_type": "ทะเบียนนายจ้าง", "answer_guideline": "เนื้อหา"},
+                "own-chunk-1-as-rep.pdf",
+                exclude_doc_id="own-chunk-1", exclude_doc_ids=["own-chunk-1", "own-chunk-2"],
+            )
+        assert decision.decision == "update"
+        assert decision.matched_doc_ids == ["genuine-other-doc"]
+        judged_ids = {c["candidate_id"] for c in mock_judge.call_args[0][1]}
+        assert "own-chunk-2" not in judged_ids
+
+    def test_excluding_every_candidate_leaves_an_empty_pool_and_returns_new(self):
+        pool = {"own-chunk-2": {"score": 1.0, "metadata": {}, "content": ""}}
+        with patch.object(resolver, "_embedding_candidates", return_value=pool), \
+             patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
+             patch.object(resolver, "_llm_judge") as mock_judge:
+            decision = resolver.resolve_topic(
+                {"department": "สำนักงานประกันสังคม", "license_type": "ทะเบียนนายจ้าง", "answer_guideline": "เนื้อหา"},
+                "f.pdf", exclude_doc_ids=["own-chunk-2"],
+            )
+        assert decision.decision == "new"
+        mock_judge.assert_not_called()
+
+    def test_none_excluded_is_a_safe_noop(self):
+        pool = {"doc-1": {"score": 0.91, "metadata": {"department": "สำนักงานประกันสังคม", "license_type": "ทะเบียนนายจ้าง"}, "content": ""}}
+        with patch.object(resolver, "_embedding_candidates", return_value=pool), \
+             patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
+             patch.object(resolver, "_llm_judge", return_value={
+                 "doc-1": {"is_same_topic": True, "content_status": "duplicate", "reasoning": "x"},
+             }):
+            decision = resolver.resolve_topic(
+                {"department": "สำนักงานประกันสังคม", "license_type": "ทะเบียนนายจ้าง", "answer_guideline": "เนื้อหา"},
+                "f.pdf", exclude_doc_ids=None,
+            )
+        assert decision.decision == "duplicate"
+        assert decision.matched_doc_ids == ["doc-1"]
+
+
+@pytest.mark.unit
 class TestFieldDiffUsesContentAppropriateKeys:
     """PDF-M1 (2026-10): _field_diff defaults to _PROCEDURAL_FIELD_KEYS
     (registration_type/fees/operation_duration/...), which only matches the
@@ -613,9 +671,18 @@ class TestContentCompletenessCheckCatchesNonBlankDilution:
     a field that's non-empty on BOTH sides, but the new side has dropped a
     specific detail the old side had. Scoped to run only on update_ids that
     already survived the free blank-field guard, so these tests mock
-    _check_content_completeness directly rather than the real LLM call."""
+    _check_content_completeness directly rather than the real LLM call.
 
-    def test_flagged_missing_claim_blocks_retirement_despite_nonblank_fields(self):
+    2026-10 redesign: a flagged claim no longer blocks retirement outright
+    (see _resolve's own comment on the incident this fixes — permanently
+    blocking turned into 204 stuck duplicate docs across one real corpus,
+    with zero automated path to ever resolve them, in a pipeline with no
+    human review step). "omitted" claims now get folded into the new
+    topic's field_merges instead; "contradicted" claims (the new doc
+    deliberately replaced the value) are dropped with no merge. Retirement
+    always proceeds either way."""
+
+    def test_omitted_claim_merges_into_field_merges_and_update_still_proceeds(self):
         pool = {"doc-old": {"score": 0.9, "metadata": {
             "department": "X", "license_type": "Y", "service_channel": "ที่หน่วยจดทะเบียนสถานประกอบการ",
         }, "content": ""}}
@@ -625,7 +692,7 @@ class TestContentCompletenessCheckCatchesNonBlankDilution:
                  "doc-old": {"is_same_topic": True, "content_status": "update", "reasoning": "r"},
              }), \
              patch.object(resolver, "_check_content_completeness", return_value={
-                 "doc-old": [{"field": "service_channel", "claim": "ยื่นได้ที่สำนักงานใหญ่กรณีมีสาขา"}],
+                 "doc-old": [{"field": "service_channel", "claim": "ยื่นได้ที่สำนักงานใหญ่กรณีมีสาขา", "status": "omitted"}],
              }):
             decision = resolver.resolve_topic(
                 {
@@ -636,8 +703,99 @@ class TestContentCompletenessCheckCatchesNonBlankDilution:
                 },
                 "f.pdf",
             )
-        assert decision.decision == "new"
-        assert "doc-old" not in decision.matched_doc_ids
+        assert decision.decision == "update"
+        assert "doc-old" in decision.matched_doc_ids
+        assert "service_channel" in decision.field_merges
+        assert "ยื่นได้ที่สำนักงานใหญ่กรณีมีสาขา" in decision.field_merges["service_channel"]
+
+    def test_contradicted_claim_does_not_merge_but_update_still_proceeds(self):
+        """A deliberate correction (e.g. a changed fee) must not get its
+        stale old value folded back in — only retire, no merge for that
+        field."""
+        pool = {"doc-old": {"score": 0.9, "metadata": {"department": "X", "license_type": "Y", "fees": "100 บาท"}, "content": ""}}
+        with patch.object(resolver, "_embedding_candidates", return_value=pool), \
+             patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
+             patch.object(resolver, "_llm_judge", return_value={
+                 "doc-old": {"is_same_topic": True, "content_status": "update", "reasoning": "r"},
+             }), \
+             patch.object(resolver, "_check_content_completeness", return_value={
+                 "doc-old": [{"field": "fees", "claim": "ค่าธรรมเนียม 100 บาท", "status": "contradicted"}],
+             }):
+            decision = resolver.resolve_topic(
+                {"department": "X", "license_type": "Y", "answer_guideline": "z", "fees": "150 บาท"},
+                "f.pdf",
+            )
+        assert decision.decision == "update"
+        assert "doc-old" in decision.matched_doc_ids
+        assert "fees" not in decision.field_merges
+
+    def test_mixed_omitted_and_contradicted_claims_on_one_doc(self):
+        pool = {"doc-old": {"score": 0.9, "metadata": {"department": "X", "license_type": "Y"}, "content": ""}}
+        with patch.object(resolver, "_embedding_candidates", return_value=pool), \
+             patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
+             patch.object(resolver, "_llm_judge", return_value={
+                 "doc-old": {"is_same_topic": True, "content_status": "update", "reasoning": "r"},
+             }), \
+             patch.object(resolver, "_check_content_completeness", return_value={
+                 "doc-old": [
+                     {"field": "fees", "claim": "ค่าธรรมเนียม 100 บาท", "status": "contradicted"},
+                     {"field": "operation_duration", "claim": "ใช้เวลา 15 วัน", "status": "omitted"},
+                 ],
+             }):
+            decision = resolver.resolve_topic(
+                {"department": "X", "license_type": "Y", "answer_guideline": "z", "fees": "150 บาท"},
+                "f.pdf",
+            )
+        assert decision.decision == "update"
+        assert "fees" not in decision.field_merges
+        assert "operation_duration" in decision.field_merges
+        assert "ใช้เวลา 15 วัน" in decision.field_merges["operation_duration"]
+
+    def test_unrecognized_field_name_is_skipped_not_merged(self):
+        """A field name the completeness check returns that isn't actually
+        one of this topic's own diff_keys must be skipped, not silently
+        create a dead key or collide with something unrelated."""
+        pool = {"doc-old": {"score": 0.9, "metadata": {"department": "X", "license_type": "Y"}, "content": ""}}
+        with patch.object(resolver, "_embedding_candidates", return_value=pool), \
+             patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
+             patch.object(resolver, "_llm_judge", return_value={
+                 "doc-old": {"is_same_topic": True, "content_status": "update", "reasoning": "r"},
+             }), \
+             patch.object(resolver, "_check_content_completeness", return_value={
+                 "doc-old": [{"field": "ไม่มี field นี้จริง", "claim": "x", "status": "omitted"}],
+             }):
+            decision = resolver.resolve_topic(
+                {"department": "X", "license_type": "Y", "answer_guideline": "z"},
+                "f.pdf",
+            )
+        assert decision.decision == "update"
+        assert decision.field_merges == {}
+
+    def test_two_old_docs_flagging_the_same_field_merge_into_one_note(self):
+        pool = {
+            "doc-a": {"score": 0.9, "metadata": {"department": "X", "license_type": "Y"}, "content": ""},
+            "doc-b": {"score": 0.9, "metadata": {"department": "X", "license_type": "Y"}, "content": ""},
+        }
+        with patch.object(resolver, "_embedding_candidates", return_value=pool), \
+             patch.object(resolver, "_identity_fuzzy_candidates", return_value={}), \
+             patch.object(resolver, "_llm_judge", return_value={
+                 "doc-a": {"is_same_topic": True, "content_status": "update", "reasoning": "r"},
+                 "doc-b": {"is_same_topic": True, "content_status": "update", "reasoning": "r"},
+             }), \
+             patch.object(resolver, "_check_content_completeness", return_value={
+                 "doc-a": [{"field": "operation_duration", "claim": "claim จาก doc-a", "status": "omitted"}],
+                 "doc-b": [{"field": "operation_duration", "claim": "claim จาก doc-b", "status": "omitted"}],
+             }):
+            decision = resolver.resolve_topic(
+                {"department": "X", "license_type": "Y", "answer_guideline": "z"},
+                "f.pdf",
+            )
+        assert decision.decision == "update"
+        assert set(decision.matched_doc_ids) == {"doc-a", "doc-b"}
+        assert "claim จาก doc-a" in decision.field_merges["operation_duration"]
+        assert "claim จาก doc-b" in decision.field_merges["operation_duration"]
+        # Exactly one marker block for this field, not one per contributing doc.
+        assert decision.field_merges["operation_duration"].count(resolver._MERGE_NOTE_MARKER) == 1
 
     def test_no_missing_claims_does_not_block_a_genuine_update(self):
         pool = {"doc-old": {"score": 0.9, "metadata": {"department": "X", "license_type": "Y", "fees": "100 บาท"}, "content": ""}}
@@ -713,6 +871,8 @@ class TestCheckContentCompletenessUnit:
         mock_openai.assert_not_called()
 
     def test_parses_missing_claims_from_response(self):
+        """No `status` in the response at all → defaults to 'omitted', the
+        safe default (see this function's docstring)."""
         mock_client = MagicMock()
         mock_resp = MagicMock()
         mock_resp.choices[0].message.content = (
@@ -723,7 +883,67 @@ class TestCheckContentCompletenessUnit:
             result = resolver._check_content_completeness(
                 {"doc-1": {"fees": "100 บาท"}}, {"answer_guideline": "เนื้อหาใหม่"}, ["fees"], "m",
             )
-        assert result == {"doc-1": [{"field": "fees", "claim": "ค่าธรรมเนียม 100 บาท"}]}
+        assert result == {"doc-1": [{"field": "fees", "claim": "ค่าธรรมเนียม 100 บาท", "status": "omitted"}]}
+
+    def test_corroborated_contradicted_claim_stays_contradicted(self):
+        """status=contradicted + a new_value_found that genuinely occurs in
+        new_content → trusted as-is."""
+        mock_client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.choices[0].message.content = (
+            '{"missing_claims": [{"field": "fees", "claim": "ค่าธรรมเนียม 100 บาท", '
+            '"status": "contradicted", "new_value_found": "ค่าธรรมเนียม 150 บาท"}]}'
+        )
+        mock_client.chat.completions.create.return_value = mock_resp
+        with patch.object(resolver, "OpenAI", return_value=mock_client):
+            result = resolver._check_content_completeness(
+                {"doc-1": {"fees": "100 บาท"}}, {"answer_guideline": "ค่าธรรมเนียม 150 บาท"}, ["fees"], "m",
+            )
+        assert result == {"doc-1": [{"field": "fees", "claim": "ค่าธรรมเนียม 100 บาท", "status": "contradicted"}]}
+
+    def test_ungrounded_contradicted_claim_downgrades_to_omitted(self):
+        """status=contradicted but the asserted new_value_found does NOT
+        actually occur anywhere in new_content — the LLM's bare word alone
+        must not be trusted on the one branch that skips the merge safety
+        net; downgrade rather than silently dropping the old claim."""
+        mock_client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.choices[0].message.content = (
+            '{"missing_claims": [{"field": "fees", "claim": "ค่าธรรมเนียม 100 บาท", '
+            '"status": "contradicted", "new_value_found": "ไม่มีข้อความแบบนี้อยู่จริง"}]}'
+        )
+        mock_client.chat.completions.create.return_value = mock_resp
+        with patch.object(resolver, "OpenAI", return_value=mock_client):
+            result = resolver._check_content_completeness(
+                {"doc-1": {"fees": "100 บาท"}}, {"answer_guideline": "เนื้อหาใหม่ไม่เกี่ยวข้องกันเลย"}, ["fees"], "m",
+            )
+        assert result == {"doc-1": [{"field": "fees", "claim": "ค่าธรรมเนียม 100 บาท", "status": "omitted"}]}
+
+    def test_contradicted_with_no_new_value_found_downgrades_to_omitted(self):
+        mock_client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.choices[0].message.content = (
+            '{"missing_claims": [{"field": "fees", "claim": "ค่าธรรมเนียม 100 บาท", "status": "contradicted"}]}'
+        )
+        mock_client.chat.completions.create.return_value = mock_resp
+        with patch.object(resolver, "OpenAI", return_value=mock_client):
+            result = resolver._check_content_completeness(
+                {"doc-1": {"fees": "100 บาท"}}, {"answer_guideline": "เนื้อหาใหม่"}, ["fees"], "m",
+            )
+        assert result == {"doc-1": [{"field": "fees", "claim": "ค่าธรรมเนียม 100 บาท", "status": "omitted"}]}
+
+    def test_unrecognized_status_value_downgrades_to_omitted(self):
+        mock_client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.choices[0].message.content = (
+            '{"missing_claims": [{"field": "fees", "claim": "x", "status": "something_else"}]}'
+        )
+        mock_client.chat.completions.create.return_value = mock_resp
+        with patch.object(resolver, "OpenAI", return_value=mock_client):
+            result = resolver._check_content_completeness(
+                {"doc-1": {"fees": "100 บาท"}}, {"answer_guideline": "z"}, ["fees"], "m",
+            )
+        assert result == {"doc-1": [{"field": "fees", "claim": "x", "status": "omitted"}]}
 
     def test_empty_missing_claims_list_excludes_doc_from_result(self):
         mock_client = MagicMock()

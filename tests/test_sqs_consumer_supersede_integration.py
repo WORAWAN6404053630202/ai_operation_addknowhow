@@ -110,6 +110,43 @@ class TestBuildItemsDirectSupersedeWiring:
         assert call_order == ["add", "archive"]
         mock_archive.assert_called_once_with(["old-a-1"], reason="superseded by updated_law.pdf")
 
+    def test_update_decision_field_merges_land_in_the_written_document_metadata(self):
+        """2026-10 (pdf_supersede_resolver.py field_merges redesign): proves
+        the merge note isn't just computed correctly in isolation — it must
+        actually reach the Document.metadata that build_merged_documents()
+        fans out to every written sub-chunk. Uses the REAL build_merged_
+        documents (not mocked), matching how test_update_topic_writes_new_
+        then_retires_old_in_order already exercises the retire-ordering path."""
+        pages, markdowns = _make_pages(2)
+
+        def fake_identify(page_markdowns, cost_accumulator=None):
+            return [_topic(page_ranges=[(1, 2)])]
+
+        def fake_draft(topic_markdowns, cost_accumulator=None):
+            return {"หน่วยงาน": "Dept A", "ใบอนุญาต": "License A", "ค่าธรรมเนียม": "100 บาท"}
+
+        def fake_resolve(merged, source_file, cost_accumulator=None):
+            return SupersedeDecision(
+                "update", matched_doc_ids=["old-a-1"],
+                field_merges={"operation_duration": "(ข้อมูลเพิ่มเติมจากเอกสารฉบับก่อนหน้า, 2026-10-27) ภายใน 7 วัน"},
+            )
+
+        with patch.object(sqs_consumer, "identify_knowhow_topics", side_effect=fake_identify), \
+             patch.object(sqs_consumer, "draft_fields_from_pages", side_effect=fake_draft), \
+             patch.object(sqs_consumer.pdf_supersede_resolver, "resolve_topic", side_effect=fake_resolve), \
+             patch.object(sqs_consumer, "_add_documents_to_vectorstore") as mock_add, \
+             patch.object(sqs_consumer, "_filter_to_pdf_auto_ids", side_effect=lambda ids, filename: ids), \
+             patch.object(sqs_consumer, "_archive_and_remove_in_vectorstore"):
+            mock_add.return_value = 1
+            sqs_consumer._build_items_direct("updated_law.pdf", "s3://bucket/updated_law.pdf", pages, markdowns)
+
+        written_docs = mock_add.call_args[0][0]
+        assert len(written_docs) >= 1
+        assert all(
+            "ภายใน 7 วัน" in doc.metadata.get("operation_duration", "")
+            for doc in written_docs
+        ), [doc.metadata.get("operation_duration") for doc in written_docs]
+
     def test_vectorstore_write_failure_saves_a_recovery_placeholder(self):
         """PDF-M11 (2026-10): before this fix, a failed final Chroma write
         (after OCR/topic-splitting/drafting all succeeded — real billed

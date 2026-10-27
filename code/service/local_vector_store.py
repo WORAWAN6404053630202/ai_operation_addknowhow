@@ -644,6 +644,98 @@ class LocalVectorStoreManager:
         self._bump_corpus_version()
         return len(to_delete)
 
+    def update_live_metadata(self, doc_ids: List[str], field_updates: Dict[str, str]) -> int:
+        """In-place patch of already-live documents — added 2026-10 for
+        code/scripts/pdf_supersede_backfill.py (the one-time cleanup of
+        docs that got stuck permanently blocked under the OLD supersede-
+        resolver behavior, before pdf_supersede_resolver.py's field_merges
+        redesign). The live ingest path never needs this: there,
+        field_merges gets folded into a topic's drafted values BEFORE
+        build_merged_documents ever writes a Document, so there's nothing
+        already-live to patch. The backfill is different — the "new"
+        sibling doc_updates needs merged into is already live, so this
+        patches it directly instead.
+
+        field_updates: {metadata_field: text_to_append} — APPENDED to each
+        doc's own current value for that field (same convention
+        sqs_consumer.py's live path uses: `merged[k] = str(merged.get(k)
+        or "") + v`), not a replacement. Applied identically to every id in
+        doc_ids — the caller is responsible for first resolving the full
+        set of sibling sub-chunk ids sharing one logical topic (each
+        chunk_index/chunk_total sub-chunk carries its own independent copy
+        of the structured fields, by build_merged_documents' own design —
+        see that function's docstring — so a merge must reach every one of
+        them, not just whichever single id the resolver happened to
+        return).
+
+        Also appends the same text to page_content (not just metadata) —
+        otherwise the merged detail would sit in metadata but never be
+        part of what similarity search actually matches against. This is
+        the one thing that makes this call genuinely cost money (an
+        explicit re-embed of the changed documents, same as add_documents
+        pays) — acceptable here since it's a one-time backfill over a
+        bounded, already-identified id list, not a per-ingest-event cost.
+
+        2026-10 fix (live-crashed on the real corpus's first --confirm run):
+        this used to call self.vectorstore._collection.update(ids=ids,
+        documents=new_documents, metadatas=new_metadatas) with NO
+        embeddings= argument, trusting the raw chromadb collection to
+        auto-embed the changed documents the same way add_documents()
+        does. It does not: add_documents() goes through LangChain's own
+        Chroma.add_documents(), which explicitly computes embeddings via
+        self.embedding_model (bge-m3, 1024-dim) and passes them through —
+        calling the RAW collection's .update() directly with documents=
+        but no embeddings= instead falls back to chromadb's own bundled
+        DEFAULT embedding function (all-MiniLM-L6-v2, 384-dim), which
+        chromadb.errors.InvalidArgumentError rejects outright against a
+        collection created with a 1024-dim function ("expecting embedding
+        with dimension of 1024, got 384") — confirmed live, mid-backfill.
+        Chroma validates before writing, so this crashed cleanly with no
+        partial mutation, but it means embeddings must be computed
+        explicitly here, exactly like add_documents does, never left to
+        the raw collection's own default.
+
+        Upsert-then-verify, same reversibility posture as archive_and_remove:
+        only reports ids actually confirmed changed; never partially
+        applies without the caller being able to tell."""
+        if not doc_ids or not field_updates:
+            return 0
+        if self.vectorstore is None:
+            self.connect_to_existing(fail_if_empty=False)
+        fetched = self.vectorstore._collection.get(ids=doc_ids, include=["documents", "metadatas"])
+        ids = fetched.get("ids") or []
+        if not ids:
+            print(f"[VectorStore] update_live_metadata: none of {len(doc_ids)} id(s) found live, no-op")
+            return 0
+        documents = fetched.get("documents") or []
+        metadatas = fetched.get("metadatas") or []
+
+        new_documents = []
+        new_metadatas = []
+        for doc, meta in zip(documents, metadatas):
+            meta = dict(meta or {})
+            doc_text = doc or ""
+            for field, note in field_updates.items():
+                meta[field] = str(meta.get(field) or "") + note
+                doc_text = f"{doc_text}\n\n{note}".strip()
+            new_documents.append(doc_text)
+            new_metadatas.append(_stringify_metadata(meta))
+
+        new_embeddings = self.embedding_model.embed_documents(new_documents)
+        _record_embedding_cost_estimate("VectorStore/update_live_metadata", new_documents)
+        with self._rebuild_lock(exclusive=False):
+            self.vectorstore._collection.update(
+                ids=ids, documents=new_documents, metadatas=new_metadatas, embeddings=new_embeddings,
+            )
+            try:
+                self.vectorstore.persist()
+            except Exception:
+                pass
+
+        print(f"[VectorStore] update_live_metadata: patched {len(ids)} doc(s) with field(s) {list(field_updates.keys())}")
+        self._bump_corpus_version()
+        return len(ids)
+
     def list_archived_docs(self, pattern: Optional[str] = None, since_epoch: Optional[float] = None) -> List[Dict]:
         """Audit/inspection helper — the periodic review mechanism that
         compensates for there being no real-time human gate on supersede
@@ -962,6 +1054,11 @@ def delete_by_source_file(source_file: str) -> int:
 def archive_and_remove(doc_ids: List[str], reason: str) -> int:
     """Public API — see LocalVectorStoreManager.archive_and_remove."""
     return _MANAGER.archive_and_remove(doc_ids, reason)
+
+
+def update_live_metadata(doc_ids: List[str], field_updates: Dict[str, str]) -> int:
+    """Public API — see LocalVectorStoreManager.update_live_metadata."""
+    return _MANAGER.update_live_metadata(doc_ids, field_updates)
 
 
 def list_archived_docs(pattern: Optional[str] = None, since_epoch: Optional[float] = None) -> List[Dict]:

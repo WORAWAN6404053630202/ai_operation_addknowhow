@@ -26,6 +26,31 @@ def fuzzy_ratio(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a2, b2).ratio()
 
 
+def fuzzy_excerpt_found(excerpt: str, content: str, threshold: float = 0.6) -> bool:
+    """Whether a short `excerpt` genuinely appears somewhere inside a much
+    longer `content` blob — NOT the same question fuzzy_ratio answers.
+    fuzzy_ratio compares two strings as wholes, so a true excerpt-inside-a-
+    huge-blob match still scores near 0 (SequenceMatcher's ratio is a
+    function of total length overlap, not substring containment) — exactly
+    the shape of check pdf_supersede_resolver.py's completeness-check needs
+    (verify a short claimed quote from a new document's full text actually
+    occurs in it) but fuzzy_ratio can't answer.
+
+    Exact (normalized) substring match short-circuits true. Otherwise finds
+    the longest common contiguous run between the two and requires it cover
+    at least `threshold` of the excerpt's own length — tolerates minor
+    wording drift (the excerpt paraphrasing rather than quoting verbatim)
+    while still rejecting an excerpt that doesn't really occur."""
+    e2 = re.sub(r"\s+", "", (excerpt or "")).strip().lower()
+    c2 = re.sub(r"\s+", "", (content or "")).strip().lower()
+    if not e2 or not c2:
+        return False
+    if e2 in c2:
+        return True
+    match = difflib.SequenceMatcher(None, c2, e2).find_longest_match(0, len(c2), 0, len(e2))
+    return (match.size / len(e2)) >= threshold
+
+
 def group_into_ranges(page_nums: list[int]) -> list[tuple[int, int]]:
     """[1,2,3,5] -> [(1,3),(5,5)] — compresses a flat page-number list into
     contiguous (start,end) runs. Shared by format_page_ranges below and by

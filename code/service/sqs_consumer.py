@@ -342,6 +342,24 @@ def _build_items_direct(
                 f"update — will retire {decision.matched_doc_ids} after the new doc(s) are written"
             )
             retire_doc_ids.extend(decision.matched_doc_ids)
+            # 2026-10 (pdf_supersede_resolver.py field_merges redesign): a
+            # claim the completeness check found genuinely "omitted" (not
+            # superseded by a newer value) from a retiring doc gets folded
+            # into this topic's own field value BEFORE it's written —
+            # `merged` is the same dict build_merged_documents() fans into
+            # every sub-chunk Document, so this reaches all of them for
+            # free, no extra plumbing. Replaces the old behavior of simply
+            # refusing to retire (see that module's own comments on why:
+            # blocking forever was never actually a resting state in a
+            # pipeline with no human review — it was silent, permanent
+            # duplication).
+            if decision.field_merges:
+                for field, note in decision.field_merges.items():
+                    merged[field] = str(merged.get(field) or "") + note
+                logger.info(
+                    f"[SQSConsumer] {filename} topic ({merged.get('main_topic')!r}/{merged.get('sub_topic')!r}): "
+                    f"merged omitted detail(s) from retired doc(s) into field(s) {list(decision.field_merges.keys())}"
+                )
             update_count += 1
         else:
             new_count += 1

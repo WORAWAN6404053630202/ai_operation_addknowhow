@@ -41,7 +41,7 @@ from service.pdf_candidate_matching import _field_diff, _PROCEDURAL_FIELD_KEYS
 from utils.llm_cost_logging import CostAccumulator, log_llm_cost
 from utils.pdf_cost_guard import get_cost_guard
 from utils.logger import get_logger
-from utils.page_ranges import fuzzy_ratio
+from utils.page_ranges import fuzzy_excerpt_found, fuzzy_ratio
 from utils.prompt_safety import INJECTION_GUARD
 
 logger = get_logger(__name__)
@@ -104,17 +104,29 @@ KNOWHOW_CATCHALL_MAIN_TOPIC = "เนื้อหาที่เหลือ (�
 
 class SupersedeDecision:
     """decision: "new" | "update" | "duplicate".
-    matched_doc_ids: live Chroma doc ids to retire — only non-empty for "update"."""
+    matched_doc_ids: live Chroma doc ids to retire — only non-empty for "update".
+    field_merges: {field: text_to_append} — only non-empty for "update". Text
+    the completeness-check found genuinely "omitted" (not superseded by a
+    newer value) from a retired doc, that the caller must fold into the new
+    topic's own field value BEFORE writing it — see _resolve's docstring on
+    why "update" no longer blocks on this check, just merges around it."""
 
-    __slots__ = ("decision", "matched_doc_ids", "reasoning")
+    __slots__ = ("decision", "matched_doc_ids", "reasoning", "field_merges")
 
-    def __init__(self, decision: str, matched_doc_ids: Optional[list[str]] = None, reasoning: str = ""):
+    def __init__(
+        self, decision: str, matched_doc_ids: Optional[list[str]] = None, reasoning: str = "",
+        field_merges: Optional[dict[str, str]] = None,
+    ):
         self.decision = decision
         self.matched_doc_ids = matched_doc_ids or []
         self.reasoning = reasoning
+        self.field_merges = field_merges or {}
 
     def __repr__(self) -> str:
-        return f"SupersedeDecision({self.decision!r}, matched_doc_ids={self.matched_doc_ids!r})"
+        return (
+            f"SupersedeDecision({self.decision!r}, matched_doc_ids={self.matched_doc_ids!r}, "
+            f"field_merges={list(self.field_merges.keys())!r})"
+        )
 
 
 def _comparison_text(values: dict, keys: tuple) -> str:
@@ -284,9 +296,48 @@ def _llm_judge(
         return {}
 
 
+# 2026-10 fix (full-corpus live audit: 204 docs stuck blocked-forever out of
+# ~421 live, after reprocessing 91 real PDFs): the ORIGINAL version of this
+# prompt only asked "does each old claim still appear in the new content" —
+# every flagged claim did the exact same thing (block retirement), with no
+# further automated resolution, ever. That conflated two completely
+# different situations: a DELIBERATE correction (a government fee changing
+# 100→150 บาท — the old claim "100 บาท" will NEVER appear in the new text,
+# because it was intentionally replaced, not lost) and an accidental
+# OMISSION (new document silently drops a detail that's still true). Both
+# looked identical to the old prompt. Live-sampled 20 of the 204 stuck docs
+# in full: all were legitimate content, duplicated only because the LLM
+# re-worded the same real document slightly differently across two separate
+# ingest runs — meaning most of what this prompt used to flag was never a
+# real "value changed" case at all, just paraphrasing noise, and the old
+# behavior (block forever, no further resolution) let it accumulate
+# unboundedly since nothing in this pipeline ever revisits a blocked pair.
+#
+# Now asks for a `status` per claim so the caller (_check_content_completeness
+# below, then _resolve) can react differently: "contradicted" claims are
+# superseded corrections — safe to let go, no merge, no block. "omitted"
+# claims are genuinely at risk of silent loss — get merged into the new
+# document's matching field instead of blocking forever (see _resolve).
+#
+# "omitted" is the explicitly safer default: `_check_content_completeness`
+# treats any missing/malformed `status` as "omitted", never "contradicted" —
+# an LLM asserting "contradicted" is the ONE path that can make an old
+# detail vanish with nothing else checking it, so the prompt both biases
+# toward "omitted" under any doubt AND requires `new_value_found` (the
+# specific new-document text believed to replace the claim) whenever it
+# answers "contradicted" — _check_content_completeness cross-checks that
+# excerpt actually occurs in new_content (utils.page_ranges.fuzzy_excerpt_
+# found) and downgrades to "omitted" if it doesn't hold up. Never trust the
+# LLM's bare word alone on the one branch that skips the safety net.
 _COMPLETENESS_CHECK_PROMPT = """คุณกำลังช่วยตรวจสอบว่าการแทนที่เอกสารเก่าด้วยเอกสารใหม่ (ระบบตัดสินแล้วว่าเป็นเรื่องเดียวกันและเนื้อหามีการเปลี่ยนแปลง) จะทำให้ข้อมูลสำคัญที่มีอยู่ในเอกสารเก่าหายไปหรือไม่ — การตัดสินใจนี้จะถูกนำไปใช้จริงทันทีโดยไม่มีคนตรวจสอบ
 
-วิธีตรวจ: แยกเนื้อหาของเอกสารเก่าแต่ละ field ด้านล่างออกเป็น "ข้อเท็จจริงย่อย" (claim) ทีละข้อที่แยกจากกันได้ แล้วเช็คว่าแต่ละข้อเท็จจริงยังปรากฏอยู่ในเนื้อหาเอกสารใหม่ทั้งหมดหรือไม่ (ไม่ต้องคำต่อคำ ความหมายเดียวกันถือว่า "ยังมี") ระบุเฉพาะข้อเท็จจริงที่หายไปจริงๆ ไม่ใช่แค่เปลี่ยนคำพูด/จัดรูปแบบใหม่
+วิธีตรวจ: แยกเนื้อหาของเอกสารเก่าแต่ละ field ด้านล่างออกเป็น "ข้อเท็จจริงย่อย" (claim) ทีละข้อ — **แยกให้ละเอียดที่สุด แต่ละตัวเลข/วันที่/เงื่อนไขที่ระบุชื่อ ต้องเป็นคนละ claim กัน** (เช่น "ค่าธรรมเนียม 100 บาท ชำระภายใน 15 วัน" ต้องแยกเป็น 2 claims: "ค่าธรรมเนียม 100 บาท" กับ "ชำระภายใน 15 วัน" ไม่ใช่รวมเป็นข้อเดียว — เพราะถ้ารวมกัน แล้วมีแค่ส่วนใดส่วนหนึ่งเปลี่ยนไป ระบบจะตรวจไม่พบว่าอีกส่วนเปลี่ยน)
+
+สำหรับแต่ละ claim ที่ไม่ปรากฏตรงๆ ในเอกสารใหม่ (ความหมายเดียวกันถือว่า "ยังมี" ไม่ต้องคำต่อคำ) ให้ตัดสินว่าเป็นแบบไหน:
+- "contradicted" = เอกสารใหม่พูดถึงเรื่องเดียวกันนี้ แต่ให้ค่า/รายละเอียดที่ต่างออกไป (เช่น ค่าธรรมเนียมเปลี่ยนจาก 100 เป็น 150 บาท) — ต้องระบุ new_value_found เป็นข้อความที่ยกมาจากเอกสารใหม่จริงๆ ที่คุณเชื่อว่าเป็นค่าที่แทนที่
+- "omitted" = เอกสารใหม่ไม่ได้พูดถึงเรื่องนี้เลย ไม่มีค่าใหม่มาแทนที่
+
+**ถ้าไม่แน่ใจว่าเป็น contradicted จริงหรือเปล่า ให้ตอบ omitted ไว้ก่อนเสมอ** (ปลอดภัยกว่า — omitted จะถูกเก็บข้อมูลเดิมไว้ ไม่ทำให้ข้อมูลหาย ส่วน contradicted จะถือว่าเอกสารเก่าผิดไปแล้วและไม่เก็บไว้)
 
 """ + INJECTION_GUARD + """
 
@@ -296,10 +347,42 @@ _COMPLETENESS_CHECK_PROMPT = """คุณกำลังช่วยตรวจ
 เนื้อหาเอกสารใหม่ทั้งหมด (จะมาแทนที่เอกสารเก่า):
 {new_content}
 
-ตอบเป็น JSON เท่านั้น ระบุเฉพาะข้อเท็จจริงที่หายไปจริง (ไม่ใช่แค่เปลี่ยนคำพูด):
-{{"missing_claims": [{{"field": "<ชื่อ field ของเอกสารเก่า>", "claim": "<ข้อเท็จจริงที่หายไป>"}}]}}
+ตอบเป็น JSON เท่านั้น ระบุเฉพาะข้อเท็จจริงที่ไม่ปรากฏตรงๆ ในเอกสารใหม่ (ไม่ใช่แค่เปลี่ยนคำพูด/จัดรูปแบบใหม่โดยความหมายเดิม):
+{{"missing_claims": [{{"field": "<ชื่อ field ของเอกสารเก่า>", "claim": "<ข้อเท็จจริงที่ไม่ปรากฏ>", "status": "contradicted"|"omitted", "new_value_found": "<ข้อความจากเอกสารใหม่ที่แทนที่ — ใส่เฉพาะตอน status=contradicted>"}}]}}
 ถ้าไม่มีข้อเท็จจริงไหนหายไปเลย ตอบ {{"missing_claims": []}}
 """
+
+
+# 2026-10: cap on how much "omitted claim" text can get folded into one
+# field via _build_field_merge_note below — a dedicated, designed cap
+# rather than relying on _MERGED_FIELD_CAPS (pdf_direct_ingest.py, applied
+# at embed time) or _STORE_FIELD_CAPS (persona_practical.py, applied at
+# retrieval time) to truncate it later. Both of those happen to truncate
+# from the end, which is the ONLY reason "it'll just get cut off eventually"
+# would even be true — and for a field already near ITS cap on a real,
+# verbose document (plausible for legal_regulatory's 2000-char embed cap),
+# an un-capped merge note could be silently swallowed whole on the very
+# first merge, not "eventually". Small enough that even several claims
+# folded into one field in a single resolve() call stay well under any
+# downstream field cap.
+_MERGE_NOTE_MAX_CHARS = 400
+# Fixed, greppable prefix — _build_field_merge_note always emits exactly
+# one block per field per resolve() call (claims grouped first), so this
+# never needs within-call deduplication; it exists so a human glancing at
+# a document later can tell "this sentence came from a retired sibling doc,
+# not the original source PDF" at a glance.
+_MERGE_NOTE_MARKER = "(ข้อมูลเพิ่มเติมจากเอกสารฉบับก่อนหน้า"
+
+
+def _build_field_merge_note(claims: list[str]) -> str:
+    """One marker-prefixed, capped note combining every omitted claim
+    folded into a single field during one resolve() call. Caller appends
+    this to the field's own fresh value — never called with an empty
+    `claims` list."""
+    date_str = time.strftime("%Y-%m-%d", time.gmtime())
+    body = "; ".join(c.strip() for c in claims if c.strip())
+    note = f"{_MERGE_NOTE_MARKER}, {date_str}) {body}"
+    return note[:_MERGE_NOTE_MAX_CHARS]
 
 
 def _new_content_blob(new_values: dict[str, str]) -> str:
@@ -334,14 +417,26 @@ def _check_content_completeness(
     claims, verify each independently, rather than asking once "is this
     complete?".
 
-    Returns {doc_id: [{"field", "claim"}, ...]} — only ids with 1+ missing
-    claims. Only called for candidates that already passed the blank-field
-    guard (i.e. a non-empty vs non-empty comparison is actually meaningful
-    here) — deliberately NOT run for every candidate, keeping this
-    additional LLM cost scoped to the one case the cheaper deterministic
-    check structurally cannot see. Never raises — a failed call means "no
-    claims flagged" (nothing EXTRA caught by this layer), never "block
-    everything"; the blank-field guard already ran and stands regardless."""
+    Returns {doc_id: [{"field", "claim", "status"}, ...]} — only ids with 1+
+    missing claims. `status` is "contradicted" (new doc addresses the same
+    specific point with a different value — a deliberate correction, the
+    caller should NOT try to preserve this claim) or "omitted" (new doc
+    doesn't address it at all — genuinely at risk of silent loss, the
+    caller should merge it back in). "omitted" is the safe default: any
+    response with a missing/unrecognized status, or a "contradicted"
+    verdict whose new_value_found doesn't actually appear in new_content
+    (fuzzy_excerpt_found — never trust the LLM's bare word on the one
+    branch that skips the merge), is normalized to "omitted" here, before
+    this function returns, so every caller downstream only ever has to
+    handle the two validated values.
+
+    Only called for candidates that already passed the blank-field guard
+    (i.e. a non-empty vs non-empty comparison is actually meaningful here)
+    — deliberately NOT run for every candidate, keeping this additional LLM
+    cost scoped to the one case the cheaper deterministic check structurally
+    cannot see. Never raises — a failed call means "no claims flagged"
+    (nothing EXTRA caught by this layer), never "block everything"; the
+    blank-field guard already ran and stands regardless."""
     if not old_values_by_id:
         return {}
     new_content = _new_content_blob(new_values)
@@ -376,10 +471,23 @@ def _check_content_completeness(
             raw = (resp.choices[0].message.content or "{}").strip()
             raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
             parsed = json.loads(raw)
-            missing = [
-                m for m in parsed.get("missing_claims", [])
-                if isinstance(m, dict) and m.get("claim")
-            ]
+            missing: list[dict] = []
+            for m in parsed.get("missing_claims", []):
+                if not isinstance(m, dict) or not m.get("claim"):
+                    continue
+                status = m.get("status")
+                new_value_found = str(m.get("new_value_found") or "").strip()
+                # Safe-default normalization: anything other than an
+                # explicit, CORROBORATED "contradicted" becomes "omitted" —
+                # see this function's docstring. A "contradicted" verdict
+                # with no new_value_found, or one that doesn't actually
+                # occur in new_content, is exactly the ungrounded-assertion
+                # case this check exists to catch — downgrade, don't trust.
+                if status == "contradicted" and new_value_found and fuzzy_excerpt_found(new_value_found, new_content):
+                    final_status = "contradicted"
+                else:
+                    final_status = "omitted"
+                missing.append({"field": m.get("field"), "claim": m.get("claim"), "status": final_status})
             if missing:
                 out[doc_id] = missing
         except Exception as e:
@@ -388,6 +496,49 @@ def _check_content_completeness(
                 f"(blank-field guard result, if any, still stands): {e}"
             )
     return out
+
+
+def build_field_merges_from_missing_claims(
+    missing_claims: dict[str, list[dict]], diff_keys: list[str], source_file: str,
+) -> dict[str, str]:
+    """Shared by _resolve (live ingest path) and code/scripts/pdf_supersede_
+    backfill.py (one-time cleanup of docs stuck under the OLD pre-redesign
+    behavior) — turns _check_content_completeness's per-doc claim list into
+    one field_merges dict, applying the same two safety rules both callers
+    need: skip any field name _check_content_completeness's LLM named that
+    isn't actually in this topic shape's diff_keys (fail closed rather than
+    create a dead/colliding key), and never merge a "contradicted" claim
+    (logged instead — see _check_content_completeness's docstring on why
+    that branch intentionally carries nothing over)."""
+    field_merges: dict[str, str] = {}
+    if not missing_claims:
+        return field_merges
+    claims_by_field: dict[str, list[str]] = {}
+    for doc_id, claims in missing_claims.items():
+        for c in claims:
+            field = c.get("field")
+            if field not in diff_keys:
+                logger.warning(
+                    f"[SupersedeResolver] {source_file!r}: completeness check for {doc_id!r} "
+                    f"named field {field!r}, not in this topic's own diff_keys — skipping that claim"
+                )
+                continue
+            if c.get("status") == "contradicted":
+                logger.info(
+                    f"[SupersedeResolver] {source_file!r}: {doc_id!r} field {field!r} superseded "
+                    f"by a factual correction in the new doc ({c['claim']!r} → {c.get('new_value_found')!r}) "
+                    f"— retiring normally, old value not carried over"
+                )
+                continue
+            claims_by_field.setdefault(field, []).append(c["claim"])
+    for field, claims in claims_by_field.items():
+        field_merges[field] = _build_field_merge_note(claims)
+    if field_merges:
+        logger.info(
+            f"[SupersedeResolver] {source_file!r}: merging {sum(len(v) for v in claims_by_field.values())} "
+            f"omitted claim(s) across field(s) {list(field_merges.keys())} from retired doc(s) into the new topic"
+        )
+    return field_merges
 
 
 def _resolve(
@@ -399,6 +550,8 @@ def _resolve(
     source_file: str,
     cost_accumulator: Optional[CostAccumulator] = None,
     metadata_key_aliases: Optional[dict[str, str]] = None,
+    exclude_doc_id: Optional[str] = None,
+    exclude_doc_ids: Optional[list[str]] = None,
 ) -> SupersedeDecision:
     # 2026-10 fix (PDF2-C2): comparison_keys/diff_keys are logical field
     # names used throughout this module (and sent to the LLM judge as the
@@ -436,6 +589,31 @@ def _resolve(
     except Exception as e:
         logger.error(f"[SupersedeResolver] Candidate pool fetch failed for {source_file!r}, defaulting to new: {e}")
         return SupersedeDecision("new", reasoning=f"candidate fetch failed: {e}")
+
+    # 2026-10 (backfill use case): re-resolving an already-live doc against
+    # itself (pdf_supersede_backfill.py treats a stuck old doc's own content
+    # as if it were a fresh incoming topic, to reuse this exact candidate-
+    # retrieval logic rather than building a second matcher) would otherwise
+    # near-always self-match at ~1.0 embedding similarity, making the whole
+    # exercise a no-op. The live ingest path never passes this (the new
+    # topic has no doc_id yet), so it's a no-op there.
+    if exclude_doc_id:
+        pool.pop(exclude_doc_id, None)
+    # 2026-10 fix (live-confirmed on the real corpus, first --all-live dry
+    # run): exclude_doc_id alone only pops the ONE id the backfill picked as
+    # its "representative" for a topic — but a topic with chunk_total > 1
+    # writes one independent Document PER sub-chunk, and every sub-chunk
+    # shares the EXACT SAME main_topic/sub_topic (and usually department/
+    # license_type too). _identity_fuzzy_candidates matches on exactly those
+    # fields, so a representative's own OTHER sub-chunks score a perfect
+    # identity match and get pulled into its own candidate pool — the
+    # backfill then "confirms" its own sibling chunk as if it were a
+    # genuinely different stuck duplicate, and (worse) ends up computing the
+    # SAME id set as both "the sibling to merge into" and "the old doc to
+    # retire", archiving the entire topic. exclude_doc_ids lets the caller
+    # pop its FULL own sibling-chunk-id set up front, not just one id.
+    for doc_id in (exclude_doc_ids or []):
+        pool.pop(doc_id, None)
 
     if not pool:
         return SupersedeDecision("new", reasoning="no live candidates found")
@@ -532,6 +710,24 @@ def _resolve(
     # to ONLY the update_ids that survived the free guard above, so this
     # extra LLM cost is paid only for the one case the deterministic check
     # structurally cannot see — not for every candidate.
+    #
+    # 2026-10 redesign (full-corpus live audit — see the module's and
+    # _COMPLETENESS_CHECK_PROMPT's comments for the incident this fixes):
+    # this used to remove a flagged doc_id from update_ids entirely —
+    # "both stay live forever", no further automated resolution, ever. That
+    # made EVERY flagged claim (whether a deliberate correction or a real
+    # accidental omission) permanently block retirement, which is exactly
+    # the unbounded-duplicate-accumulation + stale-value-retrieval risk
+    # this redesign exists to close: the pipeline has zero human review,
+    # so "block and wait for someone to look" was never actually a resting
+    # state, it was silent, permanent duplication. Now: update_ids is never
+    # filtered by this check. "contradicted" claims (a value the new doc
+    # deliberately replaced) are logged and otherwise ignored. "omitted"
+    # claims (genuinely at risk of silent loss) get folded into the new
+    # topic's own field value via field_merges instead of blocking —
+    # applied by the caller (sqs_consumer.py) before the topic is written,
+    # so retirement always proceeds and nothing is silently lost either way.
+    field_merges: dict[str, str] = {}
     if update_ids:
         completeness_candidates = {
             doc_id: existing_values_by_id.get(doc_id, {}) for doc_id in update_ids
@@ -539,26 +735,20 @@ def _resolve(
         missing_claims = _check_content_completeness(
             completeness_candidates, new_values, diff_keys, model, cost_accumulator=cost_accumulator,
         )
-        if missing_claims:
-            for doc_id, claims in missing_claims.items():
-                logger.warning(
-                    f"[SupersedeResolver] {source_file!r}: LLM judged {doc_id!r} as 'update', and its "
-                    f"fields aren't fully blank in the new doc, but a claim-level completeness check "
-                    f"flagged {len(claims)} specific detail(s) that don't appear to carry over "
-                    f"(e.g. {claims[0]['field']!r}: {claims[0]['claim']!r}) — refusing to retire it; "
-                    f"both will stay live until manually reviewed."
-                )
-            update_ids = [doc_id for doc_id in update_ids if doc_id not in missing_claims]
+        field_merges = build_field_merges_from_missing_claims(missing_claims, diff_keys, source_file)
 
     if duplicate_ids and not update_ids:
         return SupersedeDecision("duplicate", matched_doc_ids=duplicate_ids, reasoning="LLM confirmed duplicate")
     if update_ids:
-        return SupersedeDecision("update", matched_doc_ids=update_ids, reasoning="LLM confirmed content changed")
+        return SupersedeDecision(
+            "update", matched_doc_ids=update_ids, reasoning="LLM confirmed content changed", field_merges=field_merges,
+        )
     return SupersedeDecision("new", reasoning="no candidate confirmed as same-topic by LLM")
 
 
 def resolve_topic(
     merged_topic: dict[str, Any], source_file: str, cost_accumulator: Optional[CostAccumulator] = None,
+    exclude_doc_id: Optional[str] = None, exclude_doc_ids: Optional[list[str]] = None,
 ) -> SupersedeDecision:
     """merged_topic: output of pdf_direct_ingest.merge_drafted_fields() —
     main_topic/sub_topic/summary/category (always populated) plus
@@ -581,7 +771,18 @@ def resolve_topic(
     because it wasn't phrased as a license-application procedure) must
     still be findable and supersedable once a re-upload correctly resolves
     it as regulatory. Splitting the candidate pool by data_type would make
-    that cross-shape correction impossible."""
+    that cross-shape correction impossible.
+
+    exclude_doc_id / exclude_doc_ids: only used by code/scripts/pdf_
+    supersede_backfill.py, which re-resolves an already-live stuck doc
+    against its own content as if it were a fresh incoming topic — without
+    exclude_doc_id the doc would near-always self-match on its own exact
+    id; without exclude_doc_ids ALSO covering its own other sub-chunk ids
+    (chunk_total > 1 topics write one Document per sub-chunk, all sharing
+    the same main_topic/sub_topic), it would self-match on a SIBLING of its
+    own topic instead (identity-fuzzy matches main_topic/sub_topic
+    perfectly) — live-confirmed bug, see _resolve's own comment on this.
+    The live ingest path never passes either."""
     if str(merged_topic.get("main_topic") or "") == KNOWHOW_CATCHALL_MAIN_TOPIC:
         return SupersedeDecision("new", reasoning="catch-all topic, never matched")
     return _resolve(
@@ -608,6 +809,8 @@ def resolve_topic(
         # kept for backward-compatible reads of those older docs until the
         # corpus fully turns over.
         metadata_key_aliases=_KNOWHOW_METADATA_KEY_ALIASES,
+        exclude_doc_id=exclude_doc_id,
+        exclude_doc_ids=exclude_doc_ids,
     )
 
 
