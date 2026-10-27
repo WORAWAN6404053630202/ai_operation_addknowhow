@@ -176,3 +176,37 @@ class TestReadRecentEvents:
         with patch.object(mod, "_client", return_value=mock_client):
             events = mod.read_recent_events("test-bucket", days=1)  # must not raise
         assert events == []
+
+
+@pytest.mark.unit
+class TestClassifyEventOutcome:
+    """2026-10 (admin dashboard gap): append_event's payload has no explicit
+    status field — classify_event_outcome is the one shared place that
+    turns new_count/update_count/duplicate_count/error into a human-facing
+    outcome, used by both router/admin_pdf.py's /admin/api/pdf-queue
+    (finished list) and /admin/api/pdf-status (activity table)."""
+
+    def test_error_set_is_failed_regardless_of_counts(self):
+        event = {"error": "Chroma write failed", "new_count": 3, "update_count": 1}
+        assert mod.classify_event_outcome(event) == "failed"
+
+    def test_new_or_update_count_is_live(self):
+        assert mod.classify_event_outcome({"new_count": 1, "update_count": 0, "duplicate_count": 0}) == "live"
+        assert mod.classify_event_outcome({"new_count": 0, "update_count": 2, "duplicate_count": 0}) == "live"
+
+    def test_only_duplicate_count_is_duplicate(self):
+        event = {"new_count": 0, "update_count": 0, "duplicate_count": 4}
+        assert mod.classify_event_outcome(event) == "duplicate"
+
+    def test_all_zero_counts_is_no_content(self):
+        event = {"new_count": 0, "update_count": 0, "duplicate_count": 0}
+        assert mod.classify_event_outcome(event) == "no_content"
+
+    def test_missing_count_fields_default_to_zero_not_a_crash(self):
+        assert mod.classify_event_outcome({}) == "no_content"
+
+    def test_empty_string_error_is_not_treated_as_set(self):
+        """An empty string is falsy — write_error defaults to None/"" on the
+        success path (sqs_consumer.py), must not be misread as a failure."""
+        event = {"error": "", "new_count": 1, "update_count": 0, "duplicate_count": 0}
+        assert mod.classify_event_outcome(event) == "live"

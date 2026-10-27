@@ -117,3 +117,35 @@ def read_recent_events(bucket: str, days: int = 7, limit: Optional[int] = 500) -
         except Exception as e:
             logger.warning(f"[PdfIngestionLog] Failed to read event {key}: {e}")
     return events
+
+
+def classify_event_outcome(event: dict[str, Any]) -> str:
+    """2026-10 (admin dashboard gap): append_event's own payload has no
+    explicit status field — every caller that wants to SHOW a human
+    whether a file's content is now live had to re-derive that from
+    new_count/update_count/duplicate_count/error independently, which is
+    exactly how router/admin_pdf.py's dashboard ended up reading a field
+    ("shape") that didn't exist on the event anymore after schema
+    unification. One shared, single source of truth instead.
+
+    Returns one of:
+      "failed"     — error is set. Checked first, regardless of counts —
+                     a write failure after a drafted count is still a failure.
+      "live"       — new_count + update_count > 0: genuinely new/changed
+                     content, now queryable.
+      "duplicate"  — only duplicate_count > 0: content recognized as fully
+                     redundant with what's already live — a correct,
+                     intentional no-op, not a problem.
+      "no_content" — every count is 0: topic-splitting found nothing to
+                     extract from this file at all. Worth a glance, not
+                     quite a failure (no error was raised)."""
+    if event.get("error"):
+        return "failed"
+    new_ct = event.get("new_count", 0) or 0
+    upd_ct = event.get("update_count", 0) or 0
+    dup_ct = event.get("duplicate_count", 0) or 0
+    if new_ct + upd_ct > 0:
+        return "live"
+    if dup_ct > 0:
+        return "duplicate"
+    return "no_content"

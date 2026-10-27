@@ -269,6 +269,11 @@
     .status-pill.rejected { color: var(--red);    border-color: var(--red); }
     .status-pill.processing { color: var(--blue); border-color: var(--blue); }
     .status-pill.failed-retry { color: var(--red); border-color: var(--red); }
+    /* 2026-10: finished-file outcomes (see finishedRowHtml) — a file that
+       succeeds used to simply vanish from this list with no trace at all. */
+    .status-pill.live { color: var(--green); border-color: var(--green); }
+    .status-pill.duplicate { color: var(--muted); border-color: var(--muted); }
+    .status-pill.no-content { color: var(--orange); border-color: var(--orange); }
 
     /* ── In-flight (S3 status/, no ReviewItem yet — see pdf_status_tracker.py) ── */
     .pq-item.in-flight { cursor: default; }
@@ -559,6 +564,9 @@
 <div class="layout" id="view-pdfqueue" style="display:none">
   <div class="session-panel">
     <div class="panel-title">รอตรวจสอบ (<span id="pdfQueueCount">0</span>)</div>
+    <div class="log-controls" style="padding:0 16px 10px">
+      <input type="text" id="pdfQueueFilter" placeholder="ค้นหาชื่อไฟล์..." oninput="renderPdfQueueList()" />
+    </div>
     <div class="session-list" id="pdfQueueList"></div>
   </div>
 
@@ -854,6 +862,7 @@
   // ── PDF Review Queue ──────────────────────────────────────────
   let allPdfQueueItems = [];
   let allInFlightItems = [];
+  let allFinishedItems = [];
   let activePdfQueueItem = null;
   let selectedDecisionType = null;
 
@@ -861,6 +870,7 @@
     const d = await apiGet(`${PDF_API_BASE}/admin/api/pdf-queue`);
     allPdfQueueItems = d.items || [];
     allInFlightItems = d.in_flight || [];
+    allFinishedItems = d.finished || [];
     document.getElementById("pdfQueueCount").textContent = allPdfQueueItems.length;
 
     // Badge counts pending reviews + stuck-retrying in-flight docs — both
@@ -898,6 +908,33 @@
       </div>`;
   }
 
+  // 2026-10 (admin dashboard gap): a file that finishes processing
+  // successfully used to just vanish from this list with zero trace —
+  // pdf_status_tracker clears its in-flight row once the build phase
+  // concludes, and a successful direct-ingest write never reaches the
+  // review queue (`allPdfQueueItems`) either. This renders the real
+  // per-file outcome from the ingestion log instead (see
+  // utils/pdf_ingestion_log.py's classify_event_outcome, computed
+  // server-side — this function only picks the label/pill class).
+  const FINISHED_OUTCOME_LABELS = {
+    live: "✅ เสร็จแล้ว พร้อมใช้งาน",
+    duplicate: "เสร็จแล้ว — ซ้ำกับข้อมูลเดิม",
+    no_content: "⚠ ไม่พบเนื้อหาที่ดึงได้",
+  };
+
+  function finishedRowHtml(e) {
+    const label = FINISHED_OUTCOME_LABELS[e.outcome] || e.outcome;
+    const pillClass = e.outcome === "no_content" ? "no-content" : e.outcome;
+    return `
+      <div class="pq-item in-flight">
+        <div class="pq-filename">${escHtml(e.filename)}</div>
+        <div class="pq-meta">
+          <span class="status-pill ${escHtml(pillClass)}">${escHtml(label)}</span>
+          <span style="color:var(--muted);font-size:11px">${fmt(e.updated_at)}</span>
+        </div>
+      </div>`;
+  }
+
   function flagCountPill(totalFlags, highFlags) {
     if (highFlags > 0) return `<span class="flag-pill high">${totalFlags} flag${totalFlags > 1 ? "s" : ""}</span>`;
     if (totalFlags > 0) return `<span class="flag-pill medium">${totalFlags} flag${totalFlags > 1 ? "s" : ""}</span>`;
@@ -906,24 +943,38 @@
 
   function renderPdfQueueList() {
     const el = document.getElementById("pdfQueueList");
-    if (!allPdfQueueItems.length && !allInFlightItems.length) {
+    if (!allPdfQueueItems.length && !allInFlightItems.length && !allFinishedItems.length) {
       el.innerHTML = '<div style="padding:20px;color:var(--muted);text-align:center">ยังไม่มีไฟล์ในคิว</div>';
       return;
     }
+
+    const filter = (document.getElementById("pdfQueueFilter").value || "").toLowerCase().trim();
+    const matchesFilter = (filename) => !filter || (filename || "").toLowerCase().includes(filter);
+
     // In-flight rows (still OCR-ing on EC2, or stuck retrying — no
     // ReviewItem yet) always show above the real queue, newest-updated
     // first, so a stuck/failing document doesn't just silently sit off
     // the bottom of a long list.
     const inFlightHtml = [...allInFlightItems]
+      .filter(f => matchesFilter(f.filename))
       .sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0))
       .map(inFlightRowHtml)
+      .join("");
+
+    // Recently-finished files (2026-10) — "just completed" is exactly what
+    // the user is checking for, so these show right after in-flight work
+    // and before the older pending/failed queue items below.
+    const finishedHtml = [...allFinishedItems]
+      .filter(e => matchesFilter(e.filename))
+      .sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0))
+      .map(finishedRowHtml)
       .join("");
 
     // department/license_type/page_range let a structured_license PDF that
     // split into several independent review items (sqs_consumer.py,
     // 2026-08-24) be told apart at a glance instead of showing as N
     // identical-looking "filename.pdf" rows.
-    const itemsHtml = allPdfQueueItems.map(i => {
+    const itemsHtml = allPdfQueueItems.filter(i => matchesFilter(i.filename)).map(i => {
       const subParts = [i.department, i.license_type].filter(Boolean).join(" — ");
       return `
       <div class="pq-item ${i.id === activePdfQueueItem ? 'active' : ''}" onclick="selectPdfQueueItem('${i.id}')">
@@ -939,7 +990,7 @@
     `;
     }).join("");
 
-    el.innerHTML = inFlightHtml + itemsHtml;
+    el.innerHTML = inFlightHtml + finishedHtml + itemsHtml;
   }
 
   async function selectPdfQueueItem(id) {

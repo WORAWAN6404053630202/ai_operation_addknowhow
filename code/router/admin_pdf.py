@@ -74,7 +74,7 @@ from utils.admin_auth import require_admin_key
 from utils.logger import get_logger
 from utils.page_ranges import format_page_ranges
 from utils.pdf_cost_guard import get_cost_guard
-from utils.pdf_ingestion_log import read_recent_events
+from utils.pdf_ingestion_log import classify_event_outcome, read_recent_events
 
 _LOG = get_logger(__name__)
 
@@ -130,7 +130,40 @@ async def pdf_queue_list():
         except Exception as e:
             _LOG.warning(f"[pdf_queue_list] Failed to list in-flight status: {e}")
 
+    # 2026-10 (admin dashboard gap): a file that finishes processing
+    # SUCCESSFULLY has no trace anywhere in this list — pdf_status_tracker
+    # deletes its in-flight entry once the build phase concludes (success
+    # or failure alike, see that module's own docstring), and a successful
+    # direct-ingest write never reaches `items` above (that queue only ever
+    # receives failure/legacy placeholders since the 2026-09 pivot — see
+    # this module's own docstring). `finished` surfaces the real per-file
+    # outcome from the ingestion-log event instead, so a file doesn't just
+    # silently vanish once it's actually done. Scoped to a short window
+    # (days=2) and a small cap — this view answers "did the file I just
+    # uploaded finish," not a weekly audit (that's /admin/api/pdf-status's
+    # job, with its own 7-day window).
+    in_flight_filenames = {f.get("filename") for f in in_flight}
+    finished = []
+    if bucket:
+        try:
+            events = read_recent_events(bucket, days=2, limit=50)
+            seen_filenames: set[str] = set()
+            for e in events:
+                filename = e.get("filename")
+                if not filename or filename in seen_filenames:
+                    continue  # newest-first already — keep only the newest per filename (re-upload/reprocess case)
+                seen_filenames.add(filename)
+                if filename in in_flight_filenames:
+                    continue  # race: an event can land microseconds before its in-flight status is cleared — in-flight wins
+                outcome = classify_event_outcome(e)
+                if outcome == "failed":
+                    continue  # already shown via in_flight's "failed-retry" pill, or via `items` once given up — don't triple-show
+                finished.append({**e, "outcome": outcome, "updated_at": e.get("timestamp")})
+        except Exception as e:
+            _LOG.warning(f"[pdf_queue_list] Failed to list recent finished events: {e}")
+
     return JSONResponse({
+        "finished": finished,
         "items": [
             {
                 "id": i.id,
@@ -381,7 +414,10 @@ async def pdf_status():
     recent_activity = []
     if bucket:
         try:
-            recent_activity = read_recent_events(bucket, days=7)
+            recent_activity = [
+                {**e, "outcome": classify_event_outcome(e)}
+                for e in read_recent_events(bucket, days=7)
+            ]
         except Exception as e:
             _LOG.warning(f"[pdf_status] Failed to read recent ingestion activity: {e}")
 
@@ -446,6 +482,10 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #2a2e38; }
   th { color: #999; font-weight: 500; }
   .err { color: #f85149; }
+  .outcome-live { color: #3fb950; }
+  .outcome-duplicate { color: #999; }
+  .outcome-no_content { color: #d29922; }
+  .outcome-failed { color: #f85149; }
   .flag-high { color: #da3633; font-weight: 600; cursor: help; }
   .muted { color: #777; }
   .refresh-note { color: #666; font-size: 12px; margin-top: 8px; }
@@ -466,7 +506,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="card">
     <h2 style="font-size:14px;margin:0 0 10px;">กิจกรรมล่าสุด (7 วัน)</h2>
     <table id="activityTable">
-      <thead><tr><th>เวลา</th><th>ไฟล์</th><th>ประเภท</th><th>ใหม่</th><th>อัปเดต</th><th>ซ้ำ</th><th>ต้นทุน</th><th>แฟล็กร้ายแรง</th><th>ผิดพลาด</th></tr></thead>
+      <thead><tr><th>เวลา</th><th>ไฟล์</th><th>สถานะ</th><th>ใหม่</th><th>อัปเดต</th><th>ซ้ำ</th><th>ต้นทุน</th><th>แฟล็กร้ายแรง</th><th>ผิดพลาด</th></tr></thead>
       <tbody><tr><td colspan="9" class="muted">กำลังโหลด...</td></tr></tbody>
     </table>
   </div>
@@ -542,10 +582,26 @@ function renderCost(data) {
       : data.pct_of_ceiling.toFixed(1) + "% ของค่าอ้างอิงวันนี้";
 }
 
+// 2026-10 fix: this column used to render e.shape, a field removed from
+// the event payload during schema unification (sqs_consumer.py's own
+// comment at the append_event call site confirms "shape" no longer
+// exists as a document-level concept) — the column silently rendered
+// blank for every row. e.outcome (utils/pdf_ingestion_log.py's
+// classify_event_outcome, attached server-side) is the real per-file
+// result: did this file's content end up live/queryable, recognized as
+// a duplicate, found to have no extractable content, or fail outright.
+const OUTCOME_LABELS = {
+  live: "✅ พร้อมใช้งานแล้ว",
+  duplicate: "ซ้ำกับข้อมูลเดิม",
+  no_content: "⚠ ไม่พบเนื้อหา",
+  failed: "ผิดพลาด",
+};
+
 function renderActivity(events) {
   const tbody = document.querySelector("#activityTable tbody");
   if (!events.length) { tbody.innerHTML = '<tr><td colspan="9" class="muted">ไม่มีกิจกรรม</td></tr>'; return; }
   tbody.innerHTML = events.map(e => {
+    const outcomeLabel = OUTCOME_LABELS[e.outcome] || escapeHtml(e.outcome || "");
     // 2026-10 fix (PDF-M3): validate_extraction()'s high-severity flags
     // (arithmetic mismatches, dual-model disagreements) used to be computed
     // then silently discarded — this is the one place a human can see them
@@ -559,7 +615,7 @@ function renderActivity(events) {
     <tr>
       <td>${escapeHtml(fmtTime(e.timestamp))}</td>
       <td>${escapeHtml(e.filename || "")}</td>
-      <td>${escapeHtml(e.shape || "")}</td>
+      <td class="outcome-${escapeHtml(e.outcome || "")}">${outcomeLabel}</td>
       <td>${e.new_count ?? 0}</td>
       <td>${e.update_count ?? 0}</td>
       <td>${e.duplicate_count ?? 0}</td>
