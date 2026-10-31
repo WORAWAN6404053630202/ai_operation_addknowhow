@@ -487,6 +487,14 @@ RETRIEVAL_CATEGORY_MIN_KEEP = _safe_int("RETRIEVAL_CATEGORY_MIN_KEEP", 3)
 # logs for a while before enabling.
 REGULATORY_IDENTITY_GUARD_ENFORCE = os.getenv("REGULATORY_IDENTITY_GUARD_ENFORCE", "false").lower() == "true"
 
+# Groundedness judge truncation retry (2026-10, live-observed via LangSmith trace
+# after label-tagging shipped): a dense DOCUMENTS payload + required chain-of-
+# thought reasoning can exceed the judge's base max_tokens=500 — confirmed NOT
+# rare, happened on a routine commercial-registration question. Same shape as
+# MAX_TOKENS_PRACTICAL_RETRY below: keep the base budget cheap, pay for one
+# widened retry only when truncation actually happens.
+GROUNDEDNESS_JUDGE_RETRY_MAX_TOKENS = _safe_int("GROUNDEDNESS_JUDGE_RETRY_MAX_TOKENS", 900)
+
 # Iterative Retrieval: minimum number of missing coverage fields that triggers Round 3 gap-fill.
 ITERATIVE_RETRIEVAL_MIN_MISSING_FIELDS = _safe_int("ITERATIVE_RETRIEVAL_MIN_MISSING_FIELDS", 2)
 

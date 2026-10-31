@@ -409,13 +409,35 @@ class AcademicPersonaService:
                 "ตอบเป็น JSON เท่านั้น ตามรูปแบบนี้ (ใส่ reasoning มาก่อนเสมอ): "
                 '{"reasoning": "อธิบายทีละคำกล่าวอ้างสั้นๆ", "unsupported": true/false, "claims": ["ข้อความที่ไม่มีหลักฐาน", ...]}'
             )
-            try:
-                text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Academic/groundedness", state=state)
+            def _invoke(_judge_llm) -> str:
+                return extract_llm_text(
+                    llm_invoke(_judge_llm, [HumanMessage(content=prompt)], logger=_LOG, label="Academic/groundedness", state=state)
                 ).strip()
+            try:
+                text = _invoke(llm)
             except Exception as _e:
-                _LOG.warning("[Academic/groundedness] LLM call failed: %s — treating as grounded (fail-open)", _e)
-                return {"unsupported": False, "claims": [], "reasoning": ""}
+                # 2026-10 fix — see persona_practical.py's identical fix (its own
+                # _default_groundedness_llm_call) for the live-observed rationale:
+                # a dense DOCUMENTS payload can genuinely overflow max_tokens=500,
+                # not a rare edge case. One widened-budget retry, mirroring this
+                # codebase's established _call_llm_json_with_truncation_retry shape.
+                if "LengthFinishReasonError" in type(_e).__name__ or "LengthFinishReason" in str(_e)[:80]:
+                    _retry_max_tokens = int(getattr(conf, "GROUNDEDNESS_JUDGE_RETRY_MAX_TOKENS", 900))
+                    _LOG.warning(
+                        "[Academic/groundedness] judge hit max_tokens=500 — retrying once with max_tokens=%d",
+                        _retry_max_tokens,
+                    )
+                    try:
+                        text = _invoke(llm.bind(max_tokens=_retry_max_tokens))
+                    except Exception as _e2:
+                        _LOG.warning(
+                            "[Academic/groundedness] widened-budget retry also failed: %s — treating as grounded (fail-open)",
+                            _e2,
+                        )
+                        return {"unsupported": False, "claims": [], "reasoning": ""}
+                else:
+                    _LOG.warning("[Academic/groundedness] LLM call failed: %s — treating as grounded (fail-open)", _e)
+                    return {"unsupported": False, "claims": [], "reasoning": ""}
             if "```json" in text:
                 text = text.split("```json")[1].split("```")[0].strip()
             elif "```" in text:

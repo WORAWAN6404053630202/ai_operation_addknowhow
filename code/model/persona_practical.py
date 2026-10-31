@@ -898,13 +898,39 @@ class PracticalPersonaService:
                 "ตอบเป็น JSON เท่านั้น ตามรูปแบบนี้ (ใส่ reasoning มาก่อนเสมอ): "
                 '{"reasoning": "อธิบายทีละคำกล่าวอ้างสั้นๆ", "unsupported": true/false, "claims": ["ข้อความที่ไม่มีหลักฐาน", ...]}'
             )
-            try:
-                text = extract_llm_text(
-                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/groundedness", state=state)
+            def _invoke(_judge_llm) -> str:
+                return extract_llm_text(
+                    llm_invoke(_judge_llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/groundedness", state=state)
                 ).strip()
+            try:
+                text = _invoke(llm)
             except Exception as _e:
-                _LOG.warning("[Practical/groundedness] LLM call failed: %s — treating as grounded (fail-open)", _e)
-                return {"unsupported": False, "claims": [], "reasoning": ""}
+                # 2026-10 fix (live-observed via LangSmith trace after tagging shipped):
+                # a dense DOCUMENTS payload + the chain-of-thought reasoning this judge
+                # requires can genuinely exceed max_tokens=500 — NOT a rare edge case,
+                # confirmed live on a routine commercial-registration question. Mirrors
+                # this file's own _call_llm_json_with_truncation_retry: keep the base
+                # budget cheap for the common case, pay for one widened-budget retry
+                # ONLY when truncation is the actual failure, rather than either
+                # raising the base cost for every call or leaving the judge silently
+                # skipped (fail-open) on every DOCUMENTS-heavy case.
+                if "LengthFinishReasonError" in type(_e).__name__ or "LengthFinishReason" in str(_e)[:80]:
+                    _retry_max_tokens = int(getattr(conf, "GROUNDEDNESS_JUDGE_RETRY_MAX_TOKENS", 900))
+                    _LOG.warning(
+                        "[Practical/groundedness] judge hit max_tokens=500 — retrying once with max_tokens=%d",
+                        _retry_max_tokens,
+                    )
+                    try:
+                        text = _invoke(llm.bind(max_tokens=_retry_max_tokens))
+                    except Exception as _e2:
+                        _LOG.warning(
+                            "[Practical/groundedness] widened-budget retry also failed: %s — treating as grounded (fail-open)",
+                            _e2,
+                        )
+                        return {"unsupported": False, "claims": [], "reasoning": ""}
+                else:
+                    _LOG.warning("[Practical/groundedness] LLM call failed: %s — treating as grounded (fail-open)", _e)
+                    return {"unsupported": False, "claims": [], "reasoning": ""}
             if "```json" in text:
                 text = text.split("```json")[1].split("```")[0].strip()
             elif "```" in text:
