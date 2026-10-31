@@ -10,7 +10,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 import conf
 from model.conversation_state import ConversationState
 from model.persona_practical import _classify_link, _parse_link_entries
-from utils.llm_call import llm_invoke, extract_llm_text, build_speed_extra_body, get_shared_http_client
+from utils.llm_call import llm_invoke, extract_llm_text, build_speed_extra_body, build_cached_system_message, get_shared_http_client
 from utils.prompts_academic import SYSTEM_PROMPT as SYSTEM_PROMPT_ACADEMIC
 from utils.prompt_safety import INJECTION_GUARD
 from utils.phone_extraction import extract_thai_phone_numbers
@@ -387,33 +387,41 @@ class AcademicPersonaService:
             "ผลลัพธ์: {\"reasoning\": \"ทุกจุดตรงกับ DOCUMENTS\", \"unsupported\": false, \"claims\": []}"
         )
 
+        # 2026-11 cost optimization — see persona_practical.py's identical fix
+        # for the full rationale: this block is byte-identical on every call,
+        # split out into its own cached SystemMessage instead of being re-paid
+        # at full input price every time.
+        _STATIC_INSTRUCTIONS = (
+            "หน้าที่: ตรวจสอบว่าคำตอบร่างด้านล่างมีข้อความที่เป็นข้อเท็จจริงเชิงรูปธรรม "
+            "(ตัวเลข, จำนวนเงิน, ชื่อขั้นตอน/เครื่องมือ/แพลตฟอร์มเฉพาะเจาะจง, กำหนดเวลา) "
+            "ที่ไม่มีหลักฐานรองรับใน DOCUMENTS เลยหรือไม่\n\n"
+            "ก่อนสรุปผล ให้อธิบายเหตุผลสั้นๆก่อนเสมอ แล้วค่อยสรุปเป็น JSON "
+            "(คำตอบยาวหลายรายการ: จุดที่ตรงกับ DOCUMENTS ชัดเจนให้สรุปรวมสั้นๆคำเดียว เช่น \"จุดอื่นตรงกับ DOCUMENTS ทั้งหมด\" "
+            "ไม่ต้องไล่อธิบายทีละจุด — เจาะจงอธิบายเฉพาะจุดที่สงสัยว่าไม่มีหลักฐานเท่านั้น เพื่อไม่ให้เหตุผลยาวเกินไปจนตอบไม่ทัน)\n\n"
+            "กฎการตัดสิน:\n"
+            "- flag เฉพาะคำกล่าวอ้างที่ \"เจาะจง\" เท่านั้น (มีตัวเลข/ชื่อเฉพาะ) "
+            "ไม่ flag การสรุป/เรียบเรียงเนื้อหาที่มีอยู่จริงใน DOCUMENTS\n"
+            "- ไม่ flag การปฏิเสธ/บอกว่าไม่พบข้อมูล ([[INFO_GAP]] หรือข้อความทำนองนั้น)\n"
+            "- ไม่ flag คำถามกลับ/คำอธิบายทั่วไปที่ไม่มีตัวเลขหรือชื่อเฉพาะ\n\n"
+            f"{_FEW_SHOT}\n\n"
+            "ตอบเป็น JSON เท่านั้น ตามรูปแบบนี้ (ใส่ reasoning มาก่อนเสมอ): "
+            '{"reasoning": "อธิบายทีละคำกล่าวอ้างสั้นๆ", "unsupported": true/false, "claims": ["ข้อความที่ไม่มีหลักฐาน", ...]}'
+        )
+
         def _call(answer_text: str, docs_json: List[dict], state=None) -> dict:
             try:
                 _docs_blob = json.dumps(docs_json, ensure_ascii=False)[:6000]
             except Exception:
                 _docs_blob = "[]"
             prompt = (
-                "หน้าที่: ตรวจสอบว่าคำตอบร่างด้านล่างมีข้อความที่เป็นข้อเท็จจริงเชิงรูปธรรม "
-                "(ตัวเลข, จำนวนเงิน, ชื่อขั้นตอน/เครื่องมือ/แพลตฟอร์มเฉพาะเจาะจง, กำหนดเวลา) "
-                "ที่ไม่มีหลักฐานรองรับใน DOCUMENTS เลยหรือไม่\n\n"
-                "ก่อนสรุปผล ให้อธิบายเหตุผลสั้นๆก่อนเสมอ แล้วค่อยสรุปเป็น JSON "
-                "(คำตอบยาวหลายรายการ: จุดที่ตรงกับ DOCUMENTS ชัดเจนให้สรุปรวมสั้นๆคำเดียว เช่น \"จุดอื่นตรงกับ DOCUMENTS ทั้งหมด\" "
-                "ไม่ต้องไล่อธิบายทีละจุด — เจาะจงอธิบายเฉพาะจุดที่สงสัยว่าไม่มีหลักฐานเท่านั้น เพื่อไม่ให้เหตุผลยาวเกินไปจนตอบไม่ทัน)\n\n"
-                "กฎการตัดสิน:\n"
-                "- flag เฉพาะคำกล่าวอ้างที่ \"เจาะจง\" เท่านั้น (มีตัวเลข/ชื่อเฉพาะ) "
-                "ไม่ flag การสรุป/เรียบเรียงเนื้อหาที่มีอยู่จริงใน DOCUMENTS\n"
-                "- ไม่ flag การปฏิเสธ/บอกว่าไม่พบข้อมูล ([[INFO_GAP]] หรือข้อความทำนองนั้น)\n"
-                "- ไม่ flag คำถามกลับ/คำอธิบายทั่วไปที่ไม่มีตัวเลขหรือชื่อเฉพาะ\n\n"
-                f"{_FEW_SHOT}\n\n"
                 f"--- ตอนนี้ตรวจเคสจริง ---\n\n"
                 f"DOCUMENTS (JSON ของเอกสารที่ส่งให้ตอบคำถามนี้):\n{_docs_blob}\n\n"
-                f"คำตอบร่างที่ต้องตรวจ:\n{answer_text}\n\n"
-                "ตอบเป็น JSON เท่านั้น ตามรูปแบบนี้ (ใส่ reasoning มาก่อนเสมอ): "
-                '{"reasoning": "อธิบายทีละคำกล่าวอ้างสั้นๆ", "unsupported": true/false, "claims": ["ข้อความที่ไม่มีหลักฐาน", ...]}'
+                f"คำตอบร่างที่ต้องตรวจ:\n{answer_text}"
             )
             def _invoke(_judge_llm) -> str:
+                _sys_msg = build_cached_system_message(_STATIC_INSTRUCTIONS, model)
                 return extract_llm_text(
-                    llm_invoke(_judge_llm, [HumanMessage(content=prompt)], logger=_LOG, label="Academic/groundedness", state=state)
+                    llm_invoke(_judge_llm, [_sys_msg, HumanMessage(content=prompt)], logger=_LOG, label="Academic/groundedness", state=state)
                 ).strip()
             try:
                 text = _invoke(llm)
