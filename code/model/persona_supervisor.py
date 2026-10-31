@@ -117,6 +117,7 @@ from utils.text_patterns import (
     nonreg_chapter_semantic_check as _shared_nonreg_chapter_semantic_check,
     NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE as _SHARED_NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE,
     nonreg_chapter_disagreement_should_reject as _shared_nonreg_chapter_disagreement_should_reject,
+    regulatory_identity_mismatch_should_reject as _shared_regulatory_identity_mismatch_should_reject,
     bowtie_reorder as _shared_bowtie_reorder,
 )
 from utils.prompts_supervisor import (
@@ -4933,18 +4934,46 @@ class PersonaSupervisor:
         _sv_vstore = getattr(self.retriever, "vectorstore", None)
 
         def _sv_search(q: str, k: int, metadata_filter: Optional[dict] = None) -> list:
-            """Hybrid or Dense retrieval for Supervisor broad-retrieval paths."""
+            """Hybrid or Dense retrieval for Supervisor broad-retrieval paths.
+
+            2026-10 (Phase-0 follow-up): every branch now attaches the doc's
+            similarity score onto metadata["_sim"] (never changes the return
+            type — still list[Document] — so none of this function's call
+            sites need updating). This is what lets the regulatory-identity
+            dominance guard in the narrow/follow-up fallback branch below
+            know how confident the top doc is. hybrid_scored_search's score
+            is the original dense relevance score (not the internal RRF-rank
+            score), so it's on the same 0-1 scale as
+            similarity_search_with_relevance_scores — directly comparable
+            across all 3 branches. A doc with no score available (the final
+            .invoke() last resort) simply has no "_sim" key, which the guard
+            treats as "not confident enough to use as a dominance signal."
+            """
             if _sv_hybrid and _sv_vstore is not None:
                 from utils.hybrid_retriever import hybrid_scored_search
-                return [d for d, _ in hybrid_scored_search(
+                _pairs = hybrid_scored_search(
                     _sv_vstore, q, k=k, rrf_k=_sv_rrf_k, metadata_filter=metadata_filter,
                     bm25_bypass_min_ratio=_sv_bm25_ratio,
-                )]
+                )
+                for _d, _s in _pairs:
+                    _d.metadata["_sim"] = float(_s)
+                return [d for d, _ in _pairs]
             if metadata_filter and _sv_vstore is not None:
                 try:
-                    return list(_sv_vstore.similarity_search(q, k=k, filter=metadata_filter) or [])
+                    _pairs = _sv_vstore.similarity_search_with_relevance_scores(q, k=k, filter=metadata_filter) or []
+                    for _d, _s in _pairs:
+                        _d.metadata["_sim"] = float(_s)
+                    return [d for d, _ in _pairs]
                 except Exception as _e_svf:
                     _LOG.debug("[Supervisor] _sv_search filtered similarity_search failed (%s) — unfiltered", _e_svf)
+            if _sv_vstore is not None:
+                try:
+                    _pairs = _sv_vstore.similarity_search_with_relevance_scores(q, k=k) or []
+                    for _d, _s in _pairs:
+                        _d.metadata["_sim"] = float(_s)
+                    return [d for d, _ in _pairs]
+                except Exception as _e_svu:
+                    _LOG.debug("[Supervisor] _sv_search unfiltered scored search failed (%s) — plain invoke", _e_svu)
             return list(self.retriever.invoke(q) or [])
 
         if _is_broad_q:
@@ -5236,6 +5265,49 @@ class PersonaSupervisor:
                     _fb_license, _fb_dept,
                 )
                 docs = _sv_search(q_expanded, top_k)
+
+            # Regulatory-identity dominance guard (2026-10, Phase-0 audit follow-up):
+            # _sv_search now attaches a "_sim" score to every doc's metadata (see its
+            # own docstring above), which is what makes this guard possible here —
+            # it was left unwired until now specifically because this path had no
+            # score to gate on. Log-only soft launch (conf.REGULATORY_IDENTITY_GUARD_
+            # ENFORCE, default False): always compute + log what would be dropped;
+            # only actually drop when the flag is on. See conf.py's comment for why
+            # this gets its own flag instead of matching nonreg_chapter_disagreement_
+            # should_reject's unflagged precedent — this reuses that guard's
+            # uncalibrated-for-THIS-site 0.70 floor on the highest-traffic path.
+            if docs:
+                try:
+                    _rid_top_doc = max(docs, key=lambda d: (getattr(d, "metadata", {}) or {}).get("_sim", 0.0))
+                    _rid_top_score = float((getattr(_rid_top_doc, "metadata", {}) or {}).get("_sim", 0.0) or 0.0)
+                    if _rid_top_score > 0.0:
+                        _rid_top_md = getattr(_rid_top_doc, "metadata", {}) or {}
+                        _rid_top_lt = str(_rid_top_md.get("license_type") or "").strip()
+                        _rid_top_dept = str(_rid_top_md.get("department") or "").strip()
+                        _rid_kept = []
+                        _rid_dropped = []
+                        for _rid_d in docs:
+                            _rid_cand_md = getattr(_rid_d, "metadata", {}) or {}
+                            _rid_reject = (
+                                _shared_regulatory_identity_mismatch_should_reject(
+                                    _rid_top_lt, str(_rid_cand_md.get("license_type") or "").strip(), _rid_top_score,
+                                )
+                                or _shared_regulatory_identity_mismatch_should_reject(
+                                    _rid_top_dept, str(_rid_cand_md.get("department") or "").strip(), _rid_top_score,
+                                )
+                            )
+                            (_rid_dropped if _rid_reject else _rid_kept).append(_rid_d)
+                        if _rid_dropped:
+                            _LOG.info(
+                                "[Supervisor] identity-mismatch guard would drop %d/%d docs "
+                                "(top=%r/%r score=%.3f, enforce=%s)",
+                                len(_rid_dropped), len(docs), _rid_top_lt, _rid_top_dept,
+                                _rid_top_score, getattr(conf, "REGULATORY_IDENTITY_GUARD_ENFORCE", False),
+                            )
+                            if _rid_kept and getattr(conf, "REGULATORY_IDENTITY_GUARD_ENFORCE", False):
+                                docs = _rid_kept
+                except Exception as _rid_e:
+                    _LOG.warning("[Supervisor] identity-mismatch guard failed (%s) — continuing unfiltered", _rid_e)
 
             # 2026-10 fix (Phase-0 codebase audit, QA-reproduced cross-domain
             # contamination — e.g. DBD commerce-registration content answering a

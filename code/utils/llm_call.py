@@ -539,7 +539,18 @@ def llm_invoke(
 
     for attempt in range(1 + _MAX_RETRIES):
         try:
-            response = llm.invoke(messages)
+            # LangSmith tag/metadata (2026-10, Phase-0 audit follow-up): label is the
+            # one identifier consistently passed at every real call site (persona/
+            # operation currently aren't) — tags lets the LangSmith UI filter by
+            # call type (e.g. "Practical/groundedness") once LANGSMITH_TRACING=true
+            # is set in the active env file. Tracing itself needs zero other code
+            # changes (langchain auto-detects LANGSMITH_* from os.environ); this
+            # just makes individual calls filterable once it's on. No-op/harmless
+            # when tracing is off.
+            response = llm.invoke(messages, config={
+                "tags": [t for t in (label, persona, operation) if t],
+                "metadata": {"persona": persona, "operation": operation, "label": label},
+            })
             break
         except Exception as exc:
             last_exc = exc
@@ -683,7 +694,11 @@ async def llm_invoke_async(
     for attempt in range(1 + _MAX_RETRIES):
         try:
             # Use ainvoke for async call
-            response = await llm.ainvoke(messages)
+            # LangSmith tag/metadata — see llm_invoke's identical block above for rationale.
+            response = await llm.ainvoke(messages, config={
+                "tags": [t for t in (label, persona, operation) if t],
+                "metadata": {"persona": persona, "operation": operation, "label": label},
+            })
             break
         except Exception as exc:
             last_exc = exc

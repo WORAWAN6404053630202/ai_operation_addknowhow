@@ -476,6 +476,17 @@ RETRIEVAL_CATEGORY_CONCENTRATION_THRESHOLD = _safe_float("RETRIEVAL_CATEGORY_CON
 RETRIEVAL_CATEGORY_MIN_POOL_SIZE = _safe_int("RETRIEVAL_CATEGORY_MIN_POOL_SIZE", 5)
 RETRIEVAL_CATEGORY_MIN_KEEP = _safe_int("RETRIEVAL_CATEGORY_MIN_KEEP", 3)
 
+# Regulatory-identity dominance guard (utils.text_patterns.regulatory_identity_mismatch_should_reject),
+# wired into persona_supervisor.py's narrow/follow-up fallback retrieval path (2026-10,
+# Phase-0 audit follow-up). OFF by default: this guard reuses the SAME 0.70 score floor
+# as its sibling (nonreg_chapter_disagreement_should_reject), which was calibrated against
+# 2 real live-reproduced cases for a DIFFERENT, rarer call site — this one has not yet been
+# calibrated against real traffic and runs on the highest-traffic Practical retrieval path.
+# Log-only soft launch: the guard ALWAYS computes + logs what it would drop regardless of
+# this flag; only flipping it to true makes it actually drop the flagged docs. Watch real
+# logs for a while before enabling.
+REGULATORY_IDENTITY_GUARD_ENFORCE = os.getenv("REGULATORY_IDENTITY_GUARD_ENFORCE", "false").lower() == "true"
+
 # Iterative Retrieval: minimum number of missing coverage fields that triggers Round 3 gap-fill.
 ITERATIVE_RETRIEVAL_MIN_MISSING_FIELDS = _safe_int("ITERATIVE_RETRIEVAL_MIN_MISSING_FIELDS", 2)
 
