@@ -719,6 +719,59 @@ def nonreg_chapter_disagreement_should_reject(
     return bool(sem_top_main_topic) and sem_top_main_topic != exact_match_main_topic and sem_top_score >= min_score
 
 
+# ── Regulatory-identity dominance guard (license_type / department) ────────
+# 2026-10 addition (Phase-0 codebase audit, QA-reproduced cross-domain
+# contamination — e.g. a DBD commerce-registration procedure answering a VAT
+# registration question). The guard above (nonreg_chapter_disagreement_
+# should_reject) and reranker.filter_by_category_concentration both only
+# distinguish "regulatory" from "non-regulatory" (data_type-level) — neither
+# ever compares license_type/department WITHIN regulatory content, which is
+# exactly where this QA failure pattern lives: two confidently-regulatory
+# docs from different departments/license_types, with nothing checking
+# whether they actually agree on WHICH department/license this turn is about.
+#
+# Same calibrated shape as nonreg_chapter_disagreement_should_reject
+# deliberately: a bare "these two values differ" check with no score floor is
+# the exact "known-unsafe degenerate case" that function's own docstring
+# warns about (a coincidental weak match would reject a genuinely good
+# answer) — so this reuses the SAME threshold constant
+# (NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE = 0.70) as a starting point,
+# since it's the same embedding model/corpus. Unlike its sibling, this value
+# has NOT yet been calibrated against real license_type/department
+# disagreement cases (the sibling's 0.70 came from 2 live-reproduced cases) —
+# treat as a reasonable starting point, not a proven-correct number, and
+# revisit once real traffic exercises it.
+#
+# NOT YET WIRED into persona_supervisor.py's fallback retrieval path (the
+# exact path the QA contamination cases went through): that path's _sv_search
+# helper doesn't currently attach a similarity score to its results in the
+# metadata-filtered or unfiltered-.invoke() branches (only the hybrid-search
+# branch does), so there is no score to gate this guard on yet in that
+# specific call site without first changing what _sv_search returns — a
+# separate, wider-blast-radius change (that helper is shared by the
+# broad-question multi-pass retrieval too) deliberately left out of this
+# pass rather than wiring an unfloored version of exactly the pattern this
+# function exists to avoid.
+def regulatory_identity_mismatch_should_reject(
+    top_value: str, candidate_value: str, top_score: float,
+    min_score: float = NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE,
+) -> bool:
+    """True when a confident top-scoring doc's license_type (or department)
+    disagrees with a candidate doc's value for the same field — signal to
+    drop the candidate as likely cross-domain contamination rather than a
+    genuine multi-license/multi-department answer.
+
+    Call once per field (license_type, department) per candidate — e.g.:
+        reject = (
+            regulatory_identity_mismatch_should_reject(top_lt, cand_lt, top_score)
+            or regulatory_identity_mismatch_should_reject(top_dept, cand_dept, top_score)
+        )
+    Both `top_value` and `candidate_value` empty/blank never rejects (nothing
+    to disagree about — most non-regulatory or unlabeled docs). Mirrors
+    nonreg_chapter_disagreement_should_reject's exact shape and reasoning."""
+    return bool(top_value) and bool(candidate_value) and top_value != candidate_value and top_score >= min_score
+
+
 # ── PDF-book-aware similarity floor ─────────────────────────────────────────
 # Shared by persona_practical.py's and persona_academic.py's independently
 # re-implemented sim_filter steps (2026-09) — see conf.RETRIEVAL_MIN_SIMILARITY_PDF_BOOK

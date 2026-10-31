@@ -690,6 +690,22 @@ def _extract_salient_tokens(markdown: str) -> dict[str, set]:
 
 _MIN_PAGE_TEXT_LAYER_CHARS = 40  # below this, treat as scanned/image-only — not enough embedded text to trust
 
+# 2026-10 fix (QA-reproduced: real multi-page PDFs landing with ~224 bytes of
+# total extracted text). Typhoon's OCR SDK can return an empty string with NO
+# exception (degraded image quality, moderation, truncation) —
+# _extract_salient_tokens("") then finds nothing, which previously made the
+# page look like "genuinely blank" and skipped the one mechanism that could
+# recover real text (vision-verify). Forcing vision-verify on truly-empty
+# Typhoon output as well closes that gap. Deliberately checks for EMPTY
+# (stripped length 0), not merely "short" — a length-threshold version of
+# this check (first attempt, since reverted) false-triggered on legitimate
+# short-but-correct OCR text (caught by tests/test_pdf_fault_isolation.py's
+# existing fixture text, 19 chars of genuinely complete content) and would
+# waste a vision-verify call on any real page that happens to have little
+# text. Empty-only can only make vision-verify fire MORE often than before
+# (never less), so it's a pure recall improvement over the existing
+# salient-token optimization, not a replacement for it.
+
 # Character-validity check for a PDF's embedded text layer — the established
 # root cause of a corrupted text layer (per PyMuPDF/Docling issue trackers
 # and mojibake-detection literature, e.g. the `ftfy` library's heuristic
@@ -915,11 +931,17 @@ def _extract_one_page(pdf_bytes: bytes, page_num: int, cost_accumulator: "_CostA
         # of these categories, so a page with none of them can't produce a flag
         # regardless of what the vision model would say.
         salient = _extract_salient_tokens(typhoon_markdown)
-        if any(salient[k] for k in salient):
+        _typhoon_is_empty = not (typhoon_markdown or "").strip()
+        if any(salient[k] for k in salient) or _typhoon_is_empty:
+            if _typhoon_is_empty:
+                logger.info(f"Page {page_num}: Typhoon returned empty output — running vision-verify to check for a real OCR failure, not just a blank page")
             claude_markdown = _run_vision_verify(png_bytes, cost_accumulator=cost_accumulator)
         else:
             claude_markdown = ""
             logger.info(f"Page {page_num}: no salient tokens in Typhoon output, skipping vision-verify")
+
+        if not (typhoon_markdown or "").strip() and not (claude_markdown or "").strip():
+            logger.warning(f"Page {page_num}: BOTH Typhoon and vision-verify returned empty text — this page is likely silently missing from the ingested document, worth a manual re-check")
 
         logger.info(f"Page {page_num}: extracted via OCR (Typhoon {len(typhoon_markdown)} chars, Claude {len(claude_markdown)} chars)")
         return {"page_num": page_num, "typhoon_markdown": typhoon_markdown, "claude_markdown": claude_markdown}

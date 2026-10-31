@@ -803,6 +803,147 @@ class PracticalPersonaService:
 
         return _call
 
+    def _default_groundedness_llm_call(self) -> Callable[..., dict]:
+        """Lightweight (switch-model) judge: does this draft answer contain any
+        concrete factual claim (fee amount, deadline, named procedure/tool/
+        platform, numeric requirement) that is NOT traceable to DOCUMENTS?
+
+        2026-10 addition (QA-reproduced fabrication cases — see Phase-0 codebase
+        audit): the existing anti-hallucination defenses are prompt-only
+        (MANDATORY EVIDENCE CONSTRAINT in prompts_practical.py) plus two narrow
+        shape-based post-hoc strips further down this method (phone numbers via
+        self._extract_thai_phone_numbers against a DOCUMENTS-derived whitelist,
+        and a URL whitelist). Neither catches a fabricated claim phrased as ordinary
+        prose (an invented fee, an invented procedure name) — exactly the shape
+        of 3 real QA failures (invented Zoom/Teams requirement, invented 660-baht
+        fee, invented "Reset Password" procedure). This is the general-purpose
+        check those shape-specific strips can't be: an LLM judge comparing the
+        draft answer's claims against the actual DOCUMENTS sent this turn.
+
+        Deliberately lenient — only flags claims that are SPECIFIC and
+        CONCRETE (a number, a named thing). Generic framing, restating the
+        question, or synthesizing/summarizing content that IS in DOCUMENTS is
+        never flagged. False positives here cost a retry; false negatives are
+        the exact failure mode this exists to catch, so leniency is the wrong
+        direction to err in."""
+        model = getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL)
+        timeout = int(getattr(conf, "LLM_TOPIC_PICKER_TIMEOUT", 8))
+        llm = ChatOpenAI(
+            model=model,
+            openai_api_key=conf.OPENROUTER_API_KEY,
+            openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
+            temperature=0.0,
+            max_tokens=300,
+            request_timeout=timeout,
+            model_kwargs={"response_format": {"type": "json_object"}},
+        )
+
+        def _call(answer_text: str, docs_json: List[dict], state=None) -> dict:
+            try:
+                _docs_blob = json.dumps(docs_json, ensure_ascii=False)[:6000]
+            except Exception:
+                _docs_blob = "[]"
+            prompt = (
+                "หน้าที่: ตรวจสอบว่าคำตอบร่างด้านล่างมีข้อความที่เป็นข้อเท็จจริงเชิงรูปธรรม "
+                "(ตัวเลข, จำนวนเงิน, ชื่อขั้นตอน/เครื่องมือ/แพลตฟอร์มเฉพาะเจาะจง, กำหนดเวลา) "
+                "ที่ไม่มีหลักฐานรองรับใน DOCUMENTS เลยหรือไม่\n\n"
+                "กฎการตัดสิน:\n"
+                "- flag เฉพาะคำกล่าวอ้างที่ \"เจาะจง\" เท่านั้น (มีตัวเลข/ชื่อเฉพาะ) "
+                "ไม่ flag การสรุป/เรียบเรียงเนื้อหาที่มีอยู่จริงใน DOCUMENTS\n"
+                "- ไม่ flag การปฏิเสธ/บอกว่าไม่พบข้อมูล ([[INFO_GAP]] หรือข้อความทำนองนั้น)\n"
+                "- ไม่ flag คำถามกลับ/คำอธิบายทั่วไปที่ไม่มีตัวเลขหรือชื่อเฉพาะ\n\n"
+                f"DOCUMENTS (JSON ของเอกสารที่ส่งให้ตอบคำถามนี้):\n{_docs_blob}\n\n"
+                f"คำตอบร่างที่ต้องตรวจ:\n{answer_text}\n\n"
+                "ตอบเป็น JSON เท่านั้น: "
+                '{"unsupported": true/false, "claims": ["ข้อความที่ไม่มีหลักฐาน", ...]}'
+            )
+            try:
+                text = extract_llm_text(
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/groundedness", state=state)
+                ).strip()
+            except Exception as _e:
+                _LOG.warning("[Practical/groundedness] LLM call failed: %s — treating as grounded (fail-open)", _e)
+                return {"unsupported": False, "claims": []}
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0].strip()
+            elif "```" in text:
+                text = text.split("```")[1].split("```")[0].strip()
+            try:
+                obj = json.loads(text)
+                if not isinstance(obj, dict):
+                    return {"unsupported": False, "claims": []}
+                return {"unsupported": bool(obj.get("unsupported")), "claims": list(obj.get("claims") or [])}
+            except Exception as _je:
+                _LOG.debug("[Practical/groundedness] JSON parse failed: %s", _je)
+                return {"unsupported": False, "claims": []}
+
+        return _call
+
+    def _apply_groundedness_safety_net(
+        self, action: str, exec_: dict, decision: dict, docs_json: List[dict], prompt: str, state=None,
+    ) -> Tuple[dict, dict]:
+        """Checks a draft action="answer" for claims not traceable to DOCUMENTS
+        (self._groundedness_llm_call) and retries once with a corrective
+        reminder if flagged. Returns (decision, exec_) — unchanged if action
+        isn't "answer", there's no answer text, or the check passes.
+
+        2026-10 addition (QA-reproduced fabrication cases, Phase-0 codebase
+        audit): runs on every action="answer" turn — unlike the entity_type and
+        multi-license retry-once safety nets elsewhere in handle(), fabrication
+        risk has no cheap deterministic pre-condition to gate on (it can happen
+        on any turn, and most live traffic is actually routed through
+        persona_supervisor.py's retrieval, not this file's own low-confidence
+        fallback in _retrieve_docs), so this is intentionally broader.
+        Cost-bounded: one cheap Haiku-tier call per answer turn, a second only
+        on the minority of turns the first flags."""
+        if action != "answer" or not str(exec_.get("answer") or "").strip():
+            return decision, exec_
+
+        _ground_answer = str(exec_.get("answer") or "")
+        _ground_result = self._groundedness_llm_call(_ground_answer, docs_json, state=state)
+        if not _ground_result.get("unsupported"):
+            return decision, exec_
+
+        _LOG.warning(
+            "[Practical] groundedness check flagged unsupported claim(s) %r in answer — "
+            "retrying once with a corrective reminder",
+            _ground_result.get("claims"),
+        )
+        _ground_retry_prompt = (
+            prompt
+            + "\n\n[SYSTEM REMINDER] Your previous draft answer included a claim that is NOT "
+            "traceable to DOCUMENTS: " + "; ".join(str(c) for c in (_ground_result.get("claims") or []))[:500] + ". "
+            "This is a hallucination and is not acceptable. Rewrite the answer using ONLY "
+            "facts present in DOCUMENTS. For anything not covered, say so explicitly "
+            "(use [[INFO_GAP]] for that part) instead of inventing a plausible-sounding answer."
+        )
+        try:
+            _ground_retry_decision = self._call_llm_json_with_truncation_retry(_ground_retry_prompt, state=state)
+            _ground_retry_exec_raw = _ground_retry_decision.get("execution", {})
+            if isinstance(_ground_retry_exec_raw, str):
+                try:
+                    _ground_retry_exec_raw = json.loads(_ground_retry_exec_raw)
+                except Exception:
+                    _ground_retry_exec_raw = {}
+            _ground_retry_exec = _ground_retry_exec_raw if isinstance(_ground_retry_exec_raw, dict) else {}
+            _ground_retry_answer = str(_ground_retry_exec.get("answer") or "")
+            if not _ground_retry_answer:
+                _LOG.warning("[Practical] groundedness retry returned no answer text — keeping first attempt")
+                return decision, exec_
+            _ground_recheck = self._groundedness_llm_call(_ground_retry_answer, docs_json, state=state)
+            if not _ground_recheck.get("unsupported"):
+                _LOG.info("[Practical] groundedness retry succeeded — claim no longer present")
+                return _ground_retry_decision, _ground_retry_exec
+            _LOG.warning(
+                "[Practical] groundedness retry STILL flagged %r — keeping first attempt",
+                _ground_recheck.get("claims"),
+            )
+            return decision, exec_
+        except Exception as _e_ground_retry:
+            _LOG.warning("[Practical] groundedness retry failed: %s — keeping original decision", _e_ground_retry)
+            return decision, exec_
+
     def _default_dont_know_llm_call(self) -> Callable[[str], dict]:
         """Lightweight classifier: user expresses uncertainty or asks to see available types."""
         model = getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL)
@@ -1784,6 +1925,7 @@ class PracticalPersonaService:
         self._short_followup_llm_call = self._default_short_followup_llm_call()
         self._practical_legal_q_llm_call = self._default_practical_legal_q_llm_call()
         self._greeting_llm_call = self._default_greeting_llm_call()
+        self._groundedness_llm_call = self._default_groundedness_llm_call()
         self._init_llm()
 
     def _init_llm(self):
@@ -3085,8 +3227,19 @@ class PracticalPersonaService:
                 "fallback_n": _fallback_n,
                 "min_similarity": min_similarity
             })
+            # 2026-10 fix (QA-reproduced fabrication cases, Phase-0 codebase audit):
+            # this fallback hands the LLM top-N docs REGARDLESS of score — content
+            # that cleared no relevance bar looks identical to a confident match by
+            # the time it reaches the prompt. Flag it on state so the prompt-builder
+            # below can bias the LLM toward [[INFO_GAP]] instead of confidently
+            # answering from weak context. Cleared in the else-branch so a later,
+            # genuinely-confident turn doesn't inherit a stale flag from this one.
+            if state is not None and isinstance(getattr(state, "context", None), dict):
+                state.context["_low_confidence_retrieval"] = True
         else:
             _LOG.debug("[Practical] sim_filter: %d → %d docs (removed %d below %.2f)", len(docs), len(filtered_docs), len(low_quality_docs), min_similarity)
+            if state is not None and isinstance(getattr(state, "context", None), dict):
+                state.context["_low_confidence_retrieval"] = False
         
         docs = filtered_docs
 
@@ -6571,6 +6724,23 @@ Rules:
                 "Write 'ติดต่อ [ชื่อหน่วยงาน] โดยตรง' without a number."
             )
 
+        # 2026-10 fix (QA-reproduced fabrication cases, Phase-0 codebase audit):
+        # when _retrieve_docs' similarity-filter fallback fired this turn (see the
+        # state.context["_low_confidence_retrieval"] flag set there), the DOCUMENTS
+        # below cleared no relevance bar — bias the LLM toward [[INFO_GAP]] instead
+        # of answering confidently from context that's only here because nothing
+        # better was available. Does not block/short-circuit anything — the
+        # groundedness retry-once safety net further below is the deterministic
+        # backstop for when this instruction alone isn't followed.
+        _low_confidence_instruction = (
+            "\n\n⚠️ LOW-CONFIDENCE RETRIEVAL: the DOCUMENTS below did not clear the normal "
+            "relevance threshold for this query — they are the best available, not a confirmed "
+            "match. Be MORE conservative than usual: if DOCUMENTS do not clearly and specifically "
+            "answer the question, say so ([[INFO_GAP]]) rather than extrapolating or filling gaps."
+            if bool((getattr(state, "context", None) or {}).get("_low_confidence_retrieval"))
+            else ""
+        )
+
         # 2026-10 fix (core2-M3): `getattr(conf, "MAX_ROUNDS", 7) or 7` below
         # used to silently turn a deliberate MAX_ROUNDS=0 (the documented way
         # to disable the round cap, see persona_supervisor.py's matching fix)
@@ -6595,7 +6765,7 @@ CONTEXT_MEMORY:
 
 DOCUMENTS ({len(docs_json)} found):
 {json.dumps(docs_json, ensure_ascii=False)}
-ROUND: {int(getattr(state, "round", 0) or 0)}/{_max_rounds_pr}{_entity_filter_hint}{_topic_hint}{_multi_license_instruction}{_fee_info_instruction}{_info_q_instruction}{_broad_instruction}{_tc_instruction}{_chapter_overview_instruction}{_phone_guard_instruction}
+ROUND: {int(getattr(state, "round", 0) or 0)}/{_max_rounds_pr}{_entity_filter_hint}{_topic_hint}{_multi_license_instruction}{_fee_info_instruction}{_info_q_instruction}{_broad_instruction}{_tc_instruction}{_chapter_overview_instruction}{_phone_guard_instruction}{_low_confidence_instruction}
 
 Your JSON response:
 """
@@ -6788,6 +6958,14 @@ Your JSON response:
                         )
                 except Exception as _e_cs_retry:
                     _LOG.warning("[Practical] multi-license completeness retry failed: %s", _e_cs_retry)
+
+        # Deterministic groundedness safety net (2026-10, QA-reproduced — same
+        # retry-once shape as the two safety nets above, for a DIFFERENT failure
+        # mode: groundedness instead of completeness). Extracted to its own
+        # method (unlike the two above, which are inline) specifically so it's
+        # unit-testable without driving the whole handle() flow — see
+        # _apply_groundedness_safety_net's docstring for the full rationale.
+        decision, exec_ = self._apply_groundedness_safety_net(action, exec_, decision, docs_json, prompt, state)
 
         # Diagnostic-only (2026-09, paired with the docs_json log above) —
         # catches the exact failing moment if this info-gap pattern recurs:

@@ -5216,6 +5216,39 @@ class PersonaSupervisor:
                     _fb_license, _fb_dept,
                 )
                 docs = _sv_search(q_expanded, top_k)
+
+            # 2026-10 fix (Phase-0 codebase audit, QA-reproduced cross-domain
+            # contamination — e.g. DBD commerce-registration content answering a
+            # VAT question): this fallback is most live Practical traffic's actual
+            # retrieval path (see _retrieve_docs' own comment on this), yet unlike
+            # the rare-license branch above (and persona_practical.py's own
+            # _retrieve_docs) it never applied the category filter or reranker —
+            # whatever _sv_search returned went straight to the LLM with no
+            # correction stage at all. Same call shape as the rare-license branch,
+            # just applied here too. Both flags default off (conf.py) — this wiring
+            # is inert until the user turns them on; no default-behavior change.
+            if getattr(conf, "RETRIEVAL_CATEGORY_FILTER_ENABLED", False) and docs:
+                try:
+                    from utils.reranker import filter_by_category_concentration
+                    docs = filter_by_category_concentration(
+                        docs,
+                        concentration_threshold=getattr(conf, "RETRIEVAL_CATEGORY_CONCENTRATION_THRESHOLD", 0.75),
+                        min_pool_size=getattr(conf, "RETRIEVAL_CATEGORY_MIN_POOL_SIZE", 5),
+                        min_keep=getattr(conf, "RETRIEVAL_CATEGORY_MIN_KEEP", 3),
+                    )
+                except Exception as _cf_e:
+                    _LOG.warning("[Supervisor] fallback category filter failed (%s) — continuing unfiltered", _cf_e)
+            if getattr(conf, "RERANKER_ENABLED", False) and docs:
+                try:
+                    from utils.reranker import rerank as _do_rerank
+                    _rr_model = getattr(conf, "RERANKER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
+                    _rr_top_k = int(getattr(conf, "RERANKER_TOP_K", len(docs)))
+                    _rr_backend = getattr(conf, "RERANKER_BACKEND", "pytorch")
+                    _rr_onnx_file = getattr(conf, "RERANKER_ONNX_FILE", "model_quint8_avx2.onnx")
+                    _rr_min_score = getattr(conf, "RERANKER_MIN_SCORE", None)
+                    docs = _do_rerank(q_expanded, docs, model_name=_rr_model, top_k=_rr_top_k, backend=_rr_backend, onnx_file=_rr_onnx_file, min_score=_rr_min_score)
+                except Exception as _rr_e:
+                    _LOG.warning("[Supervisor] fallback reranker failed (%s) — continuing without rerank", _rr_e)
         _doc_chars = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700) or 700)
         # Token: cap long metadata fields before storing — prevent ×N token explosion
         _SUPERVISOR_META_WHITELIST = frozenset({

@@ -47,6 +47,18 @@ logger = get_logger(__name__)
 
 _MAX_WORKERS = 4  # same concurrency cap as the Lambda extractor, for the same reason
 
+# 2026-10 fix (QA-reproduced: real multi-page PDFs landing with ~224 bytes of
+# total extracted text) — mirrors the identical fix in lambda/pdf_extraction/
+# handler.py's _extract_one_page. Typhoon's OCR SDK can return an empty string
+# with NO exception; forcing vision-verify on truly-empty output (not just on
+# salient-token presence) closes the gap where that looked like a genuinely
+# blank page instead of a failed OCR call. Deliberately checks for EMPTY
+# (stripped length 0), not merely "short" — a length-threshold version of
+# this check (first attempt, since reverted) false-triggered on legitimate
+# short-but-correct OCR text (caught by tests/test_pdf_fault_isolation.py's
+# existing fixture text, 19 chars of genuinely complete content). Recall-only
+# change — can only make vision-verify fire more often, never less.
+
 # Typhoon's own docs (https://docs.opentyphoon.ai/en/rate-limits/, checked
 # 2026-09): typhoon-ocr is rate-limited to 2 requests/sec AND 20 requests/min.
 # GlobalTyphoonRateLimiter (utils/pdf_rate_limiter.py) coordinates against
@@ -199,11 +211,17 @@ def _extract_one_page(pdf_bytes: bytes, page_num: int, cost_accumulator: Optiona
         # no observed recall loss. Re-run the backtest periodically as more
         # documents accumulate to confirm this still holds.
         salient = _extract_salient_tokens(typhoon_markdown)
-        if any(salient[k] for k in salient):
+        _typhoon_is_empty = not (typhoon_markdown or "").strip()
+        if any(salient[k] for k in salient) or _typhoon_is_empty:
+            if _typhoon_is_empty:
+                logger.info(f"[LargeExtraction] Page {page_num}: Typhoon returned empty output — running vision-verify to check for a real OCR failure, not just a blank page")
             claude_markdown = _run_vision_verify(png_bytes, cost_accumulator=cost_accumulator, cost_guard=cost_guard)
         else:
             claude_markdown = ""
             logger.info(f"[LargeExtraction] Page {page_num}: no salient tokens in Typhoon output, skipping Claude cross-check")
+
+        if not (typhoon_markdown or "").strip() and not (claude_markdown or "").strip():
+            logger.warning(f"[LargeExtraction] Page {page_num}: BOTH Typhoon and vision-verify returned empty text — this page is likely silently missing from the ingested document, worth a manual re-check")
 
         logger.info(f"[LargeExtraction] Page {page_num}: extracted (Typhoon {len(typhoon_markdown)} chars, Claude {len(claude_markdown)} chars)")
         return {"page_num": page_num, "typhoon_markdown": typhoon_markdown, "claude_markdown": claude_markdown}
