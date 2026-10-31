@@ -396,7 +396,9 @@ class AcademicPersonaService:
                 "หน้าที่: ตรวจสอบว่าคำตอบร่างด้านล่างมีข้อความที่เป็นข้อเท็จจริงเชิงรูปธรรม "
                 "(ตัวเลข, จำนวนเงิน, ชื่อขั้นตอน/เครื่องมือ/แพลตฟอร์มเฉพาะเจาะจง, กำหนดเวลา) "
                 "ที่ไม่มีหลักฐานรองรับใน DOCUMENTS เลยหรือไม่\n\n"
-                "ก่อนสรุปผล ให้อธิบายเหตุผลสั้นๆก่อนเสมอ (เทียบคำกล่าวอ้างที่เจาะจงในคำตอบกับ DOCUMENTS ทีละจุด) แล้วค่อยสรุปเป็น JSON\n\n"
+                "ก่อนสรุปผล ให้อธิบายเหตุผลสั้นๆก่อนเสมอ แล้วค่อยสรุปเป็น JSON "
+                "(คำตอบยาวหลายรายการ: จุดที่ตรงกับ DOCUMENTS ชัดเจนให้สรุปรวมสั้นๆคำเดียว เช่น \"จุดอื่นตรงกับ DOCUMENTS ทั้งหมด\" "
+                "ไม่ต้องไล่อธิบายทีละจุด — เจาะจงอธิบายเฉพาะจุดที่สงสัยว่าไม่มีหลักฐานเท่านั้น เพื่อไม่ให้เหตุผลยาวเกินไปจนตอบไม่ทัน)\n\n"
                 "กฎการตัดสิน:\n"
                 "- flag เฉพาะคำกล่าวอ้างที่ \"เจาะจง\" เท่านั้น (มีตัวเลข/ชื่อเฉพาะ) "
                 "ไม่ flag การสรุป/เรียบเรียงเนื้อหาที่มีอยู่จริงใน DOCUMENTS\n"
@@ -422,7 +424,7 @@ class AcademicPersonaService:
                 # not a rare edge case. One widened-budget retry, mirroring this
                 # codebase's established _call_llm_json_with_truncation_retry shape.
                 if "LengthFinishReasonError" in type(_e).__name__ or "LengthFinishReason" in str(_e)[:80]:
-                    _retry_max_tokens = int(getattr(conf, "GROUNDEDNESS_JUDGE_RETRY_MAX_TOKENS", 900))
+                    _retry_max_tokens = int(getattr(conf, "GROUNDEDNESS_JUDGE_RETRY_MAX_TOKENS", 1500))
                     _LOG.warning(
                         "[Academic/groundedness] judge hit max_tokens=500 — retrying once with max_tokens=%d",
                         _retry_max_tokens,

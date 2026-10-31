@@ -487,13 +487,17 @@ RETRIEVAL_CATEGORY_MIN_KEEP = _safe_int("RETRIEVAL_CATEGORY_MIN_KEEP", 3)
 # logs for a while before enabling.
 REGULATORY_IDENTITY_GUARD_ENFORCE = os.getenv("REGULATORY_IDENTITY_GUARD_ENFORCE", "false").lower() == "true"
 
-# Groundedness judge truncation retry (2026-10, live-observed via LangSmith trace
-# after label-tagging shipped): a dense DOCUMENTS payload + required chain-of-
-# thought reasoning can exceed the judge's base max_tokens=500 — confirmed NOT
-# rare, happened on a routine commercial-registration question. Same shape as
-# MAX_TOKENS_PRACTICAL_RETRY below: keep the base budget cheap, pay for one
-# widened retry only when truncation actually happens.
-GROUNDEDNESS_JUDGE_RETRY_MAX_TOKENS = _safe_int("GROUNDEDNESS_JUDGE_RETRY_MAX_TOKENS", 900)
+# Groundedness judge truncation retry (2026-10/11, live-observed via LangSmith
+# trace after label-tagging shipped): a dense DOCUMENTS payload + required
+# chain-of-thought reasoning can exceed the judge's base max_tokens=500 —
+# confirmed NOT rare. First fix attempt (retry at 900) was itself live-
+# observed to still truncate on a long two-entity-type answer (บุคคลธรรมดา +
+# นิติบุคคล, ~16 itemized documents) — raised further, paired with a prompt
+# change asking for terse reasoning on clearly-supported points so token
+# usage doesn't scale linearly with every bullet in a long answer. Same shape
+# as MAX_TOKENS_PRACTICAL_RETRY below: keep the base budget cheap, pay for
+# one widened retry only when truncation actually happens.
+GROUNDEDNESS_JUDGE_RETRY_MAX_TOKENS = _safe_int("GROUNDEDNESS_JUDGE_RETRY_MAX_TOKENS", 1500)
 
 # Iterative Retrieval: minimum number of missing coverage fields that triggers Round 3 gap-fill.
 ITERATIVE_RETRIEVAL_MIN_MISSING_FIELDS = _safe_int("ITERATIVE_RETRIEVAL_MIN_MISSING_FIELDS", 2)

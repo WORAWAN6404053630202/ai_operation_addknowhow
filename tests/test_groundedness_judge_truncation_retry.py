@@ -13,9 +13,12 @@ that exception silently fell into the generic fail-open path (treated as
 grounded — verification SKIPPED, not performed). Fix mirrors this codebase's
 already-established _call_llm_json_with_truncation_retry shape: keep the base
 max_tokens budget cheap for the common case, retry ONCE with a widened budget
-(conf.GROUNDEDNESS_JUDGE_RETRY_MAX_TOKENS, default 900) specifically when a
+(conf.GROUNDEDNESS_JUDGE_RETRY_MAX_TOKENS) specifically when a
 LengthFinishReasonError is detected, and only fail open if the retry ALSO
-fails.
+fails. First retry ceiling (900) was itself live-observed (via the same
+LangSmith trace) to still truncate on a longer two-entity-type answer — raised
+to 1500, paired with a prompt change asking for terse reasoning on clearly-
+supported points instead of exhaustively restating every matching claim.
 
 Both PracticalPersonaService and AcademicPersonaService build their judge's
 real ChatOpenAI client inside the closure at __init__ time (no network access
@@ -62,7 +65,7 @@ class TestPracticalGroundednessJudgeTruncationRetry:
         assert mock_invoke.call_count == 2
         # Second call's llm arg must be a widened-max_tokens bind, not the base client.
         second_llm_arg = mock_invoke.call_args_list[1].args[0]
-        assert second_llm_arg.kwargs.get("max_tokens") == 900
+        assert second_llm_arg.kwargs.get("max_tokens") == 1500
 
     def test_length_error_retry_also_fails_open(self, service):
         with patch(
@@ -110,7 +113,7 @@ class TestAcademicGroundednessJudgeTruncationRetry:
         assert result == {"unsupported": False, "claims": [], "reasoning": "ok"}
         assert mock_invoke.call_count == 2
         second_llm_arg = mock_invoke.call_args_list[1].args[0]
-        assert second_llm_arg.kwargs.get("max_tokens") == 900
+        assert second_llm_arg.kwargs.get("max_tokens") == 1500
 
     def test_length_error_retry_also_fails_open(self, service):
         with patch(
