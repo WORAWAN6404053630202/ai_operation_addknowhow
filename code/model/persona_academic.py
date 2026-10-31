@@ -2,7 +2,7 @@
 import json
 import logging
 import re
-from typing import Tuple, Dict, Any, List, Optional, Set
+from typing import Tuple, Dict, Any, List, Optional, Set, Callable
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -284,6 +284,7 @@ class AcademicPersonaService:
         self._cached_sub_topics: Optional[List[str]] = None   # populated together with _cached_main_topics
         self._cached_topics_version: int = -1  # corpus version these two were built at — core-C4 (2026-10)
         self._init_llm()
+        self._groundedness_llm_call = self._default_groundedness_llm_call()
 
     def _init_llm(self):
         model_name = getattr(conf, "OPENROUTER_MODEL_ACADEMIC", conf.OPENROUTER_MODEL)
@@ -337,6 +338,169 @@ class AcademicPersonaService:
             model_kwargs={"response_format": {"type": "json_object"}},
             extra_body=build_speed_extra_body(switch_model),
         )
+
+    def _default_groundedness_llm_call(self) -> Callable[..., dict]:
+        """Lightweight (switch-model) judge: does this draft answer contain any
+        concrete factual claim (fee amount, deadline, named procedure/tool/
+        platform, numeric requirement) that is NOT traceable to DOCUMENTS?
+
+        2026-10 port from persona_practical.py's identical judge — Academic
+        generates real legal answers from real DOCUMENTS via _finalize_answer
+        exactly like Practical does via its own answer path, with the same
+        fabrication risk and, until this port, no equivalent check at all.
+        Prompt is the SAME chain-of-thought + few-shot design already
+        calibrated (6/6 on held-out cases) for Practical earlier the same
+        session — copied rather than shared, matching this codebase's
+        existing convention of each persona file being self-contained (e.g.
+        phone/URL stripping is independently duplicated, not shared, between
+        this file and persona_practical.py). See persona_practical.py's
+        _default_groundedness_llm_call for the full rationale/research
+        citations behind the prompt design."""
+        model = getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL)
+        timeout = int(getattr(conf, "LLM_TOPIC_PICKER_TIMEOUT", 8))
+        llm = ChatOpenAI(
+            model=model,
+            openai_api_key=conf.OPENROUTER_API_KEY,
+            openai_api_base=conf.OPENROUTER_BASE_URL,
+            http_client=get_shared_http_client(),
+            temperature=0.0,
+            max_tokens=500,
+            request_timeout=timeout,
+            model_kwargs={"response_format": {"type": "json_object"}},
+        )
+
+        _FEW_SHOT = (
+            "ตัวอย่างที่ 1 (ต้อง flag — ขั้นตอนที่แต่งเอง):\n"
+            "DOCUMENTS: [{\"metadata\": {\"operation_steps\": \"ยื่นคำขอที่สำนักงานเขตพร้อมเอกสารประจำตัว เจ้าหน้าที่ตรวจเอกสารหน้าเคาน์เตอร์\"}}]\n"
+            "คำตอบร่าง: \"...จากนั้นต้องนัดประชุมผ่าน Zoom หรือ Teams กับเจ้าหน้าที่ก่อนยื่นคำขอ...\"\n"
+            "เหตุผล: DOCUMENTS พูดถึงแค่การยื่นคำขอที่สำนักงานเขต ไม่มีคำว่า Zoom หรือ Teams หรือการนัดประชุมออนไลน์เลย — เป็นขั้นตอนที่แต่งขึ้นเอง\n"
+            "ผลลัพธ์: {\"reasoning\": \"ไม่มี Zoom/Teams ใน DOCUMENTS\", \"unsupported\": true, \"claims\": [\"ต้องนัดประชุมผ่าน Zoom หรือ Teams\"]}\n\n"
+            "ตัวอย่างที่ 2 (ต้อง flag — ตัวเลขที่แต่งเอง):\n"
+            "DOCUMENTS: [{\"metadata\": {\"fees\": \"ไม่พบข้อมูลค่าธรรมเนียมในเอกสารที่มี\"}}]\n"
+            "คำตอบร่าง: \"ค่าธรรมเนียมในการยื่นคำขออยู่ที่ 660 บาท\"\n"
+            "เหตุผล: DOCUMENTS ระบุชัดว่าไม่พบข้อมูลค่าธรรมเนียม แต่คำตอบใส่ตัวเลข 660 บาทมาเอง ไม่มีหลักฐานรองรับตัวเลขนี้เลย\n"
+            "ผลลัพธ์: {\"reasoning\": \"DOCUMENTS บอกว่าไม่พบค่าธรรมเนียม แต่คำตอบระบุ 660 บาทเอง\", \"unsupported\": true, \"claims\": [\"ค่าธรรมเนียม 660 บาท\"]}\n\n"
+            "ตัวอย่างที่ 3 (ไม่ต้อง flag — สรุปเนื้อหาจริงถูกต้อง):\n"
+            "DOCUMENTS: [{\"metadata\": {\"operation_steps\": \"ยื่นคำขอที่สำนักงานเขต รอผลพิจารณา 7 วันทำการ\"}}]\n"
+            "คำตอบร่าง: \"ยื่นคำขอที่สำนักงานเขต ใช้เวลาพิจารณาประมาณ 7 วันทำการครับ\"\n"
+            "เหตุผล: ทั้ง \"สำนักงานเขต\" และ \"7 วันทำการ\" มีอยู่จริงใน DOCUMENTS ตรงกันทุกจุด เป็นการสรุปเนื้อหาที่ถูกต้อง ไม่ใช่การแต่ง\n"
+            "ผลลัพธ์: {\"reasoning\": \"ทุกจุดตรงกับ DOCUMENTS\", \"unsupported\": false, \"claims\": []}"
+        )
+
+        def _call(answer_text: str, docs_json: List[dict], state=None) -> dict:
+            try:
+                _docs_blob = json.dumps(docs_json, ensure_ascii=False)[:6000]
+            except Exception:
+                _docs_blob = "[]"
+            prompt = (
+                "หน้าที่: ตรวจสอบว่าคำตอบร่างด้านล่างมีข้อความที่เป็นข้อเท็จจริงเชิงรูปธรรม "
+                "(ตัวเลข, จำนวนเงิน, ชื่อขั้นตอน/เครื่องมือ/แพลตฟอร์มเฉพาะเจาะจง, กำหนดเวลา) "
+                "ที่ไม่มีหลักฐานรองรับใน DOCUMENTS เลยหรือไม่\n\n"
+                "ก่อนสรุปผล ให้อธิบายเหตุผลสั้นๆก่อนเสมอ (เทียบคำกล่าวอ้างที่เจาะจงในคำตอบกับ DOCUMENTS ทีละจุด) แล้วค่อยสรุปเป็น JSON\n\n"
+                "กฎการตัดสิน:\n"
+                "- flag เฉพาะคำกล่าวอ้างที่ \"เจาะจง\" เท่านั้น (มีตัวเลข/ชื่อเฉพาะ) "
+                "ไม่ flag การสรุป/เรียบเรียงเนื้อหาที่มีอยู่จริงใน DOCUMENTS\n"
+                "- ไม่ flag การปฏิเสธ/บอกว่าไม่พบข้อมูล ([[INFO_GAP]] หรือข้อความทำนองนั้น)\n"
+                "- ไม่ flag คำถามกลับ/คำอธิบายทั่วไปที่ไม่มีตัวเลขหรือชื่อเฉพาะ\n\n"
+                f"{_FEW_SHOT}\n\n"
+                f"--- ตอนนี้ตรวจเคสจริง ---\n\n"
+                f"DOCUMENTS (JSON ของเอกสารที่ส่งให้ตอบคำถามนี้):\n{_docs_blob}\n\n"
+                f"คำตอบร่างที่ต้องตรวจ:\n{answer_text}\n\n"
+                "ตอบเป็น JSON เท่านั้น ตามรูปแบบนี้ (ใส่ reasoning มาก่อนเสมอ): "
+                '{"reasoning": "อธิบายทีละคำกล่าวอ้างสั้นๆ", "unsupported": true/false, "claims": ["ข้อความที่ไม่มีหลักฐาน", ...]}'
+            )
+            try:
+                text = extract_llm_text(
+                    llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Academic/groundedness", state=state)
+                ).strip()
+            except Exception as _e:
+                _LOG.warning("[Academic/groundedness] LLM call failed: %s — treating as grounded (fail-open)", _e)
+                return {"unsupported": False, "claims": [], "reasoning": ""}
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0].strip()
+            elif "```" in text:
+                text = text.split("```")[1].split("```")[0].strip()
+            try:
+                obj = json.loads(text)
+                if not isinstance(obj, dict):
+                    return {"unsupported": False, "claims": [], "reasoning": ""}
+                return {
+                    "unsupported": bool(obj.get("unsupported")),
+                    "claims": list(obj.get("claims") or []),
+                    "reasoning": str(obj.get("reasoning") or ""),
+                }
+            except Exception as _je:
+                _LOG.debug("[Academic/groundedness] JSON parse failed: %s", _je)
+                return {"unsupported": False, "claims": [], "reasoning": ""}
+
+        return _call
+
+    def _apply_groundedness_safety_net(self, ans: str, docs_json: List[dict], prompt: str, state=None) -> str:
+        """Checks a finalized Academic answer for claims not traceable to
+        DOCUMENTS (self._groundedness_llm_call) and retries once with a
+        corrective reminder if flagged. Returns the (possibly corrected)
+        answer string — unchanged if the check passes, empty input, or any
+        step fails.
+
+        2026-10 port from persona_practical.py's _apply_groundedness_safety_net,
+        adapted to this file's structure: _finalize_answer has no action/
+        decision/exec_ dispatch to thread through (Academic's FSM decides
+        ask-vs-answer procedurally in Python, not via an LLM "action" field),
+        so this takes/returns a plain string. Also uses self._call_llm_json
+        directly for the retry since this file has no truncation-retry
+        wrapper to reuse (confirmed: no equivalent of persona_practical.py's
+        _call_llm_json_with_truncation_retry exists here)."""
+        if not (ans or "").strip():
+            return ans
+
+        _ground_result = self._groundedness_llm_call(ans, docs_json, state=state)
+        if not _ground_result.get("unsupported"):
+            return ans
+
+        _LOG.warning(
+            "[Academic] groundedness check flagged unsupported claim(s) %r (reasoning: %r) in answer — "
+            "retrying once with a corrective reminder",
+            _ground_result.get("claims"), _ground_result.get("reasoning"),
+        )
+        _ground_retry_prompt = (
+            prompt
+            + "\n\n[SYSTEM REMINDER] Your previous draft answer included a claim that is NOT "
+            "traceable to DOCUMENTS: " + "; ".join(str(c) for c in (_ground_result.get("claims") or []))[:500] + ". "
+            "This is a hallucination and is not acceptable. Rewrite the answer using ONLY "
+            "facts present in DOCUMENTS. For anything not covered, say so explicitly "
+            "(use [[INFO_GAP]] for that part) instead of inventing a plausible-sounding answer."
+        )
+        try:
+            _ground_retry_decision = self._call_llm_json(_ground_retry_prompt, state=state)
+            _ground_retry_ex_raw = _ground_retry_decision.get("execution") or {}
+            if isinstance(_ground_retry_ex_raw, str):
+                try:
+                    _ground_retry_ex_raw = json.loads(_ground_retry_ex_raw)
+                except Exception:
+                    _ground_retry_ex_raw = {}
+            _ground_retry_ex = _ground_retry_ex_raw if isinstance(_ground_retry_ex_raw, dict) else {}
+            _ground_retry_ans = str(_ground_retry_ex.get("answer") or "").strip()
+            if not _ground_retry_ans:
+                _LOG.warning("[Academic] groundedness retry returned no answer text — keeping first attempt")
+                return ans
+            # Same treatment the original answer already went through, so both
+            # paths are processed identically before the caller's URL/phone strips.
+            _ground_retry_ans, _retry_info_gap = _shared_extract_info_gap_tag(_ground_retry_ans)
+            if _retry_info_gap:
+                state.context["_info_gap_detected"] = True
+            _ground_retry_ans = self._fix_line_wrapping(_ground_retry_ans)
+            _ground_recheck = self._groundedness_llm_call(_ground_retry_ans, docs_json, state=state)
+            if not _ground_recheck.get("unsupported"):
+                _LOG.info("[Academic] groundedness retry succeeded — claim no longer present")
+                return _ground_retry_ans
+            _LOG.warning(
+                "[Academic] groundedness retry STILL flagged %r — keeping first attempt",
+                _ground_recheck.get("claims"),
+            )
+            return ans
+        except Exception as _e_ground_retry:
+            _LOG.warning("[Academic] groundedness retry failed: %s — keeping original answer", _e_ground_retry)
+            return ans
 
     def _meta_request_llm_classify(
         self, user_text: str, state: ConversationState
@@ -4419,7 +4583,11 @@ class AcademicPersonaService:
         }
 
     def _build_final_prompt(self, state: ConversationState, user_question: str) -> tuple:
-        # Returns (prompt, doc_phones) — doc_phones (2026-10 fix, core2-M1)
+        # Returns (prompt, doc_phones, docs_json) — docs_json (2026-10 addition)
+        # is handed back to _finalize_answer so it can pass the exact DOCUMENTS
+        # blob the LLM saw to the groundedness judge, without that caller
+        # re-deriving/duplicating this method's own doc-filtering logic.
+        # doc_phones (2026-10 fix, core2-M1)
         # is the set of phone numbers verbatim in DOCUMENTS, handed straight
         # to _finalize_answer's Layer 3 strip instead of that layer
         # re-deriving it by re-scanning the whole assembled prompt text. The
@@ -4868,7 +5036,7 @@ DOCUMENTS ({len(state.current_docs or [])} found):
 
 Return JSON:
 """.strip()
-        return _ac_prompt_text, _ac_doc_phones
+        return _ac_prompt_text, _ac_doc_phones, docs_json
 
     _URL_TRAILING_RE = re.compile(r'https?://\S+$')
     _URL_CONTINUATION_RE = re.compile(r'^[a-zA-Z0-9._/\-?=&%+#@!~,;:]+')
@@ -4932,7 +5100,7 @@ Return JSON:
         uq = uq or getattr(conf, "DEFAULT_RETRIEVAL_FALLBACK_QUERY",
                            "กฎหมายร้านอาหาร ใบอนุญาต ภาษี VAT จดทะเบียน สุขาภิบาล ประกันสังคม")
 
-        prompt, _ac_doc_phones = self._build_final_prompt(state, user_question=uq)
+        prompt, _ac_doc_phones, docs_json = self._build_final_prompt(state, user_question=uq)
 
         # Fix 6: Collect allowed URLs from the injected link sections so we can strip any
         # hallucinated URLs the LLM generates that are NOT from the approved source list.
@@ -4978,6 +5146,11 @@ Return JSON:
             ans = "ขอโทษครับ ตอนนี้ยังไม่พบข้อมูลในเอกสารที่เกี่ยวข้อง"
             state.context["_info_gap_detected"] = True
         ans = self._fix_line_wrapping(ans)
+
+        # Groundedness safety net (2026-10 port from persona_practical.py) — must run
+        # BEFORE the URL/phone stripping below so whichever answer wins (original or
+        # corrective retry) flows through the same stripping logic uniformly.
+        ans = self._apply_groundedness_safety_net(ans, docs_json, prompt, state=state)
 
         # Fix 6 (continued): Remove hallucinated URLs from the answer — any URL not in _allowed_urls.
         if _allowed_urls:

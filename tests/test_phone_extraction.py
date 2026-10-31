@@ -82,9 +82,9 @@ class TestAcademicPhoneGuardPromptInjection:
         state = ConversationState(session_id="t1", persona_id="academic", context={})
         state.current_docs = docs
         # 2026-10 fix (core2-M1): _build_final_prompt now returns
-        # (prompt, doc_phones) — see its docstring. Tests here only need
-        # the prompt text; the doc_phones half is covered separately below.
-        prompt, _doc_phones = ac._build_final_prompt(state, user_question="ติดต่อยังไง")
+        # (prompt, doc_phones, docs_json) — see its docstring. Tests here only
+        # need the prompt text; doc_phones is covered separately below.
+        prompt, _doc_phones, _docs_json = ac._build_final_prompt(state, user_question="ติดต่อยังไง")
         return prompt
 
     def test_phone_in_documents_appears_in_guard_whitelist(self):
@@ -134,7 +134,7 @@ class TestAcademicLayer3DoesNotWhitelistItsOwnGuardTextExample:
         state.current_docs = [{"content": "c", "metadata": {
             "license_type": "ทะเบียนนายจ้าง", "department": "สำนักงานประกันสังคม",
         }}]
-        prompt, doc_phones = ac._build_final_prompt(state, user_question="ติดต่อยังไง")
+        prompt, doc_phones, _docs_json = ac._build_final_prompt(state, user_question="ติดต่อยังไง")
 
         assert "1570" in prompt  # sanity: the guard's own example is in there
         assert doc_phones == set(), (

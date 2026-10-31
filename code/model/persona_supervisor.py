@@ -992,19 +992,23 @@ class PersonaSupervisor:
         )
         return state, self._append_pending_slot_reminder(state, reply)
 
+    _DEFLECT_FALLBACK_REPLY = "ผมช่วยได้ทั้งเรื่องกฎหมาย/ใบอนุญาต การตลาด และการเปิดร้านครับ มีอะไรอยากถามไหมครับ? 😊"
+
     def _handle_deflect(self, state: ConversationState, raw_input: str) -> Tuple[ConversationState, str]:
         """
         Guardrail deflection — LLM-guided response for off-topic / personal questions.
         Used by: 2.2c early-off-topic, greeting+personal-question, unknown_intent.
         """
         _LOG.debug("[Supervisor] deflect input=%r", (raw_input or "")[:60])
+        _ctx_parts: list = []
         try:
             _llm = self._deflect_llm
             # Build context string so LLM can ask a relevant clarifying question
-            _ctx_parts: list = []
             _last_license = (state.context or {}).get("last_license_type") or (state.context or {}).get("last_topic") or ""
             if _last_license:
                 _ctx_parts.append(f"หัวข้อล่าสุด: {_last_license}")
+            _pkey = ""
+            _popts: list = []
             _pslot = (state.context or {}).get("pending_slot")
             if isinstance(_pslot, dict) and _pslot.get("key"):
                 _pkey = _pslot.get("key", "")
@@ -1019,6 +1023,7 @@ class PersonaSupervisor:
                 "- ห้ามทักทายหรือแนะนำตัวซ้ำ (ทักทายไปแล้ว)\n"
                 "- ถ้ามี context ให้ถามให้ชัดขึ้นโดยอ้างอิง context นั้น\n"
                 "- ถ้ามี pending slot ให้ถามซ้ำเฉพาะ slot นั้น\n"
+                "- ถ้าจะอ้างอิงหัวข้อ/ตัวเลือกใน context ต้องใช้คำเดิมเป๊ะ ห้ามเปลี่ยนคำหรือสรุปใหม่\n"
                 "- ถ้าไม่มี context ให้ถามสั้นๆ ว่าต้องการความช่วยเหลือเรื่องอะไร\n"
                 "- ตอบเป็น plain text บรรทัดเดียว ไม่เกิน 30 คำ ห้ามขึ้นบรรทัดใหม่\n"
             )
@@ -1028,9 +1033,24 @@ class PersonaSupervisor:
             ).strip()
             # Hard-enforce single line — collapse any newlines the LLM sneaks in
             _reply = " ".join(_reply.splitlines()).strip()
+            # Deterministic slot-fidelity check (2026-10): the LLM was handed exact
+            # known-correct values (last topic / pending-slot key / its options) and
+            # told to quote them verbatim. Rather than trust a second LLM call to
+            # verify that (same cost, same unreliability as the risk itself), check
+            # membership directly — same whitelist-and-verify shape this codebase
+            # already uses for phone numbers/URLs. Only fires when there WAS context
+            # to get wrong; no context means nothing to verify against.
+            if _ctx_parts:
+                _known_values = [v for v in ([_last_license, _pkey] + _popts) if v]
+                if _known_values and not any(v in _reply for v in _known_values):
+                    _LOG.warning(
+                        "[Supervisor] deflect reply failed slot-fidelity check "
+                        "(known=%r, reply=%r) — using safe fallback", _known_values, _reply,
+                    )
+                    _reply = self._DEFLECT_FALLBACK_REPLY
         except Exception as _e:
             _LOG.warning("[Supervisor] deflect LLM failed: %s", _e)
-            _reply = "ผมช่วยได้ทั้งเรื่องกฎหมาย/ใบอนุญาต การตลาด และการเปิดร้านครับ มีอะไรอยากถามไหมครับ? 😊"
+            _reply = self._DEFLECT_FALLBACK_REPLY
         _reply = self._normalize_male(_reply)
         self._add_assistant(state, _reply)
         state.last_action = "unknown_deflect"
