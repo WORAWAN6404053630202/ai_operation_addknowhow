@@ -147,7 +147,17 @@ async def root_health():
     import time
     from router.monitoring import _start_time
     try:
-        from service.local_vector_store import get_vs_manager
+        # 2026-11 fix: this used to always import local_vector_store (Chroma)
+        # regardless of backend — on the Elasticsearch-backed instance,
+        # conf.USE_ELASTICSEARCH=true means route_v1.py never touches
+        # local_vector_store's manager at all, so its vectorstore stays None
+        # forever and /health reported ready:false permanently even once ES
+        # was fully working (live-caught deploying the ES-parallel instance,
+        # see .claude/plans/mutable-seeking-wave.md).
+        if getattr(conf, "USE_ELASTICSEARCH", False):
+            from service.es_vector_store import get_vs_manager
+        else:
+            from service.local_vector_store import get_vs_manager
         mgr = get_vs_manager()
         ready = mgr.vectorstore is not None and (mgr._collection_count() or 0) > 0
     except Exception as e:
