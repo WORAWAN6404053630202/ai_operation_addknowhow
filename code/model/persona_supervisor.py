@@ -10933,6 +10933,26 @@ class PersonaSupervisor:
                             )
                     except Exception:
                         pass
+                elif _slot_key_sv == "registration_type":
+                    # 2026-11 fix (live-caught: a user who answered "รูปแบบการจดทะเบียน"
+                    # with "ห้างหุ้นส่วนจำกัด" via a slot keyed literally "registration_type"
+                    # — not "choice"/"entity_type" — got entity_type left unsaved, so every
+                    # downstream consumer reading collected_slots.get("entity_type") (e.g.
+                    # the operation_group handler's retrieval filter below) silently found
+                    # nothing and either skipped its entity-scoped retrieval entirely or fell
+                    # back to unscoped/wrong-entity docs. Symmetric with the "choice" branch
+                    # above — same normalization, just keyed on this slot name instead.
+                    try:
+                        from service.data_loader import DataLoader as _DL_rt
+                        _rt_norm = _DL_rt._normalize_entity_type(_slot_val_sv)
+                        if _rt_norm:
+                            state.save_collected_slot("entity_type", _rt_norm)
+                            _LOG.info(
+                                "[Supervisor] registration_type %r → entity_type=%r auto-derived",
+                                _slot_val_sv, _rt_norm,
+                            )
+                    except Exception:
+                        pass
                 # Auto-fill registration_type when entity_type was answered with a specific sub-type.
                 # Happens when the LLM merges entity+registration into one question and user picks
                 # e.g. "บริษัทจำกัด" (not "นิติบุคคล") — the sub-type answer implicitly fills both slots.

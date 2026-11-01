@@ -200,3 +200,50 @@ class TestSvSearchMultiKeyFilterNormalization:
     def test_single_key_filter_passes_through_unwrapped(self):
         block = self._sv_search_source()
         assert '_sv_cleaned if len(_sv_cleaned) <= 1' in block
+
+
+@pytest.mark.unit
+class TestRegistrationTypeAutoFillsEntityType:
+    """2026-11 fix, round 2: my first entity-type fix (TestFallbackEntityTypeFilter
+    above) targeted _ensure_practical_retrieval_for_legal's fallback — but live
+    re-testing showed the real conversation flow (registration_type slot ->
+    operation_group slot) never goes through that fallback at all. It goes
+    through a SEPARATE operation_group-specific handler
+    (persona_supervisor.py:~11885+) whose own retrieval is gated on
+    collected_slots.get("entity_type") being set — and that was never being
+    auto-derived from a registration_type-keyed slot answer (only "choice"/
+    "entity_type"-keyed answers got that treatment). Fixed at the source — the
+    generic slot-save block every pending-slot answer passes through — so
+    EVERY downstream consumer of collected_slots["entity_type"] benefits, not
+    just operation_group's retrieval filter."""
+
+    def _slot_save_block_source(self) -> str:
+        source = inspect.getsource(PersonaSupervisor._route_pending_slot_to_persona)
+        m = re.search(
+            r'elif isinstance\(pending, dict\) and pending\.get\("key"\) and mapped:(.*?)state\.context\.pop\("pending_slot"',
+            source, re.DOTALL,
+        )
+        assert m, "generic slot-save block not found in _route_pending_slot_to_persona"
+        return m.group(1)
+
+    def test_registration_type_branch_exists(self):
+        block = self._slot_save_block_source()
+        assert 'elif _slot_key_sv == "registration_type":' in block
+
+    def test_registration_type_branch_normalizes_and_saves_entity_type(self):
+        block = self._slot_save_block_source()
+        m = re.search(
+            r'elif _slot_key_sv == "registration_type":(.*?)(?:\n                elif |\n                if |\Z)',
+            block, re.DOTALL,
+        )
+        assert m, "registration_type branch body not found"
+        branch = m.group(1)
+        assert '_normalize_entity_type(_slot_val_sv)' in branch
+        assert 'state.save_collected_slot("entity_type", _rt_norm)' in branch
+
+    def test_does_not_touch_registration_type_save_itself(self):
+        """The unconditional state.save_collected_slot(_slot_key_sv, _slot_val_sv)
+        a few lines above must be untouched — this fix only ADDS the entity_type
+        derivation, it doesn't change how registration_type itself gets saved."""
+        block = self._slot_save_block_source()
+        assert 'state.save_collected_slot(_slot_key_sv, _slot_val_sv)' in block
