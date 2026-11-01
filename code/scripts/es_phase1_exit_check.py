@@ -38,16 +38,27 @@ from service.local_vector_store import _materialize_embeddings
 def _pull_from_chroma(chroma_dir: str, limit: int):
     """Read-only: connects to a (copied) Chroma persist dir and pulls
     `limit` real docs with content + metadata + embeddings already computed
-    — no OpenRouter embedding calls made here at all."""
+    — no OpenRouter embedding calls made here at all. Filters to docs that
+    actually have license_type set, since a plain unfiltered `.get(limit=N)`
+    can land entirely on metadata-sparse marketing/guide docs (confirmed
+    live: the first 30 by insertion order had zero regulatory docs among
+    them), which defeats the point of a filter+kNN parity check."""
     import chromadb
     client = chromadb.PersistentClient(path=chroma_dir)
     coll = client.get_collection(conf.COLLECTION_NAME)
-    raw = coll.get(limit=limit, include=["documents", "metadatas", "embeddings"])
+    raw = coll.get(limit=limit, where={"license_type": {"$ne": ""}}, include=["documents", "metadatas", "embeddings"])
     ids = raw.get("ids") or []
     docs = raw.get("documents") or []
     metas = raw.get("metadatas") or []
     embeddings = _materialize_embeddings(raw)
-    print(f"[Chroma] pulled {len(ids)} docs from collection {conf.COLLECTION_NAME!r} at {chroma_dir}")
+    print(f"[Chroma] pulled {len(ids)} docs (license_type != '') from collection {conf.COLLECTION_NAME!r} at {chroma_dir}")
+    if not ids:
+        print("[Chroma] that filter found nothing — falling back to an unfiltered pull (comparison queries will be skipped)")
+        raw = coll.get(limit=limit, include=["documents", "metadatas", "embeddings"])
+        ids = raw.get("ids") or []
+        docs = raw.get("documents") or []
+        metas = raw.get("metadatas") or []
+        embeddings = _materialize_embeddings(raw)
     return ids, docs, metas, embeddings
 
 
@@ -61,6 +72,10 @@ def _index_into_es(ids, docs, metas, embeddings):
         metadatas=[_stringify_metadata(m) for m in metas],
         embeddings=embeddings,
     )
+    # ES doesn't make newly-indexed docs searchable/countable instantly —
+    # default refresh_interval is ~1s. Force it so this script's own count
+    # check right after indexing is deterministic, not a timing race.
+    mgr.vectorstore._collection._client.indices.refresh(index=mgr.vectorstore._collection._index)
     count = mgr._collection_count()
     print(f"[ES] indexed {len(ids)} docs into {mgr._live_index!r} — live count now {count}")
     return mgr
