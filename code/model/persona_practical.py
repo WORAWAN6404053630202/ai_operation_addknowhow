@@ -5840,12 +5840,30 @@ class PracticalPersonaService:
                             include=["documents", "metadatas"],
                         )
                         _guar_max_chars_lt = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700))
+                        # 2026-11 fix (live-caught cross-entity-type contamination): this
+                        # fetch is deliberately license_type-only (see the comment above
+                        # explaining why — some licenses embed the entity comparison as
+                        # running text in a single entity-neutral row rather than
+                        # splitting by entity_type_normalized). But "license_type-only"
+                        # was ALSO silently admitting rows from a DIFFERENT, definite
+                        # entity_type_normalized (e.g. บุคคลธรรมดา rows when the user had
+                        # explicitly established นิติบุคคล) — those aren't the entity-
+                        # neutral "both covered in one row" case this guarantee exists
+                        # for, they're a genuinely wrong-entity row for a license that
+                        # DOES split by entity. Keep entity-neutral rows (empty field —
+                        # exactly the case this guarantee was built for) and rows that
+                        # match a target entity; drop rows confidently tagged as a
+                        # different entity. Same "empty = applies to everyone" contract
+                        # already used throughout this file's entity_type_normalized
+                        # filtering (e.g. _scored_search's $in: [val, ""] widening).
                         _guar_docs_lt = [
                             {"content": (c or "")[:_guar_max_chars_lt], "metadata": m or {}}
                             for c, m in zip(
                                 _guar_res_lt.get("documents") or [],
                                 _guar_res_lt.get("metadatas") or [],
                             )
+                            if not str((m or {}).get("entity_type_normalized") or "").strip()
+                            or str((m or {}).get("entity_type_normalized") or "").strip() in _target_entities
                         ]
                         if _guar_docs_lt:
                             _docs_to_process = _guar_docs_lt + _docs_to_process
