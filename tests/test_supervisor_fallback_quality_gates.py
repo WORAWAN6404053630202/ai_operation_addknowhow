@@ -126,3 +126,77 @@ class TestRegulatoryIdentityGuardWiring:
         block = self._broad_question_block_source()
         assert '_shared_regulatory_identity_mismatch_should_reject' not in block
         assert 'REGULATORY_IDENTITY_GUARD_ENFORCE' not in block
+
+
+@pytest.mark.unit
+class TestFallbackEntityTypeFilter:
+    """2026-11 fix: live-caught via the groundedness judge (session memory
+    identity_guard_langsmith_tagging_and_judge_truncation_fix_2026-11.md) —
+    a user who had just explicitly picked "ห้างหุ้นส่วนจำกัด" (registration_type
+    slot) still got "บุคคลธรรมดา" documents in their final answer, because this
+    fallback's metadata filter only ever scoped by license_type + department,
+    which are identical across entity-type variants of the same license. This
+    pins that the filter now also derives + applies entity_type_normalized."""
+
+    def _entity_filter_block_source(self) -> str:
+        source = inspect.getsource(PersonaSupervisor._ensure_practical_retrieval_for_legal)
+        m = re.search(
+            r'_fb_cs = state\.get_collected_slots\(\).*?docs = _sv_search\(q_expanded, top_k, metadata_filter=_fb_filter or None\)',
+            source, re.DOTALL,
+        )
+        assert m, "entity-type filter block not found in _ensure_practical_retrieval_for_legal"
+        return m.group(0)
+
+    def test_prefers_already_set_entity_type_from_collected_slots(self):
+        block = self._entity_filter_block_source()
+        assert '(_fb_cs or {}).get("entity_type")' in block
+
+    def test_falls_back_to_deriving_from_registration_type(self):
+        block = self._entity_filter_block_source()
+        assert 'DataLoader' in block
+        assert '_normalize_entity_type(' in block
+        assert '"registration_type"' in block
+
+    def test_entity_type_filter_uses_the_same_in_widening_shape_as_practical(self):
+        """Must widen to {"$in": [val, ""]} — same shape as persona_practical.py's
+        _scored_search — so entity-neutral docs (entity_type_normalized="") aren't
+        incorrectly excluded."""
+        block = self._entity_filter_block_source()
+        assert '"entity_type_normalized"] = {"$in": [_fb_entity_type, ""]}' in block
+
+    def test_missing_entity_type_does_not_add_the_filter_key(self):
+        """"only add coverage, never regress" — if entity_type can't be resolved
+        at all, the filter key must not be added (existing license/department-only
+        behavior preserved)."""
+        block = self._entity_filter_block_source()
+        assert 'if _fb_entity_type:' in block
+
+
+@pytest.mark.unit
+class TestSvSearchMultiKeyFilterNormalization:
+    """2026-11 fix: Branch B/C of _sv_search passed a flat multi-key filter dict
+    straight to Chroma's similarity_search_with_relevance_scores, which raises
+    "Expected where to have exactly one operator" for 2+ keys — silently caught
+    and falling through to an unfiltered search. Branch A (hybrid) already gets
+    this normalization for free via hybrid_retriever.py's _normalize_chroma_filter;
+    this pins that Branch B/C now gets the same $and-wrapping, inline (not an
+    import of that other module's private helper, matching this codebase's
+    per-file self-containment convention)."""
+
+    def _sv_search_source(self) -> str:
+        source = inspect.getsource(PersonaSupervisor._ensure_practical_retrieval_for_legal)
+        m = re.search(
+            r'if metadata_filter and _sv_vstore is not None:(.*?)if _sv_vstore is not None:',
+            source, re.DOTALL,
+        )
+        assert m, "_sv_search Branch B block not found"
+        return m.group(1)
+
+    def test_flat_multi_key_filter_gets_and_wrapped(self):
+        block = self._sv_search_source()
+        assert '"$and"' in block
+        assert 'len(_sv_cleaned) <= 1' in block
+
+    def test_single_key_filter_passes_through_unwrapped(self):
+        block = self._sv_search_source()
+        assert '_sv_cleaned if len(_sv_cleaned) <= 1' in block

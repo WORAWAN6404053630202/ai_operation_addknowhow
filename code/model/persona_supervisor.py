@@ -4960,7 +4960,19 @@ class PersonaSupervisor:
                 return [d for d, _ in _pairs]
             if metadata_filter and _sv_vstore is not None:
                 try:
-                    _pairs = _sv_vstore.similarity_search_with_relevance_scores(q, k=k, filter=metadata_filter) or []
+                    # Chroma requires exactly one top-level operator when a filter has more
+                    # than one field — a flat multi-key dict raises "Expected where to have
+                    # exactly one operator". Branch A (hybrid) gets this normalization for
+                    # free via hybrid_retriever.py's own _normalize_chroma_filter; this branch
+                    # didn't, so a 2+-key metadata_filter here (e.g. license_type + department,
+                    # now also entity_type_normalized below) would silently fail and fall
+                    # through to the unfiltered branch whenever HYBRID_SEARCH_ENABLED=false.
+                    _sv_cleaned = {k: v for k, v in metadata_filter.items() if v is not None}
+                    _sv_eff_filter = (
+                        _sv_cleaned if len(_sv_cleaned) <= 1
+                        else {"$and": [{k: v} for k, v in _sv_cleaned.items()]}
+                    ) or None
+                    _pairs = _sv_vstore.similarity_search_with_relevance_scores(q, k=k, filter=_sv_eff_filter) or []
                     for _d, _s in _pairs:
                         _d.metadata["_sim"] = float(_s)
                     return [d for d, _ in _pairs]
@@ -5253,16 +5265,43 @@ class PersonaSupervisor:
                 or (state.context or {}).get("slots", {}).get("department", "")
                 or ""
             ).strip()
+            # 2026-11 fix (live-caught via the groundedness judge, see memory
+            # identity_guard_langsmith_tagging_and_judge_truncation_fix_2026-11.md):
+            # this filter used to scope only by license_type/department, which are
+            # identical across entity-type variants of the same license (e.g.
+            # ใบทะเบียนพาณิชย์ for บุคคลธรรมดา vs นิติบุคคล) — so a user who had just
+            # explicitly picked one entity type could still get the OTHER entity
+            # type's documents if it scored marginally higher on pure semantic
+            # similarity. entity_type may already be set (canonical นิติบุคคล/
+            # บุคคลธรรมดา); if not, derive it from registration_type — the slot
+            # that's actually populated when the pending slot's key was literally
+            # "registration_type" rather than "choice"/"entity_type" (see
+            # state.save_collected_slot call sites around the pending-slot handler).
+            _fb_entity_type = str((_fb_cs or {}).get("entity_type") or "").strip()
+            if not _fb_entity_type:
+                try:
+                    from service.data_loader import DataLoader as _DL_fb
+                    _fb_entity_type = _DL_fb._normalize_entity_type(
+                        str((_fb_cs or {}).get("registration_type") or "").strip()
+                    ) or ""
+                except Exception:
+                    _fb_entity_type = ""
             _fb_filter: dict = {}
             if _fb_license:
                 _fb_filter["license_type"] = _fb_license
             if _fb_dept:
                 _fb_filter["department"] = _fb_dept
+            if _fb_entity_type:
+                # Widen to include entity-neutral docs (entity_type_normalized=""
+                # means "applies to all entity types") — same shape as
+                # persona_practical.py's _scored_search, so a genuinely
+                # entity-agnostic doc never gets excluded by this filter.
+                _fb_filter["entity_type_normalized"] = {"$in": [_fb_entity_type, ""]}
             docs = _sv_search(q_expanded, top_k, metadata_filter=_fb_filter or None)
             if not docs and _fb_filter:
                 _LOG.info(
-                    "[Supervisor] fallback scoped retrieval empty (license=%r dept=%r) — relaxing to unfiltered",
-                    _fb_license, _fb_dept,
+                    "[Supervisor] fallback scoped retrieval empty (license=%r dept=%r entity_type=%r) — relaxing to unfiltered",
+                    _fb_license, _fb_dept, _fb_entity_type,
                 )
                 docs = _sv_search(q_expanded, top_k)
 

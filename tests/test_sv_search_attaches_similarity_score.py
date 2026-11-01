@@ -51,7 +51,10 @@ class TestSvSearchAttachesSimilarityScore:
 
     def test_filtered_branch_uses_scored_search_not_plain_similarity_search(self):
         block = self._sv_search_source()
-        assert 'similarity_search_with_relevance_scores(q, k=k, filter=metadata_filter)' in block
+        # 2026-11: filter is now normalized (multi-key -> $and) before use —
+        # see TestSvSearchMultiKeyFilterNormalization in
+        # test_supervisor_fallback_quality_gates.py for that fix's own tests.
+        assert 'similarity_search_with_relevance_scores(q, k=k, filter=_sv_eff_filter)' in block
 
     def test_unfiltered_branch_tries_scored_search_before_plain_invoke_fallback(self):
         block = self._sv_search_source()
