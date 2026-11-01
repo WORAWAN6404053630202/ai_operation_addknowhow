@@ -578,6 +578,19 @@ ZILLIZ_API_KEY = os.getenv("ZILLIZ_API_KEY")
 
 LOCAL_MILVUS_URI = os.getenv("LOCAL_MILVUS_URI", "./milvus_lite.db")
 
+# 2026-11 — parallel ES-backed PDF-only instance (port 3002), evaluated against
+# the existing Chroma-backed one. service/es_vector_store.py mirrors
+# local_vector_store.py's interface via a Chroma-shaped facade so retrieval/
+# persona/groundedness logic runs completely unmodified against either
+# backend — the backend is the only variable between the two instances.
+USE_ELASTICSEARCH = os.getenv("USE_ELASTICSEARCH", "false").lower() == "true"
+ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "https://localhost:9200")
+ELASTICSEARCH_API_KEY = os.getenv("ELASTICSEARCH_API_KEY")
+ELASTICSEARCH_INDEX_NAME = os.getenv("ELASTICSEARCH_INDEX_NAME", "thai_food_business_v3_es")
+ELASTICSEARCH_ARCHIVE_INDEX_NAME = os.getenv(
+    "ELASTICSEARCH_ARCHIVE_INDEX_NAME", ELASTICSEARCH_INDEX_NAME + "_archive"
+)
+
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "thai_food_business_v3")
 
 # Archive collection for the PDF content supersede resolver (2026-10) — superseded

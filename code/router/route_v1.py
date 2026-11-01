@@ -75,6 +75,16 @@ try:
         vs_manager = VectorStoreManager()
         retriever = vs_manager.connect_to_existing()
         logger.info("Using Milvus/Zilliz retriever")
+    elif conf.USE_ELASTICSEARCH:
+        # 2026-11 — parallel ES-backed instance (port 3002), evaluated
+        # against this same Chroma-backed instance. service/es_vector_store
+        # .py's get_retriever() returns an object whose .vectorstore (once
+        # assigned by PersonaSupervisor) presents the same Chroma-collection-
+        # shaped facade every existing retrieval call site already expects —
+        # see .claude/plans/mutable-seeking-wave.md for the full design.
+        from service.es_vector_store import get_retriever
+        retriever = get_retriever(fail_if_empty=False)
+        logger.info("Using Elasticsearch retriever")
     else:
         from service.local_vector_store import get_retriever
         retriever = get_retriever(fail_if_empty=False)
@@ -560,6 +570,7 @@ async def health_check():
         "supervisor_initialized": supervisor is not None,
         "state_manager_initialized": state_manager is not None,
         "use_zilliz": conf.USE_ZILLIZ,
+        "use_elasticsearch": conf.USE_ELASTICSEARCH,
         "collection_name": conf.COLLECTION_NAME,
         "session_retention_days": SESSION_RETENTION_DAYS,
         "cache": cache_stats,

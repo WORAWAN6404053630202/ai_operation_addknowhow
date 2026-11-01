@@ -41,6 +41,16 @@ sentence-transformers>=3.0.1,<4
 transformers>=4.41.0,<5.0.0
 huggingface-hub>=0.23.0,<1.0
 
+# --- Elasticsearch (2026-11, parallel ES-backed PDF-only instance evaluation —
+# see .claude/plans/mutable-seeking-wave.md). Raw client, not langchain-
+# elasticsearch: this codebase already bypasses LangChain's VectorStore
+# abstraction constantly for raw Chroma-collection access, so a second
+# wrapper on top of the hand-rolled Chroma-shaped facade in
+# service/es_vector_store.py would add a layer with no benefit here. Upper-
+# bounded below 9.0 to start on the well-documented 8.x API (native hybrid
+# `rrf` retriever requires 8.9+) rather than chasing 9.x on day one.
+elasticsearch>=8.9,<9
+
 # --- Reranker ONNX backend (optional, RERANKER_BACKEND=onnx — off by default) ---
 optimum[onnxruntime]>=1.20.0
 
