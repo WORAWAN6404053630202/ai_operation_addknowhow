@@ -247,3 +247,76 @@ class TestRegistrationTypeAutoFillsEntityType:
         derivation, it doesn't change how registration_type itself gets saved."""
         block = self._slot_save_block_source()
         assert 'state.save_collected_slot(_slot_key_sv, _slot_val_sv)' in block
+
+
+@pytest.mark.unit
+class TestEntityCommitClearsStaleMultiEntityFlag:
+    """2026-11 fix, round 5 of the same live-caught bug (see
+    identity_guard_langsmith_tagging_and_judge_truncation_fix_2026-11.md and
+    the follow-up entity-type-retrieval-contamination memory for the full
+    saga): when the user's ORIGINAL message ambiguously named BOTH entity
+    types (e.g. "ทั้งบุคคลธรรมดาและนิติบุคคล"), _apply_slot_change_if_detected
+    sets state.context["_multi_entity_mentioned"] — a real, intentional
+    feature for genuine "compare both" questions. But nothing ever cleared
+    it once the user explicitly resolved that ambiguity by picking ONE
+    specific entity/registration_type via a slot answer. The stale flag kept
+    feeding persona_practical.py's established-topic guarantee
+    (_target_entities, ~line 5814 — confirmed the ONLY read site of this
+    flag anywhere in the codebase), which deliberately re-injected the
+    OTHER entity's documents into every subsequent answer — confirmed via a
+    real trace: "established-topic guarantee (entity): entity='บุคคลธรรมดา'
+    ... +3 doc(s)" firing on a turn where the user had already committed to
+    ห้างหุ้นส่วนจำกัด (นิติบุคคล) two turns earlier. Fix: clear the flag at
+    all 3 points where a slot answer commits to one specific entity type."""
+
+    def _slot_save_block_source(self) -> str:
+        source = inspect.getsource(PersonaSupervisor._route_pending_slot_to_persona)
+        m = re.search(
+            r'elif isinstance\(pending, dict\) and pending\.get\("key"\) and mapped:(.*?)state\.context\.pop\("pending_slot"',
+            source, re.DOTALL,
+        )
+        assert m, "generic slot-save block not found in _route_pending_slot_to_persona"
+        return m.group(1)
+
+    def test_choice_direct_entity_match_clears_the_flag(self):
+        block = self._slot_save_block_source()
+        m = re.search(
+            r'if _slot_key_sv == "choice" and _slot_val_sv in.*?(?=elif _slot_key_sv == "choice":)',
+            block, re.DOTALL,
+        )
+        assert m, "choice-direct-entity-match branch not found"
+        assert 'state.context.pop("_multi_entity_mentioned", None)' in m.group(0)
+
+    def test_choice_subtype_branch_clears_the_flag(self):
+        block = self._slot_save_block_source()
+        m = re.search(
+            r'elif _slot_key_sv == "choice":(.*?)elif _slot_key_sv == "registration_type":',
+            block, re.DOTALL,
+        )
+        assert m, "choice sub-type branch not found"
+        assert 'state.context.pop("_multi_entity_mentioned", None)' in m.group(1)
+
+    def test_registration_type_branch_clears_the_flag(self):
+        block = self._slot_save_block_source()
+        m = re.search(
+            r'elif _slot_key_sv == "registration_type":(.*?)# Auto-fill registration_type',
+            block, re.DOTALL,
+        )
+        assert m, "registration_type branch not found"
+        assert 'state.context.pop("_multi_entity_mentioned", None)' in m.group(1)
+
+    def test_direct_entity_type_slot_answer_clears_the_flag(self):
+        block = self._slot_save_block_source()
+        m = re.search(
+            r'# Auto-fill registration_type when entity_type.*?except Exception:\s*\n\s*pass',
+            block, re.DOTALL,
+        )
+        assert m, "direct entity_type slot-answer branch not found"
+        assert 'state.context.pop("_multi_entity_mentioned", None)' in m.group(0)
+
+    def test_clear_count_matches_all_four_commit_sites(self):
+        """4 sites commit an entity type in this block (choice-direct-match,
+        choice-subtype, registration_type, direct entity_type) — each must
+        clear the flag exactly once; no fewer, matching every commit path."""
+        block = self._slot_save_block_source()
+        assert block.count('state.context.pop("_multi_entity_mentioned", None)') == 4

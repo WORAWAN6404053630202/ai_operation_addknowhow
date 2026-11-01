@@ -10917,6 +10917,9 @@ class PersonaSupervisor:
                 if _slot_key_sv == "choice" and _slot_val_sv in ("นิติบุคคล", "บุคคลธรรมดา", "นิติ"):
                     state.save_collected_slot("entity_type", _slot_val_sv)
                     _LOG.info("[Supervisor] normalized choice→entity_type: %r", _slot_val_sv)
+                    # 2026-11 fix (round 5 of the same live-caught bug, see below) —
+                    # clearing applied uniformly across all 3 entity-commit branches.
+                    state.context.pop("_multi_entity_mentioned", None)
                 elif _slot_key_sv == "choice":
                     # Value may be an entity sub-type (e.g. บริษัทจำกัด, ห้างหุ้นส่วนจำกัด)
                     # Save as both entity_type (normalized) and registration_type so slot_queue
@@ -10931,6 +10934,7 @@ class PersonaSupervisor:
                                 "[Supervisor] choice sub-type %r → entity_type=%r + registration_type saved",
                                 _slot_val_sv, _cs_norm,
                             )
+                            state.context.pop("_multi_entity_mentioned", None)
                     except Exception:
                         pass
                 elif _slot_key_sv == "registration_type":
@@ -10942,6 +10946,29 @@ class PersonaSupervisor:
                     # nothing and either skipped its entity-scoped retrieval entirely or fell
                     # back to unscoped/wrong-entity docs. Symmetric with the "choice" branch
                     # above — same normalization, just keyed on this slot name instead.
+                    #
+                    # 2026-11 fix, round 5 of this same bug: fixing entity_type derivation
+                    # (above) and retrieval scoping (persona_supervisor.py's
+                    # _ensure_practical_retrieval_for_legal fallback, persona_practical.py's
+                    # _retrieve_docs and its "blanket license-level guarantee") still wasn't
+                    # enough — live-reproduced one more layer: when the user's ORIGINAL
+                    # message ambiguously named BOTH entity types (e.g. "ทั้งบุคคลธรรมดาและ
+                    # นิติบุคคล"), _apply_slot_change_if_detected sets
+                    # state.context["_multi_entity_mentioned"] = ["บุคคลธรรมดา", "นิติบุคคล"]
+                    # (a real, intentional feature for genuine "compare both" questions) —
+                    # but nothing ever cleared it once the user explicitly resolved that
+                    # ambiguity by picking ONE specific registration_type here. The stale
+                    # flag kept feeding persona_practical.py's established-topic guarantee
+                    # (_target_entities, ~line 5814), which deliberately injected the OTHER
+                    # entity's documents back into every answer afterward — confirmed via a
+                    # real trace: "[Practical] established-topic guarantee (entity):
+                    # entity='บุคคลธรรมดา' ... +3 doc(s)" firing on a turn where the user had
+                    # already committed to ห้างหุ้นส่วนจำกัด two turns earlier. The bot itself
+                    # decides a specific registration_type needs picking before it can
+                    # answer — there's no code path where it asks for one specific type AND
+                    # still intends to keep comparing both — so clearing unconditionally here
+                    # is safe (confirmed: persona_practical.py:5770 is the flag's only read
+                    # site anywhere in the codebase).
                     try:
                         from service.data_loader import DataLoader as _DL_rt
                         _rt_norm = _DL_rt._normalize_entity_type(_slot_val_sv)
@@ -10951,12 +10978,19 @@ class PersonaSupervisor:
                                 "[Supervisor] registration_type %r → entity_type=%r auto-derived",
                                 _slot_val_sv, _rt_norm,
                             )
+                            state.context.pop("_multi_entity_mentioned", None)
                     except Exception:
                         pass
                 # Auto-fill registration_type when entity_type was answered with a specific sub-type.
                 # Happens when the LLM merges entity+registration into one question and user picks
                 # e.g. "บริษัทจำกัด" (not "นิติบุคคล") — the sub-type answer implicitly fills both slots.
                 if _slot_key_sv == "entity_type":
+                    # 2026-11 fix, round 5 (see the registration_type branch above for the
+                    # full explanation) — the slot key being literally "entity_type" here
+                    # always means the user just explicitly committed to one specific
+                    # entity type (already saved unconditionally above, line ~10914),
+                    # regardless of whether the sub-type auto-fill below also fires.
+                    state.context.pop("_multi_entity_mentioned", None)
                     try:
                         from service.data_loader import DataLoader as _DL_at
                         _et_norm_at = _DL_at._normalize_entity_type(_slot_val_sv)
