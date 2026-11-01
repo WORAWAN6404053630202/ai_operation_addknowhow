@@ -101,6 +101,12 @@ class TestGroundednessSafetyNetOrchestration:
         retry_prompt_arg = practical._call_llm_json_with_truncation_retry.call_args[0][0]
         assert "prompt text" in retry_prompt_arg
         assert "660 บาท" in retry_prompt_arg
+        # 2026-11 fix: the retry must show the model its own draft (so there's
+        # something concrete to edit) and must explicitly forbid discarding
+        # supported content wholesale — see the method's own 2026-11 comment.
+        assert "answer with invented 660 baht fee" in retry_prompt_arg
+        assert "KEPT AS-IS" in retry_prompt_arg
+        assert "Do NOT discard the whole answer" in retry_prompt_arg
 
     def test_retry_still_unsupported_keeps_first_attempt(self, practical):
         practical._groundedness_llm_call = MagicMock(side_effect=[

@@ -995,13 +995,28 @@ class PracticalPersonaService:
             "retrying once with a corrective reminder",
             _ground_result.get("claims"), _ground_result.get("reasoning"),
         )
+        # 2026-11 fix (live-reproduced via today's post-fix QA re-test, 3/5 cases
+        # affected): the retry prompt used to tell the model to "rewrite the
+        # answer" without showing it the original draft, and real traces showed
+        # the model treating that as license to discard the ENTIRE answer and
+        # fall back to a blanket "ไม่พบข้อมูล" even when only one claim out of
+        # several was actually unsupported — technically grounded (zero claims
+        # = nothing to flag) but far less helpful than necessary. Fix: show the
+        # actual draft text so there's something concrete to edit, and make the
+        # "keep what's supported, only fix what's flagged" instruction explicit
+        # instead of implicit in "rewrite ... use [[INFO_GAP]] for that part".
         _ground_retry_prompt = (
             prompt
-            + "\n\n[SYSTEM REMINDER] Your previous draft answer included a claim that is NOT "
-            "traceable to DOCUMENTS: " + "; ".join(str(c) for c in (_ground_result.get("claims") or []))[:500] + ". "
-            "This is a hallucination and is not acceptable. Rewrite the answer using ONLY "
-            "facts present in DOCUMENTS. For anything not covered, say so explicitly "
-            "(use [[INFO_GAP]] for that part) instead of inventing a plausible-sounding answer."
+            + "\n\n[SYSTEM REMINDER] Your previous draft answer was:\n\n" + _ground_answer
+            + "\n\nThe following specific claim(s) in that draft are NOT traceable to DOCUMENTS: "
+            + "; ".join(str(c) for c in (_ground_result.get("claims") or []))[:500] + ". "
+            "This is a hallucination and is not acceptable. Edit ONLY those specific unsupported "
+            "claims — replace each one with [[INFO_GAP]] or remove it. Every OTHER part of the "
+            "draft that IS grounded in DOCUMENTS must be KEPT AS-IS, not rewritten from scratch. "
+            "Do NOT discard the whole answer or fall back to a generic \"no information found\" "
+            "response just because one claim failed — most of the draft may still be correct and "
+            "useful. Only say information is missing for the SPECIFIC part(s) that are actually "
+            "unsupported, not the entire answer."
         )
         try:
             _ground_retry_decision = self._call_llm_json_with_truncation_retry(_ground_retry_prompt, state=state)

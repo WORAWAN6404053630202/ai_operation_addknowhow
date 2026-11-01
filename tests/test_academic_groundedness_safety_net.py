@@ -76,6 +76,12 @@ class TestAcademicGroundednessSafetyNetOrchestration:
         retry_prompt_arg = academic._call_llm_json.call_args[0][0]
         assert "prompt text" in retry_prompt_arg
         assert "1,200 บาท" in retry_prompt_arg
+        # 2026-11 fix (ported from persona_practical.py's identical fix): the
+        # retry must show the model its own draft and explicitly forbid
+        # discarding supported content wholesale.
+        assert "answer with invented 1,200 baht fee" in retry_prompt_arg
+        assert "KEPT AS-IS" in retry_prompt_arg
+        assert "Do NOT discard the whole answer" in retry_prompt_arg
 
     def test_retry_still_unsupported_keeps_first_attempt(self, academic):
         academic._groundedness_llm_call = MagicMock(side_effect=[
