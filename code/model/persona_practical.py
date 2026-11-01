@@ -3063,6 +3063,39 @@ class PracticalPersonaService:
                             if docs:
                                 _LOG.info("[Practical] location-stripped fallback: %d docs (location not in metadata for this topic)", len(docs))
                     if not docs:
+                        # 2026-11 fix (live-caught cross-entity-type contamination: a
+                        # ห้างหุ้นส่วนจำกัด query answered from บุคคลธรรมดา docs). Before
+                        # dropping ALL metadata scoping below, try keeping JUST
+                        # entity_type_normalized — callers that pass it (e.g.
+                        # persona_supervisor.py's operation_group handler) already
+                        # deliberately order their OWN multi-stage fallback to drop
+                        # license_type/department before entity_type, specifically
+                        # because cross-entity-type contamination is worse than a
+                        # slightly-too-broad license/department match. But each
+                        # individual call here can independently hit the fully-
+                        # unfiltered fallback below regardless of that intent, since
+                        # this method has no visibility into which filter component
+                        # the caller considers most important — so that intent was
+                        # silently lost one layer down. This restores it.
+                        _entity_only_filter: dict | None = None
+                        if isinstance(metadata_filter, dict):
+                            _et_val = metadata_filter.get("entity_type_normalized")
+                            if _et_val is None:
+                                for _p_et in (metadata_filter.get("$and") or []):
+                                    if "entity_type_normalized" in _p_et:
+                                        _et_val = _p_et["entity_type_normalized"]
+                                        break
+                            if _et_val is not None:
+                                _entity_only_filter = {"entity_type_normalized": _et_val}
+                        if _entity_only_filter:
+                            docs = _scored_search(query, top_k, _entity_only_filter)
+                            if docs:
+                                _LOG.info(
+                                    "[Practical] entity-type-only fallback: %d docs "
+                                    "(license_type/department too restrictive for this entity type)",
+                                    len(docs),
+                                )
+                    if not docs:
                         logger.log_with_data("warning", "No documents matched metadata filter — falling back to unfiltered retrieval with expanded query", {
                             "action": "filtered_retrieval_empty_fallback",
                             "filter": str(metadata_filter),
