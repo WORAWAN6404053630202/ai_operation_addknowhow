@@ -54,6 +54,11 @@ class ChatRequest(BaseModel):
     # (see _merge_branch_fields in chat()/_stream_reply()).
     branch_id: str = Field(default="", description="Branch identifier of the caller (may be empty string)")
     branch_name: str = Field(default="", description="Branch display name of the caller (may be empty string)")
+    # Round 3 Phase 7: opt-in only — normal callers (the live web UI) never
+    # set this, so response payload/shape is unchanged for them. Set True to
+    # get `retrieved_sources` back in the response (the Chroma-vs-ES
+    # LangSmith groundedness evaluator needs this; nothing else does).
+    include_sources: bool = Field(default=False, description="If true, include this turn's retrieved documents in the response (for evaluation tooling)")
 
 
 class SessionRequest(BaseModel):
@@ -704,6 +709,10 @@ async def chat(request: ChatRequest, http_request: Request):
         logger.info(f"[{session_id}] Cache MISS - Calling LLM")
         loop = asyncio.get_running_loop()
         state, bot_reply = await loop.run_in_executor(None, supervisor.handle, state, request.message)
+        # Round 3 Phase 7: pop BEFORE saving — this key must never reach the
+        # persisted session file (see persona_practical.py's stash site for
+        # why), only live long enough to optionally go into this one response.
+        _retrieved_sources = (state.context or {}).pop("_last_retrieved_docs", None)
         await _save_state_async(session_id, state)
 
         # Record token delta and cache inside the lock — prevents stale reads
@@ -758,6 +767,10 @@ async def chat(request: ChatRequest, http_request: Request):
             cached=False,
             cache_stats=cache.get_stats(),
             total_cost=round(_actual_cost, 6),
+            # Only present at all when explicitly requested — omitted (not even
+            # `null`) for every normal caller, so this stays a true no-op for
+            # existing traffic/payload size.
+            **({"retrieved_sources": _retrieved_sources} if request.include_sources else {}),
         )
         # If the turn's answer call crossed the session token budget, the actual
         # summarize/trim work (an LLM call) was deferred (see llm_call.py's
