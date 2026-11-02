@@ -1,0 +1,91 @@
+#/Users/w.worawan/Downloads/ai-operation-microservice3_v2ori/docker-compose.es.yaml
+# Round 3 Phase 6 (.claude/plans/mutable-seeking-wave.md): the Elasticsearch
+# container for the ES-backed PDF-only instance (43.210.35.109) was hand-run
+# via `docker run` since Session 1 — this captures that exact live config as
+# code, plus the two real hardening gaps a live `docker inspect` audit found:
+# no `memlock` ulimit / `bootstrap.memory_lock`, and no healthcheck at all.
+#
+# `es-data` (the volume already holding the real 1023-doc corpus migrated in
+# Phase 5) and `es-net` were both created by hand, not by Compose — marked
+# `external: true` below. Without that, Compose would create new
+# project-prefixed names (e.g. a fresh, EMPTY `<dir>_es-data`) and the
+# recreated container would silently start with no data at all while the
+# real data sat orphaned in the old volume. Swap procedure: `docker stop
+# ai-restbiz-es` (do NOT rm -v / `docker volume rm`), `docker compose -f
+# docker-compose.es.yaml up -d`, then verify `cluster.health()` is green and
+# count is still 1023 before trusting the new container.
+#
+# Live-verified 2026-11-02 via the equivalent `docker run` flags (this EC2
+# instance has neither `docker-compose` nor the `docker compose` plugin
+# installed — installing one is a worthwhile follow-up, not done yet):
+# cluster went green, 1023/1023 docs intact, healthcheck reports "healthy"
+# after the ELASTIC_PASSWORD/CMD-SHELL auth fix below.
+version: '3.9'
+
+services:
+  es:
+    container_name: ai-restbiz-es
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - ES_JAVA_OPTS=-Xms2g -Xmx2g
+      # NEW: Elastic's own Docker-production guidance — disable swapping via
+      # memory_lock rather than relying on the host not swapping at all.
+      - bootstrap.memory_lock=true
+      # Live-only (not persisted to a .env file in this repo, never committed):
+      # with xpack.security.enabled=true, the healthcheck below needs to
+      # authenticate — _cluster/health returns 401 unauthenticated (confirmed
+      # live). Since the data dir already has the elastic user initialized,
+      # this env var is a no-op for ES itself (only consulted on an empty
+      # data dir at first boot) and exists purely so the healthcheck's shell
+      # can read it from the container's own environment at check-time. Set
+      # via `ELASTIC_PASSWORD=... docker compose -f docker-compose.es.yaml up -d`
+      # at the shell, never written into this file.
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+      # NEW: memory_lock above requires an unlimited memlock ulimit, or ES
+      # fails to actually lock memory (logs a warning, keeps running — the
+      # existing container was missing this entirely, so memory_lock would
+      # have silently not applied if it had been set without this).
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      # Unchanged from Session 1's decision: loopback-only, never exposed via
+      # the security group. App containers reach ES by container name over
+      # es-net, not through this host-port binding.
+      - "127.0.0.1:9200:9200"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    networks:
+      - es-net
+    healthcheck:
+      # NEW — nothing existed before. Mirrors docker-compose.prod.yaml's
+      # shape/timing (same interval/timeout/retries convention this repo
+      # already uses for the app containers). CMD-SHELL (not exec-form CMD)
+      # so $ELASTIC_PASSWORD actually expands — confirmed live that the
+      # exec-form array version never auths and the container sits stuck
+      # "unhealthy" forever despite the cluster itself being green.
+      test: ["CMD-SHELL", "curl -s -f -u elastic:$ELASTIC_PASSWORD http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+volumes:
+  es-data:
+    external: true
+
+networks:
+  es-net:
+    external: true
