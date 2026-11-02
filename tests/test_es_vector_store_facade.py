@@ -22,7 +22,25 @@ from service.es_vector_store import (
     ESCompatCollection,
     ESCompatVectorStore,
     ESVectorStoreManager,
+    _index_mapping,
 )
+
+
+@pytest.mark.unit
+class TestIndexMapping:
+    """A replica can never be assigned on a single-node cluster — the index
+    was silently stuck 'yellow' since Session 1 because _index_mapping()
+    never set number_of_replicas. Round 3 Step 0 fix (.claude/plans/
+    mutable-seeking-wave.md)."""
+
+    def test_number_of_replicas_is_zero(self):
+        mapping = _index_mapping()
+        assert mapping["settings"]["index"]["number_of_replicas"] == 0
+
+    def test_mappings_unchanged(self):
+        mapping = _index_mapping()
+        assert mapping["mappings"]["properties"]["page_content"] == {"type": "text"}
+        assert mapping["mappings"]["properties"]["embedding"]["type"] == "dense_vector"
 
 
 @pytest.mark.unit

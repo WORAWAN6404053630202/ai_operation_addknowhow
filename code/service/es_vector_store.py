@@ -85,7 +85,12 @@ def _index_mapping() -> dict:
     }
     properties.update({f: {"type": "keyword"} for f in keyword_fields})
     properties.update({f: {"type": "text"} for f in text_fields})
-    return {"mappings": {"properties": properties}}
+    return {
+        # A replica can never be assigned on a single-node cluster — leaving
+        # the ES default of 1 just leaves the index permanently "yellow".
+        "settings": {"index": {"number_of_replicas": 0}},
+        "mappings": {"properties": properties},
+    }
 
 
 class ESCompatCollection:
@@ -242,7 +247,11 @@ class ESCompatCollection:
                 src["embedding"] = list(embeddings[i])
             actions.append({"_op_type": "index", "_index": self._index, "_id": doc_id, "_source": src})
         if actions:
-            es_bulk(self._client, actions)
+            # max_retries/initial_backoff: a full-corpus reindex (Round 3,
+            # code/scripts/es_full_reindex.py) sends far more bulk batches
+            # than any prior caller — give the client's own retry-on-429
+            # handling a chance before a batch is treated as failed.
+            es_bulk(self._client, actions, max_retries=3, initial_backoff=2)
 
 
 class ESCompatVectorStore:
