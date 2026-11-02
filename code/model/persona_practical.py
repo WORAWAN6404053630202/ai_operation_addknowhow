@@ -6304,6 +6304,16 @@ class PracticalPersonaService:
             [((dj.get("metadata") or {}).get("license_type") or (dj.get("metadata") or {}).get("operation_topic") or "?")[:40] for dj in docs_json],
         )
 
+        # Round 3 Phase 7 (.claude/plans/mutable-seeking-wave.md): stash this
+        # turn's exact retrieved-doc payload so route_v1.py's chat() can
+        # optionally surface it as `retrieved_sources` for an opt-in caller
+        # (the Chroma-vs-ES LangSmith groundedness evaluator needs the SAME
+        # docs the model actually saw, not a re-retrieval). route_v1.py pops
+        # this key before _save_state_async — it must never reach the
+        # persisted session file, since it's a per-turn-only payload with no
+        # reason to outlive this single response.
+        state.context["_last_retrieved_docs"] = docs_json
+
         # Build labeled link sections — LLM copies these directly, no URL pattern matching needed
         # When docs come from multiple licenses, tag each link with [license_type] so LLM
         # only includes links relevant to the license it is currently answering about.
