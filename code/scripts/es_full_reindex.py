@@ -104,17 +104,24 @@ def main() -> None:
     parser.add_argument("--chroma-dir", required=True, help="path to a (copied) Chroma persist directory, read-only")
     parser.add_argument("--batch-size", type=int, default=_BATCH_SIZE)
     parser.add_argument("--archive-too", action="store_true", help="also migrate the archive (superseded-docs) collection")
+    parser.add_argument(
+        "--collection-name", default=None,
+        help="Chroma collection name to pull from (defaults to conf.COLLECTION_NAME) — "
+             "override when the copied persist dir's collection was named before a later "
+             "rename conf.py doesn't know about; run `client.list_collections()` to check.",
+    )
     args = parser.parse_args()
 
     import chromadb
     from service.es_vector_store import get_vs_manager
 
     chroma_client = chromadb.PersistentClient(path=args.chroma_dir)
+    collection_name = args.collection_name or conf.COLLECTION_NAME
 
     es_mgr = get_vs_manager()
     es_mgr.connect_to_existing(fail_if_empty=False)
 
-    live_coll = chroma_client.get_collection(conf.COLLECTION_NAME)
+    live_coll = chroma_client.get_collection(collection_name)
     migrated, failed = _reindex_collection(
         live_coll, es_mgr, es_mgr._live_index, id_prefix="full_", batch_size=args.batch_size,
     )
@@ -123,7 +130,7 @@ def main() -> None:
     print(f"[LIVE] final ES count: {final_es_count} (Chroma had {live_coll.count()})")
 
     if args.archive_too:
-        archive_collection_name = getattr(conf, "ARCHIVE_COLLECTION_NAME", conf.COLLECTION_NAME + "_archive")
+        archive_collection_name = getattr(conf, "ARCHIVE_COLLECTION_NAME", None) or (collection_name + "_archive")
         try:
             archive_coll = chroma_client.get_collection(archive_collection_name)
         except Exception as exc:
