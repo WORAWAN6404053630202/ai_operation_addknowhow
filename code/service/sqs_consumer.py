@@ -36,9 +36,20 @@ from service.pdf_extraction_validation import validate_extraction
 from service.pdf_field_drafting import draft_fields_from_pages, DRAFT_FIELDS_PROMPT_VERSION
 from service.pdf_knowhow_drafting import identify_knowhow_topics, KNOWHOW_TOPIC_SPLIT_PROMPT_VERSION
 from service.pdf_large_extraction import extract_full_document
-from service.local_vector_store import add_documents as _add_documents_to_vectorstore
-from service.local_vector_store import archive_and_remove as _archive_and_remove_in_vectorstore
-from service.local_vector_store import get_vs_manager
+# 2026-11 fix: the actual PDF-ingestion write path was hardcoded to
+# local_vector_store (Chroma) regardless of backend — on the
+# Elasticsearch-backed instance every newly-ingested PDF would silently
+# write to Chroma instead of ES. Both functions already exist on
+# es_vector_store with the same contract (built + live-verified in
+# Session 1), so this is purely an import-site fix.
+if getattr(conf, "USE_ELASTICSEARCH", False):
+    from service.es_vector_store import add_documents as _add_documents_to_vectorstore
+    from service.es_vector_store import archive_and_remove as _archive_and_remove_in_vectorstore
+    from service.es_vector_store import get_vs_manager
+else:
+    from service.local_vector_store import add_documents as _add_documents_to_vectorstore
+    from service.local_vector_store import archive_and_remove as _archive_and_remove_in_vectorstore
+    from service.local_vector_store import get_vs_manager
 from service import pdf_status_tracker
 from utils.llm_cost_logging import CostAccumulator
 from utils.logger import get_logger

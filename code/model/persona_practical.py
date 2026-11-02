@@ -3007,8 +3007,14 @@ class PracticalPersonaService:
                 return list(self.retriever.invoke(q))
             try:
                 if _hybrid_enabled:
-                    from utils.hybrid_retriever import hybrid_scored_search
-                    pairs = hybrid_scored_search(vectorstore, q, k=k, metadata_filter=flt, rrf_k=_rrf_k, bm25_bypass_min_ratio=_bm25_ratio)
+                    # 2026-11: ES's own hybrid_search() method, not Chroma's
+                    # free-function hybrid_scored_search() — see
+                    # ESCompatVectorStore.hybrid_search's docstring.
+                    if getattr(conf, "USE_ELASTICSEARCH", False):
+                        pairs = vectorstore.hybrid_search(q, k=k, filter=flt, rrf_k=_rrf_k, bm25_bypass_min_ratio=_bm25_ratio)
+                    else:
+                        from utils.hybrid_retriever import hybrid_scored_search
+                        pairs = hybrid_scored_search(vectorstore, q, k=k, metadata_filter=flt, rrf_k=_rrf_k, bm25_bypass_min_ratio=_bm25_ratio)
                 else:
                     kwargs: dict = {"k": k}
                     if flt:

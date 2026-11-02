@@ -4370,13 +4370,25 @@ class PersonaSupervisor:
                         _top_k_rare = int(getattr(conf, "RETRIEVAL_TOP_K", 20))
                         try:
                             if getattr(conf, "HYBRID_SEARCH_ENABLED", False):
-                                from utils.hybrid_retriever import hybrid_scored_search
-                                _scored = hybrid_scored_search(
-                                    _vstore, q, k=_top_k_rare,
-                                    metadata_filter={"license_type": _rare_lt},
-                                    rrf_k=int(getattr(conf, "HYBRID_RRF_K", 60)),
-                                    bm25_bypass_min_ratio=float(getattr(conf, "BM25_BYPASS_MIN_RATIO", 0.35)),
-                                )
+                                # 2026-11: ES's own hybrid_search() method vs. Chroma's
+                                # free-function hybrid_scored_search() — see
+                                # ESCompatVectorStore.hybrid_search's docstring for why
+                                # this isn't a shared code path (ES's BM25 leg is a real
+                                # scalable `match` query, not an in-process corpus index).
+                                if getattr(conf, "USE_ELASTICSEARCH", False):
+                                    _scored = _vstore.hybrid_search(
+                                        q, k=_top_k_rare, filter={"license_type": _rare_lt},
+                                        rrf_k=int(getattr(conf, "HYBRID_RRF_K", 60)),
+                                        bm25_bypass_min_ratio=float(getattr(conf, "BM25_BYPASS_MIN_RATIO", 0.35)),
+                                    )
+                                else:
+                                    from utils.hybrid_retriever import hybrid_scored_search
+                                    _scored = hybrid_scored_search(
+                                        _vstore, q, k=_top_k_rare,
+                                        metadata_filter={"license_type": _rare_lt},
+                                        rrf_k=int(getattr(conf, "HYBRID_RRF_K", 60)),
+                                        bm25_bypass_min_ratio=float(getattr(conf, "BM25_BYPASS_MIN_RATIO", 0.35)),
+                                    )
                             else:
                                 _scored = _vstore.similarity_search_with_relevance_scores(
                                     q, k=_top_k_rare, filter={"license_type": _rare_lt}
@@ -4950,11 +4962,20 @@ class PersonaSupervisor:
             treats as "not confident enough to use as a dominance signal."
             """
             if _sv_hybrid and _sv_vstore is not None:
-                from utils.hybrid_retriever import hybrid_scored_search
-                _pairs = hybrid_scored_search(
-                    _sv_vstore, q, k=k, rrf_k=_sv_rrf_k, metadata_filter=metadata_filter,
-                    bm25_bypass_min_ratio=_sv_bm25_ratio,
-                )
+                # 2026-11: ES's own hybrid_search() method, not Chroma's
+                # free-function hybrid_scored_search() — see
+                # ESCompatVectorStore.hybrid_search's docstring.
+                if getattr(conf, "USE_ELASTICSEARCH", False):
+                    _pairs = _sv_vstore.hybrid_search(
+                        q, k=k, filter=metadata_filter, rrf_k=_sv_rrf_k,
+                        bm25_bypass_min_ratio=_sv_bm25_ratio,
+                    )
+                else:
+                    from utils.hybrid_retriever import hybrid_scored_search
+                    _pairs = hybrid_scored_search(
+                        _sv_vstore, q, k=k, rrf_k=_sv_rrf_k, metadata_filter=metadata_filter,
+                        bm25_bypass_min_ratio=_sv_bm25_ratio,
+                    )
                 for _d, _s in _pairs:
                     _d.metadata["_sim"] = float(_s)
                 return [d for d, _ in _pairs]
@@ -6995,12 +7016,21 @@ class PersonaSupervisor:
                 if _vstore_lq is not None:
                     _lq_query = _base_q_lq or _enriched_q_lq
                     if getattr(conf, "HYBRID_SEARCH_ENABLED", False):
-                        from utils.hybrid_retriever import hybrid_scored_search
-                        _broad_lq = [d for d, _ in hybrid_scored_search(
-                            _vstore_lq, _lq_query, k=5,
-                            rrf_k=int(getattr(conf, "HYBRID_RRF_K", 60)),
-                            bm25_bypass_min_ratio=float(getattr(conf, "BM25_BYPASS_MIN_RATIO", 0.35)),
-                        )]
+                        # 2026-11: ES's own hybrid_search() method, not
+                        # Chroma's free-function hybrid_scored_search().
+                        if getattr(conf, "USE_ELASTICSEARCH", False):
+                            _broad_lq = [d for d, _ in _vstore_lq.hybrid_search(
+                                _lq_query, k=5,
+                                rrf_k=int(getattr(conf, "HYBRID_RRF_K", 60)),
+                                bm25_bypass_min_ratio=float(getattr(conf, "BM25_BYPASS_MIN_RATIO", 0.35)),
+                            )]
+                        else:
+                            from utils.hybrid_retriever import hybrid_scored_search
+                            _broad_lq = [d for d, _ in hybrid_scored_search(
+                                _vstore_lq, _lq_query, k=5,
+                                rrf_k=int(getattr(conf, "HYBRID_RRF_K", 60)),
+                                bm25_bypass_min_ratio=float(getattr(conf, "BM25_BYPASS_MIN_RATIO", 0.35)),
+                            )]
                     else:
                         _tmp_broad_lq = _vstore_lq.as_retriever(search_kwargs={"k": 5})
                         _broad_lq = _tmp_broad_lq.invoke(_lq_query)

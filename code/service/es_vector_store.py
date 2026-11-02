@@ -11,16 +11,14 @@ USE_ZILLIZ precedent in service/vector_store.py) would silently leave most
 of the app talking to a backend that doesn't exist. See the approved plan at
 .claude/plans/mutable-seeking-wave.md for the full design rationale.
 
-Scope note (2026-11, Phase 1+2 of that plan): this file currently implements
-plain kNN dense search only — no hybrid (BM25+kNN) search yet, that's Phase
-3. Because of that, `_sim` (the 0-1 relevance score attached to every
-retrieved doc, consumed by utils.text_patterns.regulatory_identity_mismatch_
-should_reject and the RETRIEVAL_MIN_SIMILARITY* floors) is ALREADY the pure
-dense-cosine score Phase 2's design calls for, with no extra work needed —
-every search here IS a pure kNN search for now. Phase 3 must preserve this
-property when hybrid search is added (run a separate pure-kNN sub-query for
-`_sim` specifically, never a fused/hybrid score) — see that phase's own
-design note in the plan before changing this.
+Round 2 (2026-11) added real hybrid search (`ESCompatVectorStore.hybrid_search`
++ `ESCompatCollection.match_search` + module-level `_rrf_fuse`) — ES-native
+kNN + BM25 (`match`) legs fused client-side with Reciprocal Rank Fusion,
+NOT Elasticsearch's own licensed `retriever.rrf` (Enterprise-gated, confirmed
+403 on the free Basic tier this project runs). `_sim` stays the pure-kNN
+leg's own bounded 0-1 cosine score always — never the fused/BM25 score —
+preserving the Round 1 invariant utils.text_patterns.regulatory_identity_
+mismatch_should_reject and the RETRIEVAL_MIN_SIMILARITY* floors depend on.
 """
 from __future__ import annotations
 
@@ -187,6 +185,27 @@ class ESCompatCollection:
             dists.append(1.0 - float(h.get("_score", 0.0)))
         return {"ids": [ids], "documents": [docs], "metadatas": [metas], "distances": [dists]}
 
+    def match_search(self, query_text: str, k: int, where: Optional[dict] = None) -> List[Tuple[Document, float]]:
+        """Pure lexical (BM25) search over `page_content` — ES's own
+        Lucene-backed BM25, not the in-process rank_bm25 index
+        utils/hybrid_retriever.py builds for Chroma. No in-memory corpus
+        loading, scales independently of result-set size — the actual
+        point of moving off Chroma. Returns [(Document, raw_bm25_score), ...]
+        ranked by ES's own relevance score (NOT comparable to kNN's 0-1
+        cosine scale — see _rrf_fuse below for why these never get mixed
+        into _sim)."""
+        body: Dict[str, Any] = {"query": {"bool": {"must": [{"match": {"page_content": query_text}}]}}}
+        if where:
+            body["query"]["bool"]["filter"] = [chroma_filter_to_es_query(where)]
+        resp = self._client.search(index=self._index, size=k, body=body, source={"excludes": ["embedding"]})
+        out: List[Tuple[Document, float]] = []
+        for h in resp.get("hits", {}).get("hits", []):
+            src = h.get("_source", {}) or {}
+            meta = {k2: v for k2, v in src.items() if k2 not in ("page_content", "embedding")}
+            meta["_es_id"] = h["_id"]
+            out.append((Document(page_content=src.get("page_content", ""), metadata=meta), float(h.get("_score", 0.0))))
+        return out
+
     def delete(self, ids: Optional[List[str]] = None, where: Optional[dict] = None) -> None:
         if ids:
             for doc_id in ids:
@@ -256,6 +275,36 @@ class ESCompatVectorStore:
     def similarity_search(self, query: str, k: int = 4, filter: Optional[dict] = None) -> List[Document]:
         return [d for d, _ in self.similarity_search_with_relevance_scores(query, k=k, filter=filter)]
 
+    def hybrid_search(
+        self, query: str, k: int = 20, filter: Optional[dict] = None,
+        rrf_k: int = 60, bm25_bypass_min_ratio: float = 0.35,
+    ) -> List[Tuple[Document, float]]:
+        """ES-native hybrid search: a real kNN leg + a real ES `match` (BM25)
+        leg, fused client-side with Reciprocal Rank Fusion — NOT Elasticsearch's
+        own `retriever.rrf` (license-gated to the Enterprise tier, confirmed
+        403 "current license is non-compliant" on the free Basic tier this
+        project runs; see the approved plan for the research). Same RRF
+        formula/rrf_k=60 default and the same bm25_bypass_min_ratio relative-
+        threshold design utils/hybrid_retriever.py already uses for Chroma —
+        reimplemented fresh here (not imported) because that module's BM25
+        leg loads the ENTIRE corpus into an in-process rank_bm25 index, which
+        would defeat the actual reason for this migration (Chroma's lack of
+        scale). ES's own BM25 (Lucene-backed, used via the `match` query in
+        ESCompatCollection.match_search) scales independently of corpus size.
+
+        Returns List[(Document, dense_sim_score)] — same shape as
+        similarity_search_with_relevance_scores, so callers attach `_sim`
+        from the SECOND tuple element exactly as before. Critically, that
+        score is always the pure-kNN leg's own cosine score (dense_scores
+        below), never the fused RRF score and never the BM25 leg's raw
+        unbounded score — preserves the Phase 2 invariant that `_sim` stays
+        on the same bounded 0-1 scale regulatory_identity_mismatch_should_
+        reject's 0.70 threshold and RETRIEVAL_MIN_SIMILARITY* assume."""
+        dense_pairs = self.similarity_search_with_relevance_scores(query, k=k, filter=filter)
+        oversample = k * 5 if filter else k * 2
+        bm25_pairs = self._collection.match_search(query, k=oversample, where=filter)
+        return _rrf_fuse(dense_pairs, bm25_pairs, rrf_k=rrf_k, bm25_bypass_min_ratio=bm25_bypass_min_ratio)[:k]
+
     def as_retriever(self, search_kwargs: Optional[dict] = None):
         search_kwargs = search_kwargs or {}
 
@@ -272,6 +321,52 @@ class ESCompatVectorStore:
                 return self.invoke(query)
 
         return _ESRetriever(self, int(search_kwargs.get("k") or getattr(conf, "RETRIEVAL_TOP_K", 20)))
+
+
+def _rrf_fuse(
+    dense_pairs: List[Tuple[Document, float]],
+    bm25_pairs: List[Tuple[Document, float]],
+    rrf_k: int = 60,
+    bm25_bypass_min_ratio: float = 0.35,
+) -> List[Tuple[Document, float]]:
+    """score(d) = Σ_i 1 / (rrf_k + rank_i(d)) — identical formula/constant to
+    utils/hybrid_retriever.py's _rrf_fuse, reimplemented for ES's result
+    shape. Deduplicates on doc.metadata["_es_id"] (a real, unique
+    Elasticsearch document id, always present on both legs' results) rather
+    than that module's content-hash fallback, which exists there only
+    because LangChain's Chroma wrapper drops Chroma's own ids.
+
+    bm25_bypass_min_ratio: a BM25-only doc (missing from the kNN leg
+    entirely) only gets the "_bm25_hit" similarity-floor-bypass flag when
+    its BM25 score is at least this fraction of this query's OWN top BM25
+    score — a relative threshold, since raw BM25 scores have no shared
+    absolute scale across different queries (same reasoning as the Chroma
+    version's BM25_BYPASS_MIN_RATIO)."""
+    rrf_scores: Dict[str, float] = {}
+    dense_scores: Dict[str, float] = {}
+    doc_map: Dict[str, Document] = {}
+
+    for rank, (doc, sim) in enumerate(dense_pairs):
+        did = doc.metadata.get("_es_id")
+        rrf_scores[did] = rrf_scores.get(did, 0.0) + 1.0 / (rrf_k + rank + 1)
+        dense_scores[did] = sim
+        doc_map[did] = doc
+
+    top_bm25_score = bm25_pairs[0][1] if bm25_pairs else 0.0
+    for rank, (doc, score) in enumerate(bm25_pairs):
+        did = doc.metadata.get("_es_id")
+        rrf_scores[did] = rrf_scores.get(did, 0.0) + 1.0 / (rrf_k + rank + 1)
+        if did not in doc_map:
+            is_confident = top_bm25_score > 0 and (score / top_bm25_score) >= bm25_bypass_min_ratio
+            md = dict(doc.metadata)
+            if is_confident:
+                md["_bm25_hit"] = True
+            doc_map[did] = Document(page_content=doc.page_content, metadata=md)
+
+    merged = sorted(rrf_scores.items(), key=lambda x: -x[1])
+    # BM25-only docs get 0.0 dense score (not None) — callers do arithmetic/
+    # comparison on this score, and None raises TypeError against ">".
+    return [(doc_map[did], dense_scores.get(did, 0.0)) for did, _ in merged]
 
 
 class ESVectorStoreManager:

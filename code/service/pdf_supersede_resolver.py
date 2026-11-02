@@ -36,7 +36,17 @@ from typing import Any, Optional
 from openai import OpenAI
 
 import conf
-from service.local_vector_store import get_vs_manager
+# 2026-11 fix: this was hardcoded to local_vector_store (Chroma) regardless
+# of backend — on the Elasticsearch-backed instance, every supersede
+# decision (query_live_with_ids / vectorstore._collection.get below) would
+# silently compare against the Chroma collection instead of ES. Both
+# methods already exist on es_vector_store's manager with the same
+# contract (built + live-verified in Session 1), so this is purely an
+# import-site fix.
+if getattr(conf, "USE_ELASTICSEARCH", False):
+    from service.es_vector_store import get_vs_manager
+else:
+    from service.local_vector_store import get_vs_manager
 from service.pdf_candidate_matching import _field_diff, _PROCEDURAL_FIELD_KEYS
 from utils.llm_cost_logging import CostAccumulator, log_llm_cost
 from utils.pdf_cost_guard import get_cost_guard

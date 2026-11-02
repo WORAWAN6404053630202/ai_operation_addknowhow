@@ -10,6 +10,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, Response
 from typing import Dict, Any
 
+import conf
 from utils.admin_auth import require_admin_key
 from utils.metrics import metrics
 from utils.logger import get_logger
@@ -56,14 +57,21 @@ def _check_services() -> Dict[str, bool]:
     """Check if critical services are available"""
     checks = {}
     
-    # Check ChromaDB
+    # Check vector store — 2026-11 fix: this used to always import
+    # local_vector_store (Chroma) regardless of backend, same bug class as
+    # app.py's /health (already fixed) — on the Elasticsearch-backed
+    # instance this silently reported chromadb:false forever since
+    # route_v1.py never touches that manager when USE_ELASTICSEARCH=true.
     try:
-        from service.local_vector_store import get_vs_manager
+        if getattr(conf, "USE_ELASTICSEARCH", False):
+            from service.es_vector_store import get_vs_manager
+        else:
+            from service.local_vector_store import get_vs_manager
         mgr = get_vs_manager()
         count = mgr._collection_count() or 0
         checks['chromadb'] = count > 0
     except Exception as e:
-        logger.warning(f"ChromaDB check failed: {e}")
+        logger.warning(f"Vector store check failed: {e}")
         checks['chromadb'] = False
 
     # Check OpenRouter API key
