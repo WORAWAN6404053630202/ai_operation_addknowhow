@@ -95,6 +95,30 @@ class TestPracticalGroundednessJudgeTruncationRetry:
         second_llm_arg = mock_invoke.call_args_list[1].args[0]
         assert second_llm_arg.kwargs.get("max_tokens") == 1234
 
+    def test_many_docs_over_budget_truncates_per_doc_not_off_the_tail(self, service):
+        """2026-11 fix: a chapter-overview doc set (e.g. 20 single-chunk
+        sub_topic docs from one company-registration PDF) used to get sliced
+        as one joined JSON string at a flat 6000 chars — whichever docs
+        serialized last (often the ones furthest down the list) silently
+        never reached the judge at all. Build enough docs that the naive
+        slice would have dropped the last one, and assert its unique marker
+        still appears in what's actually sent to the judge."""
+        docs_json = [
+            {"metadata": {"sub_topic": f"sub_topic_{i}"}, "content": f"UNIQUEMARKER_{i} " + ("x" * 400)}
+            for i in range(20)
+        ]
+        with patch(
+            "model.persona_practical.llm_invoke",
+            return_value=_fake_response('{"reasoning":"ok","unsupported":false,"claims":[]}'),
+        ) as mock_invoke:
+            service._groundedness_llm_call("some answer", docs_json)
+
+        human_msg = mock_invoke.call_args.args[1][1]
+        sent_prompt = human_msg.content
+        assert "UNIQUEMARKER_0" in sent_prompt, "first doc should still be represented"
+        assert "UNIQUEMARKER_19" in sent_prompt, "last doc must not be silently dropped off the tail"
+        assert len(sent_prompt) < 50_000, "per-doc cap should keep the payload bounded, not unbounded"
+
 
 @pytest.mark.unit
 class TestAcademicGroundednessJudgeTruncationRetry:

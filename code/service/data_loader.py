@@ -501,7 +501,11 @@ class DataLoader:
         if md.get("area_size"):
             head_parts.append(f"ขนาดพื้นที่ร้าน: {md['area_size']}")
         if md.get("entity_type_normalized"):
-            head_parts.append(f"ประเภทผู้ประกอบการ: {md['entity_type_normalized']}")
+            # Deliberately NOT "ประเภทผู้ประกอบการ" — that's the literal screen name of
+            # a different, unrelated VAT ภ.พ.01 registration-flow field (see
+            # entity_type_internal_label_collision fix), and the model was observed
+            # answering the real form field using this internal classification instead.
+            head_parts.append(f"ประเภทบุคคล: {md['entity_type_normalized']}")
         elif md.get("registration_type"):
             head_parts.append(f"ประเภทการจดทะเบียน: {md['registration_type']}")
         if md.get("operation_topic"):

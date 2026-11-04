@@ -372,7 +372,10 @@ def _build_head_only_content(md: Dict[str, Any]) -> str:
     if md.get("area_size"):
         parts.append(f"ขนาดพื้นที่ร้าน: {md['area_size']}")
     if md.get("entity_type_normalized"):
-        parts.append(f"ประเภทผู้ประกอบการ: {md['entity_type_normalized']}")
+        # Mirrors data_loader.py's _build_page_content — kept in sync deliberately,
+        # not "ประเภทผู้ประกอบการ" (collides with the real VAT ภ.พ.01 form's own
+        # distinct "เลือกประเภทผู้ประกอบการ" screen name).
+        parts.append(f"ประเภทบุคคล: {md['entity_type_normalized']}")
     elif md.get("registration_type"):
         parts.append(f"ประเภทการจดทะเบียน: {md['registration_type']}")
     if md.get("operation_topic"):
@@ -904,7 +907,26 @@ class PracticalPersonaService:
 
         def _call(answer_text: str, docs_json: List[dict], state=None) -> dict:
             try:
-                _docs_blob = json.dumps(docs_json, ensure_ascii=False)[:6000]
+                _docs_blob = json.dumps(docs_json, ensure_ascii=False)
+                if len(_docs_blob) > 6000:
+                    # 2026-11 fix (Phase-0 follow-up, QA-reproduced fabrication cases):
+                    # a chapter-overview doc set can span 15+ separate single-chunk
+                    # sub_topic docs (e.g. a company-registration how-to PDF). Slicing
+                    # the JOINED JSON string at a flat 6000 chars silently dropped
+                    # whichever docs happened to serialize last — so the judge
+                    # sometimes checked a fabricated fee/document-list claim against a
+                    # doc set that was missing the exact doc needed to flag it as
+                    # ungrounded. Truncate PER-DOC content instead, so every doc stays
+                    # represented (just more tersely) rather than losing entire docs
+                    # off the tail.
+                    _per_doc_cap = max(80, 6000 // max(1, len(docs_json)) - 150)
+                    _trimmed = [
+                        {"metadata": dj.get("metadata"), "content": (dj.get("content") or "")[:_per_doc_cap]}
+                        for dj in docs_json
+                    ]
+                    _docs_blob = json.dumps(_trimmed, ensure_ascii=False)[:6000]
+                else:
+                    _docs_blob = _docs_blob[:6000]
             except Exception:
                 _docs_blob = "[]"
             prompt = (
