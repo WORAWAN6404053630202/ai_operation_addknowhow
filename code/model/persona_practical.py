@@ -4043,6 +4043,10 @@ class PracticalPersonaService:
                     or user_text
                 )
                 try:
+                    # coverage-guard: non-short-circuiting — no early return tied to
+                    # this filter's result; falls through either way, and a wrong/
+                    # thin department here can still be repaired later in the same
+                    # turn by the established-topic guarantee block further down.
                     _dept_for_switch = str(
                         (state.context or {}).get("collected_slots", {}).get("department") or ""
                     ).strip()
@@ -4163,6 +4167,9 @@ class PracticalPersonaService:
                     or user_text
                 )
                 try:
+                    # coverage-guard: non-short-circuiting — empty result resets
+                    # _query_loc_override and falls through, never returns early
+                    # (see tests/test_no_change_sites_regression_pin.py).
                     # Lock to current topic's license_type so a location-only filter
                     # can't pull in docs from unrelated licenses (e.g. ใบอนุญาตจัดตั้งฯ
                     # when the user is asking about EDC).
@@ -4541,6 +4548,9 @@ class PracticalPersonaService:
                             _curr_ot_sc = max(_ot_lscore(ot) for ot in _ot_vals_ff)
                             if _curr_ot_sc <= 0:
                                 try:
+                                    # coverage-guard: non-short-circuiting — result only
+                                    # builds a candidate operation_topic set for scoring
+                                    # below, never becomes document content directly.
                                     _vs_ff = getattr(self.retriever, "vectorstore", None)
                                     _coll_ff = getattr(_vs_ff, "_collection", None) if _vs_ff else None
                                     if _coll_ff is not None:
@@ -4570,6 +4580,10 @@ class PracticalPersonaService:
                                         # actual relevance) and threw away the correctly-matching
                                         # doc, which has operation_topic=None/empty and was never
                                         # a candidate in this comparison to begin with.
+                                        # coverage-guard: non-short-circuiting — gated by a
+                                        # positive-score verification just above (not just
+                                        # non-emptiness), and no early return follows; falls
+                                        # through regardless of outcome.
                                         if _best_ot_ff and _best_ot_sc_ff > 0:
                                             _ot_fresh = self._retrieve_docs(
                                                 user_text,
@@ -4615,6 +4629,7 @@ class PracticalPersonaService:
             for _d in _all_docs
         ):
             try:
+                # coverage-guard: additive-only — see "Prepend, not append" below.
                 _qr_vs = getattr(self.retriever, "vectorstore", None)
                 _qr_coll = getattr(_qr_vs, "_collection", None) if _qr_vs else None
                 if _qr_coll is not None:
@@ -4672,6 +4687,11 @@ class PracticalPersonaService:
                 )
                 if not _has_tc:
                     try:
+                        # coverage-guard: non-short-circuiting — re-verified downstream
+                        # (the MANDATORY cut-off-time prompt instruction only fires if
+                        # a later _tc_has_data recheck finds real terms_and_conditions
+                        # content; a thin/wrong refetch here just means that recheck
+                        # stays False and the LLM behaves as if no data was ever found).
                         _tc_query_for_retrieve = _tc_query_text or user_text
                         _tc_fresh = self._retrieve_docs(
                             _tc_query_for_retrieve,
@@ -5358,6 +5378,10 @@ class PracticalPersonaService:
                                     {"license_type": _slt},
                                     {"operation_by_department": _sop},
                                 ] + _dept_clauses + _entity_clauses}
+                            # coverage-guard: additive-only — "Additive only — a no-op
+                            # whenever the branch above already capped it" (see comment
+                            # further down this method); result only ever extends
+                            # _op_pass_docs, never replaces it.
                             _sr = _vs_for_sib._collection.get(
                                     where=_sib_where,
                                     include=["metadatas", "documents"],
@@ -5658,6 +5682,10 @@ class PracticalPersonaService:
             # e.g. "วิธีลงทะเบียน QR-Payment API นิติบุคคล" → replace "นิติบุคคล" with "บุคคลธรรมดา"
             _old_et = "นิติบุคคล" if _refetch_et == "บุคคลธรรมดา" else "บุคคลธรรมดา"
             _refetch_query = re.sub(rf"\b{re.escape(_old_et)}\b", _refetch_et, _refetch_query)
+            # coverage-guard: non-short-circuiting — no early return tied to this
+            # filter's result; falls through regardless, and a wrong/thin department
+            # here can still be repaired later in the same turn by the
+            # established-topic guarantee block further down.
             # Preserve department constraint from existing docs or collected_slots.
             # Without this, refetch drops to entity-only filter and returns docs from ALL departments —
             # causing wrong-bank answer and 36K token bloat.
@@ -5744,6 +5772,9 @@ class PracticalPersonaService:
         # the merged-in docs simply won't match and the LLM's topic-drift instruction (see
         # prompts_practical.py) handles picking the right ones when both are present.
         try:
+            # coverage-guard: additive-only — prepends docs only when a named
+            # department is absent from the current result set, never excludes
+            # (see tests/test_no_change_sites_regression_pin.py).
             _cs_established_dept = str(
                 state.get_collected_slot("department") if hasattr(state, "get_collected_slot") else ""
             ).strip()
@@ -5878,6 +5909,8 @@ class PracticalPersonaService:
                     for d in _docs_to_process
                 ):
                     try:
+                        # coverage-guard: additive-only — prepended below (_docs_to_process
+                        # = _guar_docs_lt + _docs_to_process), never replaces.
                         _guar_res_lt = _coll_guarantee_ent.get(
                             where={"license_type": _established_license},
                             include=["documents", "metadatas"],
@@ -5924,6 +5957,7 @@ class PracticalPersonaService:
                 }
                 if _coll_guarantee_ent is not None:
                     _guar_max_chars_ent = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700))
+                    # coverage-guard: additive-only — prepended below, never replaces.
                     for _target_entity in _target_entities:
                         if not _target_entity or _target_entity in _entities_present:
                             continue
@@ -7624,6 +7658,9 @@ Your JSON response:
                 _lt_for_url = (state.context or {}).get("last_topic", "") or ""
             if _lt_for_url:
                 try:
+                    # coverage-guard: non-short-circuiting — result only feeds a URL
+                    # candidate pool for restoring truncated/validating form links in
+                    # already-generated answer text, never document content.
                     _vs = getattr(self.retriever, "vectorstore", None)
                     _col = getattr(_vs, "_collection", None) if _vs else None
                     if _col is not None:
@@ -7803,6 +7840,10 @@ Your JSON response:
             # Guard: skip for penalty/definition questions (_needs_forms=False).
             if not _link_form and _needs_forms and not _suppress_links_broad and (_user_wants_forms or _answer_has_doc_list) and "📄" not in ans and not _ans_is_error_fallback:
                 try:
+                    # coverage-guard: additive-only — each candidate row is individually
+                    # filtered (op_exclude/sub_topic/entity_type/registration_type match)
+                    # before the only commit action, _link_form.append(...) — append-only
+                    # to a links list, never a replacement of document content.
                     _vs4 = getattr(self.retriever, "vectorstore", None)
                     _col4 = getattr(_vs4, "_collection", None) if _vs4 else None
                     # Collect ALL distinct license_types from docs (multi-license: iterate all)

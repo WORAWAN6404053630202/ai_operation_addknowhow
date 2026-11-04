@@ -487,6 +487,27 @@ RETRIEVAL_CATEGORY_MIN_KEEP = _safe_int("RETRIEVAL_CATEGORY_MIN_KEEP", 3)
 # logs for a while before enabling.
 REGULATORY_IDENTITY_GUARD_ENFORCE = os.getenv("REGULATORY_IDENTITY_GUARD_ENFORCE", "false").lower() == "true"
 
+# Coverage-adequacy supplement for the rare-license and multi-topic license_type merge
+# loops in persona_supervisor.py (2026-11, retrieval-safety audit, Phase 3 — separate
+# mechanism from REGULATORY_IDENTITY_GUARD_ENFORCE above, which catches a WRONG value;
+# this catches a non-empty but structurally THIN filtered result that used to commit and
+# `return` immediately with no broader fallback). OFF by default: when a filtered result
+# has no doc with >=2 of 5 structural fields populated (PersonaSupervisor.
+# _is_structurally_adequate), an additional unfiltered similarity_search is run and
+# appended (never replaces) the filtered result. Watch real logs for supplement frequency
+# before enabling — an always-adequate corpus means this never fires and costs nothing;
+# a frequently-thin one means it's doing real work, but adds one extra vector-store call
+# per qualifying turn.
+RARE_LT_COVERAGE_SUPPLEMENT_ENABLED = os.getenv("RARE_LT_COVERAGE_SUPPLEMENT_ENABLED", "false").lower() == "true"
+MULTI_TOPIC_COVERAGE_SUPPLEMENT_ENABLED = os.getenv("MULTI_TOPIC_COVERAGE_SUPPLEMENT_ENABLED", "false").lower() == "true"
+
+# Same mechanism as the two flags above, for the 13 additional single-filtered-fetch
+# sites found in persona_supervisor.py by a follow-up static-scan pass (2026-11) — these
+# are neither the "rare license" nor "multi-topic merge" scenario the two existing flags
+# were named for (a single department/license_type-filtered fetch, not a per-license
+# merge loop), so they get their own flag rather than overloading an existing one.
+SINGLE_FILTER_COVERAGE_SUPPLEMENT_ENABLED = os.getenv("SINGLE_FILTER_COVERAGE_SUPPLEMENT_ENABLED", "false").lower() == "true"
+
 # Groundedness judge truncation retry (2026-10/11, live-observed via LangSmith
 # trace after label-tagging shipped): a dense DOCUMENTS payload + required
 # chain-of-thought reasoning can exceed the judge's base max_tokens=500 —

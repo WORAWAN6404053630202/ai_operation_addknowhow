@@ -2315,6 +2315,9 @@ class AcademicPersonaService:
             "[Academic] Targeted re-retrieval for topic '%s' (%d broad-filtered docs) query=%r",
             selected_key, len(filtered), target_q[:60],
         )
+        # coverage-guard: verify-then-retry — _has_matched_filtered (below) checks
+        # the filter actually matched before trusting it, retrying with main_topic/
+        # supervisor-hint filters otherwise (see tests/test_no_change_sites_regression_pin.py).
         # Use Chroma license_type filter for targeted re-retrieval — avoids getting 12 mixed docs
         # back from unfiltered vector search and then falling into the "re-filter gave 1 < 2" path.
         # For non-regulatory topics (sub_topic key), license_type won't match → try sub_topic get().
@@ -2350,6 +2353,8 @@ class AcademicPersonaService:
                 _get_keys_to_try = [selected_key]
                 if _sv_lt_hint_early and _sv_lt_hint_early != selected_key:
                     _get_keys_to_try.append(_sv_lt_hint_early)
+                # coverage-guard: additive-only — only appends docs not already seen
+                # (via _seen_lt), never excludes/replaces fresh_docs.
                 _max_chars_lt = int(getattr(conf, "LLM_DOC_CHARS_ACADEMIC", 700) or 700)
                 if fresh_docs is None:
                     fresh_docs = []
@@ -2436,6 +2441,9 @@ class AcademicPersonaService:
                 )
             else:
                 try:
+                    # coverage-guard: verify-then-retry — only commits (fresh_docs =
+                    # _hint_docs) when the result is checked to actually carry
+                    # _sv_lt_hint, below.
                     _hint_docs = self._retrieve_docs(target_q, metadata_filter={"license_type": _sv_lt_hint}, state=state)
                     if _hint_docs and any(
                         str((d.get("metadata") or {}).get("license_type") or "").strip() == _sv_lt_hint
@@ -2652,6 +2660,38 @@ class AcademicPersonaService:
             fresh = self._retrieve_docs(target_q, metadata_filter={"license_type": key}, state=state)
             if not fresh:
                 fresh = self._retrieve_docs(target_q, state=state)
+
+            # coverage-guard: verify-then-retry (2026-11, retrieval-safety audit).
+            # _retrieve_docs silently substitutes an unfiltered result when its
+            # metadata filter matches 0 docs (same documented behavior as the
+            # single-topic selection path above this method — see
+            # _has_matched_filtered there) — so `fresh` is never empty even when
+            # NOTHING actually carries this `key`. Without this check, an
+            # unrelated-topic doc could silently merge under this key's umbrella
+            # with no way to tell. Retry with a main_topic filter first, same as
+            # the single-topic path; fall back to the unverified result only as
+            # a last resort (log it, don't drop the key's content entirely).
+            _key_matched = any(
+                str((d.get("metadata") or {}).get("license_type") or "").strip() == key
+                or str((d.get("metadata") or {}).get("main_topic") or "").strip() == key
+                or str((d.get("metadata") or {}).get("sub_topic") or "").strip() == key
+                for d in (fresh or [])
+            )
+            if not _key_matched:
+                try:
+                    _mt_retry = self._retrieve_docs(target_q, metadata_filter={"main_topic": key}, state=state)
+                    if any(str((d.get("metadata") or {}).get("main_topic") or "").strip() == key for d in (_mt_retry or [])):
+                        fresh = _mt_retry
+                        _key_matched = True
+                except Exception as _e_mtk:
+                    _LOG.warning("[Academic] multi-topic main_topic retry failed for key=%r: %s", key, _e_mtk)
+                if not _key_matched:
+                    _LOG.info(
+                        "[Academic] multi-topic merge: key=%r — neither license_type nor main_topic filter "
+                        "matched; keeping unfiltered semantic result (%d docs) as a best-effort fallback",
+                        key, len(fresh or []),
+                    )
+
             for d in (fresh or []):
                 fp = hash((d.get("content") or "")[:200])
                 if fp not in seen_fps:
@@ -3408,6 +3448,10 @@ class AcademicPersonaService:
         # may have only 1 value (e.g. ["บริษัท"]), but Chroma has more sub-types (ห้างหุ้นส่วน).
         if "registration_type" in diversity_data and _selected_lt:
             try:
+                # coverage-guard: non-short-circuiting — result only feeds slot-
+                # question diversity choices, never state.current_docs/document
+                # content; a wrong/thin result degrades to fewer offered sub-type
+                # choices, not dropped regulatory content.
                 _vstore_div = getattr(self.retriever, "vectorstore", None)
                 if _vstore_div is not None:
                     _all_lt = _vstore_div.get(
