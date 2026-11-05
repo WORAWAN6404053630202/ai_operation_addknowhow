@@ -7,10 +7,20 @@ this does NOT re-embed or re-upsert whole documents — it reads
 no OpenRouter calls), and writes back only that one field via a partial
 `_update`, leaving embeddings/every other field untouched.
 
-Paginates with `search_after` on `_id` rather than relying on
-ESCompatCollection.get()'s flat `size: 10000` cap — that cap happens to
+Paginates with a Point-in-Time (PIT) + `search_after` rather than relying
+on ESCompatCollection.get()'s flat `size: 10000` cap — that cap happens to
 cover today's ~869-doc corpus, but scale was the whole point of migrating
 to Elasticsearch, so this script doesn't bake in the same ceiling.
+
+**Live-caught bug (2026-11)**: the first version sorted by plain `_doc`
+(no PIT) — since this script WRITES to the same index it's scanning, the
+underlying Lucene segment this process reads from shifted mid-scan, and
+`_doc`-order pagination silently re-visited some documents while skipping
+others entirely (confirmed live: 274 of 869 docs never got the new field
+on the first run, while others were counted twice). PIT freezes a
+consistent snapshot for the whole scan's lifetime regardless of concurrent
+writes to the live index — the documented correct fix for exactly this
+"paginate while writing" scenario.
 
 Usage (same container-exec shape as es_full_reindex.py):
 
@@ -48,47 +58,62 @@ def _backfill_index(client, index_name: str, batch_size: int = _BATCH_SIZE):
     skipped = 0
     failed_batches = []
     search_after = None
-    while True:
-        body = {
-            "size": batch_size,
-            "sort": [{"_id": "asc"}],
-            "_source": ["page_content", "page_content_tokenized"],
-        }
-        if search_after is not None:
-            body["search_after"] = search_after
-        resp = client.search(index=index_name, body=body)
-        hits = resp.get("hits", {}).get("hits", [])
-        if not hits:
-            break
-
-        for attempt in range(1, _MAX_BATCH_ATTEMPTS + 1):
-            try:
-                for h in hits:
-                    src = h.get("_source", {}) or {}
-                    # Idempotent: a doc that already has the field (e.g. a
-                    # re-run, or a doc ingested after this feature shipped)
-                    # is left untouched rather than re-tokenized for nothing.
-                    if src.get("page_content_tokenized"):
-                        skipped += 1
-                        continue
-                    tokenized = tokenize_thai_for_search(src.get("page_content", ""))
-                    client.update(
-                        index=index_name, id=h["_id"],
-                        body={"doc": {"page_content_tokenized": tokenized}},
-                    )
-                    updated += 1
-                print(f"  batch (after {search_after}): updated={updated} skipped={skipped} so far")
+    pit_id = client.open_point_in_time(index=index_name, keep_alive="5m")["id"]
+    try:
+        while True:
+            body = {
+                "size": batch_size,
+                "pit": {"id": pit_id, "keep_alive": "5m"},
+                # `_shard_doc` is the documented tiebreaker ES adds
+                # automatically for PIT + search_after when no other sort
+                # is needed — unlike plain `_doc` (no PIT), this stays
+                # correct even though this same process is concurrently
+                # WRITING to the index it's scanning (PIT freezes the view).
+                "sort": [{"_shard_doc": "asc"}],
+                "_source": ["page_content", "page_content_tokenized"],
+            }
+            if search_after is not None:
+                body["search_after"] = search_after
+            # PIT carries its own index context — no `index=` kwarg here.
+            resp = client.search(body=body)
+            pit_id = resp.get("pit_id", pit_id)  # PIT id can rotate; always use the latest
+            hits = resp.get("hits", {}).get("hits", [])
+            if not hits:
                 break
-            except Exception as exc:
-                print(f"  batch (after {search_after}) attempt {attempt}/{_MAX_BATCH_ATTEMPTS} failed: {exc}")
-                if attempt == _MAX_BATCH_ATTEMPTS:
-                    failed_batches.append(search_after)
-                else:
-                    time.sleep(2 * attempt)
 
-        search_after = hits[-1]["sort"]
-        if len(hits) < batch_size:
-            break
+            for attempt in range(1, _MAX_BATCH_ATTEMPTS + 1):
+                try:
+                    for h in hits:
+                        src = h.get("_source", {}) or {}
+                        # Idempotent: a doc that already has the field (e.g. a
+                        # re-run, or a doc ingested after this feature shipped)
+                        # is left untouched rather than re-tokenized for nothing.
+                        if src.get("page_content_tokenized"):
+                            skipped += 1
+                            continue
+                        tokenized = tokenize_thai_for_search(src.get("page_content", ""))
+                        client.update(
+                            index=index_name, id=h["_id"],
+                            body={"doc": {"page_content_tokenized": tokenized}},
+                        )
+                        updated += 1
+                    print(f"  batch (after {search_after}): updated={updated} skipped={skipped} so far")
+                    break
+                except Exception as exc:
+                    print(f"  batch (after {search_after}) attempt {attempt}/{_MAX_BATCH_ATTEMPTS} failed: {exc}")
+                    if attempt == _MAX_BATCH_ATTEMPTS:
+                        failed_batches.append(search_after)
+                    else:
+                        time.sleep(2 * attempt)
+
+            search_after = hits[-1]["sort"]
+            if len(hits) < batch_size:
+                break
+    finally:
+        try:
+            client.close_point_in_time(id=pit_id)
+        except Exception as exc:
+            print(f"  warning: failed to close PIT cleanly: {exc}")
 
     return updated, skipped, failed_batches
 

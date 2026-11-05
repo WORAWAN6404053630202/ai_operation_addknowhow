@@ -22,15 +22,21 @@ from scripts.es_backfill_tokenized_field import _backfill_index
 
 def _fake_es_client(docs: dict, batch_size: int):
     """`docs` maps id -> {"page_content": ..., "page_content_tokenized": ...}.
-    Mirrors real ES search_after pagination: sorted by id, each page's last
-    hit's `sort` value is what the next call's `search_after` must equal."""
+    Mirrors real ES PIT + search_after pagination: a frozen, sorted-by-id
+    snapshot taken at `open_point_in_time` time, immune to any writes the
+    script itself makes during the scan (same guarantee a real PIT gives —
+    this is the exact property the live-caught `_doc`-sort bug lacked)."""
     client = MagicMock()
-    ids_sorted = sorted(docs.keys())
+    ids_sorted = sorted(docs.keys())  # frozen "snapshot" order, fixed at PIT-open time
 
     def _count(index):
         return {"count": len(ids_sorted)}
 
-    def _search(index, body):
+    def _open_pit(index, keep_alive):
+        return {"id": "fake-pit-id"}
+
+    def _search(body):
+        assert "pit" in body, "must use PIT, not a plain index= search"
         search_after = body.get("search_after")
         start = 0
         if search_after is not None:
@@ -40,9 +46,10 @@ def _fake_es_client(docs: dict, batch_size: int):
             {"_id": i, "_source": dict(docs[i]), "sort": [i]}
             for i in page_ids
         ]
-        return {"hits": {"hits": hits}}
+        return {"hits": {"hits": hits}, "pit_id": body["pit"]["id"]}
 
     client.count.side_effect = _count
+    client.open_point_in_time.side_effect = _open_pit
     client.search.side_effect = _search
     return client
 
@@ -117,3 +124,26 @@ class TestBackfillPagination:
 
         assert updated == 0
         assert len(failed) == 1
+
+    def test_pit_closed_even_when_a_batch_fails(self, monkeypatch):
+        """The live-caught bug this PIT rewrite fixes was a silent data-
+        completeness bug (missed/duplicated docs), not a crash — but the PIT
+        itself must still be released on the ES side even when something
+        inside the scan fails, or it leaks until its keep_alive expires."""
+        import scripts.es_backfill_tokenized_field as mod
+        monkeypatch.setattr(mod.time, "sleep", lambda *_: None)
+        docs = {"1": {"page_content": "x"}}
+        client = _fake_es_client(docs, batch_size=10)
+        client.update.side_effect = RuntimeError("simulated ES failure")
+
+        _backfill_index(client, "my_index", batch_size=10)
+
+        client.close_point_in_time.assert_called_once_with(id="fake-pit-id")
+
+    def test_pit_opened_on_the_target_index(self):
+        docs = {"1": {"page_content": "x"}}
+        client = _fake_es_client(docs, batch_size=10)
+
+        _backfill_index(client, "my_index", batch_size=10)
+
+        client.open_point_in_time.assert_called_once_with(index="my_index", keep_alive="5m")
