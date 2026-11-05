@@ -865,7 +865,7 @@ class PracticalPersonaService:
             openai_api_base=conf.OPENROUTER_BASE_URL,
             http_client=get_shared_http_client(),
             temperature=0.0,
-            max_tokens=500,
+            max_tokens=int(getattr(conf, "GROUNDEDNESS_JUDGE_BASE_MAX_TOKENS", 1200)),
             request_timeout=timeout,
             max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
@@ -954,18 +954,21 @@ class PracticalPersonaService:
             except Exception as _e:
                 # 2026-10 fix (live-observed via LangSmith trace after tagging shipped):
                 # a dense DOCUMENTS payload + the chain-of-thought reasoning this judge
-                # requires can genuinely exceed max_tokens=500 — NOT a rare edge case,
-                # confirmed live on a routine commercial-registration question. Mirrors
-                # this file's own _call_llm_json_with_truncation_retry: keep the base
-                # budget cheap for the common case, pay for one widened-budget retry
-                # ONLY when truncation is the actual failure, rather than either
+                # requires can genuinely exceed the base max_tokens — NOT a rare edge
+                # case, confirmed live on a routine commercial-registration question.
+                # Mirrors this file's own _call_llm_json_with_truncation_retry: keep the
+                # base budget cheap for the common case, pay for one widened-budget
+                # retry ONLY when truncation is the actual failure, rather than either
                 # raising the base cost for every call or leaving the judge silently
-                # skipped (fail-open) on every DOCUMENTS-heavy case.
+                # skipped (fail-open) on every DOCUMENTS-heavy case. See
+                # GROUNDEDNESS_JUDGE_BASE_MAX_TOKENS in conf.py for the 2026-11 follow-up
+                # that raised the base itself after this retry was still firing routinely.
                 if "LengthFinishReasonError" in type(_e).__name__ or "LengthFinishReason" in str(_e)[:80]:
+                    _base_max_tokens = int(getattr(conf, "GROUNDEDNESS_JUDGE_BASE_MAX_TOKENS", 1200))
                     _retry_max_tokens = int(getattr(conf, "GROUNDEDNESS_JUDGE_RETRY_MAX_TOKENS", 1500))
                     _LOG.warning(
-                        "[Practical/groundedness] judge hit max_tokens=500 — retrying once with max_tokens=%d",
-                        _retry_max_tokens,
+                        "[Practical/groundedness] judge hit max_tokens=%d — retrying once with max_tokens=%d",
+                        _base_max_tokens, _retry_max_tokens,
                     )
                     try:
                         text = _invoke(llm.bind(max_tokens=_retry_max_tokens))

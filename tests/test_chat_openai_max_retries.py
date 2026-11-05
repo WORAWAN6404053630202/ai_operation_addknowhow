@@ -73,3 +73,29 @@ class TestChatOpenAIMaxRetries:
         )
         assert judge_llm.request_timeout == conf.LLM_GROUNDEDNESS_JUDGE_TIMEOUT
         assert judge_llm.max_retries == CHAT_OPENAI_MAX_RETRIES
+
+    def test_groundedness_judges_use_the_raised_base_max_tokens(self):
+        """2026-11 cost fix: base max_tokens=500 was found (via live-logged
+        cost breakdown) to truncate routinely, not rarely — every truncation
+        pays for a full discarded call AND a second, widened-budget retry.
+        Raised to conf.GROUNDEDNESS_JUDGE_BASE_MAX_TOKENS (1200), comfortably
+        above the real observed successful-retry usage (606, 1010 completion
+        tokens) — same closure-inspection approach as the sibling timeout test
+        above, no real LLM call made."""
+        from model.persona_practical import PracticalPersonaService
+        from model.persona_academic import AcademicPersonaService
+        import conf
+
+        practical = PracticalPersonaService(retriever=MagicMock())
+        practical_judge_llm = next(
+            c.cell_contents for c in practical._groundedness_llm_call.__closure__
+            if hasattr(c.cell_contents, "request_timeout")
+        )
+        assert practical_judge_llm.max_tokens == conf.GROUNDEDNESS_JUDGE_BASE_MAX_TOKENS
+
+        academic = AcademicPersonaService(retriever=MagicMock())
+        academic_judge_llm = next(
+            c.cell_contents for c in academic._groundedness_llm_call.__closure__
+            if hasattr(c.cell_contents, "request_timeout")
+        )
+        assert academic_judge_llm.max_tokens == conf.GROUNDEDNESS_JUDGE_BASE_MAX_TOKENS

@@ -372,7 +372,7 @@ class AcademicPersonaService:
             openai_api_base=conf.OPENROUTER_BASE_URL,
             http_client=get_shared_http_client(),
             temperature=0.0,
-            max_tokens=500,
+            max_tokens=int(getattr(conf, "GROUNDEDNESS_JUDGE_BASE_MAX_TOKENS", 1200)),
             request_timeout=timeout,
             max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
@@ -437,14 +437,17 @@ class AcademicPersonaService:
             except Exception as _e:
                 # 2026-10 fix — see persona_practical.py's identical fix (its own
                 # _default_groundedness_llm_call) for the live-observed rationale:
-                # a dense DOCUMENTS payload can genuinely overflow max_tokens=500,
+                # a dense DOCUMENTS payload can genuinely overflow the base max_tokens,
                 # not a rare edge case. One widened-budget retry, mirroring this
                 # codebase's established _call_llm_json_with_truncation_retry shape.
+                # See GROUNDEDNESS_JUDGE_BASE_MAX_TOKENS in conf.py for the 2026-11
+                # follow-up that raised the base itself after this retry kept firing.
                 if "LengthFinishReasonError" in type(_e).__name__ or "LengthFinishReason" in str(_e)[:80]:
+                    _base_max_tokens = int(getattr(conf, "GROUNDEDNESS_JUDGE_BASE_MAX_TOKENS", 1200))
                     _retry_max_tokens = int(getattr(conf, "GROUNDEDNESS_JUDGE_RETRY_MAX_TOKENS", 1500))
                     _LOG.warning(
-                        "[Academic/groundedness] judge hit max_tokens=500 — retrying once with max_tokens=%d",
-                        _retry_max_tokens,
+                        "[Academic/groundedness] judge hit max_tokens=%d — retrying once with max_tokens=%d",
+                        _base_max_tokens, _retry_max_tokens,
                     )
                     try:
                         text = _invoke(llm.bind(max_tokens=_retry_max_tokens))

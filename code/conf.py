@@ -520,6 +520,27 @@ SINGLE_FILTER_COVERAGE_SUPPLEMENT_ENABLED = os.getenv("SINGLE_FILTER_COVERAGE_SU
 # one widened retry only when truncation actually happens.
 GROUNDEDNESS_JUDGE_RETRY_MAX_TOKENS = _safe_int("GROUNDEDNESS_JUDGE_RETRY_MAX_TOKENS", 1500)
 
+# 2026-11 cost audit: the base max_tokens=500 above was found to truncate far
+# more than "the rare edge case" the original design assumed — a live-logged
+# broad-question turn truncated on BOTH of its groundedness calls, each then
+# paying for a full second attempt (bind-retry at GROUNDEDNESS_JUDGE_RETRY_MAX_TOKENS)
+# that completed fine using only 606 and 1010 completion tokens respectively.
+# That means ~27% of this one turn's total cost was two calls paid for twice —
+# once truncated-and-discarded, once successful — purely because the base
+# ceiling sat below the judge's real, routine completion-token usage. Looked
+# into caching the DOCUMENTS payload to make the *retry* path cheaper instead
+# (see .claude/plans — researched, not pursued: Anthropic's cache economics
+# (2x write / 0.1x read at the 1h TTL this codebase uses) roughly cancel out
+# over exactly one write + one read, so it's a wash at best for a call site
+# that retries at most once, and confirmed net-negative at the 1h TTL using
+# this same live data). Raising the base instead is a strict win with no
+# such trade-off: same judge, same prompt, same decision logic, just a
+# ceiling sized to match observed real usage instead of triggering a
+# duplicate paid call on the common case. 1200 clears both observed values
+# (606, 1010) with headroom, mirroring the margin GROUNDEDNESS_JUDGE_RETRY_MAX_TOKENS
+# itself used after 900 proved too tight.
+GROUNDEDNESS_JUDGE_BASE_MAX_TOKENS = _safe_int("GROUNDEDNESS_JUDGE_BASE_MAX_TOKENS", 1200)
+
 # Iterative Retrieval: minimum number of missing coverage fields that triggers Round 3 gap-fill.
 ITERATIVE_RETRIEVAL_MIN_MISSING_FIELDS = _safe_int("ITERATIVE_RETRIEVAL_MIN_MISSING_FIELDS", 2)
 
@@ -924,6 +945,11 @@ def validate_config() -> None:
         errors.append(
             f"LLM_GROUNDEDNESS_JUDGE_TIMEOUT={LLM_GROUNDEDNESS_JUDGE_TIMEOUT} must be >= "
             f"LLM_TOPIC_PICKER_TIMEOUT={LLM_TOPIC_PICKER_TIMEOUT} (it exists to give MORE room for a heavier payload, not less)"
+        )
+    if GROUNDEDNESS_JUDGE_RETRY_MAX_TOKENS < GROUNDEDNESS_JUDGE_BASE_MAX_TOKENS:
+        errors.append(
+            f"GROUNDEDNESS_JUDGE_RETRY_MAX_TOKENS={GROUNDEDNESS_JUDGE_RETRY_MAX_TOKENS} must be >= "
+            f"GROUNDEDNESS_JUDGE_BASE_MAX_TOKENS={GROUNDEDNESS_JUDGE_BASE_MAX_TOKENS} (it exists to give MORE room, not less)"
         )
     if PROVIDER_ROUTING_SORT not in ("", "throughput", "latency", "price"):
         errors.append(f"PROVIDER_ROUTING_SORT={PROVIDER_ROUTING_SORT!r} must be one of: '', throughput, latency, price")
