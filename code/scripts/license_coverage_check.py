@@ -187,7 +187,7 @@ def run_live_check(base_url: str, license_types: List[str]) -> List[LiveResult]:
 # ── Layer 3: LLM-generated alias check (optional, best-effort) ─────────────────
 
 def _generate_aliases(license_type: str) -> List[str]:
-    from utils.llm_call import llm_invoke, get_shared_http_client, extract_llm_text
+    from utils.llm_call import llm_invoke, get_shared_http_client, extract_llm_text, CHAT_OPENAI_MAX_RETRIES
     from langchain_openai import ChatOpenAI
     from langchain_core.messages import HumanMessage
     import conf
@@ -201,6 +201,7 @@ def _generate_aliases(license_type: str) -> List[str]:
         temperature=0.3,
         max_tokens=200,
         request_timeout=15,
+        max_retries=CHAT_OPENAI_MAX_RETRIES,
         model_kwargs={"response_format": {"type": "json_object"}},
     )
     prompt = (

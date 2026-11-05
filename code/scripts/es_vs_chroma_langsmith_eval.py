@@ -74,7 +74,7 @@ def _make_target(base_url: str):
 
 def _judge_llm():
     from langchain_openai import ChatOpenAI
-    from utils.llm_call import get_shared_http_client
+    from utils.llm_call import get_shared_http_client, CHAT_OPENAI_MAX_RETRIES
 
     return ChatOpenAI(
         model=getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL),
@@ -82,8 +82,17 @@ def _judge_llm():
         openai_api_base=conf.OPENROUTER_BASE_URL,
         http_client=get_shared_http_client(),
         temperature=0.0,
-        max_tokens=400,
+        # 2026-11, pilot-run-caught bug: 400 was too small once prompt_tokens
+        # grow past ~1,600 (long question + reference + candidate answer) —
+        # the reasoning field alone can eat the whole budget before the
+        # JSON closes, and response_format=json_object makes OpenAI's
+        # client raise LengthFinishReasonError on a truncated body instead
+        # of returning partial text. Confirmed live: a real judge call hit
+        # exactly this (1,657 prompt tokens, 400/400 completion tokens
+        # used, parse failed) on the very first pilot question.
+        max_tokens=1000,
         request_timeout=20,
+        max_retries=CHAT_OPENAI_MAX_RETRIES,
         model_kwargs={"response_format": {"type": "json_object"}},
     )
 
@@ -112,7 +121,22 @@ def correctness_evaluator(run, example) -> dict:
         f"คำถาม: {question}\n\nคำตอบอ้างอิง: {reference}\n\nคำตอบของบอท: {answer}\n\n"
         'ตอบเป็น JSON เท่านั้น: {"reasoning": "...", "correct": true/false}'
     )
-    text = llm.invoke(prompt).content
+    # 2026-11, pilot-run-caught: a single judge-call failure (truncation,
+    # rate limit, transient network error) must not risk aborting a paid
+    # 113-175-question x 2-backend evaluate() run — report it as a skipped
+    # score for this one example instead of raising. Routed through
+    # llm_invoke (not a bare llm.invoke()) for the same retry/logging/
+    # metrics parity every other LLM call in this codebase gets — this was
+    # previously the one real bypass found during the retry-duplication
+    # audit (.claude/plans/mutable-seeking-wave.md).
+    from langchain_core.messages import HumanMessage
+    from utils.llm_call import llm_invoke, extract_llm_text
+    try:
+        text = extract_llm_text(
+            llm_invoke(llm, [HumanMessage(content=prompt)], label="ESEval/correctness")
+        ).strip()
+    except Exception as exc:
+        return {"key": "correctness", "score": None, "comment": f"judge call failed: {exc}"}
     result = _parse_judge_json(text)
     return {
         "key": "correctness",
@@ -133,7 +157,14 @@ def relevance_evaluator(run, example) -> dict:
         f"คำถาม: {question}\n\nคำตอบ: {answer}\n\n"
         'ตอบเป็น JSON เท่านั้น: {"reasoning": "...", "relevant": true/false}'
     )
-    text = llm.invoke(prompt).content
+    from langchain_core.messages import HumanMessage
+    from utils.llm_call import llm_invoke, extract_llm_text
+    try:
+        text = extract_llm_text(
+            llm_invoke(llm, [HumanMessage(content=prompt)], label="ESEval/relevance")
+        ).strip()
+    except Exception as exc:
+        return {"key": "relevance", "score": None, "comment": f"judge call failed: {exc}"}
     result = _parse_judge_json(text)
     return {
         "key": "relevance",
@@ -155,7 +186,10 @@ def _make_groundedness_evaluator():
         docs = (run.outputs or {}).get("retrieved_sources")
         if not docs:
             return {"key": "groundedness", "score": None, "comment": "no retrieved_sources on this run (cache hit, or include_sources wasn't honored) — skipped"}
-        result = service._groundedness_llm_call(answer, docs, state=None)
+        try:
+            result = service._groundedness_llm_call(answer, docs, state=None)
+        except Exception as exc:
+            return {"key": "groundedness", "score": None, "comment": f"judge call failed: {exc}"}
         return {
             "key": "groundedness",
             "score": 0.0 if result.get("unsupported") else 1.0,

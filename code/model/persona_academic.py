@@ -10,7 +10,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 import conf
 from model.conversation_state import ConversationState
 from model.persona_practical import _classify_link, _parse_link_entries
-from utils.llm_call import llm_invoke, extract_llm_text, build_speed_extra_body, build_cached_system_message, get_shared_http_client
+from utils.llm_call import llm_invoke, extract_llm_text, build_speed_extra_body, build_cached_system_message, get_shared_http_client, CHAT_OPENAI_MAX_RETRIES
 from utils.prompts_academic import SYSTEM_PROMPT as SYSTEM_PROMPT_ACADEMIC
 from utils.prompt_safety import INJECTION_GUARD
 from utils.phone_extraction import extract_thai_phone_numbers
@@ -303,6 +303,7 @@ class AcademicPersonaService:
             temperature=getattr(conf, "TEMPERATURE_ACADEMIC", 0.3),
             max_tokens=getattr(conf, "MAX_TOKENS_ACADEMIC", 10000),
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
             extra_body=build_speed_extra_body(model_name),
             **_reasoning_kwargs,
@@ -319,6 +320,7 @@ class AcademicPersonaService:
             temperature=0.0,
             max_tokens=slots_max_tokens,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
             extra_body=build_speed_extra_body(model_name),
             **_reasoning_kwargs,
@@ -335,6 +337,7 @@ class AcademicPersonaService:
             temperature=0.0,
             max_tokens=300,
             request_timeout=classifier_timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
             extra_body=build_speed_extra_body(switch_model),
         )
@@ -357,7 +360,12 @@ class AcademicPersonaService:
         _default_groundedness_llm_call for the full rationale/research
         citations behind the prompt design."""
         model = getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL)
-        timeout = int(getattr(conf, "LLM_TOPIC_PICKER_TIMEOUT", 8))
+        # 2026-11: this judge receives the full retrieved-DOCUMENTS JSON as
+        # input (unlike every other LLM_TOPIC_PICKER_TIMEOUT classifier's
+        # short fixed input) — see conf.LLM_GROUNDEDNESS_JUDGE_TIMEOUT's own
+        # comment (and persona_practical.py's sibling judge) for the full
+        # live-incident rationale for why it has its own, longer timeout.
+        timeout = int(getattr(conf, "LLM_GROUNDEDNESS_JUDGE_TIMEOUT", 20))
         llm = ChatOpenAI(
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
@@ -366,6 +374,7 @@ class AcademicPersonaService:
             temperature=0.0,
             max_tokens=500,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 

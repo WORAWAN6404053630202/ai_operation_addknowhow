@@ -92,7 +92,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 import conf
 from model.conversation_state import ConversationState
 from model.clarification_flags import DYNAMIC_CLARIFICATION_SKIP_FLAGS, has_any_flag
-from utils.llm_call import llm_invoke, extract_llm_text, get_shared_http_client
+from utils.llm_call import llm_invoke, extract_llm_text, get_shared_http_client, CHAT_OPENAI_MAX_RETRIES
 from utils.query_synonyms import SYNONYM_PATTERNS
 from utils.query_rewriter import enrich_query_for_retrieval, _needs_rewrite as _qr_needs_rewrite
 from utils.text_patterns import (
@@ -1343,6 +1343,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=512,  # topic list JSON ต้องการพอ (5 topics + confidence + reasoning)
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -1382,6 +1383,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=180,  # Increased from 150 to accommodate yes/no + reasoning
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -1413,6 +1415,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=250,  # Increased from 200 to accommodate analysis + reasoning
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -1451,6 +1454,7 @@ class PersonaSupervisor:
             temperature=0.35,
             max_tokens=200,  # Increased from 120 to accommodate context-aware greetings
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -1506,6 +1510,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=1200,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -1543,6 +1548,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=600,  # เพิ่มจาก 300 เพื่อรองรับ list ที่ยาวขึ้น
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -1599,6 +1605,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=180,  # Increased from 120 to accommodate slot mapping + confidence + reasoning
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -1667,6 +1674,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=250,  # Increased from 150 to accommodate intent classification + query generation + confidence + reasoning
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -1878,6 +1886,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=300,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -1912,6 +1921,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=200,  # was 150 — hit LengthFinishReasonError on longer inputs
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -1946,6 +1956,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=300,  # was 150 — hit LengthFinishReasonError on longer inputs
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -1980,6 +1991,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -2014,6 +2026,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=300,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -2048,6 +2061,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=400,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -2081,6 +2095,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -2114,6 +2129,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=300,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -2147,6 +2163,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=300,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -2180,6 +2197,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=300,  # was 150 — hit LengthFinishReasonError on longer inputs
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -2213,6 +2231,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=300,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -2246,6 +2265,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -2279,6 +2299,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -2312,6 +2333,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -2345,6 +2367,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=300,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -2378,6 +2401,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=300,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -2411,6 +2435,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=300,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -2444,6 +2469,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -2477,6 +2503,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=300,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -2517,6 +2544,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=300,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -2547,6 +2575,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -2580,6 +2609,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -2772,6 +2802,7 @@ class PersonaSupervisor:
             temperature=0.7,
             max_tokens=200,
             request_timeout=int(getattr(conf, "LLM_TOPIC_PICKER_TIMEOUT", 8)),
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
         )
 
         # NEW: pending_slot free-text mapper (no hardcode)
@@ -2833,6 +2864,7 @@ class PersonaSupervisor:
             temperature=0.0,
             max_tokens=50,
             request_timeout=int(getattr(conf, "LLM_TOPIC_PICKER_TIMEOUT", 8)),
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -10942,6 +10974,7 @@ class PersonaSupervisor:
                 temperature=0.0,
                 max_tokens=800,
                 request_timeout=_timeout,
+                max_retries=CHAT_OPENAI_MAX_RETRIES,
                 model_kwargs={"response_format": {"type": "json_object"}},
             )
             _prompt = build_sub_op_group_classifier_prompt(license_type, sub_ops)
@@ -11212,6 +11245,7 @@ class PersonaSupervisor:
                 temperature=0.0,
                 max_tokens=300,
                 request_timeout=timeout,
+                max_retries=CHAT_OPENAI_MAX_RETRIES,
                 model_kwargs={"response_format": {"type": "json_object"}},
             )
             text = extract_llm_text(

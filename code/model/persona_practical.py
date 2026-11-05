@@ -12,7 +12,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 import conf
 from model.conversation_state import ConversationState
 from model.clarification_flags import ENTITY_INJECTION_SKIP_FLAGS, has_any_flag
-from utils.llm_call import llm_invoke, extract_llm_text, build_speed_extra_body, build_cached_system_message, build_thinking_extra_body, get_shared_http_client
+from utils.llm_call import llm_invoke, extract_llm_text, build_speed_extra_body, build_cached_system_message, build_thinking_extra_body, get_shared_http_client, CHAT_OPENAI_MAX_RETRIES
 from utils.prompts_practical import SYSTEM_PROMPT as SYSTEM_PROMPT_PRACTICAL, build_lqs_license_detect_prompt, build_satisfaction_detect_prompt, build_dont_know_detect_prompt, build_short_followup_detect_prompt
 from utils.prompt_safety import INJECTION_GUARD
 from utils.phone_extraction import extract_thai_phone_numbers as _shared_extract_thai_phone_numbers
@@ -685,6 +685,7 @@ class PracticalPersonaService:
             temperature=0.35,
             max_tokens=120,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -751,6 +752,7 @@ class PracticalPersonaService:
             temperature=0.0,
             max_tokens=100,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -781,6 +783,7 @@ class PracticalPersonaService:
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -849,7 +852,13 @@ class PracticalPersonaService:
         shipping — run manually, not part of the pytest suite, since it makes
         real paid LLM calls."""
         model = getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL)
-        timeout = int(getattr(conf, "LLM_TOPIC_PICKER_TIMEOUT", 8))
+        # 2026-11: this judge receives the full retrieved-DOCUMENTS JSON as
+        # input (unlike every other LLM_TOPIC_PICKER_TIMEOUT classifier's
+        # short fixed input), and the truncation-retry path below asks for
+        # up to 3x the base completion tokens on this same budget — see
+        # conf.LLM_GROUNDEDNESS_JUDGE_TIMEOUT's own comment for the full
+        # live-incident rationale for why it has its own, longer timeout.
+        timeout = int(getattr(conf, "LLM_GROUNDEDNESS_JUDGE_TIMEOUT", 20))
         llm = ChatOpenAI(
             model=model,
             openai_api_key=conf.OPENROUTER_API_KEY,
@@ -858,6 +867,7 @@ class PracticalPersonaService:
             temperature=0.0,
             max_tokens=500,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -1078,6 +1088,7 @@ class PracticalPersonaService:
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -1115,6 +1126,7 @@ class PracticalPersonaService:
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -1152,6 +1164,7 @@ class PracticalPersonaService:
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -1189,6 +1202,7 @@ class PracticalPersonaService:
             temperature=0.0,
             max_tokens=150,
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
@@ -2071,6 +2085,7 @@ class PracticalPersonaService:
             temperature=_temperature,
             max_tokens=getattr(conf, "MAX_TOKENS_PRACTICAL", 4000),
             request_timeout=timeout,
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
             extra_body=_extra_body,
         )

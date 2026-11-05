@@ -65,7 +65,7 @@ def _get_llm():
     try:
         import conf
         from langchain_openai import ChatOpenAI
-        from utils.llm_call import get_shared_http_client
+        from utils.llm_call import get_shared_http_client, CHAT_OPENAI_MAX_RETRIES
         _llm = ChatOpenAI(
             model=getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL),
             openai_api_key=conf.OPENROUTER_API_KEY,
@@ -74,6 +74,7 @@ def _get_llm():
             temperature=0.0,
             max_tokens=100,
             request_timeout=int(getattr(conf, "LLM_TOPIC_PICKER_TIMEOUT", 8)),
+            max_retries=CHAT_OPENAI_MAX_RETRIES,
         )
         _LOG.debug("[QueryRewriter] LLM initialised: %s",
                    getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL))

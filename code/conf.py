@@ -534,6 +534,21 @@ LLM_REQUEST_TIMEOUT_PRACTICAL = _safe_int("LLM_REQUEST_TIMEOUT_PRACTICAL",
                                            _safe_int("LLM_REQUEST_TIMEOUT", 60))
 # Shorter timeout for topic_picker (non-critical, fast-fail to fallback)
 LLM_TOPIC_PICKER_TIMEOUT = _safe_int("LLM_TOPIC_PICKER_TIMEOUT", 8)
+# Groundedness judges (persona_practical.py / persona_academic.py) used to share
+# LLM_TOPIC_PICKER_TIMEOUT with every other classifier — but unlike those (short,
+# fixed-size inputs with a cheap fallback on failure), a groundedness judge
+# receives the full retrieved-DOCUMENTS JSON as input, and persona_practical.py's
+# own truncation-retry path (see GROUNDEDNESS_JUDGE_RETRY_MAX_TOKENS) asks for up
+# to 3x the base completion tokens on this SAME timeout via llm.bind(), which only
+# widens max_tokens, never request_timeout. Live-confirmed too tight: a real
+# groundedness call on an 8s budget took 25.8s to fail (retry-duplication bug,
+# fixed separately — see CHAT_OPENAI_MAX_RETRIES in utils/llm_call.py), but even
+# with that bug fixed, 8s remains a narrow budget for this call shape specifically.
+# 20s matches this project's own precedent for a similarly document-heavy judge
+# (scripts/es_vs_chroma_langsmith_eval.py's _judge_llm). Not live-calibrated
+# against real production latency yet — kept env-overridable so it can be tuned
+# with real data without a code change.
+LLM_GROUNDEDNESS_JUDGE_TIMEOUT = _safe_int("LLM_GROUNDEDNESS_JUDGE_TIMEOUT", 20)
 SHEETS_REQUEST_TIMEOUT = _safe_int("SHEETS_REQUEST_TIMEOUT", 20)
 # Query-embedding calls (OpenRouter). Live-measured 2026-08-05: 410-2129ms per call
 # under normal conditions — 15s gives generous headroom for a slow provider response
@@ -905,6 +920,11 @@ def validate_config() -> None:
         errors.append(f"RETRIEVAL_TOP_K={RETRIEVAL_TOP_K} must be >= 1")
     if LLM_REQUEST_TIMEOUT < 5:
         errors.append(f"LLM_REQUEST_TIMEOUT={LLM_REQUEST_TIMEOUT} is very short (min 5s)")
+    if LLM_GROUNDEDNESS_JUDGE_TIMEOUT < LLM_TOPIC_PICKER_TIMEOUT:
+        errors.append(
+            f"LLM_GROUNDEDNESS_JUDGE_TIMEOUT={LLM_GROUNDEDNESS_JUDGE_TIMEOUT} must be >= "
+            f"LLM_TOPIC_PICKER_TIMEOUT={LLM_TOPIC_PICKER_TIMEOUT} (it exists to give MORE room for a heavier payload, not less)"
+        )
     if PROVIDER_ROUTING_SORT not in ("", "throughput", "latency", "price"):
         errors.append(f"PROVIDER_ROUTING_SORT={PROVIDER_ROUTING_SORT!r} must be one of: '', throughput, latency, price")
     if RERANKER_BACKEND not in ("pytorch", "onnx"):

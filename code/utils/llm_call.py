@@ -33,6 +33,23 @@ import httpx
 _MAX_RETRIES = 2
 _RETRY_DELAYS = (0.3, 1.0)  # exponential backoff in seconds
 
+# 2026-11: pass this to EVERY ChatOpenAI(...) construction's `max_retries`
+# kwarg. Left unset (None), langchain_openai falls through to the openai SDK's
+# own hidden default (max_retries=2, i.e. 3 low-level HTTP attempts) — fully
+# invisible to this file's own llm_invoke() retry loop below, so the two
+# layers silently stack (up to 3 app-level x 3 SDK-level = 9 attempts per
+# logical call). Live-confirmed: a groundedness judge configured with
+# request_timeout=8 took 25.8s to register as llm_invoke's first failed
+# attempt — 8s x 3 hidden SDK attempts, before this file's own retry even
+# started counting. llm_invoke() is this codebase's single intended retry
+# authority (see _MAX_RETRIES/_RETRY_DELAYS above); 0 is the only value that
+# keeps it that way. Enforced codebase-wide by code/scripts/
+# retry_guard_static_scan.py. Hardcoded rather than env-overridable like the
+# timeout constants in conf.py — this encodes an architectural invariant
+# ("exactly one retry layer"), not a per-deployment tuning knob; an env
+# override would let a .env file silently reintroduce this exact bug.
+CHAT_OPENAI_MAX_RETRIES = 0
+
 if TYPE_CHECKING:
     from code.model.conversation_state import ConversationState
 
