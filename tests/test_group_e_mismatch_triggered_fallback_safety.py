@@ -15,6 +15,13 @@ Minor gap ("department" pending-slot handler): already safe on the
 empty-result path (explicit "keep existing docs" fallback); this adds the
 SAME guard+supplement treatment as everywhere else for consistency, lowest
 priority per the project plan but included since there was time.
+
+Follow-up fix (2026-11, live-testing): the guard+supplement had been nested
+inside `if _dept_docs:`, so a zero-result exact-match filter skipped the
+supplement entirely and fell straight to "keep existing docs" — stale docs
+from BEFORE the user picked this department, not a safe degrade. Guard+
+supplement now run unconditionally; the if/else still gates only the final
+commit, now checked after supplement.
 """
 from __future__ import annotations
 
@@ -98,3 +105,12 @@ class TestDepartmentPendingSlotMinorGapClosed:
         idx = source.find('_dept_filter: dict = {"department": _dept_val}')
         tail = source[idx:idx + 3000]
         assert "else:" in tail
+
+    def test_guard_not_gated_on_raw_result(self):
+        """2026-11 live-testing follow-up: guard+supplement must run BEFORE
+        the if/else, not inside `if _dept_docs:` — otherwise a zero-result
+        exact-match filter never gets a supplement attempt."""
+        block = _dept_slot_block()
+        guard_idx = block.index("_identity_guard_majority_vote(")
+        if_idx = block.index("if _dept_docs:")
+        assert guard_idx < if_idx

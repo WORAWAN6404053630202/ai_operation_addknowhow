@@ -4780,59 +4780,69 @@ class PersonaSupervisor:
                             except Exception as _rare_rid_e:
                                 _LOG.warning("[Supervisor] rare-license identity-mismatch guard failed (%s) — continuing unfiltered", _rare_rid_e)
 
-                        if _raw_docs:
-                            _doc_chars2 = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700) or 700)
-                            _SUPERVISOR_META_WL2 = frozenset({
-                                "license_type", "operation_by_department", "operation_topic",
-                                "entity_type_normalized", "registration_type", "department",
-                                "fees", "operation_duration", "service_channel",
-                                "identification_documents", "operation_steps", "research_reference",
-                            })
-                            _SUPERVISOR_FC2 = {
-                                "operation_steps": 1500, "identification_documents": 4000,
-                                "research_reference": 3200, "fees": 900, "service_channel": 600,
-                            }
-                            _filtered = []
-                            for _rd in _raw_docs:
-                                _fc = getattr(_rd, "page_content", "") or ""
-                                _fm = getattr(_rd, "metadata", {}) or {}
-                                _sm = {}
-                                for _k, _v in _fm.items():
-                                    if _k not in _SUPERVISOR_META_WL2 or _v in (None, "", "nan", "None"):
-                                        continue
-                                    _vs = str(_v)
-                                    _cap = _SUPERVISOR_FC2.get(_k)
-                                    _sm[_k] = _vs[:_cap] if _cap and len(_vs) > _cap else _vs
-                                _filtered.append({"content": _fc[:_doc_chars2], "metadata": _sm})
+                        # coverage-guard fix (2026-11, live-testing follow-up): the block below
+                        # used to be gated on `if _raw_docs:`, which meant a ZERO-result exact-
+                        # match (the hardcoded _rare_lt value simply doesn't exist in the real
+                        # corpus — live-confirmed for "ทะเบียนนายจ้าง", which has 0 matching docs
+                        # in the real baseline) never reached the supplement at all: the whole
+                        # commit+return block was skipped silently, identical to the original
+                        # unguarded bug this round was meant to fix. Building _filtered (possibly
+                        # empty) unconditionally and gating the FINAL commit on `if _filtered:`
+                        # instead lets the supplement below run even on a fully empty _raw_docs.
+                        _doc_chars2 = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700) or 700)
+                        _SUPERVISOR_META_WL2 = frozenset({
+                            "license_type", "operation_by_department", "operation_topic",
+                            "entity_type_normalized", "registration_type", "department",
+                            "fees", "operation_duration", "service_channel",
+                            "identification_documents", "operation_steps", "research_reference",
+                        })
+                        _SUPERVISOR_FC2 = {
+                            "operation_steps": 1500, "identification_documents": 4000,
+                            "research_reference": 3200, "fees": 900, "service_channel": 600,
+                        }
+                        _filtered = []
+                        for _rd in _raw_docs:
+                            _fc = getattr(_rd, "page_content", "") or ""
+                            _fm = getattr(_rd, "metadata", {}) or {}
+                            _sm = {}
+                            for _k, _v in _fm.items():
+                                if _k not in _SUPERVISOR_META_WL2 or _v in (None, "", "nan", "None"):
+                                    continue
+                                _vs = str(_v)
+                                _cap = _SUPERVISOR_FC2.get(_k)
+                                _sm[_k] = _vs[:_cap] if _cap and len(_vs) > _cap else _vs
+                            _filtered.append({"content": _fc[:_doc_chars2], "metadata": _sm})
 
-                            # Coverage-adequacy supplement (2026-11, Phase 3 of the retrieval-safety
-                            # fix): the identity guard above catches a WRONG value; this catches a
-                            # THIN-but-not-wrong result — a non-empty but structurally sparse filtered
-                            # result used to commit and `return` immediately with nothing to fall back
-                            # on. Appended AFTER the filtered docs (never replaces them) so the
-                            # correct, targeted result still comes first.
-                            if (
-                                getattr(conf, "RARE_LT_COVERAGE_SUPPLEMENT_ENABLED", False)
-                                and not PersonaSupervisor._is_structurally_adequate(_filtered)
-                            ):
-                                try:
-                                    _rare_supp_docs = _vstore.similarity_search(q, k=_top_k_rare)
-                                    _rare_seen_fp = {(d.get("content") or "")[:120] for d in _filtered}
-                                    _rare_supplement = [
-                                        {"content": (getattr(_sd, "page_content", "") or "")[:_doc_chars2], "metadata": getattr(_sd, "metadata", {}) or {}}
-                                        for _sd in _rare_supp_docs
-                                        if (getattr(_sd, "page_content", "") or "")[:120] not in _rare_seen_fp
-                                    ]
-                                    if _rare_supplement:
-                                        _LOG.info(
-                                            "[Supervisor] rare-license coverage supplement: %r thin result "
-                                            "(%d docs) → +%d unfiltered docs",
-                                            _rare_lt, len(_filtered), len(_rare_supplement),
-                                        )
-                                        _filtered = _filtered + _rare_supplement
-                                except Exception as _rare_supp_e:
-                                    _LOG.warning("[Supervisor] rare-license coverage supplement failed (%s) — continuing with filtered result only", _rare_supp_e)
+                        # Coverage-adequacy supplement (2026-11, Phase 3 of the retrieval-safety
+                        # fix): the identity guard above catches a WRONG value; this catches a
+                        # THIN-but-not-wrong result (including the all-the-way-to-zero case) — a
+                        # non-empty-or-empty but structurally sparse filtered result used to
+                        # commit and `return` immediately with nothing to fall back on. Appended
+                        # AFTER the filtered docs (never replaces them) so a correct, targeted
+                        # result still comes first when one exists.
+                        if (
+                            getattr(conf, "RARE_LT_COVERAGE_SUPPLEMENT_ENABLED", False)
+                            and not PersonaSupervisor._is_structurally_adequate(_filtered)
+                        ):
+                            try:
+                                _rare_supp_docs = _vstore.similarity_search(q, k=_top_k_rare)
+                                _rare_seen_fp = {(d.get("content") or "")[:120] for d in _filtered}
+                                _rare_supplement = [
+                                    {"content": (getattr(_sd, "page_content", "") or "")[:_doc_chars2], "metadata": getattr(_sd, "metadata", {}) or {}}
+                                    for _sd in _rare_supp_docs
+                                    if (getattr(_sd, "page_content", "") or "")[:120] not in _rare_seen_fp
+                                ]
+                                if _rare_supplement:
+                                    _LOG.info(
+                                        "[Supervisor] rare-license coverage supplement: %r %s result "
+                                        "(%d docs) → +%d unfiltered docs",
+                                        _rare_lt, "empty" if not _filtered else "thin", len(_filtered), len(_rare_supplement),
+                                    )
+                                    _filtered = _filtered + _rare_supplement
+                            except Exception as _rare_supp_e:
+                                _LOG.warning("[Supervisor] rare-license coverage supplement failed (%s) — continuing with filtered result only", _rare_supp_e)
 
+                        if _filtered:
                             _LOG.info(
                                 "[Supervisor] rare-license ranked fetch: %r → %d docs (%s)",
                                 _rare_lt, len(_filtered),
@@ -6339,25 +6349,32 @@ class PersonaSupervisor:
                             metadata_filter={"department": _query_dept_any},
                             max_docs=int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 4)),
                         )
+                    # coverage-guard fix (2026-11, live-testing follow-up): the guard+supplement
+                    # used to be nested inside the same truthy check that gates the final commit
+                    # below — meaning if ALL 3 relaxation attempts above returned zero (e.g. the
+                    # department name the user just switched to doesn't exactly match any real
+                    # department value), the supplement never ran and this whole department-switch
+                    # request silently fell through to unrelated intent-check logic below. Running
+                    # the guard/supplement unconditionally and gating only the final commit+return
+                    # on the post-supplement result lets a fully-empty case still get a real
+                    # unfiltered-search chance.
+                    _dept_docs, _ = PersonaSupervisor._identity_guard_majority_vote(
+                        _dept_docs, identity_fields=["license_type"],
+                        enforce=getattr(conf, "REGULATORY_IDENTITY_GUARD_ENFORCE", False),
+                        log_label="dept-switch re-retrieve",
+                    )
+                    _dept_vs_sw = getattr(self.retriever, "vectorstore", None)
+                    _dept_docs = PersonaSupervisor._supplement_if_thin(
+                        _dept_docs,
+                        enabled=getattr(conf, "SINGLE_FILTER_COVERAGE_SUPPLEMENT_ENABLED", False),
+                        supplement_fn=lambda: (
+                            [{"content": (getattr(_sd, "page_content", "") or "")[:700], "metadata": getattr(_sd, "metadata", {}) or {}}
+                             for _sd in _dept_vs_sw.similarity_search(_dept_retrieval_q, k=10)]
+                            if _dept_vs_sw is not None else []
+                        ),
+                        log_label="dept-switch re-retrieve",
+                    )
                     if _dept_docs:
-                        # coverage-guard (2026-11, retrieval-safety audit, Group B):
-                        # department is the filter here, so check license_type.
-                        _dept_docs, _ = PersonaSupervisor._identity_guard_majority_vote(
-                            _dept_docs, identity_fields=["license_type"],
-                            enforce=getattr(conf, "REGULATORY_IDENTITY_GUARD_ENFORCE", False),
-                            log_label="dept-switch re-retrieve",
-                        )
-                        _dept_vs_sw = getattr(self.retriever, "vectorstore", None)
-                        _dept_docs = PersonaSupervisor._supplement_if_thin(
-                            _dept_docs,
-                            enabled=getattr(conf, "SINGLE_FILTER_COVERAGE_SUPPLEMENT_ENABLED", False),
-                            supplement_fn=lambda: (
-                                [{"content": (getattr(_sd, "page_content", "") or "")[:700], "metadata": getattr(_sd, "metadata", {}) or {}}
-                                 for _sd in _dept_vs_sw.similarity_search(_dept_retrieval_q, k=10)]
-                                if _dept_vs_sw is not None else []
-                            ),
-                            log_label="dept-switch re-retrieve",
-                        )
                         state.current_docs = _dept_docs
                         state.last_retrieval_query = _dept_retrieval_q
                         _LOG.info(
@@ -6576,25 +6593,30 @@ class PersonaSupervisor:
                                         metadata_filter={"license_type": _lt_infoq},
                                         max_docs=int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 4)),
                                     )
+                                    # coverage-guard fix (2026-11, live-testing follow-up): guard/
+                                    # supplement now run unconditionally (not gated on `if
+                                    # _op_docs_iq:`) so a fully-empty exact-match result still gets
+                                    # a real supplement attempt instead of silently leaving
+                                    # state.current_docs stale from before this operation_group
+                                    # change — see the rare-license loop's identical fix above for
+                                    # the full rationale.
+                                    _op_docs_iq, _ = PersonaSupervisor._identity_guard_majority_vote(
+                                        _op_docs_iq, identity_fields=["department"],
+                                        enforce=getattr(conf, "REGULATORY_IDENTITY_GUARD_ENFORCE", False),
+                                        log_label="info-query op-inferred re-retrieve",
+                                    )
+                                    _iq_vs = getattr(self.retriever, "vectorstore", None)
+                                    _op_docs_iq = PersonaSupervisor._supplement_if_thin(
+                                        _op_docs_iq,
+                                        enabled=getattr(conf, "SINGLE_FILTER_COVERAGE_SUPPLEMENT_ENABLED", False),
+                                        supplement_fn=lambda: (
+                                            [{"content": (getattr(_sd, "page_content", "") or "")[:700], "metadata": getattr(_sd, "metadata", {}) or {}}
+                                             for _sd in _iq_vs.similarity_search(_enrich_iq, k=10)]
+                                            if _iq_vs is not None else []
+                                        ),
+                                        log_label="info-query op-inferred re-retrieve",
+                                    )
                                     if _op_docs_iq:
-                                        # coverage-guard (2026-11, retrieval-safety audit, Group B):
-                                        # license_type is the filter here, so check department.
-                                        _op_docs_iq, _ = PersonaSupervisor._identity_guard_majority_vote(
-                                            _op_docs_iq, identity_fields=["department"],
-                                            enforce=getattr(conf, "REGULATORY_IDENTITY_GUARD_ENFORCE", False),
-                                            log_label="info-query op-inferred re-retrieve",
-                                        )
-                                        _iq_vs = getattr(self.retriever, "vectorstore", None)
-                                        _op_docs_iq = PersonaSupervisor._supplement_if_thin(
-                                            _op_docs_iq,
-                                            enabled=getattr(conf, "SINGLE_FILTER_COVERAGE_SUPPLEMENT_ENABLED", False),
-                                            supplement_fn=lambda: (
-                                                [{"content": (getattr(_sd, "page_content", "") or "")[:700], "metadata": getattr(_sd, "metadata", {}) or {}}
-                                                 for _sd in _iq_vs.similarity_search(_enrich_iq, k=10)]
-                                                if _iq_vs is not None else []
-                                            ),
-                                            log_label="info-query op-inferred re-retrieve",
-                                        )
                                         state.current_docs = _op_docs_iq
                                         state.last_retrieval_query = _enrich_iq
                                         _LOG.info(
@@ -7024,26 +7046,30 @@ class PersonaSupervisor:
                                     elif _ml_dept:
                                         _ml_filter = {"department": _ml_dept}
                                     _recovery_docs = self._practical._retrieve_docs(_last_q, metadata_filter=_ml_filter)
+                                    # coverage-guard fix (2026-11, live-testing follow-up): guard/
+                                    # supplement run unconditionally — a fully-empty exact-match
+                                    # filter must still get a real supplement attempt before
+                                    # falling through to the deflect path below, not skip straight
+                                    # to deflecting (same fix as the other single-fetch sites).
+                                    # filter is department/entity_type_normalized, never
+                                    # license_type — check that instead.
+                                    _recovery_docs, _ = PersonaSupervisor._identity_guard_majority_vote(
+                                        _recovery_docs, identity_fields=["license_type"],
+                                        enforce=getattr(conf, "REGULATORY_IDENTITY_GUARD_ENFORCE", False),
+                                        log_label="multi-license mismatch recovery",
+                                    )
+                                    _ml_vs = getattr(self.retriever, "vectorstore", None)
+                                    _recovery_docs = PersonaSupervisor._supplement_if_thin(
+                                        _recovery_docs,
+                                        enabled=getattr(conf, "SINGLE_FILTER_COVERAGE_SUPPLEMENT_ENABLED", False),
+                                        supplement_fn=lambda: (
+                                            [{"content": (getattr(_sd, "page_content", "") or "")[:700], "metadata": getattr(_sd, "metadata", {}) or {}}
+                                             for _sd in _ml_vs.similarity_search(_last_q, k=10)]
+                                            if _ml_vs is not None else []
+                                        ),
+                                        log_label="multi-license mismatch recovery",
+                                    )
                                     if _recovery_docs:
-                                        # coverage-guard (2026-11, retrieval-safety audit, Group B):
-                                        # filter is department/entity_type_normalized, never
-                                        # license_type — check that instead.
-                                        _recovery_docs, _ = PersonaSupervisor._identity_guard_majority_vote(
-                                            _recovery_docs, identity_fields=["license_type"],
-                                            enforce=getattr(conf, "REGULATORY_IDENTITY_GUARD_ENFORCE", False),
-                                            log_label="multi-license mismatch recovery",
-                                        )
-                                        _ml_vs = getattr(self.retriever, "vectorstore", None)
-                                        _recovery_docs = PersonaSupervisor._supplement_if_thin(
-                                            _recovery_docs,
-                                            enabled=getattr(conf, "SINGLE_FILTER_COVERAGE_SUPPLEMENT_ENABLED", False),
-                                            supplement_fn=lambda: (
-                                                [{"content": (getattr(_sd, "page_content", "") or "")[:700], "metadata": getattr(_sd, "metadata", {}) or {}}
-                                                 for _sd in _ml_vs.similarity_search(_last_q, k=10)]
-                                                if _ml_vs is not None else []
-                                            ),
-                                            log_label="multi-license mismatch recovery",
-                                        )
                                         _LOG.info(
                                             "[Supervisor] multi-license mismatch recovery: re-retrieved %d docs using last_q=%r filter=%s",
                                             len(_recovery_docs), _last_q[:50], _ml_filter,
@@ -7318,25 +7344,28 @@ class PersonaSupervisor:
                             metadata_filter={"license_type": license_type} if license_type else None,
                             max_docs=int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 4)),
                         )
+                        # coverage-guard fix (2026-11, live-testing follow-up): guard/
+                        # supplement run unconditionally — a fully-empty exact-match result
+                        # must still get a real supplement attempt instead of silently
+                        # leaving state.current_docs stale (same fix as the other sites).
+                        # license_type is the filter here, so check department.
+                        _op_docs_6, _ = PersonaSupervisor._identity_guard_majority_vote(
+                            _op_docs_6, identity_fields=["department"],
+                            enforce=getattr(conf, "REGULATORY_IDENTITY_GUARD_ENFORCE", False),
+                            log_label="legal_q Step6 op-inferred re-retrieve",
+                        )
+                        _og6_vs = getattr(self.retriever, "vectorstore", None)
+                        _op_docs_6 = PersonaSupervisor._supplement_if_thin(
+                            _op_docs_6,
+                            enabled=getattr(conf, "SINGLE_FILTER_COVERAGE_SUPPLEMENT_ENABLED", False),
+                            supplement_fn=lambda: (
+                                [{"content": (getattr(_sd, "page_content", "") or "")[:700], "metadata": getattr(_sd, "metadata", {}) or {}}
+                                 for _sd in _og6_vs.similarity_search(_enrich_q_6, k=10)]
+                                if _og6_vs is not None else []
+                            ),
+                            log_label="legal_q Step6 op-inferred re-retrieve",
+                        )
                         if _op_docs_6:
-                            # coverage-guard (2026-11, retrieval-safety audit, Group B):
-                            # license_type is the filter here, so check department.
-                            _op_docs_6, _ = PersonaSupervisor._identity_guard_majority_vote(
-                                _op_docs_6, identity_fields=["department"],
-                                enforce=getattr(conf, "REGULATORY_IDENTITY_GUARD_ENFORCE", False),
-                                log_label="legal_q Step6 op-inferred re-retrieve",
-                            )
-                            _og6_vs = getattr(self.retriever, "vectorstore", None)
-                            _op_docs_6 = PersonaSupervisor._supplement_if_thin(
-                                _op_docs_6,
-                                enabled=getattr(conf, "SINGLE_FILTER_COVERAGE_SUPPLEMENT_ENABLED", False),
-                                supplement_fn=lambda: (
-                                    [{"content": (getattr(_sd, "page_content", "") or "")[:700], "metadata": getattr(_sd, "metadata", {}) or {}}
-                                     for _sd in _og6_vs.similarity_search(_enrich_q_6, k=10)]
-                                    if _og6_vs is not None else []
-                                ),
-                                log_label="legal_q Step6 op-inferred re-retrieve",
-                            )
                             state.current_docs = _op_docs_6
                             state.last_retrieval_query = _enrich_q_6
                             _LOG.info(
@@ -7405,15 +7434,30 @@ class PersonaSupervisor:
                                 metadata_filter={"license_type": license_type},
                                 max_docs=int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 4)),
                             )
+                        # coverage-guard fix (2026-11, live-testing follow-up): guard+
+                        # supplement now run unconditionally — if BOTH the operation_topic
+                        # filter and the license_type fallback return zero, a third,
+                        # fully-unfiltered attempt still gets a chance before leaving
+                        # state.current_docs stale on the old operation_topic.
+                        # the license_type-fallback branch above is scoped to one
+                        # license_type — check department for a stray wrong value.
+                        _ot_docs_7, _ = PersonaSupervisor._identity_guard_majority_vote(
+                            _ot_docs_7, identity_fields=["department"],
+                            enforce=getattr(conf, "REGULATORY_IDENTITY_GUARD_ENFORCE", False),
+                            log_label="Step7 op_topic switch",
+                        )
+                        _ot7_vs = getattr(self.retriever, "vectorstore", None)
+                        _ot_docs_7 = PersonaSupervisor._supplement_if_thin(
+                            _ot_docs_7,
+                            enabled=getattr(conf, "SINGLE_FILTER_COVERAGE_SUPPLEMENT_ENABLED", False),
+                            supplement_fn=lambda: (
+                                [{"content": (getattr(_sd, "page_content", "") or "")[:700], "metadata": getattr(_sd, "metadata", {}) or {}}
+                                 for _sd in _ot7_vs.similarity_search(f"{query} {_new_ot_7}".strip(), k=10)]
+                                if _ot7_vs is not None else []
+                            ),
+                            log_label="Step7 op_topic switch",
+                        )
                         if _ot_docs_7:
-                            # coverage-guard (2026-11, retrieval-safety audit, Group B):
-                            # the license_type-fallback branch above is scoped to one
-                            # license_type — check department for a stray wrong value.
-                            _ot_docs_7, _ = PersonaSupervisor._identity_guard_majority_vote(
-                                _ot_docs_7, identity_fields=["department"],
-                                enforce=getattr(conf, "REGULATORY_IDENTITY_GUARD_ENFORCE", False),
-                                log_label="Step7 op_topic switch",
-                            )
                             state.current_docs = _ot_docs_7
                             state.last_retrieval_query = f"{query} {_new_ot_7}".strip()
                             _LOG.info(
@@ -12445,15 +12489,30 @@ class PersonaSupervisor:
                                                 metadata_filter={"license_type": _license_type_for_slots},
                                                 max_docs=int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 4)),
                                             )
+                                        # coverage-guard fix (2026-11, live-testing follow-up): guard+
+                                        # supplement now run unconditionally — if BOTH the
+                                        # operation_topic filter and the license_type fallback
+                                        # return zero, a third unfiltered attempt still gets a
+                                        # chance before leaving state.current_docs stale.
+                                        # the license_type-fallback branch above scopes to one
+                                        # license_type — check department for a stray wrong value.
+                                        _ot_docs_3b, _ = PersonaSupervisor._identity_guard_majority_vote(
+                                            _ot_docs_3b, identity_fields=["department"],
+                                            enforce=getattr(conf, "REGULATORY_IDENTITY_GUARD_ENFORCE", False),
+                                            log_label="Step3b op_topic cascade",
+                                        )
+                                        _ot3b_vs = getattr(self.retriever, "vectorstore", None)
+                                        _ot_docs_3b = PersonaSupervisor._supplement_if_thin(
+                                            _ot_docs_3b,
+                                            enabled=getattr(conf, "SINGLE_FILTER_COVERAGE_SUPPLEMENT_ENABLED", False),
+                                            supplement_fn=lambda: (
+                                                [{"content": (getattr(_sd, "page_content", "") or "")[:700], "metadata": getattr(_sd, "metadata", {}) or {}}
+                                                 for _sd in _ot3b_vs.similarity_search(f"{_full_ui} {_matched_ot_3b}".strip(), k=10)]
+                                                if _ot3b_vs is not None else []
+                                            ),
+                                            log_label="Step3b op_topic cascade",
+                                        )
                                         if _ot_docs_3b:
-                                            # coverage-guard (2026-11, retrieval-safety audit, Group B):
-                                            # the license_type-fallback branch above scopes to one
-                                            # license_type — check department for a stray wrong value.
-                                            _ot_docs_3b, _ = PersonaSupervisor._identity_guard_majority_vote(
-                                                _ot_docs_3b, identity_fields=["department"],
-                                                enforce=getattr(conf, "REGULATORY_IDENTITY_GUARD_ENFORCE", False),
-                                                log_label="Step3b op_topic cascade",
-                                            )
                                             state.current_docs = _ot_docs_3b
                                             state.last_retrieval_query = f"{_full_ui} {_matched_ot_3b}".strip()
                                     except Exception as _e_ot_3b:
@@ -12498,25 +12557,28 @@ class PersonaSupervisor:
                                             metadata_filter={"license_type": _license_type_for_slots},
                                             max_docs=int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 4)),
                                         )
+                                        # coverage-guard fix (2026-11, live-testing follow-up): guard/
+                                        # supplement run unconditionally — a fully-empty exact-match
+                                        # result must still get a real supplement attempt instead of
+                                        # silently leaving state.current_docs stale.
+                                        # license_type is the filter here, so check department.
+                                        _op_docs_3b, _ = PersonaSupervisor._identity_guard_majority_vote(
+                                            _op_docs_3b, identity_fields=["department"],
+                                            enforce=getattr(conf, "REGULATORY_IDENTITY_GUARD_ENFORCE", False),
+                                            log_label="Step3b op-inferred re-retrieve",
+                                        )
+                                        _3b_vs = getattr(self.retriever, "vectorstore", None)
+                                        _op_docs_3b = PersonaSupervisor._supplement_if_thin(
+                                            _op_docs_3b,
+                                            enabled=getattr(conf, "SINGLE_FILTER_COVERAGE_SUPPLEMENT_ENABLED", False),
+                                            supplement_fn=lambda: (
+                                                [{"content": (getattr(_sd, "page_content", "") or "")[:700], "metadata": getattr(_sd, "metadata", {}) or {}}
+                                                 for _sd in _3b_vs.similarity_search(_enrich_3b, k=10)]
+                                                if _3b_vs is not None else []
+                                            ),
+                                            log_label="Step3b op-inferred re-retrieve",
+                                        )
                                         if _op_docs_3b:
-                                            # coverage-guard (2026-11, retrieval-safety audit, Group B):
-                                            # license_type is the filter here, so check department.
-                                            _op_docs_3b, _ = PersonaSupervisor._identity_guard_majority_vote(
-                                                _op_docs_3b, identity_fields=["department"],
-                                                enforce=getattr(conf, "REGULATORY_IDENTITY_GUARD_ENFORCE", False),
-                                                log_label="Step3b op-inferred re-retrieve",
-                                            )
-                                            _3b_vs = getattr(self.retriever, "vectorstore", None)
-                                            _op_docs_3b = PersonaSupervisor._supplement_if_thin(
-                                                _op_docs_3b,
-                                                enabled=getattr(conf, "SINGLE_FILTER_COVERAGE_SUPPLEMENT_ENABLED", False),
-                                                supplement_fn=lambda: (
-                                                    [{"content": (getattr(_sd, "page_content", "") or "")[:700], "metadata": getattr(_sd, "metadata", {}) or {}}
-                                                     for _sd in _3b_vs.similarity_search(_enrich_3b, k=10)]
-                                                    if _3b_vs is not None else []
-                                                ),
-                                                log_label="Step3b op-inferred re-retrieve",
-                                            )
                                             state.current_docs = _op_docs_3b
                                             state.last_retrieval_query = _enrich_3b
                                             _LOG.info(
@@ -12896,25 +12958,30 @@ class PersonaSupervisor:
                         slot_context=_dept_slot_ctx,
                         max_docs=int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 6)),
                     )
+                    # coverage-guard fix (2026-11, live-testing follow-up): guard/supplement
+                    # now run unconditionally — the user just explicitly PICKED this
+                    # department from a menu, so a zero-result exact-match filter must get
+                    # a real supplement attempt before falling back to "keep existing docs"
+                    # (which are pre-selection docs, possibly for a different department
+                    # entirely — not actually a safe degrade for this site).
+                    # department is the filter here, so check license_type.
+                    _dept_docs, _ = PersonaSupervisor._identity_guard_majority_vote(
+                        _dept_docs, identity_fields=["license_type"],
+                        enforce=getattr(conf, "REGULATORY_IDENTITY_GUARD_ENFORCE", False),
+                        log_label="department pending-slot retrieval",
+                    )
+                    _dv_vs = getattr(self.retriever, "vectorstore", None)
+                    _dept_docs = PersonaSupervisor._supplement_if_thin(
+                        _dept_docs,
+                        enabled=getattr(conf, "SINGLE_FILTER_COVERAGE_SUPPLEMENT_ENABLED", False),
+                        supplement_fn=lambda: (
+                            [{"content": (getattr(_sd, "page_content", "") or "")[:700], "metadata": getattr(_sd, "metadata", {}) or {}}
+                             for _sd in _dv_vs.similarity_search(state.last_retrieval_query or _dept_val, k=10)]
+                            if _dv_vs is not None else []
+                        ),
+                        log_label="department pending-slot retrieval",
+                    )
                     if _dept_docs:
-                        # coverage-guard (2026-11, retrieval-safety audit, minor gap):
-                        # department is the filter here, so check license_type.
-                        _dept_docs, _ = PersonaSupervisor._identity_guard_majority_vote(
-                            _dept_docs, identity_fields=["license_type"],
-                            enforce=getattr(conf, "REGULATORY_IDENTITY_GUARD_ENFORCE", False),
-                            log_label="department pending-slot retrieval",
-                        )
-                        _dv_vs = getattr(self.retriever, "vectorstore", None)
-                        _dept_docs = PersonaSupervisor._supplement_if_thin(
-                            _dept_docs,
-                            enabled=getattr(conf, "SINGLE_FILTER_COVERAGE_SUPPLEMENT_ENABLED", False),
-                            supplement_fn=lambda: (
-                                [{"content": (getattr(_sd, "page_content", "") or "")[:700], "metadata": getattr(_sd, "metadata", {}) or {}}
-                                 for _sd in _dv_vs.similarity_search(state.last_retrieval_query or _dept_val, k=10)]
-                                if _dv_vs is not None else []
-                            ),
-                            log_label="department pending-slot retrieval",
-                        )
                         state.current_docs = _dept_docs
                         _LOG.info(
                             "[Supervisor] department retrieval: dept=%r entity=%r docs=%d",

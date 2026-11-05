@@ -13,6 +13,15 @@ site; only the value assigned to state.current_docs changes.
 7 sites: dept-switch re-retrieve, info-query op-inferred re-retrieve,
 multi-license mismatch recovery, legal_q Step6 op-inferred re-retrieve,
 Step7 op_topic switch, Step3b op_topic cascade, Step3b op-inferred re-retrieve.
+
+Follow-up fix (2026-11, live-testing): live testing found that guard+
+supplement had been nested INSIDE the same `if <raw_fetch_result>:` check
+that gates the final commit — meaning a completely-empty (zero-result)
+exact-match filter never got a chance at the coverage-adequacy supplement,
+reproducing the original silent-failure bug for that one sub-case. All 7
+sites now run guard+supplement unconditionally on the raw fetch result, and
+gate ONLY the final commit (and, where present, the `return`) on the
+post-supplement result — see each class's `test_guard_not_gated_on_raw_result`.
 """
 from __future__ import annotations
 
@@ -59,6 +68,12 @@ class TestDeptSwitchReRetrieveSafety:
         assert "return  # proceed" not in block  # it's the end anchor, not inside
         assert "state.current_docs = _dept_docs" in block
 
+    def test_guard_not_gated_on_raw_result(self):
+        block = self._blk()
+        guard_idx = block.index("_identity_guard_majority_vote(")
+        if_idx = block.index("if _dept_docs:")
+        assert guard_idx < if_idx
+
 
 @pytest.mark.unit
 class TestInfoQueryOpInferredReRetrieveSafety:
@@ -76,6 +91,12 @@ class TestInfoQueryOpInferredReRetrieveSafety:
     def test_supplement_wired(self):
         block = self._blk()
         assert "_supplement_if_thin(" in block
+
+    def test_guard_not_gated_on_raw_result(self):
+        block = self._blk()
+        guard_idx = block.index("_identity_guard_majority_vote(")
+        if_idx = block.index("if _op_docs_iq:")
+        assert guard_idx < if_idx
 
 
 @pytest.mark.unit
@@ -99,6 +120,12 @@ class TestMultiLicenseMismatchRecoverySafety:
         block = self._blk()
         assert "state.current_docs = _recovery_docs" in block
 
+    def test_guard_not_gated_on_raw_result(self):
+        block = self._blk()
+        guard_idx = block.index("_identity_guard_majority_vote(")
+        if_idx = block.index("if _recovery_docs:")
+        assert guard_idx < if_idx
+
 
 @pytest.mark.unit
 class TestStep6OpInferredReRetrieveSafety:
@@ -117,12 +144,22 @@ class TestStep6OpInferredReRetrieveSafety:
         block = self._blk()
         assert "_supplement_if_thin(" in block
 
+    def test_guard_not_gated_on_raw_result(self):
+        block = self._blk()
+        guard_idx = block.index("_identity_guard_majority_vote(")
+        if_idx = block.index("if _op_docs_6:")
+        assert guard_idx < if_idx
+
 
 @pytest.mark.unit
 class TestStep7OpTopicSwitchSafety:
+    """Guard+supplement run unconditionally after the 2-stage fetch (2026-11,
+    live-testing follow-up) — not nested inside `if _ot_docs_7:` — so a fully
+    empty result from BOTH stages still gets a real supplement attempt."""
+
     def _blk(self):
         return _block(
-            "if _ot_docs_7:",
+            "_ot_docs_7 = self._practical._retrieve_docs(",
             "Step7 op_topic switch: %r → %r docs=%d",
         )
 
@@ -131,14 +168,26 @@ class TestStep7OpTopicSwitchSafety:
         assert "_identity_guard_majority_vote(" in block
         assert 'identity_fields=["department"]' in block
 
+    def test_supplement_wired(self):
+        block = self._blk()
+        assert "_supplement_if_thin(" in block
+
+    def test_guard_and_supplement_not_gated_on_raw_result(self):
+        block = self._blk()
+        guard_idx = block.index("_identity_guard_majority_vote(")
+        if_idx = block.index("if _ot_docs_7:")
+        assert guard_idx < if_idx
+
 
 @pytest.mark.unit
 class TestStep3bOpTopicCascadeSafety:
-    """Lives in _route_pending_slot_to_persona, not _maybe_build_slot_queue_from_docs."""
+    """Lives in _route_pending_slot_to_persona, not _maybe_build_slot_queue_from_docs.
+    Guard+supplement run unconditionally (2026-11, live-testing follow-up),
+    not nested inside `if _ot_docs_3b:`."""
 
     def _blk(self):
         return _block(
-            "if _ot_docs_3b:",
+            "_ot_docs_3b = self._practical._retrieve_docs(",
             'state.last_retrieval_query = f"{_full_ui} {_matched_ot_3b}".strip()',
             source=_route_source(),
         )
@@ -148,14 +197,26 @@ class TestStep3bOpTopicCascadeSafety:
         assert "_identity_guard_majority_vote(" in block
         assert 'identity_fields=["department"]' in block
 
+    def test_supplement_wired(self):
+        block = self._blk()
+        assert "_supplement_if_thin(" in block
+
+    def test_guard_not_gated_on_raw_result(self):
+        block = self._blk()
+        guard_idx = block.index("_identity_guard_majority_vote(")
+        if_idx = block.index("if _ot_docs_3b:")
+        assert guard_idx < if_idx
+
 
 @pytest.mark.unit
 class TestStep3bOpInferredReRetrieveSafety:
-    """Lives in _route_pending_slot_to_persona, not _maybe_build_slot_queue_from_docs."""
+    """Lives in _route_pending_slot_to_persona, not _maybe_build_slot_queue_from_docs.
+    Guard+supplement run unconditionally (2026-11, live-testing follow-up),
+    not nested inside `if _op_docs_3b:`."""
 
     def _blk(self):
         return _block(
-            "if _op_docs_3b:",
+            "_op_docs_3b = self._practical._retrieve_docs(",
             "Step3b op-inferred re-retrieve: op=%r docs=%d",
             source=_route_source(),
         )
@@ -168,6 +229,12 @@ class TestStep3bOpInferredReRetrieveSafety:
     def test_supplement_wired(self):
         block = self._blk()
         assert "_supplement_if_thin(" in block
+
+    def test_guard_not_gated_on_raw_result(self):
+        block = self._blk()
+        guard_idx = block.index("_identity_guard_majority_vote(")
+        if_idx = block.index("if _op_docs_3b:")
+        assert guard_idx < if_idx
 
 
 @pytest.mark.unit
