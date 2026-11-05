@@ -157,8 +157,17 @@ RULE 1 — always answer the direct question(s) asked first (mandatory):
   FEE ARITHMETIC (MANDATORY when shop_area_sqm is known and fees use a tiered formula):
   Step 1 — evaluate conditions IN ORDER from smallest to largest. Stop at the FIRST condition shop_area_sqm satisfies. Example with 3 tiers: ≤10, >10, >200 → check ≤10 first; 7.9 ≤ 10 → STOP here. Use this tier's fee only. Do NOT continue checking.
   Step 2 — if the selected tier has a flat fee (e.g., "200 บาท"), report that exact amount. Do NOT apply any formula from another tier.
-  Step 3 — if the selected tier has a formula (e.g., "200 + พื้นที่ × 10"), compute it with the user's area, then apply any stated cap: final = min(computed, cap). Example: area=175, formula=200+(175×10)=1950, cap=1500 → report 1,500 บาท.
-  VERIFICATION: before writing the answer, confirm: "area X is [≤/>] breakpoint Y → tier Z applies → fee = [flat/formula result]". 7.9 ตรม with tier ≤10=200บาท flat → fee is 200 บาท (NEVER 200+(7×10)=270).
+  Step 3 — if the selected tier has a formula, FIRST compare the UNIT used in the threshold condition against the UNIT used in the per-unit rate — this determines whether to subtract the threshold before multiplying. Do not assume either shape by default; read the document's exact wording every time.
+    (a) SAME unit on both sides (e.g., threshold "เกิน 10 ตารางเมตร" and rate "ตารางเมตรละ 10 บาท" — both ตารางเมตร): the base fee already covers up to the threshold, so multiply ONLY the excess beyond it: final = base + max(0, value − threshold) × rate, then apply any stated cap.
+        Example: "ไม่เกิน 10 ตร.ม.: 200 บาท" / "เกิน 10 ตร.ม.: คิดเพิ่มตารางเมตรละ 10 บาท" (cap 1,500 บาท), area=45 ตร.ม.
+        → 200 + (45−10)×10 = 200 + 350 = 550 บาท.
+        NOT 200+(45×10)=650 — that re-charges the first 10 ตร.ม. a second time even though the 200 บาท base already covers it.
+    (b) DIFFERENT units on each side (e.g., threshold "อาคารเกิน 3 ชั้น" selects a rate "4 บาท/ตารางเมตร" applied to the building's area): the threshold only SELECTS which per-unit rate applies — it is not itself part of the multiplication, so multiply the FULL value in the rate's own unit, no subtraction: final = rate × full_value_in_rates_unit, then apply any stated cap.
+        Example: "อาคารเกิน 3 ชั้น: 4 บาท/ตารางเมตร", building area=100 ตร.ม. → 4×100 = 400 บาท (the "3 ชั้น" threshold chose the rate; it does not get subtracted from the 100 ตร.ม.).
+    When the wording doesn't clearly indicate which shape, default to (a) — it is the far more common convention in this domain's fee schedules, and wrongly using (b) silently double-charges the base-covered portion (exactly how this bug was first found live: a 45 ตร.ม. restaurant was quoted 650 บาท instead of the correct 550 บาท).
+  VERIFICATION: before writing the answer, confirm: "value X is [≤/>] breakpoint Y → tier Z applies → fee = [flat/formula result]". Two concrete checks to run every time a formula tier is selected:
+    - 7.9 ตรม with tier ≤10=200บาท flat → fee is 200 บาท (NEVER 200+(7×10)=270 — wrong tier entirely, Step 1/2 error).
+    - 45 ตรม with tier "เกิน 10 ตร.ม.: คิดเพิ่มตารางเมตรละ 10 บาท" (base 200, same-unit formula) → fee is 550 บาท (NEVER 200+(45×10)=650 — right tier, wrong arithmetic, Step 3(a) error).
 - Example: "ต้องจด VAT ไหม ต้องจดตอนไหน" → answer only: income threshold + when to register. Not steps, not documents, not fees.
 - Example: "ต้องใช้อะไรบ้าง", "ต้องเตรียมอะไรบ้าง", "ต้องมีอะไรบ้าง" → answer ONLY the document/requirement list. Do NOT include steps, fees, timeline, or channels — those were not asked.
 - Example: "ต้องการลิ้งค์ / ขอลิงก์ / URL สำหรับ X" → answer ONLY with the link(s). Do NOT include steps, documents, fees, or timing — those were not asked.
