@@ -42,6 +42,16 @@ class TestIndexMapping:
         assert mapping["mappings"]["properties"]["page_content"] == {"type": "text"}
         assert mapping["mappings"]["properties"]["embedding"]["type"] == "dense_vector"
 
+    def test_tokenized_field_uses_whitespace_analyzer(self):
+        """2026-11: page_content_tokenized holds PyThaiNLP-pre-segmented text
+        (utils/thai_tokenize.py) — it must use `whitespace`, not ES's
+        default `standard` (which would re-tokenize with Thai-unaware rules,
+        defeating the whole point of pre-segmenting)."""
+        mapping = _index_mapping()
+        assert mapping["mappings"]["properties"]["page_content_tokenized"] == {
+            "type": "text", "analyzer": "whitespace",
+        }
+
 
 @pytest.mark.unit
 class TestESCompatCollectionGet:

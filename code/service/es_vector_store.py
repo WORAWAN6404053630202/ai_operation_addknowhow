@@ -35,6 +35,7 @@ import conf
 from utils.es_filter_translate import chroma_filter_to_es_query
 from utils.llm_call import get_shared_http_client
 from utils.logger import get_logger
+from utils.thai_tokenize import tokenize_thai_for_search
 
 _LOG = get_logger(__name__)
 
@@ -74,6 +75,17 @@ def _index_mapping() -> dict:
     ]
     properties: Dict[str, Any] = {
         "page_content": {"type": "text"},
+        # 2026-11: PyThaiNLP-pre-segmented copy of page_content, whitespace-
+        # joined — the BM25/match leg (ESCompatCollection.match_search) reads
+        # THIS field, not page_content, because ES's default `standard`
+        # analyzer barely recognizes Thai word boundaries at all and its
+        # built-in `thai` analyzer has real segmentation bugs on this
+        # corpus's vocabulary (see utils/thai_tokenize.py's docstring for the
+        # confirmed examples). `whitespace` analyzer here is deliberate: the
+        # text already has its word boundaries marked by
+        # utils.thai_tokenize.tokenize_thai_for_search, so ES must not
+        # re-tokenize it with its own (Thai-unaware) rules.
+        "page_content_tokenized": {"type": "text", "analyzer": "whitespace"},
         "embedding": {
             "type": "dense_vector",
             "dims": _EMBEDDING_DIMS,
@@ -198,8 +210,13 @@ class ESCompatCollection:
         point of moving off Chroma. Returns [(Document, raw_bm25_score), ...]
         ranked by ES's own relevance score (NOT comparable to kNN's 0-1
         cosine scale — see _rrf_fuse below for why these never get mixed
-        into _sim)."""
-        body: Dict[str, Any] = {"query": {"bool": {"must": [{"match": {"page_content": query_text}}]}}}
+        into _sim). Matches against `page_content_tokenized`, not raw
+        `page_content` — see that field's mapping comment in
+        _index_mapping() for why. `query_text` is tokenized with the SAME
+        function used at index time so both sides agree on word
+        boundaries."""
+        tokenized_query = tokenize_thai_for_search(query_text)
+        body: Dict[str, Any] = {"query": {"bool": {"must": [{"match": {"page_content_tokenized": tokenized_query}}]}}}
         if where:
             body["query"]["bool"]["filter"] = [chroma_filter_to_es_query(where)]
         resp = self._client.search(index=self._index, size=k, body=body, source={"excludes": ["embedding"]})

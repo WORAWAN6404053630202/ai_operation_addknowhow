@@ -22,7 +22,14 @@ from service.es_vector_store import ESCompatCollection, ESCompatVectorStore, _rr
 
 @pytest.mark.unit
 class TestMatchSearch:
-    def test_issues_match_query_on_page_content(self):
+    def test_issues_match_query_on_tokenized_field(self):
+        """2026-11: targets page_content_tokenized, not raw page_content —
+        ES's default `standard` analyzer barely segments Thai at all, and
+        its built-in `thai` analyzer has confirmed real segmentation bugs
+        on this corpus's vocabulary (see utils/thai_tokenize.py's
+        docstring). "ค่าธรรมเนียม" is already a single whole word so
+        tokenization is a no-op here — the field-name change is the thing
+        under test."""
         client = MagicMock()
         client.search.return_value = {"hits": {"hits": []}}
         coll = ESCompatCollection(client, "my_index")
@@ -31,8 +38,24 @@ class TestMatchSearch:
 
         call_kwargs = client.search.call_args.kwargs
         assert call_kwargs["size"] == 10
-        assert call_kwargs["body"]["query"]["bool"]["must"] == [{"match": {"page_content": "ค่าธรรมเนียม"}}]
+        assert call_kwargs["body"]["query"]["bool"]["must"] == [{"match": {"page_content_tokenized": "ค่าธรรมเนียม"}}]
         assert "filter" not in call_kwargs["body"]["query"]["bool"]
+
+    def test_multi_word_query_text_is_tokenized_before_matching(self):
+        """A query whose words run together with no spaces (normal Thai
+        input) must come out space-separated in the `match` query, matching
+        the same word boundaries page_content_tokenized was indexed with —
+        otherwise the two sides disagree and BM25 can't match at all."""
+        client = MagicMock()
+        client.search.return_value = {"hits": {"hits": []}}
+        coll = ESCompatCollection(client, "my_index")
+
+        coll.match_search("การตรวจสอบสภาพอาคาร", k=10)
+
+        sent_query = client.search.call_args.kwargs["body"]["query"]["bool"]["must"][0]["match"]["page_content_tokenized"]
+        tokens = sent_query.split()
+        assert len(tokens) > 1
+        assert "ตรวจสอบ" in tokens  # the exact term ES's own `thai` analyzer gets wrong
 
     def test_filter_translated_into_bool_filter_clause(self):
         client = MagicMock()

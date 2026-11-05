@@ -35,6 +35,7 @@ from langchain_core.documents import Document
 import conf
 from service.data_loader import DataLoader
 from utils.pdf_text_chunking import split_into_subchunks
+from utils.thai_tokenize import tokenize_thai_for_search
 
 def _pdf_tags(source_file: str) -> dict:
     return {
@@ -437,6 +438,14 @@ def build_merged_documents(topics_with_fields: list[dict[str, Any]], source_file
                 "chunk_index": idx,
                 "chunk_total": chunk_total,
                 "research_reference": research_reference,
+                # 2026-11: PyThaiNLP-pre-segmented copy of page_content for
+                # ES's BM25/match leg — see utils/thai_tokenize.py and
+                # es_vector_store.py's _index_mapping() comment on
+                # page_content_tokenized for why this exists. Written
+                # unconditionally (not gated on conf.USE_ELASTICSEARCH) since
+                # this function is backend-agnostic and Chroma simply
+                # ignores a metadata key it never queries.
+                "page_content_tokenized": tokenize_thai_for_search(page_content),
                 **_pdf_tags(source_file),
             }
             docs.append(Document(page_content=page_content, metadata=metadata))
