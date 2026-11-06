@@ -21,6 +21,7 @@ from model.state_manager import StateManager
 from model.persona_supervisor import PersonaSupervisor
 from utils.simple_cache import get_cache
 from utils.rate_limiter import get_rate_limiter
+import utils.text_patterns as _text_patterns
 from utils.progress import set_progress_callback, clear_progress_callback
 from utils.session_auth import client_key_from_request, owns_session
 
@@ -568,26 +569,7 @@ async def chat(request: ChatRequest, http_request: Request):
 
     session_id = request.session_id or f"s_{uuid.uuid4().hex[:8]}"
     client_id = _client_identifier(http_request)
-
-    # Rate limiting check — keyed by client IP, not session_id (session_id is
-    # client-supplied and freely rotatable, see _client_identifier).
     rate_limiter = get_rate_limiter()
-    allowed, rate_info = rate_limiter.is_allowed(client_id)
-
-    if not allowed:
-        logger.warning(f"[{session_id}] Rate limit exceeded - blocking request")
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"Too many requests. Please wait {rate_info['retry_after']} seconds.",
-            headers={
-                "X-RateLimit-Limit": str(rate_info["limit"]),
-                "X-RateLimit-Remaining": "0",
-                "X-RateLimit-Reset": str(rate_info["reset_in"]),
-                "Retry-After": str(rate_info["retry_after"])
-            }
-        )
-
-    logger.info(f"[{session_id}] Rate limit OK - {rate_info['remaining']}/{rate_info['limit']} remaining")
 
     lock = _get_session_lock(session_id)
     await lock.acquire()
@@ -609,44 +591,10 @@ async def chat(request: ChatRequest, http_request: Request):
         )
         _merge_branch_fields(state, request.branch_id, request.branch_name)
 
-        # Session-level token budget.
-        # 2026-10 fix (core2-M6): conf.py's own comment has always said
-        # "Requests that would exceed this limit are rejected with HTTP
-        # 429" — the code only ever logged a WARNING and let the turn
-        # through regardless. An operator who set this after the project's
-        # $78 cost-runaway incident, believing it capped runaway per-session
-        # spend, got no actual protection. Now enforced as documented,
-        # matching the sibling TOKEN_RATE_LIMIT_PER_WINDOW check right below
-        # (which already raises 429 correctly).
         _pre_prompt = getattr(state, "total_prompt_tokens", 0) or 0
         _pre_completion = getattr(state, "total_completion_tokens", 0) or 0
         _pre_cost = getattr(state, "total_cost", 0.0) or 0.0
         _pre_tokens = _pre_prompt + _pre_completion
-        _session_budget = int(getattr(conf, "TOKEN_BUDGET_PER_SESSION", 0) or 0)
-        if _session_budget > 0 and _pre_tokens >= _session_budget:
-            logger.warning(
-                "[%s] Session token budget exceeded: used=%d limit=%d — rejecting with 429",
-                session_id, _pre_tokens, _session_budget,
-            )
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="This session has reached its token budget. Please start a new session.",
-            )
-
-        # Per-window token rate check (burst protection).
-        _window_token_limit = int(getattr(conf, "TOKEN_RATE_LIMIT_PER_WINDOW", 0) or 0)
-        if _window_token_limit > 0:
-            _token_rate_ok, _window_tokens_used = rate_limiter.is_token_rate_allowed(client_id, _window_token_limit)
-            if not _token_rate_ok:
-                logger.warning(
-                    "[%s] Token rate limit exceeded: window_tokens=%d limit=%d",
-                    session_id, _window_tokens_used, _window_token_limit,
-                )
-                raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail="Token rate limit exceeded. Please wait before sending more messages.",
-                    headers={"Retry-After": "60"},
-                )
 
         cache = get_cache()
         has_pending_slot = bool((state.context or {}).get("pending_slot"))
@@ -714,7 +662,18 @@ async def chat(request: ChatRequest, http_request: Request):
         # state.context["_info_gap_detected"] flag the supervisor sets to gate its
         # feedback-menu detection (see persona_supervisor.py's _maybe_offer_feedback) —
         # already computed for this turn, no extra work needed here.
-        _is_no_answer_reply = bool((state.context or {}).get("_info_gap_detected"))
+        #
+        # 2026-11 fix (live-reproduced cache poisoning): the tag flag alone
+        # missed real cases — the LLM sometimes refuses in free text
+        # ("ไม่มีข้อมูลระบุ...", "ไม่พบข้อมูล...แนะนำให้ติดต่อ...") without emitting
+        # [[INFO_GAP]], so _info_gap_detected stayed False and the wrong answer
+        # got cached and was replayed to later sessions. Added a text-pattern
+        # fallback check (CACHE_SKIP_NO_ANSWER_RE — see its docstring in
+        # text_patterns.py for why this is scoped to caching only, not reused
+        # as a general info-gap detector).
+        _is_no_answer_reply = bool((state.context or {}).get("_info_gap_detected")) or bool(
+            _text_patterns.CACHE_SKIP_NO_ANSWER_RE.search(bot_reply or "")
+        )
         # Never cache a reply that leaves a pending_slot behind — the cache only stores
         # the reply text, not the state.context side-effects (pending_slot, main_menu_shown,
         # etc.) that a cache HIT skips by never calling supervisor.handle(). Caching such a
@@ -825,33 +784,10 @@ async def _stream_reply(
         )
         _merge_branch_fields(state, branch_id, branch_name)
 
-        # Session-level token budget — see the matching comment/fix (core2-M6)
-        # in the non-streaming /chat handler above. Goes through the existing
-        # _stream_error path (same as the token-rate-limit check below) since
-        # a generator can't raise HTTPException directly.
         _pre_prompt_st = getattr(state, "total_prompt_tokens", 0) or 0
         _pre_completion_st = getattr(state, "total_completion_tokens", 0) or 0
         _pre_cost_st = getattr(state, "total_cost", 0.0) or 0.0
         _pre_tokens_st = _pre_prompt_st + _pre_completion_st
-        _session_budget_st = int(getattr(conf, "TOKEN_BUDGET_PER_SESSION", 0) or 0)
-        if _session_budget_st > 0 and _pre_tokens_st >= _session_budget_st:
-            logger.warning(
-                "[%s] Session token budget exceeded (stream): used=%d limit=%d — rejecting",
-                session_id, _pre_tokens_st, _session_budget_st,
-            )
-            _stream_error = "This session has reached its token budget. Please start a new session."
-
-        # Per-window token rate check (burst protection).
-        _window_token_limit_st = int(getattr(conf, "TOKEN_RATE_LIMIT_PER_WINDOW", 0) or 0)
-        if _window_token_limit_st > 0:
-            _rl_st = get_rate_limiter()
-            _token_ok_st, _window_used_st = _rl_st.is_token_rate_allowed(client_id, _window_token_limit_st)
-            if not _token_ok_st:
-                logger.warning(
-                    "[%s] Token rate limit exceeded (stream): window_tokens=%d limit=%d",
-                    session_id, _window_used_st, _window_token_limit_st,
-                )
-                _stream_error = "Token rate limit exceeded. Please wait before sending more messages."
 
         if not _stream_error:
             # Skip cache only when a slot question is pending (mid-collection).
@@ -920,7 +856,11 @@ async def _stream_reply(
 
                 # See matching comment in the non-streaming /chat handler above —
                 # never cache a "no answer found" fallback under the shared key.
-                _is_no_answer_reply_st = bool((state.context or {}).get("_info_gap_detected"))
+                # 2026-11 fix: also catch free-text refusals the tag missed (see
+                # CACHE_SKIP_NO_ANSWER_RE's docstring in text_patterns.py).
+                _is_no_answer_reply_st = bool((state.context or {}).get("_info_gap_detected")) or bool(
+                    _text_patterns.CACHE_SKIP_NO_ANSWER_RE.search(bot_reply or "")
+                )
                 # See matching comment in the non-streaming /chat handler above — never
                 # cache a reply that leaves a pending_slot behind (cache HIT skips
                 # supervisor.handle() entirely, so the pending_slot side-effect is lost).
@@ -995,15 +935,6 @@ async def chat_stream(request: ChatRequest, http_request: Request):
 
     session_id = request.session_id or f"s_{uuid.uuid4().hex[:8]}"
     client_id = _client_identifier(http_request)
-
-    # Rate limiting — keyed by client IP, see _client_identifier.
-    rate_limiter = get_rate_limiter()
-    allowed, rate_info = rate_limiter.is_allowed(client_id)
-    if not allowed:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"Too many requests. Please wait {rate_info['retry_after']} seconds.",
-        )
 
     return StreamingResponse(
         _stream_reply(

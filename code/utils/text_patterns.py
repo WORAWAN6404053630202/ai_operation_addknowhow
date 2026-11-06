@@ -69,6 +69,28 @@ def extract_info_gap_tag(text: str) -> tuple[str, bool]:
     return t, False
 
 
+# ── Cache-skip heuristic (2026-11, live-reproduced cache poisoning) ─────────
+# NOT a general-purpose info-gap detector — do not reuse this for anything
+# that drives user-visible behavior (feedback menu, retries, etc.); that's
+# exactly the "scan the visible text for hardcoded phrases" approach the
+# comment above (extract_info_gap_tag) documents as already tried and
+# replaced for its false-positive/false-negative failure modes.
+#
+# This exists for ONE narrow, asymmetric-risk use: deciding whether
+# route_v1.py's response cache may store a reply. The LLM is supposed to
+# mark a genuine info gap with INFO_GAP_TAG, but live-reproduced cases
+# (45-sqm fee question, paraphrased two ways) showed it sometimes writes a
+# free-text refusal instead ("ไม่มีข้อมูลระบุ...", "ไม่พบข้อมูลค่าธรรมเนียม...
+# แนะนำให้ติดต่อ...") without the tag — the tag-only cache guard missed both,
+# so the wrong "not found" answer got cached under the shared key and was
+# replayed verbatim to every later session asking a similarly-worded
+# question, for the full TTL — confirmed live by re-querying with a fresh
+# session and getting the identical answer back with cached=true.
+# A false positive here only skips caching a good answer (one extra LLM
+# call later) — never shown to a user, unlike the tagged detector's result.
+CACHE_SKIP_NO_ANSWER_RE = re.compile(r"ไม่พบข้อมูล|ยังไม่พบ|ไม่มีข้อมูล")
+
+
 # ── Greeting fragments (byte-identical across the files that had them) ──────
 TH_DEE_RE = re.compile(r"^\s*ดี(?:ครับ|คับ|ค่ะ|คะ|งับ|จ้า|จ้ะ|ค่า)?", re.IGNORECASE)
 EN_GREETING_RE = re.compile(r"^\s*(hi+|hello+|hey+|yo+)\b", re.IGNORECASE)
