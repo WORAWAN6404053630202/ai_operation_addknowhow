@@ -160,6 +160,18 @@ class StateManager:
         if isinstance(state.messages, list) and len(state.messages) > max_recent:
             state.messages = state.messages[-max_recent:]
 
+        # 2026-11 fix: display_messages (the untrimmed record for /session/load
+        # and the admin UI) was only ever capped inside ConversationState.trim_messages
+        # — but that only runs on turns that go through PersonaSupervisor.handle(),
+        # which a cache-hit turn (route_v1.py's cache-HIT branches append directly
+        # and save, bypassing handle() entirely) never reaches. A long run of cache
+        # hits could grow display_messages — and this persisted file — unboundedly.
+        # This save path runs unconditionally regardless of how the turn was
+        # handled, so it's the right place for the same 200-item ceiling
+        # trim_messages already applies on the normal path.
+        if isinstance(state.display_messages, list) and len(state.display_messages) > 200:
+            state.display_messages = state.display_messages[-200:]
+
         max_internal = self._default_max_internal
         if isinstance(state.internal_messages, list) and max_internal > 0 and len(state.internal_messages) > max_internal:
             state.internal_messages = state.internal_messages[-max_internal:]

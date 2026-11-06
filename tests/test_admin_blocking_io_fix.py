@@ -112,6 +112,37 @@ class TestAdminHandlersUseRunInExecutor:
         result = asyncio.run(admin.admin_session_detail("does-not-exist"))
         assert result.status_code == 404
 
+    def test_admin_session_detail_returns_display_messages_not_trimmed_messages(self, tmp_path, monkeypatch):
+        """2026-11 fix: this endpoint's own docstring says "Full message
+        history", but it used to read state.messages (the aggressively
+        trimmed, LLM-facing list) instead of state.display_messages (the
+        untrimmed record meant for exactly this purpose, same field
+        /session/load already reads). Write a session file where messages
+        has already been trimmed shorter than display_messages — matching
+        a real post-trim session — and confirm the endpoint returns the
+        longer, untrimmed display_messages content."""
+        sm = StateManager(persist_dir=str(tmp_path))
+        data = {
+            "session_id": "s_trimmed",
+            "persona_id": "practical",
+            "messages": [{"role": "user", "content": "q2"}, {"role": "assistant", "content": "a2"}],
+            "display_messages": [
+                {"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"},
+                {"role": "user", "content": "q2"}, {"role": "assistant", "content": "a2"},
+            ],
+            "context": {},
+            "total_prompt_tokens": 100,
+            "total_completion_tokens": 50,
+            "total_cost": 0.03,
+        }
+        (tmp_path / "s_trimmed.json").write_text(json.dumps(data), encoding="utf-8")
+        monkeypatch.setattr(admin, "_state_manager", sm)
+
+        result = asyncio.run(admin.admin_session_detail("s_trimmed"))
+        body = json.loads(result.body)
+        assert body["total_messages"] == 4
+        assert body["messages"][0]["content"] == "q1"
+
     def test_admin_stats_counts_sessions_by_recency(self, tmp_path, monkeypatch):
         sm = StateManager(persist_dir=str(tmp_path))
         _write_session_file(tmp_path, "recent", user_msgs=1)

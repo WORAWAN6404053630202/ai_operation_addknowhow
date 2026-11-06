@@ -255,23 +255,10 @@ async def _cleanup_old_sessions_async() -> None:
     await loop.run_in_executor(None, _cleanup_old_sessions)
 
 
-def _consume_pending_token_budget(state: ConversationState, session_id: str) -> bool:
-    """Runs the deferred summarize/trim check (see llm_call.py's
-    run_pending_token_budget_check) on a worker thread. Returns True if it actually
-    ran, so the caller knows the state changed and needs re-saving."""
-    ctx = state.context or {}
-    if not ctx.get("_needs_token_budget_check"):
-        return False
-    ctx.pop("_needs_token_budget_check", None)
-    from utils.llm_call import run_pending_token_budget_check
-    run_pending_token_budget_check(state, label=f"TokenBudget/{session_id}", log=logger)
-    return True
-
-
 # asyncio.create_task() only keeps a weak reference to the task it returns — if
 # nothing else references it, the task can be garbage-collected mid-run before it
 # finishes (a documented asyncio pitfall). Hold a strong reference here for the
-# deferred summarize/lock-release tasks below, since a GC'd task would leak the
+# deferred lock-release task below, since a GC'd task would leak the
 # session lock forever (never released).
 _background_tasks: set = set()
 
@@ -280,27 +267,6 @@ def _spawn_background(coro) -> None:
     task = asyncio.create_task(coro)
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
-
-
-async def _release_session_lock_after_deferred_work(
-    session_id: str, lock: asyncio.Lock, state: ConversationState
-) -> None:
-    """Fire-and-forget task: finishes the deferred token-budget summarize/trim (an
-    LLM call that can take 1-3s) in the background AFTER the turn's response has
-    already been returned to the client, persists the result, then releases the
-    per-session lock. The lock is deliberately held for this whole window so a
-    second message arriving for the SAME session can't start mutating
-    state.messages concurrently with this background summarize/trim — see the
-    manual acquire/release (not `async with`) in chat() and _stream_reply()."""
-    try:
-        loop = asyncio.get_running_loop()
-        changed = await loop.run_in_executor(None, _consume_pending_token_budget, state, session_id)
-        if changed:
-            await _save_state_async(session_id, state)
-    except Exception:
-        logger.warning("[%s] Deferred token-budget summarize failed (non-blocking)", session_id, exc_info=True)
-    finally:
-        lock.release()
 
 
 async def _finish_cancelled_stream_turn_in_background(session_id: str, lock: asyncio.Lock, future) -> None:
@@ -625,7 +591,6 @@ async def chat(request: ChatRequest, http_request: Request):
 
     lock = _get_session_lock(session_id)
     await lock.acquire()
-    _lock_deferred = False
     try:
         # Load state
         saved = await _load_state_async(session_id)
@@ -783,13 +748,6 @@ async def chat(request: ChatRequest, http_request: Request):
             # existing traffic/payload size.
             **({"retrieved_sources": _retrieved_sources} if request.include_sources else {}),
         )
-        # If the turn's answer call crossed the session token budget, the actual
-        # summarize/trim work (an LLM call) was deferred (see llm_call.py's
-        # run_pending_token_budget_check) — run it in the background now, AFTER
-        # the response is ready, instead of adding its latency to this turn.
-        if bool((state.context or {}).get("_needs_token_budget_check")):
-            _lock_deferred = True
-            _spawn_background(_release_session_lock_after_deferred_work(session_id, lock, state))
         return response
 
     except HTTPException:
@@ -801,8 +759,7 @@ async def chat(request: ChatRequest, http_request: Request):
             detail="Chat failed. Please try again.",
         )
     finally:
-        if not _lock_deferred:
-            lock.release()
+        lock.release()
 
 
 def _run_supervisor_with_progress(state, message, progress_cb):
@@ -1004,19 +961,6 @@ async def _stream_reply(
         if future is not None and not future.done():
             _lock_deferred = True
             _spawn_background(_finish_cancelled_stream_turn_in_background(session_id, lock, future))
-        else:
-            # If the turn's answer call crossed the session token budget, run the
-            # deferred summarize/trim (see llm_call.py's run_pending_token_budget_check)
-            # in the background, holding the lock until it's done, instead of adding
-            # its latency here. See _release_session_lock_after_deferred_work.
-            _needs_defer_st = False
-            try:
-                _needs_defer_st = bool(state is not None and (state.context or {}).get("_needs_token_budget_check"))
-            except Exception:
-                pass
-            if _needs_defer_st:
-                _lock_deferred = True
-                _spawn_background(_release_session_lock_after_deferred_work(session_id, lock, state))
         if not _lock_deferred:
             lock.release()
     # lock released (or handed off to the deferred task) — now stream the reply

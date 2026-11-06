@@ -609,19 +609,14 @@ class AcademicPersonaService:
         cache[cache_key] = result
         return result
 
-    # Safe append (dedupe) - prefer state helpers when available
+    # Safe append (dedupe) - state always provides add_user_message_once/
+    # add_assistant_message_once (ConversationState), so this delegates
+    # unconditionally rather than keeping a parallel fallback implementation
+    # that only appends to state.messages, never state.display_messages —
+    # that fallback shape is exactly the bug fixed in _append_assistant below,
+    # just dormant since no real ConversationState ever lacks the method.
     def _append_user_once(self, state: ConversationState, content: str) -> None:
-        if hasattr(state, "add_user_message_once"):
-            state.add_user_message_once(content)
-            return
-        if content is None:
-            return
-        c = str(content)
-        if not c.strip():
-            return
-        if state.messages and state.messages[-1].get("role") == "user" and (state.messages[-1].get("content") or "") == c:
-            return
-        state.messages.append({"role": "user", "content": c})
+        state.add_user_message_once(content)
 
     def _append_assistant(self, state: ConversationState, content: str) -> None:
         # One-shot implicit-confirmation flag (see entity_type_source in
@@ -630,44 +625,9 @@ class AcademicPersonaService:
         # rather than at prompt-build time, since this can be reached more than
         # once within the same turn and only the reply actually shown to the
         # user should consume it.
-        if hasattr(state, "add_assistant_message_once"):
-            state.add_assistant_message_once(content)
-            if isinstance(state.context, dict):
-                state.context.pop("_entity_type_just_inferred", None)
-            return
-        if content is None:
-            return
-        c = str(content).strip()
-        if not c:
-            return
-        state.messages = state.messages or []
-        if state.messages:
-            last = state.messages[-1]
-            if last.get("role") == "assistant" and (last.get("content") or "").strip() == c:
-                return
-        state.messages.append({"role": "assistant", "content": c})
+        state.add_assistant_message_once(content)
         if isinstance(state.context, dict):
             state.context.pop("_entity_type_just_inferred", None)
-
-    # Store a compressed version of long Academic final answers in messages history.
-    # The full answer is returned to the caller (and user) unchanged — only history is compressed.
-    _HISTORY_MAX_CHARS = 800
-
-    def _summarize_for_history(self, ans: str) -> str:
-        """Return a shortened version of ans for storage in state.messages.
-
-        Keeps at most _HISTORY_MAX_CHARS characters, cutting at the last
-        sentence-ending punctuation (。.!?ๆ newline) to avoid mid-sentence
-        truncation.  Appends '[…]' so the LLM knows the message was trimmed.
-        """
-        if len(ans) <= self._HISTORY_MAX_CHARS:
-            return ans
-        chunk = ans[: self._HISTORY_MAX_CHARS]
-        # Try to cut at last Thai/ASCII sentence boundary
-        m = re.search(r"(.*[ๆ\.\!\?\n])", chunk, re.DOTALL)
-        if m and len(m.group(1)) >= 80:
-            chunk = m.group(1).rstrip()
-        return chunk + " […]"
 
     # Context helpers (flow)
     def _get_flow(self, state: ConversationState) -> Optional[Dict[str, Any]]:
@@ -5532,7 +5492,7 @@ Return JSON:
                     q2 = self._ask_sections(state)
                     if not q2.strip():  # No sections found — finalize immediately
                         ans = self._finalize_answer(state)
-                        self._append_assistant(state, self._summarize_for_history(ans))
+                        self._append_assistant(state, ans)
                         state.round = 0
                         return state, ans
                     self._append_assistant(state, q2)
@@ -5636,7 +5596,7 @@ Return JSON:
                 q2 = self._ask_sections(state)
                 if not q2.strip():
                     ans = self._finalize_answer(state)
-                    self._append_assistant(state, self._summarize_for_history(ans))
+                    self._append_assistant(state, ans)
                     state.round = 0
                     return state, ans
                 self._append_assistant(state, q2)
@@ -5731,7 +5691,7 @@ Return JSON:
             # P0: If no sections -> finalize immediately
             if not q2.strip():
                 ans = self._finalize_answer(state)
-                self._append_assistant(state, self._summarize_for_history(ans))
+                self._append_assistant(state, ans)
                 state.round = 0
                 return state, ans
 
@@ -5804,7 +5764,7 @@ Return JSON:
             self._save_selected_sections(state, user_text, bind)
 
             ans = self._finalize_answer(state)
-            self._append_assistant(state, self._summarize_for_history(ans))
+            self._append_assistant(state, ans)
             state.round = 0
             return state, ans
 
@@ -5814,7 +5774,7 @@ Return JSON:
         # message returns the generic fallback forever.
         if stage == "no_sections":
             ans = self._finalize_answer(state)
-            self._append_assistant(state, self._summarize_for_history(ans))
+            self._append_assistant(state, ans)
             state.round = 0
             return state, ans
 

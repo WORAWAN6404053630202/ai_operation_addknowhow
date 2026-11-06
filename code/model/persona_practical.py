@@ -750,7 +750,18 @@ class PracticalPersonaService:
             openai_api_base=conf.OPENROUTER_BASE_URL,
             http_client=get_shared_http_client(),
             temperature=0.0,
-            max_tokens=100,
+            # 2026-11 cost audit: live-caught via LangSmith label-tagging hitting
+            # LengthFinishReasonError on a real call (candidates list included a
+            # long Thai license-type name) — 100 was too tight for the {"license_type":
+            # "<name from candidates>", "confidence": 0.0} schema once that name is
+            # long. No retry here (unlike the groundedness judge): this call is
+            # already a fallback-of-a-fallback (only runs when a cheaper non-LLM LQS
+            # score was 0), and on failure the bare `except: return {}` below degrades
+            # gracefully to asking the user directly rather than risking a wrong
+            # guess — so simply raising the ceiling (same fix shape already used
+            # repeatedly in persona_supervisor.py for this exact failure mode) is
+            # proportionate; a paid second attempt isn't worth it for this path.
+            max_tokens=250,
             request_timeout=timeout,
             max_retries=CHAT_OPENAI_MAX_RETRIES,
             model_kwargs={"response_format": {"type": "json_object"}},
@@ -3904,11 +3915,6 @@ class PracticalPersonaService:
                 ]
                 self._debug_log("post_retrieve", query=user_text, docs_json=tmp)
                 return self.handle(state, "__auto_post_retrieve__", _internal=True)
-
-        # Proactive trim: when session has accumulated many tokens, cut history early
-        # so the CURRENT call (not just future calls) benefits from a shorter context.
-        if getattr(state, "total_tokens", 0) > 20_000 and hasattr(state, "trim_messages"):
-            state.trim_messages(keep_last=4)
 
         # Cap each assistant message in history: 300 chars is enough for context continuity.
         # 600 was generating ~7-8% of the total prompt budget per assistant turn.

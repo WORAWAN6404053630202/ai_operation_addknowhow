@@ -15298,8 +15298,25 @@ class PersonaSupervisor:
         _t0 = _time.perf_counter()
         st, reply = self._handle_inner(state, user_input)
         reply = self._maybe_offer_feedback(st, user_input, reply)
-        if hasattr(st, "trim_messages"):
-            st.trim_messages(keep_last=12)  # เก็บ state 12 (ไม่ใช่ส่งไป LLM ทั้งหมด)
+        # 2026-11: the ONE canonical trim site for the whole turn-handling
+        # pipeline — see conf.py/llm_call.py history for the removed sibling
+        # call sites (persona_supervisor.py's own former start-of-turn trim,
+        # persona_practical.py's token-gated trim, llm_call.py's deferred
+        # trim) that each used a different keep_last with no coordination.
+        # keep_last=8 matches trim_messages' own default and comfortably
+        # covers every real consumer (Practical's state.messages[-4:] slice,
+        # Academic's [-6:] slot-inference fallback). Runs unconditionally,
+        # every turn — trim_messages' own early-return already makes a call
+        # with nothing to trim effectively free, so no gating is needed.
+        # Wrapped defensively: this runs inline on the turn's critical path
+        # now (the old deferred mechanism it replaces ran in a background
+        # task), so an unexpected trim failure must not turn an otherwise-
+        # successful answer into a failed turn.
+        try:
+            if hasattr(st, "trim_messages"):
+                st.trim_messages(keep_last=8)
+        except Exception:
+            _LOG.warning("[Supervisor] trim_messages failed (non-blocking)", exc_info=True)
         # Trim large context fields that bloat the prompt (topic_pool can be 100+ items)
         # Keep 30 items: enough for menu diversity sampling without ballooning the context.
         if st.context and len(st.context.get("topic_pool") or []) > 30:
@@ -15333,11 +15350,6 @@ class PersonaSupervisor:
 
         if raw_stripped:
             self._add_user(state, raw)
-
-        # Proactive trim: keep history bounded before LLM calls to reduce token usage.
-        # Post-call trim in llm_call.py (keep_last=8) handles further reduction after answer.
-        if hasattr(state, "trim_messages"):
-            state.trim_messages(keep_last=10)
 
         # MAX_ROUNDS enforcement: hard ceiling on conversation turns per session.
         # Checked after _add_user so the user's final message is preserved in history

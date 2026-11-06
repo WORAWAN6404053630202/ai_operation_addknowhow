@@ -102,7 +102,11 @@ async def admin_session_detail(session_id: str):
     if state is None:
         return JSONResponse({"error": "Session not found"}, status_code=404)
 
-    messages = state.messages or []
+    # 2026-11 fix: this used to read state.messages (the aggressively
+    # trimmed, LLM-facing list) despite the docstring above promising "Full
+    # message history" — display_messages is the untrimmed record meant for
+    # exactly this purpose (same shape /session/load already reads).
+    messages = state.display_messages or []
     context  = state.context or {}
 
     prompt_tokens     = getattr(state, "total_prompt_tokens", 0) or 0

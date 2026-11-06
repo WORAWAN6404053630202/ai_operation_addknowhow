@@ -209,15 +209,6 @@ except ImportError:
     logger = _ROOT_LOG
     _STRUCTURED_LOG = False
 
-# Token Management: session-level cumulative token threshold.
-# When session_total exceeds this value after an LLM call, a deferred trim is triggered
-# (see run_pending_token_budget_check below — summarize was removed entirely, core2-M7).
-# The practical system prompt alone is ~15K tokens per call. A threshold of 20K fires on the
-# first LLM call in a fresh session — useless and adds latency. Raised to 80K so that
-# trim only kicks in after ~4-5 full Q&A rounds of real message accumulation.
-_TOKEN_WARN_THRESHOLD = 80_000  # trigger a deferred trim when session total exceeds this
-
-
 def _handle_post_call_token_budget(
     state: Any,
     prompt_tokens: int,
@@ -228,19 +219,26 @@ def _handle_post_call_token_budget(
     cache_write_tokens: int = 0,
     cost_usd: float = 0.0,
 ) -> None:
-    """Track cumulative token usage. If the session budget is exceeded, this does NOT
-    run summarize/trim inline anymore — that used to fire a blocking Haiku call
-    (summarize_messages(), ~1-3s) directly in the critical path of whichever answer
-    call happened to cross the threshold, adding to the user's wait time on that turn
-    and (since total_tokens never decreases) on roughly every 2-3 turns for the rest
-    of any long conversation.
+    """Accumulate this call's token/cost usage onto the session's running total
+    (state.total_cost / total_prompt_tokens / total_completion_tokens — used by
+    TOKEN_BUDGET_PER_SESSION enforcement in route_v1.py and the /chat response's
+    cost reporting).
 
-    Instead this just flags state.context["_needs_token_budget_check"] = True — cheap,
-    no LLM call. The caller (route_v1.py) runs run_pending_token_budget_check() below
-    in a background thread AFTER the turn's response has already been built, while
-    still holding that session's asyncio lock, so no concurrent turn for the same
-    session can mutate state.messages while the deferred work runs. See
-    route_v1.py's _release_session_lock_after_deferred_work.
+    2026-11: this used to ALSO gate a deferred state.messages trim on
+    state.total_tokens crossing a threshold (80K here, a second, lower one at
+    20K in persona_practical.py) — removed. state.total_tokens never
+    decreases (it's a lifetime sum across every LLM call in the session,
+    including classifiers that never touch state.messages), so once a single
+    token-heavy turn crossed either threshold, it stayed crossed and
+    re-triggered on literally every subsequent turn, not "every 4-5 rounds"
+    as originally intended. Trimming state.messages is now consolidated into
+    exactly one unconditional call per turn — PersonaSupervisor.handle()'s
+    own end-of-turn state.trim_messages(keep_last=8) — which needs no
+    threshold at all: trim_messages' own early-return already makes a call
+    with nothing to trim practically free, and (confirmed) nothing in this
+    codebase feeds state.messages into an LLM call without first slicing it
+    to a small fixed window anyway, so pre-trimming mid-turn never actually
+    reduced that turn's own token cost the way the old comments here claimed.
 
     Shared by llm_invoke (sync) and llm_invoke_async (async) — no async operations here.
     Wrapped in a broad except so any failure is silent and never breaks the main call.
@@ -253,62 +251,8 @@ def _handle_post_call_token_budget(
             cache_write_tokens=cache_write_tokens,
             cost_usd=cost_usd,
         )
-        session_total = getattr(state, "total_tokens", 0)
-        if session_total <= _TOKEN_WARN_THRESHOLD:
-            return
-
-        log.warning(
-            "[%s] Session token budget exceeded %d (total=%d) — flagging for deferred trim",
-            label, _TOKEN_WARN_THRESHOLD, session_total,
-        )
-        try:
-            state.context = getattr(state, "context", None) or {}
-            state.context["_needs_token_budget_check"] = True
-        except Exception:
-            pass
     except Exception:
         pass
-
-
-def run_pending_token_budget_check(
-    state: Any,
-    label: str = "TokenBudget",
-    log: Optional[logging.Logger] = None,
-) -> None:
-    """Runs the deferred trim work that _handle_post_call_token_budget used
-    to run inline (see that function's docstring for why it's deferred to a
-    background thread instead).
-
-    Safe to call from a background thread ONLY while the caller still holds the
-    per-session lock for `state`'s session — this mutates state.messages wholesale
-    (via trim_messages), which would race with a concurrent turn for the same
-    session appending its own messages. route_v1.py enforces this by not
-    releasing the session lock until this function returns.
-
-    2026-10 fix (core2-M7): this used to try auto_summarize_if_needed()
-    first (a real paid Haiku call) and fall back to trim_messages only if
-    that produced nothing. Removed entirely — every consumer of
-    state.messages across all 3 personas either filters to the last N
-    messages by a fixed slice (e.g. persona_practical.py's
-    `state.messages[-4:]`) or filters on role in {"user","assistant"},
-    and summarize_old_messages always places its summary message BEFORE
-    the kept-recent slice. Since the slice size and the summarizer's own
-    keep_recent were the same number, the summary message could never
-    land inside what any persona's prompt-building code actually read —
-    it paid for an LLM call, held the session lock across it (delaying the
-    user's next message), and persisted a result to disk that nothing
-    downstream ever consulted. trim_messages alone (no LLM call, same
-    message-count bound) achieves the actual goal this function exists
-    for — keeping state.messages from growing unboundedly — without the
-    wasted cost.
-    """
-    log = log or _ROOT_LOG
-    try:
-        if hasattr(state, "trim_messages"):
-            state.trim_messages(keep_last=4)
-            log.info("[%s] Trimmed old messages to bound session size", label)
-    except Exception:
-        log.warning("[%s] Trim failed (non-blocking)", label, exc_info=True)
 
 
 # Import metrics if available

@@ -892,10 +892,17 @@ COST_WARNING_THRESHOLD = _safe_float("COST_WARNING_THRESHOLD", 1.0)  # Warn if s
 # enforced limit.
 DAILY_BUDGET_USD = _safe_float("DAILY_BUDGET_USD", 25.0)
 
-# Token budget alerts (per-call thresholds — warning/logging only, not enforced)
+# Token budget alerts (per-call thresholds — warning/logging only, not enforced).
+# 2026-11: WARNING/CRITICAL raised from their original 10K/15K — live production
+# logs showed legitimate broad-question draft/corrective-retry calls routinely
+# hitting ~46,000-49,000 total tokens per call (large DOCUMENTS payload, by
+# design, not a bug), so CRITICAL fired as noise on nearly every such call,
+# drowning out genuinely rare/actionable signals in the persistent log this
+# threshold is meant to surface. New values sit comfortably above that
+# confirmed-legitimate ceiling, so they only fire for a genuinely abnormal call.
 TOKEN_BUDGET_PER_CALL = _safe_int("TOKEN_BUDGET_PER_CALL", 8000)
-TOKEN_BUDGET_WARNING = _safe_int("TOKEN_BUDGET_WARNING", 10000)
-TOKEN_BUDGET_CRITICAL = _safe_int("TOKEN_BUDGET_CRITICAL", 15000)
+TOKEN_BUDGET_WARNING = _safe_int("TOKEN_BUDGET_WARNING", 55000)
+TOKEN_BUDGET_CRITICAL = _safe_int("TOKEN_BUDGET_CRITICAL", 70000)
 
 # Session-level token budget: cumulative tokens across all LLM calls in one session.
 # Requests that would exceed this limit are rejected with HTTP 429.
