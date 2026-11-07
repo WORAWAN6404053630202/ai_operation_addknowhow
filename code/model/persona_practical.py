@@ -1090,6 +1090,175 @@ class PracticalPersonaService:
             _LOG.warning("[Practical] groundedness retry failed: %s — keeping original decision", _e_ground_retry)
             return decision, exec_
 
+    # 2026-11 (live-reproduced, cache-exposed): prompts_practical.py's FEE ARITHMETIC
+    # block asks the LLM to show tiered-fee math inline as prose — e.g. "200 + 350 =
+    # 550". Same exact question, same code, different container restarts: one run
+    # correctly wrote "= 550", another wrote "= 650" (operands right, the model just
+    # added wrong). Not the earlier wrong-formula-shape bug (fixed in 3d912ed) — this
+    # is a plain arithmetic slip on an otherwise-correct formula, and it's the ONLY
+    # place in this codebase an LLM performs free-text arithmetic that reaches a
+    # user-facing answer. Unreliable at any temperature, so verify it deterministically
+    # instead of trusting the model's self-stated sum — shape-agnostic (doesn't need to
+    # know the fee formula's structure, just whether the written result is correct),
+    # so it generalizes to this failure class wherever it occurs, at zero LLM cost
+    # unless a mismatch is actually found.
+    _ARITH_EQ_RE = re.compile(
+        r"([\d,]+(?:\.\d+)?)\s*([+\-×x\*])\s*([\d,]+(?:\.\d+)?)\s*=\s*([\d,]+(?:\.\d+)?)"
+    )
+    # Tiered-fee answers commonly write the threshold subtraction inside
+    # parentheses before multiplying by the rate — "(45 − 10) × 10 = 350" — a
+    # 3-operand compound expression _ARITH_EQ_RE's flat "A op B = C" shape can't
+    # match at all (confirmed live: it silently found zero equations in exactly
+    # this real answer text). Matched separately; also accepts the unicode
+    # minus sign "−" models sometimes use here instead of ASCII "-".
+    _COMPOUND_EQ_RE = re.compile(
+        r"\(\s*([\d,]+(?:\.\d+)?)\s*[−\-]\s*([\d,]+(?:\.\d+)?)\s*\)\s*([×x\*])\s*([\d,]+(?:\.\d+)?)\s*=\s*([\d,]+(?:\.\d+)?)"
+    )
+    # Live-caught (2026-11) during this exact fix's own verification: a retry can
+    # correct the EQUATION ("200 + 350 = 550") while leaving the OLD wrong number
+    # still sitting in the answer's headline ("...คิดได้ 650 บาท"), because that
+    # headline is a bare stated amount, not an "A op B = C" shape the equation
+    # regex matches at all — the retried answer ends up self-contradictory (states
+    # 650 AND 550 as if both were final) instead of actually fixed. Catches that
+    # by requiring every bolded "...บาท" amount in the SAME answer to agree.
+    _BOLD_AMOUNT_RE = re.compile(r"\*\*\s*([\d,]+(?:\.\d+)?)\s*บาท")
+    # Live-caught (2026-11, during an A/B temperature test of this exact fix): a
+    # draft can get every individual equation internally correct — "(45-10)×10 =
+    # 350" is genuinely 350 — and still state the WRONG final answer, because it
+    # never added the base fee at all: "ต้องชำระ 350 บาทต่อปี" instead of "200 +
+    # 350 = 550". The equation itself has nothing wrong to catch; the omission is
+    # a missing COMBINING step, not a bad calculation. Catches this by requiring
+    # that whenever the answer states a base fee ("...ฐาน...N บาท") and a
+    # tiered-excess calculation, the base must actually get added to it
+    # SOMEWHERE (a "+" equation with the base as one operand) — if the final
+    # stated amount instead equals the bare excess alone, that's the gap.
+    _BASE_FEE_RE = re.compile(r"ฐาน.{0,40}?([\d,]+(?:\.\d+)?)\s*บาท")
+
+    @classmethod
+    def _find_arithmetic_mismatch(cls, answer_text: str):
+        """Returns (description, match_or_None) for the first problem found:
+        an inline equation whose stated result doesn't match Python's own
+        arithmetic (match is the re.Match, so callers can excise that exact
+        span), OR — when every equation checks out — either 2+ DIFFERENT
+        bolded "...บาท" amounts stated as if each were final, or a base fee
+        that never actually got added into the final total (both: match is
+        None, since there's no single span to excise; callers must replace
+        the whole answer instead). Returns None (no tuple) when nothing is
+        wrong — including when no equation/amount is present at all, which
+        is not an error, just nothing to verify."""
+        answer_text = answer_text or ""
+        _equations = []
+        for m in cls._ARITH_EQ_RE.finditer(answer_text):
+            a, op, b, stated = (m.group(i) for i in (1, 2, 3, 4))
+            a_f, b_f, stated_f = (float(v.replace(",", "")) for v in (a, b, stated))
+            actual = a_f + b_f if op == "+" else a_f - b_f if op == "-" else a_f * b_f
+            if abs(actual - stated_f) > 0.01:
+                return f"{a}{op}{b} was written as = {stated}, but the correct result is {actual:g}", m
+            _equations.append((a_f, op, b_f, actual))
+        for m in cls._COMPOUND_EQ_RE.finditer(answer_text):
+            sub_a, sub_b, mul_op, rate, stated = (m.group(i) for i in (1, 2, 3, 4, 5))
+            sub_a_f, sub_b_f, rate_f, stated_f = (float(v.replace(",", "")) for v in (sub_a, sub_b, rate, stated))
+            actual = (sub_a_f - sub_b_f) * rate_f
+            if abs(actual - stated_f) > 0.01:
+                return (
+                    f"({sub_a}-{sub_b}){mul_op}{rate} was written as = {stated}, "
+                    f"but the correct result is {actual:g}"
+                ), m
+            # Not a "+" equation, so it can never satisfy the base-fee combining
+            # check below — correctly treated as a candidate excess value only.
+            _equations.append((sub_a_f, mul_op, rate_f, actual))
+        _bold_amounts = {m2.group(1).replace(",", "") for m2 in cls._BOLD_AMOUNT_RE.finditer(answer_text)}
+        if len(_bold_amounts) > 1:
+            return f"answer states multiple conflicting final amounts: {sorted(_bold_amounts)} บาท", None
+        _base_m = cls._BASE_FEE_RE.search(answer_text)
+        if _base_m and len(_bold_amounts) == 1:
+            _base_val = float(_base_m.group(1).replace(",", ""))
+            _final_amt = float(next(iter(_bold_amounts)))
+            _has_combining_eq = any(
+                op3 == "+" and (abs(a3 - _base_val) < 0.01 or abs(b3 - _base_val) < 0.01)
+                for a3, op3, b3, _ in _equations
+            )
+            if not _has_combining_eq:
+                for a3, op3, b3, c3 in _equations:
+                    if op3 in ("×", "x", "*", "-") and abs(_final_amt - c3) < 0.01 and abs(_final_amt - (_base_val + c3)) > 0.01:
+                        return (
+                            f"final amount {_final_amt:g} appears to be only the tier increment "
+                            f"({c3:g}), missing the base fee ({_base_val:g}) — expected total "
+                            f"{_base_val + c3:g}",
+                            None,
+                        )
+        return None
+
+    def _apply_fee_arithmetic_safety_net(
+        self, action: str, exec_: dict, decision: dict, prompt: str, state=None,
+    ) -> Tuple[dict, dict]:
+        """Checks a draft action="answer" for inline arithmetic that doesn't add up
+        (self._find_arithmetic_mismatch) and retries once with a corrective reminder
+        if found. Returns (decision, exec_) — unchanged if action isn't "answer",
+        there's no answer text, or every equation found checks out. Must run AFTER
+        _apply_groundedness_safety_net (see that call site) since groundedness can
+        rewrite exec_["answer"] wholesale on its own retry — arithmetic needs to
+        inspect whatever text is final, not a version that might get replaced out
+        from under it."""
+        if action != "answer" or not str(exec_.get("answer") or "").strip():
+            return decision, exec_
+        _answer = str(exec_.get("answer") or "")
+        _mismatch = self._find_arithmetic_mismatch(_answer)
+        if not _mismatch:
+            return decision, exec_
+        _desc, _ = _mismatch
+        _LOG.warning("[Practical] arithmetic mismatch in answer: %s — retrying once", _desc)
+        _retry_prompt = (
+            prompt
+            + "\n\n[SYSTEM REMINDER] Your previous draft answer was:\n\n" + _answer
+            + f"\n\nThat draft contains an arithmetic error: {_desc}. Recompute the calculation "
+            "correctly and write a CLEAN, FINAL corrected full answer — not a correction or "
+            "apology appended to the old draft. The old wrong number must not appear ANYWHERE "
+            "in your new answer, not even crossed out or corrected inline — write it as if you "
+            "are answering for the first time with the right number. Do not say \"ขออภัย\", "
+            "\"คำนวณใหม่\", or similar meta-commentary about having made an error. Keep everything "
+            "else about the answer (wording, structure, sections) the same — fix ONLY the number."
+        )
+        try:
+            _retry_decision = self._call_llm_json_with_truncation_retry(_retry_prompt, state=state)
+            _retry_exec_raw = _retry_decision.get("execution", {})
+            if isinstance(_retry_exec_raw, str):
+                try:
+                    _retry_exec_raw = json.loads(_retry_exec_raw)
+                except Exception:
+                    _retry_exec_raw = {}
+            _retry_exec = _retry_exec_raw if isinstance(_retry_exec_raw, dict) else {}
+            _retry_answer = str(_retry_exec.get("answer") or "")
+            if not _retry_answer:
+                _LOG.warning("[Practical] arithmetic retry returned no answer text — keeping first attempt")
+                return decision, exec_
+            _recheck = self._find_arithmetic_mismatch(_retry_answer)
+            if not _recheck:
+                _LOG.info("[Practical] arithmetic retry succeeded — corrected")
+                return _retry_decision, _retry_exec
+            # Still wrong after one retry — unlike groundedness's "keep original if
+            # still flagged" (a claim MIGHT be fine; the groundedness re-check could
+            # itself be wrong), a numeric mismatch is Python ground truth with no
+            # false-positive risk. Showing a confidently wrong fee number twice is a
+            # worse failure than an honest gap, so the fallback differs: excise just
+            # the offending equation span (the regex already isolated it precisely)
+            # and replace with [[INFO_GAP]] rather than discarding the whole answer.
+            # When the mismatch is the "conflicting bolded amounts" shape (match is
+            # None — a bare stated number, not an equation, so there's no single
+            # span to excise cleanly) the whole answer is replaced instead: a
+            # self-contradictory answer (states both 650 AND 550 as final) is not
+            # salvageable by deleting one substring.
+            _desc2, _m2 = _recheck
+            _LOG.warning("[Practical] arithmetic retry STILL wrong (%s) — degrading to a safe answer", _desc2)
+            if _m2 is not None:
+                _retry_exec["answer"] = _retry_answer[:_m2.start()] + "[[INFO_GAP]]" + _retry_answer[_m2.end():]
+            else:
+                _retry_exec["answer"] = "[[INFO_GAP]]"
+            return _retry_decision, _retry_exec
+        except Exception as _e_arith_retry:
+            _LOG.warning("[Practical] arithmetic retry failed: %s — keeping original decision", _e_arith_retry)
+            return decision, exec_
+
     def _default_dont_know_llm_call(self) -> Callable[[str], dict]:
         """Lightweight classifier: user expresses uncertainty or asks to see available types."""
         model = getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL)
@@ -1969,87 +2138,18 @@ class PracticalPersonaService:
     # narrower `_BARE_GENERIC_DIM_RE`/`_SPECIFIC_TOPIC_NAME_RE` pair; consolidated into the
     # shared module during Phase 3 of the classifier-duplication cleanup so
     # persona_academic.py gets the same protection (it previously had none).
-    # ── License-query scoring patterns (used in _license_query_score inside handle()) ──
-    # Defined as class attributes so they are compiled once at class load, not per handle() call.
-    _LQS_ABBREV_CHECK = [
-        # User types abbreviation in query → boost the matching license_type.
-        # Pattern 1: search in query; Pattern 2: search in license_type name.
-        # ภป → ภาษีป้าย (bare abbreviation without form number)
-        (re.compile(r"ภป\.?", re.IGNORECASE),
-         re.compile(r"ภาษีป้าย", re.IGNORECASE)),
-        # ภพ.20 / ภพ20 → ภาษีมูลค่าเพิ่ม (bare ภพ already in _LQS_VAT_RE for full-form queries)
-        (re.compile(r"ภพ\.?20?|ภพ20", re.IGNORECASE),
-         re.compile(r"ภาษีมูลค่าเพิ่ม", re.IGNORECASE)),
-        # บจก → บริษัทจำกัด (correct abbreviation; old code had wrong บอจ)
-        (re.compile(r"บจก\.?", re.IGNORECASE),
-         re.compile(r"บริษัทจำกัด", re.IGNORECASE)),
-        # หจก → ห้างหุ้นส่วนจำกัด
-        (re.compile(r"หจก\.?", re.IGNORECASE),
-         re.compile(r"ห้างหุ้นส่วนจำกัด", re.IGNORECASE)),
-    ]
-    # Negative lookbehind (?<![เโ]) prevents "เปิดบัญชี" from matching "ปิดบัญชี".
-    _LQS_ACCOUNTING_RE = re.compile(
-        r"ปิดงบ|(?<![เโ])ปิดบัญชี|ปิงบ|งบการเงิน|งบบัญชี|ทำบัญชี|จัดทำบัญชี|"
-        r"สำนักงานบัญชี|ผู้ทำบัญชี|ผู้สอบบัญชี|ตรวจสอบบัญชี",
-        re.IGNORECASE,
-    )
-    _LQS_BANKING_RE = re.compile(
-        r"เปิดบัญชี|บัญชีธนาคาร|บัญชีออมทรัพย์|บัญชีกระแสรายวัน|บัญชีรับเงิน",
-        re.IGNORECASE,
-    )
-    _LQS_EMPLOYER_RE = re.compile(
-        r"ขึ้นทะเบียนนายจ้าง|ทะเบียนนายจ้าง|ประกันสังคม.*นายจ้าง|นายจ้าง.*ประกันสังคม",
-        re.IGNORECASE,
-    )
-    _LQS_HIRING_RE = re.compile(
-        r"จัดหาพนักงาน|รับสมัครพนักงาน|จ้างพนักงาน|หาพนักงาน|รับพนักงาน",
-        re.IGNORECASE,
-    )
-    _LQS_SAN_RE = re.compile(
-        r"\bSAN\b|\bSAN\s*PLUS\b|รับรองมาตรฐาน|มาตรฐานร้านอาหาร|สุขาภิบาลอาหาร.*SAN|SAN.*สุขาภิบาล",
-        re.IGNORECASE,
-    )
-    _LQS_QR_KEYWORDS_RE = re.compile(
-        r"\bQR\b|QR\s*Payment|QR\s*Code|คิวอาร์|คิวอาเพ|คิวอาพาย|ชำระ.*ออนไลน์|สมัคร.*QR|QR.*สมัคร",
-        re.IGNORECASE,
-    )
+    # ── License-query keyword patterns ───────────────────────────────────────────
+    # 2026-11: this used to also hold ~13 more license-specific patterns feeding
+    # _license_query_score's regex-substring scorer inside handle()'s FOCUS
+    # FILTER block — removed along with that function (replaced by similarity-
+    # score-based scoring, see the FOCUS FILTER comment in handle() for why).
+    # These 2 survive because they're still used by the separate broad-tax-query
+    # detector a few hundred lines into handle() (unrelated to FOCUS FILTER).
     _LQS_VAT_RE = re.compile(
         r"\bVAT\b|\bภพ\.?20\b|\bภพ20\b|จด\s*ภาษีมูลค่าเพิ่ม|สมัคร\s*VAT|ขึ้นทะเบียน\s*VAT",
         re.IGNORECASE,
     )
-    _LQS_SOCIAL_RE = re.compile(r"ประกันสังคม", re.IGNORECASE)
-    _LQS_INSURED_RE = re.compile(
-        r"ผู้ประกันตน|ทะเบียนผู้ประกัน|เงินสมทบ|แจ้งเข้าทำงาน|แจ้งออกจากงาน|ลูกจ้าง",
-        re.IGNORECASE,
-    )
-    _LQS_HEALTH_CERT_RE = re.compile(
-        r"ใบรับรองแพทย์|9\s*โรค|สณ\.?11|ตรวจสุขภาพ.*ร้านอาหาร|สุขภาพ.*ผู้ประกอบ",
-        re.IGNORECASE,
-    )
-    _LQS_LIQUOR_RE = re.compile(
-        r"สุรา|เหล้า|เบียร์|แอลกอฮอล์|จำหน่ายสุรา|ขายสุรา|ใบอนุญาต.*สุรา",
-        re.IGNORECASE,
-    )
     _LQS_SIGN_TAX_RE = re.compile(r"ภาษีป้าย|ป้ายร้านอาหาร", re.IGNORECASE)
-    # ใบอนุญาตอาหาร (casual phrasing) → "ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร". 2026-09: this
-    # license_type had NO dedicated keyword rule here (unlike VAT/liquor/SAN/etc. above), so a
-    # casual "ขอใบอนุญาตอาหาร" query — which shares no 8-char contiguous substring with the
-    # official name (the real name has "จัดตั้งสถานที่จำหน่าย" between "ใบอนุญาต" and "อาหาร",
-    # a casual query has neither) — scored 0 on both the food-permit AND every other license,
-    # falling through to the LLM fallback classifier, which was live-reproduced picking the
-    # wrong license ("ใบทะเบียนพาณิชย์") for a query that also mentioned entity-type comparison
-    # terms ("ห้างหุ้นส่วนจำกัด", "บุคคลธรรมดา") strongly associated with DBD/commerce
-    # registration content elsewhere in the corpus, discarding all the actual food-permit docs
-    # via FOCUS FILTER before the answer was ever generated.
-    _LQS_FOOD_PERMIT_RE = re.compile(
-        r"ใบอนุญาต.*อาหาร|อาหาร.*ใบอนุญาต|จัดตั้ง.*(?:ร้านอาหาร|จำหน่ายอาหาร)|สถานที่จำหน่ายอาหาร|bma\s*oss",
-        re.IGNORECASE,
-    )
-    _LQS_QR_PAYMENT_RE = re.compile(
-        r"qr|คิวอาร์|คิวอาเพ|คิวอาเอพีไอ|payment|biller.?id|merchant.?id|"
-        r"สมัคร.*ชำระ|ชำระ.*ออนไลน์|ลงทะเบียน.*ชำระ",
-        re.IGNORECASE,
-    )
 
     # ── Inline handle() patterns compiled once here ──────────────────────────────
     _INLINE_URL_RE = re.compile(
@@ -4326,162 +4426,77 @@ class PracticalPersonaService:
                 sorted(_explicit_merged_pair),
             )
         elif _is_multi_license_docs and not _is_broad_query and not _is_multi_topic_flag and not _is_broad_q_flag and _lt_order:
-            # Pick dominant license_type by relevance to the CURRENT user query (not doc count alone).
-            # Algorithm:
-            #   1. Score each license_type against user_text using:
-            #      a) 8-char Thai substring match (high precision — avoids false partial-word matches)
-            #      b) English/acronym token exact match with weight 5× (EDC, VAT, QR, etc.)
-            #   2. If any license scores > 0, pick the highest scorer.
-            #   3. Fall back to doc count only when no license matches the query at all.
-            def _license_query_score(lt: str, query: str) -> float:
-                s = 0.0
-                q = query  # preserve case for Thai substring; lower for English
-                q_lower = q.lower()
-                lt_ns = re.sub(r"\s+", "", lt)
-                # (a) 8-char Thai sliding window: high specificity
-                for _i in range(len(lt_ns) - 7):
-                    seg = lt_ns[_i:_i+8]
-                    if seg in q:
-                        s += 2.0
-                # (a2) Short Thai names (< 10 chars): use full-name exact match instead.
-                # Also try every 4-char substring to catch partial overlap with the query.
-                if len(lt_ns) < 10:
-                    if lt_ns in q:
-                        s += 5.0
-                    elif len(lt_ns) >= 4:
-                        for _i in range(len(lt_ns) - 3):
-                            seg4 = lt_ns[_i:_i+4]
-                            if seg4 in q:
-                                s += 1.0
-                # (a3) Abbreviation expansion: detect when user types a short abbreviation
-                # in their query (e.g. "ภป", "หจก") and map it to the correct full-name
-                # license_type stored in Chroma.  Gives +8 to prevent the full-form license
-                # name from scoring 0 on an abbreviation query.
-                for _abbrev_pat, _full_pat in self._LQS_ABBREV_CHECK:
-                    if _abbrev_pat.search(q) and _full_pat.search(lt):
-                        s += 8.0
-                        break
-                # (b) English/numeric token exact match (case-insensitive)
-                for _tok in re.split(r"\s+", lt.strip()):
-                    _tok = _tok.strip()
-                    if re.match(r"^[A-Za-z0-9]+$", _tok) and len(_tok) >= 2:
-                        if _tok.lower() in q_lower:
-                            s += 5.0
-                # (c) Keyword-to-license mapping for topics whose license_type name doesn't
-                # share n-grams with the user query ("ปิดงบบัญชี" ≠ "จัดการการเงิน",
-                # "ขึ้นทะเบียนนายจ้าง" ≠ "การจัดหาพนักงาน", "SAN PLUS" ≠ "ใบรับรองมาตรฐานร้านอาหาร").
-                #
-                # IMPORTANT: when matching license name in the condition, use SPECIFIC terms only —
-                # NOT generic words like "บัญชี" that appear in MULTIPLE license names
-                # (e.g. "บัญชีธนาคารรับเงิน" would incorrectly score +8 for accounting queries).
-                # Match "จัดการการเงิน" (the actual license name), NOT generic "บัญชี"
-                # which also appears in "บัญชีธนาคารรับเงิน" → prevents false +8 tie.
-                if self._LQS_ACCOUNTING_RE.search(q) and re.search(r"จัดการการเงิน|จัดการเงิน", lt, re.IGNORECASE):
-                    s += 8.0
-                # Banking account → "บัญชีธนาคารรับเงิน"
-                if self._LQS_BANKING_RE.search(q) and re.search(r"บัญชีธนาคาร", lt, re.IGNORECASE):
-                    s += 8.0
-                # Employer registration → "ทะเบียนนายจ้าง" (explicit registration intent)
-                # Separated from hiring (การจัดหาพนักงาน) to prevent tie when score=8 for both.
-                if self._LQS_EMPLOYER_RE.search(q) and re.search(r"ทะเบียนนายจ้าง", lt, re.IGNORECASE):
-                    s += 10.0  # higher than hiring (+8) so ทะเบียนนายจ้าง wins on employer queries
-                # Hiring / staffing → "การจัดหาพนักงาน"
-                if self._LQS_HIRING_RE.search(q) and re.search(r"จัดหาพนักงาน", lt, re.IGNORECASE):
-                    s += 8.0
-                # SAN / SAN PLUS / มาตรฐานร้านอาหาร → "ใบรับรองมาตรฐานร้านอาหาร"
-                if self._LQS_SAN_RE.search(q) and re.search(r"รับรองมาตรฐาน|มาตรฐานร้านอาหาร", lt, re.IGNORECASE):
-                    s += 8.0
-                # QR Payment / คิวอาร์ → "ระบบชำระเงินออนไลน์"
-                if self._LQS_QR_KEYWORDS_RE.search(q) and re.search(r"ชำระเงินออนไลน์|ระบบชำระ", lt, re.IGNORECASE):
-                    s += 8.0
-                # VAT / ภพ.20 / ภาษีมูลค่าเพิ่ม → "ใบภาษีมูลค่าเพิ่ม ภพ.20"
-                if self._LQS_VAT_RE.search(q) and re.search(r"ภาษีมูลค่าเพิ่ม|ภพ", lt, re.IGNORECASE):
-                    s += 8.0
-                # ประกันสังคม (general) → ทะเบียนนายจ้าง: employer registration is always
-                # required for ประกันสังคม, even when user doesn't say "นายจ้าง" explicitly.
-                # Score 8 so it exceeds the multi-requested threshold (>4) alongside VAT.
-                if self._LQS_SOCIAL_RE.search(q) and re.search(r"นายจ้าง", lt, re.IGNORECASE):
-                    s += 8.0
-                # ประกันสังคม (without explicit employer context) → ทะเบียนผู้ประกันตน.
-                # Score 8 (was 4) so it also exceeds the multi-requested threshold when
-                # query mentions both VAT and ประกันสังคม — ensures both are kept together.
-                if (self._LQS_SOCIAL_RE.search(q)
-                        and not self._LQS_EMPLOYER_RE.search(q)
-                        and re.search(r"ผู้ประกันตน", lt, re.IGNORECASE)):
-                    s += 8.0
-                # ผู้ประกันตน / ลูกจ้าง / เงินสมทบ → "ทะเบียนผู้ประกันตน"
-                if self._LQS_INSURED_RE.search(q) and re.search(r"ผู้ประกันตน", lt, re.IGNORECASE):
-                    s += 8.0
-                # Health certificate → "ใบรับรองแพทย์ 9 โรค(สณ.11)"
-                if self._LQS_HEALTH_CERT_RE.search(q) and re.search(r"รับรองแพทย์|9\s*โรค", lt, re.IGNORECASE):
-                    s += 8.0
-                # สุรา / ขายสุรา → "ใบอนุญาตจำหน่ายสุรา"
-                if self._LQS_LIQUOR_RE.search(q) and re.search(r"สุรา", lt, re.IGNORECASE):
-                    s += 8.0
-                # ภาษีป้าย → "แบบแสดงรายการภาษีป้ายร้านอาหาร"
-                if self._LQS_SIGN_TAX_RE.search(q) and re.search(r"ภาษีป้าย", lt, re.IGNORECASE):
-                    s += 8.0
-                # QR Payment / online payment → "ระบบชำระเงินออนไลน์"
-                if self._LQS_QR_PAYMENT_RE.search(q) and re.search(r"ระบบชำระเงิน", lt, re.IGNORECASE):
-                    s += 8.0
-                # ใบอนุญาตอาหาร (casual phrasing) → "ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร"
-                if self._LQS_FOOD_PERMIT_RE.search(q) and re.search(r"จัดตั้งสถานที่จำหน่ายอาหาร", lt, re.IGNORECASE):
-                    s += 8.0
-                return s
-
-            _focus_query = (user_text or "").strip()
-            # When handle() is called recursively with "__auto_post_retrieve__", user_text is a
-            # placeholder — use last_retrieval_query as the actual query for scoring.
-            if not _focus_query or _focus_query.startswith("__"):
-                _focus_query = (getattr(state, "last_retrieval_query", None) or "").strip()
-
-            # Compute scores for ALL license types so we can detect multi-requested scenarios.
-            _lt_scores: dict = {lt: _license_query_score(lt, _focus_query) for lt in _lt_order}
+            # Pick dominant license_type by RETRIEVAL'S OWN relevance judgment, not by
+            # matching query text against the license_type NAME STRING.
+            #
+            # 2026-11 fix (root-cause removal, live-reproduced): this block used to score
+            # each license_type with ~140 lines of hand-written regex (an 8-char Thai
+            # substring sliding window + ~15 per-license keyword special cases, each added
+            # one at a time after a real bug report). That approach is fundamentally blind
+            # to any phrasing that doesn't echo the license_type's own formal vocabulary.
+            # Live-reproduced failure: "พื้นที่ร้าน 45 ตร.ม. ค่าธรรมเนียมแจ้งรายปีกี่บาท" —
+            # a direct hybrid_search() call (bypassing this function entirely) ranked the
+            # CORRECT document #0, proving retrieval+reranking already knew the right
+            # answer — but the regex scorer gave that license_type ~0 because the query
+            # never contains "หนังสือรับรองการแจ้ง" verbatim, so the old LLM tie-breaker ran
+            # instead, picked different license types, and FOCUS FILTER discarded the
+            # correctly-retrieved document anyway.
+            #
+            # This is the exact failure class persona_supervisor.py's own
+            # _classify_license_dominance already named and designed around ("Deliberately
+            # NOT a regex/keyword heuristic ... hand-coding detection for every future
+            # phrasing pattern doesn't scale") — fixed here the same way: score each
+            # license_type from the similarity score (_sim) retrieval+reranking ALREADY
+            # computed for every doc reaching this point (_scored_search attaches it to
+            # doc.metadata — see that method's docstring). Semantically aware by
+            # construction, nothing left to hand-tune per keyword — and the LLM fallback
+            # below is now needed only for the rare case where no doc carries a similarity
+            # score at all (the retrieval-exception fallback path in _retrieve_docs).
+            _lt_scores: Dict[str, float] = {}
+            for _d_lqs in _all_docs:
+                _lt_d = ((_d_lqs.get("metadata") or {}).get("license_type") or "").strip()
+                if not _lt_d:
+                    continue
+                _sim_d = (_d_lqs.get("metadata") or {}).get("_sim")
+                if _sim_d is None:
+                    continue
+                _sim_d = float(_sim_d)
+                if _lt_d not in _lt_scores or _sim_d > _lt_scores[_lt_d]:
+                    _lt_scores[_lt_d] = _sim_d
             _best_lt = max(_lt_scores, key=lambda lt: _lt_scores[lt]) if _lt_scores else None
             _best_score = _lt_scores.get(_best_lt, -1.0) if _best_lt else -1.0
 
-            # When slot-answer text (e.g. "นิติบุคคล", "45 ตรม") gives score=0, retry with
-            # the original legal query — user_text is a slot value, not the topic question.
-            _orig_q = ""
-            if _best_score <= 0:
-                _orig_q = (
-                    (state.context or {}).get("last_user_legal_query")
-                    or (state.context or {}).get("last_topic")
-                    or getattr(state, "last_retrieval_query", None)
-                    or ""
-                ).strip()
-                if _orig_q.startswith("__"):
-                    _orig_q = ""
-                if _orig_q and _orig_q != _focus_query:
-                    for _lt_cand in _lt_order:
-                        _s2 = _license_query_score(_lt_cand, _orig_q)
-                        if _s2 > _lt_scores.get(_lt_cand, 0):
-                            _lt_scores[_lt_cand] = _s2
-                    _best_lt = max(_lt_scores, key=lambda lt: _lt_scores[lt]) if _lt_scores else None
-                    _best_score = _lt_scores.get(_best_lt, -1.0) if _best_lt else -1.0
-
-            # LLM fallback: when regex scoring gives 0 or a weak signal (≤4 = only partial
-            # 4-char window matches, no keyword hit), use Haiku to identify the license type.
-            # Threshold ≤4 catches ambiguous queries where regex fired on a short substring
-            # but isn't confident enough to override — LLM required confidence ≥0.80 (higher
-            # than the score=0 path) so it only overrides when truly certain.
-            if _best_score <= 4 and len(_lt_order) >= 2 and len(_lt_order) <= 12:
-                _llm_q = (_focus_query or _orig_q).strip()
-                # Require higher confidence when overriding a weak regex signal (score 1-4)
-                # vs no signal at all (score ≤0) to prevent incorrect overrides.
-                _min_conf = 0.80 if _best_score > 0 else 0.70
-                if _llm_q and not _llm_q.startswith("__"):
-                    _llm_lt = self._lqs_license_type_fallback(_llm_q, _lt_order, state, min_confidence=_min_conf)
+            # No doc carries a similarity score at all (defensive only — the retrieval-
+            # exception fallback path never attaches one): nothing to rank on, ask the LLM
+            # directly which license_type the raw query is about.
+            if _best_score <= 0 and len(_lt_order) >= 2 and len(_lt_order) <= 12:
+                _focus_query = (user_text or "").strip()
+                if not _focus_query or _focus_query.startswith("__"):
+                    _focus_query = (getattr(state, "last_retrieval_query", None) or "").strip()
+                if not _focus_query:
+                    _focus_query = (
+                        (state.context or {}).get("last_user_legal_query")
+                        or (state.context or {}).get("last_topic")
+                        or ""
+                    ).strip()
+                if _focus_query and not _focus_query.startswith("__"):
+                    _llm_lt = self._lqs_license_type_fallback(_focus_query, _lt_order, state, min_confidence=0.70)
                     if _llm_lt:
                         _best_lt = _llm_lt
-                        _best_score = 8.0  # synthetic score to enable focused filtering
-                        _lt_scores[_llm_lt] = max(_lt_scores.get(_llm_lt, 0), 8.0)
+                        _best_score = 1.0  # synthetic: enables single-dominant narrowing below
+                        _lt_scores[_llm_lt] = max(_lt_scores.get(_llm_lt, 0), 1.0)
 
-            # Multi-requested exception: if 2+ licenses scored > 4 (= explicit keyword match,
-            # not just incidental partial substring), the user asked about multiple licenses in
-            # the same query. Keep ALL explicitly-requested licenses; drop only zero-score noise.
-            # Example: "ขอใบอนุญาตจัดตั้งร้านอาหาร ฉันขายเหล้าด้วย" → food(16) + liquor(8) both >4.
-            _explicitly_requested = [lt for lt in _lt_order if _lt_scores.get(lt, 0) > 4]
+            # Multi-requested: license_types whose best-matching doc sits within a
+            # similarity MARGIN of the single best match are statistically tied for "most
+            # relevant" — genuinely both on-topic (e.g. a dual-license question), not one
+            # dominant license plus noise. A relative margin, not an absolute score cutoff,
+            # for the same reason _rrf_fuse's BM25_BYPASS_MIN_RATIO is relative to the
+            # query's own top score: raw similarity has no shared meaning across queries.
+            _sim_margin = float(getattr(conf, "FOCUS_FILTER_SIM_MARGIN", 0.03))
+            _explicitly_requested = (
+                [lt for lt in _lt_order if (_best_score - _lt_scores.get(lt, -1.0)) <= _sim_margin]
+                if _best_score > 0 else []
+            )
             if len(_explicitly_requested) >= 2:
                 _noise_count = len([d for d in _all_docs
                                     if (d.get("metadata") or {}).get("license_type", "").strip()
@@ -4492,9 +4507,9 @@ class PracticalPersonaService:
                                  in _explicitly_requested]
                     _lt_order = [lt for lt in _lt_order if lt in _explicitly_requested]
                 _LOG.info(
-                    "[Practical] FOCUS FILTER: multi-requested %s → keeping all (scores: %s, dropped %d noise docs)",
+                    "[Practical] FOCUS FILTER: multi-requested %s → keeping all (sim scores: %s, dropped %d noise docs)",
                     _explicitly_requested,
-                    {lt: round(_lt_scores.get(lt, 0), 1) for lt in _explicitly_requested},
+                    {lt: round(_lt_scores.get(lt, 0), 3) for lt in _explicitly_requested},
                     _noise_count,
                 )
                 # Signal sibling-completion to skip: docs already cover all explicitly-requested
@@ -4528,7 +4543,7 @@ class PracticalPersonaService:
                 ] if _dominant_lt else []
                 if _focused_docs:
                     _LOG.info(
-                        "[Practical] FOCUS FILTER: multi-license %s → keeping only %r (score=%.1f, %d docs, dropped %d)",
+                        "[Practical] FOCUS FILTER: multi-license %s → keeping only %r (sim score=%.3f, %d docs, dropped %d)",
                         _lt_order, _dominant_lt, _best_score, len(_focused_docs), len(_all_docs) - len(_focused_docs),
                     )
                     _all_docs = _focused_docs
@@ -4537,7 +4552,17 @@ class PracticalPersonaService:
                     # Restore full doc cap: multi-topic cap was applied before FOCUS FILTER ran.
                     # Now that we're down to a single license type, reset to the original limit
                     # so we don't unnecessarily cut docs (e.g. keeping only 3 of 6 สุรา docs).
-                    _prompt_max_docs = int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 6))
+                    # 2026-11 fix (live-reproduced): the plain reset above could still be SMALLER
+                    # than len(_focused_docs) itself — e.g. _focused_docs = 1 dominant regulatory
+                    # doc + 5 blank-license know-how docs the 2026-10 fix always preserves = 6,
+                    # but LLM_DOCS_MAX_PRACTICAL was 5 on the live deployment. The later generic
+                    # cap then had to drop 1 doc from this already-curated set, and because _sim
+                    # isn't reliably comparable across docs merged from different upstream
+                    # retrieval calls, it dropped the regulatory doc and kept all 5 filler docs —
+                    # "ไม่พบข้อมูล" even though the fee doc was retrieved. _focused_docs is already
+                    # a small, deliberately-curated, query-local set (bounded by RERANKER_TOP_K),
+                    # so never cap it below its own size.
+                    _prompt_max_docs = max(int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 6)), len(_focused_docs))
                     # Update state.current_docs immediately so supervisor/_route_pending_slot_to_persona
                     # sees the focused set when reading _area_license_lock — critical for topics without
                     # op-intent filter (e.g. Refund, WeChat Pay) where state.current_docs is not
@@ -4987,8 +5012,38 @@ class PracticalPersonaService:
                         _all_docs = _focused_tf
                         state.current_docs = _focused_tf
 
+        # 2026-11 fix: every cap/slice below used to keep whatever order _all_docs
+        # happened to be in (confirmed live: zero .sort() calls ever touched this
+        # list), so when a cap had to drop docs it could drop the actually-best-
+        # matching one and keep an arbitrary first-seen one instead. Every doc
+        # reaching this point already carries doc["metadata"]["_sim"] (attached by
+        # _scored_search — the same signal FOCUS FILTER's scoring above already
+        # trusts), so sort by it before each slice rather than inventing a new
+        # relevance signal. Missing/None _sim sorts last, never first.
+        #
+        # 2026-11 fix #2 (live-reproduced, then reverted): raw _sim alone isn't
+        # always comparable — _sim can be a per-retrieval-batch normalized score,
+        # so a blank-license_type "know-how" doc pulled in by a different
+        # retrieval pass can tie or edge out a doc that actually carries a
+        # licensed answer. First attempt here was a blanket "any non-blank
+        # license_type beats any blank one" tiebreak — reverted because it
+        # creates the mirror-image bug: a purely general know-how query that
+        # happens to retrieve one irrelevant "stray" named-license doc (no
+        # license_type filter is ever applied at retrieval) would let that doc
+        # unconditionally survive the cap ahead of genuinely relevant know-how
+        # content. The real root cause (FOCUS FILTER's single-dominant branch
+        # restoring _prompt_max_docs to a value smaller than the curated doc set
+        # it just built) is fixed at its source instead — see _focused_docs /
+        # _prompt_max_docs just above where FOCUS FILTER narrows to one
+        # dominant license_type. This helper stays plain-_sim, same as it was
+        # before that bug was ever found.
+        def _sim_key(_d):
+            _s = (_d.get("metadata") or {}).get("_sim")
+            return _s if _s is not None else -1
+
         # Cap at _prompt_max_docs per license_type (prevents token explosion on multi-topic queries)
         if _is_multi_license_docs:
+            _all_docs = sorted(_all_docs, key=_sim_key, reverse=True)
             _lt_counts: dict = {}
             _docs_to_process = []
             for _d0 in _all_docs:
@@ -5030,7 +5085,7 @@ class PracticalPersonaService:
                 if _dtm_dts and _dtm_dts <= {"marketing", "business_guide", ""}:
                     _informational_but_nonreg_chapter = True
             if bool((state.context or {}).get("_informational_query")) and not _informational_but_nonreg_chapter:
-                _docs_to_process = _all_docs[:_prompt_max_docs]
+                _docs_to_process = sorted(_all_docs, key=_sim_key, reverse=True)[:_prompt_max_docs]
                 _LOG.info(
                     "[Practical] Direct topic match (informational overview) — capped %d/%d docs",
                     len(_docs_to_process), len(_all_docs),
@@ -5108,7 +5163,7 @@ class PracticalPersonaService:
             _docs_to_process = _all_docs
             _LOG.info("[Practical] Chapter overview: sending all %d docs (no dedup)", len(_all_docs))
         else:
-            _docs_to_process = _all_docs[:_prompt_max_docs]
+            _docs_to_process = sorted(_all_docs, key=_sim_key, reverse=True)[:_prompt_max_docs]
 
         # Detect operation intent from query — must run BEFORE doc-filter and Pass 1.
         # When user_text is a slot answer (e.g. "ธนาคารไทยพาณิชย์"), fall back to last_retrieval_query.
@@ -7213,6 +7268,11 @@ Your JSON response:
         # unit-testable without driving the whole handle() flow — see
         # _apply_groundedness_safety_net's docstring for the full rationale.
         decision, exec_ = self._apply_groundedness_safety_net(action, exec_, decision, docs_json, prompt, state)
+
+        # Deterministic fee-arithmetic safety net (2026-11, live-reproduced) — see
+        # _apply_fee_arithmetic_safety_net's docstring. Runs AFTER groundedness since
+        # that check can rewrite exec_["answer"] wholesale on its own retry.
+        decision, exec_ = self._apply_fee_arithmetic_safety_net(action, exec_, decision, prompt, state)
 
         # Diagnostic-only (2026-09, paired with the docs_json log above) —
         # catches the exact failing moment if this info-gap pattern recurs:

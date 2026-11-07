@@ -5,7 +5,17 @@ files (env.properties, env.dev.properties, env.dev.properties.ec2) still
 said Sonnet. A fresh rebuild/redeploy/local run with no env override would
 silently revert to the 3x-more-expensive model with no error or log line,
 since this repo contained no copy of config matching the actual deployed
-decision. Pins all 4 to agree on Haiku going forward.
+decision. Pins all 4 to agree with each other going forward (same
+reasoning applies regardless of which model config.py's default names).
+
+2026-11-06: switched again, Haiku -> gemini-2.5-flash-lite (groundedness
+win), then reverted gemini-2.5-flash-lite -> Haiku the same day after a
+live deploy showed real OpenRouter upstream rate-limit errors on that
+model turning ordinary requests into 171-521 SECOND waits (see conf.py's
+own comment at OPENROUTER_MODEL_PRACTICAL for the full history). Back on
+Haiku until a BYOK (dedicated-quota) key is verified. _EXPECTED_MODEL
+updated to match — the test's PURPOSE (catch config drift between conf.py
+and the env files) is unchanged.
 """
 from __future__ import annotations
 
@@ -25,7 +35,7 @@ _EXPECTED_MODEL = "anthropic/claude-haiku-4-5"
 
 @pytest.mark.unit
 class TestPracticalModelConfigAgreesEverywhere:
-    def test_conf_py_default_is_haiku(self, monkeypatch):
+    def test_conf_py_default_matches_expected_model(self, monkeypatch):
         monkeypatch.delenv("OPENROUTER_MODEL_PRACTICAL", raising=False)
         # conf.py may already be imported (cached) by an earlier test in
         # this session with a different env var state — re-read the
@@ -43,7 +53,7 @@ class TestPracticalModelConfigAgreesEverywhere:
     @pytest.mark.parametrize("env_file", [
         "env.properties", "env.dev.properties", "env.dev.properties.ec2",
     ])
-    def test_env_file_sets_haiku(self, env_file):
+    def test_env_file_matches_expected_model(self, env_file):
         # These 3 files are gitignored (real/local secrets, never committed
         # — see .gitignore) — a clean checkout (including CI) won't have
         # them at all. Skip rather than fail when absent; this test's value

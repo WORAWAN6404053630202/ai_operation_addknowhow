@@ -46,6 +46,44 @@ OPENROUTER_MODEL_ACADEMIC = os.getenv("OPENROUTER_MODEL_ACADEMIC", "openai/gpt-5
 # fallback default — still said Sonnet. A fresh deploy/rebuild/local run
 # with no env override silently reverted to the 3x-more-expensive model
 # with no error or log line.
+#
+# 2026-11 switch (cost + groundedness audit): claude-haiku-4-5 was found
+# live-triggering the expensive full-regeneration retry (see llm_call.py/
+# persona_practical.py history) on 7/8 real broad-question test cases —
+# confirmed genuine fabrication (invented fee formulas, invented
+# regulation names), not judge over-sensitivity (read the actual flagged
+# claims). Live-tested 4 candidates on the identical question set,
+# cross-referenced against Vectara's grounded-summarization hallucination
+# leaderboard (the benchmark shape closest to this persona's actual task —
+# claude-haiku-4-5: 9.8%, claude-sonnet-4-5: 12.0%, google/gemini-2.5-
+# flash-lite: 3.3%) and this project's own prior PDF-pipeline model
+# comparisons (gemini-2.5-flash-lite already won 3 of those independently,
+# see OPENROUTER_MODEL_PDF_TOPIC_SPLIT/_VISION/_IMAGE_CHECK below):
+#   - claude-sonnet-4-5: 93% MORE expensive, same 50% retry rate as gemini —
+#     being "smarter"/costlier didn't mean better-grounded.
+#   - openai/gpt-6-luna: cheapest, lowest retry rate (37.5%) — but verified
+#     via retrieved_sources inspection that the low retry rate was an
+#     ARTIFACT of chronic under-answering ("ยังไม่พบข้อมูลในเอกสารครับ" on
+#     4/8 questions despite 1-9 directly relevant retrieved docs each
+#     time) — an empty non-answer can't be flagged as an unsupported
+#     claim, masking unhelpfulness as safety. Disqualified.
+#   - google/gemini-2.5-flash-lite: 63% cheaper than haiku, 50% retry rate
+#     (vs haiku's 87.5%), and verified via the same retrieved_sources
+#     inspection to give substantive answers on all 8 questions (no masked
+#     refusals) while correctly separating "what the docs support" from
+#     "what they don't" (e.g. stating the real fee tiers found, then
+#     explicitly noting the specific threshold asked about wasn't in the
+#     retrieved docs — not fabricating it, not refusing to engage either).
+# Winner on hallucination/cost grounds — BUT reverted back to haiku-4-5
+# below (2026-11-06) after live deploy on the ES test instance showed
+# google/gemini-2.5-flash-lite hitting real OpenRouter upstream rate-limit
+# errors (`RateLimitError: ... temporarily rate-limited upstream`) on
+# ordinary single-digit concurrent traffic — retries eventually succeeded
+# but real response times hit 171-521 SECONDS per request, an unacceptable
+# user-facing wait regardless of the grounding-quality win. Re-attempt only
+# after securing a BYOK (bring-your-own-key) OpenRouter/Google key with
+# dedicated quota for this model — not re-evaluate pricing/hallucination
+# alone, the way the caveat below normally frames it.
 OPENROUTER_MODEL_PRACTICAL = os.getenv("OPENROUTER_MODEL_PRACTICAL", "anthropic/claude-haiku-4-5")
 
 OPENROUTER_SWITCH_MODEL = os.getenv("OPENROUTER_SWITCH_MODEL", "anthropic/claude-haiku-4-5")
@@ -334,6 +372,18 @@ OPENROUTER_MODEL_PDF_SUPERSEDE = os.getenv("OPENROUTER_MODEL_PDF_SUPERSEDE", OPE
 
 # RAG Quality: Minimum similarity threshold
 RETRIEVAL_MIN_SIMILARITY = _safe_float("RETRIEVAL_MIN_SIMILARITY", 0.6)
+
+# FOCUS FILTER (persona_practical.py handle()) multi-requested margin: when 2+
+# license_types' best-matching retrieved doc sit within this many similarity
+# points of each other, treat them as co-equally relevant (keep both) rather
+# than picking one as dominant and discarding the other as noise. Replaces a
+# removed regex/keyword scorer (2026-11 fix, live-reproduced — see FOCUS
+# FILTER's own comment in handle() for the full story) that was blind to any
+# query phrasing not echoing the license_type's own formal name. 0.03 is a
+# reasoned starting point (observed gap between a genuinely dominant doc and
+# its runner-up in live test cases was ~0.04-0.07) rather than an extensively
+# measured constant — re-tune if live multi-license queries group wrong.
+FOCUS_FILTER_SIM_MARGIN = _safe_float("FOCUS_FILTER_SIM_MARGIN", 0.03)
 
 # PDF book content (2026-09, evidence-based): RETRIEVAL_MIN_SIMILARITY above was
 # calibrated for short, structured regulatory/marketing Sheet rows — it silently

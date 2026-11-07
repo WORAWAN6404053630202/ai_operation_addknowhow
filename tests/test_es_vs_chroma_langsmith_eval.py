@@ -44,6 +44,20 @@ class TestParseJudgeJson:
     def test_malformed_json_returns_empty_dict_not_raise(self):
         assert _parse_judge_json("not json at all") == {}
 
+    def test_strips_json_markdown_fence(self):
+        """2026-11, live-caught bug: response_format={"type": "json_object"}
+        does NOT reliably stop claude-haiku-4-5 (via OpenRouter) from
+        wrapping its JSON in a ```json fence — confirmed live, every judge
+        call in a real 175-question run came back fenced, silently
+        collapsing correctness_evaluator/relevance_evaluator to score 0.0
+        on every single example with an empty reasoning comment."""
+        raw = '```json\n{\n  "reasoning": "matches", \n  "correct": true\n}\n```'
+        assert _parse_judge_json(raw) == {"reasoning": "matches", "correct": True}
+
+    def test_strips_bare_markdown_fence_without_json_tag(self):
+        raw = '```\n{"correct": false}\n```'
+        assert _parse_judge_json(raw) == {"correct": False}
+
 
 @pytest.mark.unit
 class TestMakeTarget:

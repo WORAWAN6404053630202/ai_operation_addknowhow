@@ -6,9 +6,24 @@ their real live /chat HTTP endpoints, scores both with 3 evaluators
 (Correctness, Groundedness, Relevance), and uploads two separate LangSmith
 experiments for side-by-side comparison in the UI.
 
-COSTS REAL MONEY — each run makes 113 x (1 chat call + 3 judge calls) real
-LLM calls. Confirm with the user before running for real; nothing here is
-free like the earlier reindex/hardening scripts.
+COSTS REAL MONEY — each run makes N x (1 chat call + up to 3 judge calls)
+real LLM calls (N = dataset size, 175 real rows as of 2026-11 in
+pdf-only-qa-175 — the "113" in this file's own name/defaults is stale,
+left over from an earlier, smaller sheet). Confirm with the user before
+running for real; nothing here is free like the earlier reindex/hardening
+scripts. Use --limit for a cheap smoke-test before committing to a full run.
+
+2026-11, live-caught: the default max_concurrency=4 reliably trips the
+target bot's own per-IP rate limiter (conf.RATE_LIMIT_MAX_REQUESTS=10 per
+conf.RATE_LIMIT_WINDOW_SECONDS=60) within the first few iterations — a
+real 175-row run lost 165/175 rows to HTTP 429 with real (if partial, see
+route_v1.py's rate limiter — it rejects BEFORE calling the LLM, so no
+chat/judge cost was incurred on the rejected rows) money spent on nothing.
+Default lowered to 1: at this bot's typical ~20-35s per /chat call, even
+fully sequential requests land at ~2 req/60s, comfortably under the limit
+without needing to touch the live bot's rate-limiter config at all. Raise
+back up only if you've confirmed the target's rate limit is disabled/high
+enough for the concurrency you want.
 
 Correctness and Relevance are fresh lightweight claude-haiku-4-5 judges
 (same model/client-construction pattern this codebase already uses for its
@@ -22,14 +37,15 @@ built in __init__ never touch the retriever at all.
 Usage:
 
     python3 code/scripts/es_vs_chroma_langsmith_eval.py \
-        --dataset-name pdf-only-qa-113 \
-        --chroma-url http://43.210.64.119:3001 \
-        --es-url http://43.210.35.109:3001
+        --dataset-name pdf-only-qa-175 \
+        --es-url http://43.210.35.109:3001 --skip-chroma \
+        --limit 5   # smoke-test a handful of rows before a full paid run
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -76,8 +92,17 @@ def _judge_llm():
     from langchain_openai import ChatOpenAI
     from utils.llm_call import get_shared_http_client, CHAT_OPENAI_MAX_RETRIES
 
+    # 2026-11: ESEVAL_JUDGE_MODEL lets correctness/relevance be A/B tested
+    # against a different judge model without touching conf.py's real
+    # OPENROUTER_SWITCH_MODEL (which other live call sites also depend on).
+    # Deliberately never defaults to a Google/Gemini-family model here now
+    # that OPENROUTER_MODEL_PRACTICAL is gemini-2.5-flash-lite — judge
+    # self-preference bias is well-documented (a judge scores its own
+    # model family's outputs 10-25% more favorably, even on objective
+    # rubrics) and this judge's whole job is catching THIS bot's mistakes.
+    model = os.environ.get("ESEVAL_JUDGE_MODEL") or getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL)
     return ChatOpenAI(
-        model=getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL),
+        model=model,
         openai_api_key=conf.OPENROUTER_API_KEY,
         openai_api_base=conf.OPENROUTER_BASE_URL,
         http_client=get_shared_http_client(),
@@ -98,8 +123,25 @@ def _judge_llm():
 
 
 def _parse_judge_json(text: str) -> dict:
+    """2026-11, live-caught bug: response_format={"type": "json_object"} on
+    _judge_llm() does NOT reliably stop claude-haiku-4-5 (via OpenRouter)
+    from wrapping its JSON in a ```json ... ``` markdown fence — confirmed
+    live, every single judge call in a 175-question run came back fenced.
+    A bare json.loads() on that text fails immediately (char 0), and the
+    broad except silently returned {} — meaning correctness_evaluator and
+    relevance_evaluator scored EVERY example 0.0 with an empty reasoning
+    comment, with no error surfaced anywhere, since they were never
+    designed to expect a parse failure on a response_format=json_object
+    call. Strip the fence first, same pattern already used elsewhere in
+    this codebase (e.g. persona_academic.py's _call methods) for models
+    that aren't forced into true JSON mode."""
+    t = text.strip()
+    if "```json" in t:
+        t = t.split("```json", 1)[1].split("```", 1)[0].strip()
+    elif "```" in t:
+        t = t.split("```", 1)[1].split("```", 1)[0].strip()
     try:
-        return json.loads(text)
+        return json.loads(t)
     except Exception:
         return {}
 
@@ -201,23 +243,38 @@ def _make_groundedness_evaluator():
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--dataset-name", default="pdf-only-qa-113")
+    parser.add_argument("--dataset-name", default="pdf-only-qa-175")
     parser.add_argument("--chroma-url", default="http://43.210.64.119:3001")
     parser.add_argument("--es-url", default="http://43.210.35.109:3001")
-    parser.add_argument("--max-concurrency", type=int, default=4, help="parallel requests — keep modest, these hit live bot instances serving real traffic too")
+    # 2026-11, live-caught: 4 reliably trips the target bot's own per-IP
+    # rate limiter (see module docstring) — 1 is safe at this bot's typical
+    # per-call latency without needing to touch the live rate-limiter config.
+    parser.add_argument("--max-concurrency", type=int, default=1, help="parallel requests — keep modest, these hit live bot instances serving real traffic too; raise only if you've confirmed the target's rate limit allows it")
+    parser.add_argument("--limit", type=int, default=None, help="only run the first N dataset rows — use this for a cheap smoke-test before a full paid run")
     parser.add_argument("--skip-chroma", action="store_true")
     parser.add_argument("--skip-es", action="store_true")
     args = parser.parse_args()
 
-    from langsmith import evaluate
+    from langsmith import evaluate, Client
 
     evaluators = [correctness_evaluator, relevance_evaluator, _make_groundedness_evaluator()]
+
+    # --limit slices the dataset client-side into an explicit list of
+    # examples — evaluate()'s `data` param accepts either a dataset name
+    # (string) or an iterable of Examples, so this is a drop-in substitute
+    # for the full dataset name string below, not a separate code path.
+    data = args.dataset_name
+    if args.limit:
+        client = Client()
+        ds = client.read_dataset(dataset_name=args.dataset_name)
+        data = list(client.list_examples(dataset_id=ds.id, limit=args.limit))
+        print(f"--limit {args.limit}: running only {len(data)} row(s) of {args.dataset_name}")
 
     if not args.skip_chroma:
         print(f"\n=== Running Chroma baseline experiment against {args.chroma_url} ===")
         chroma_results = evaluate(
             _make_target(args.chroma_url),
-            data=args.dataset_name,
+            data=data,
             evaluators=evaluators,
             experiment_prefix="chroma-baseline",
             max_concurrency=args.max_concurrency,
@@ -228,7 +285,7 @@ def main() -> None:
         print(f"\n=== Running ES candidate experiment against {args.es_url} ===")
         es_results = evaluate(
             _make_target(args.es_url),
-            data=args.dataset_name,
+            data=data,
             evaluators=evaluators,
             experiment_prefix="es-hybrid",
             max_concurrency=args.max_concurrency,

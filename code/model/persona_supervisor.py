@@ -4428,6 +4428,13 @@ class PersonaSupervisor:
         )
         if (
             _active_topic_q
+            and _active_topic_q != q  # 2026-11 fix: prevent self-anchor on a fresh session with
+            # no prior topic — _active_topic_q falls back to the user's OWN current message
+            # (last_user_legal_query is set to the raw query moments earlier), so without this
+            # guard this block fired on turn 1 and doubled the query text ("q q"), skewing
+            # BM25/hybrid-search term-frequency ranking. Same guard already added to the two
+            # sibling anchoring blocks below (op-type follow-up, channel-preference follow-up)
+            # for this exact reason — this block was simply missing it.
             and len(q) <= 80
             and self._GENERIC_FOLLOWUP_KEYWORDS_RE.search(q)
             and not self._SPECIFIC_TOPIC_RE.search(q)

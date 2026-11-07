@@ -34,6 +34,11 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
     "qwen/qwen3.7-flash": {"input": 0.03, "output": 0.13},
     "google/gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40},
     "baai/bge-m3": {"input": 0.01, "output": 0.0},  # embedding model — no completion tokens
+    # --- Verified live against openrouter.ai on 2026-11-06 ---
+    # 2026-11: candidate judge model for es_vs_chroma_langsmith_eval.py's
+    # ESEVAL_JUDGE_MODEL override — real OpenRouter pricing, not yet a
+    # live production caller.
+    "openai/gpt-5-mini": {"input": 0.25, "output": 2.00},
 
     # --- NOT independently re-verified this round — no confirmed live caller ---
     "anthropic/claude-sonnet-4": {"input": 3.00, "output": 15.00},
