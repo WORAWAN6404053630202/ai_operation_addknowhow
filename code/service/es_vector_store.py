@@ -547,6 +547,40 @@ class ESVectorStoreManager:
         self._bump_corpus_version()
         return len(fetched["ids"])
 
+    def list_archived_docs(self, pattern: Optional[str] = None, since_epoch: Optional[float] = None) -> List[Dict]:
+        """ES counterpart to local_vector_store.py's LocalVectorStoreManager.
+        list_archived_docs (same pattern/since_epoch filter+sort contract) —
+        2026-11, added after finding admin_pdf.py's "recently archived docs"
+        panel always showed empty on the ES-backed deployment because this
+        function simply didn't exist on this side. Dumps self._archive_index
+        in full (ESCompatCollection.get() with no `ids` -> match_all, same
+        shape archive_and_remove/restore_from_archive already rely on above),
+        then applies the identical Python-side filtering/sorting the Chroma
+        version uses rather than inventing different semantics."""
+        client = self._get_client()
+        archive_coll = ESCompatCollection(client, self._archive_index)
+        raw = archive_coll.get(include=["metadatas", "documents"])
+        ids = raw.get("ids") or []
+        metadatas = raw.get("metadatas") or []
+        documents = raw.get("documents") or []
+
+        def _superseded_at(meta: dict) -> float:
+            try:
+                return float(meta.get("superseded_at") or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        out: List[Dict] = []
+        for doc_id, m, d in zip(ids, metadatas, documents):
+            meta = m or {}
+            if pattern and pattern not in str(meta.get("source_file") or ""):
+                continue
+            if since_epoch is not None and _superseded_at(meta) < since_epoch:
+                continue
+            out.append({"id": doc_id, "metadata": meta, "content": d or ""})
+        out.sort(key=lambda item: _superseded_at(item["metadata"]), reverse=True)
+        return out
+
     def retrieve_raw_docs(self, query: str, k: int = 0) -> List[Document]:
         if self.retriever is None:
             self.connect_to_existing(fail_if_empty=False)
@@ -641,6 +675,10 @@ def archive_and_remove(doc_ids: List[str], reason: str = "") -> int:
 
 def restore_from_archive(doc_ids: List[str]) -> int:
     return _MANAGER.restore_from_archive(doc_ids)
+
+
+def list_archived_docs(pattern: Optional[str] = None, since_epoch: Optional[float] = None) -> List[Dict]:
+    return _MANAGER.list_archived_docs(pattern, since_epoch=since_epoch)
 
 
 def list_pdf_ingested_files() -> List[str]:

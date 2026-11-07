@@ -288,6 +288,82 @@ class TestArchiveAndRemoveOrdering:
         assert n == 0
         mgr.vectorstore._collection.delete.assert_not_called()
 
+
+@pytest.mark.unit
+class TestListArchivedDocs:
+    """2026-11: admin_pdf.py's "recently archived docs" panel always showed
+    [] on the ES-backed deployment because this function simply didn't
+    exist on this side (Chroma-only). Same pattern/since_epoch filter+sort
+    contract as local_vector_store.py's LocalVectorStoreManager.
+    list_archived_docs — verified here against a fake full-dump response."""
+
+    def _mgr_with_fake_dump(self, raw_dump: dict) -> ESVectorStoreManager:
+        mgr = ESVectorStoreManager()
+        mgr._get_client = MagicMock(return_value=MagicMock())
+
+        import service.es_vector_store as mod
+
+        class _FakeCollection(mod.ESCompatCollection):
+            def get(self, *a, **k):
+                return raw_dump
+
+        mod.ESCompatCollection = _FakeCollection
+        return mgr
+
+    def test_filters_by_pattern_and_since_epoch_and_sorts_newest_first(self):
+        import service.es_vector_store as mod
+        real_coll_cls = mod.ESCompatCollection
+        mgr = self._mgr_with_fake_dump({
+            "ids": ["a", "b", "c"],
+            "metadatas": [
+                {"source_file": "x.pdf", "superseded_at": "100"},
+                {"source_file": "y.pdf", "superseded_at": "300"},
+                {"source_file": "x.pdf", "superseded_at": "200"},
+            ],
+            "documents": ["d1", "d2", "d3"],
+        })
+        try:
+            out = mgr.list_archived_docs(pattern="x.pdf", since_epoch=150)
+        finally:
+            mod.ESCompatCollection = real_coll_cls
+
+        # b excluded by pattern (y.pdf), a excluded by since_epoch (100 < 150)
+        assert [d["id"] for d in out] == ["c"]
+
+    def test_no_filters_returns_full_dump_newest_first(self):
+        import service.es_vector_store as mod
+        real_coll_cls = mod.ESCompatCollection
+        mgr = self._mgr_with_fake_dump({
+            "ids": ["a", "b", "c"],
+            "metadatas": [
+                {"source_file": "x.pdf", "superseded_at": "100"},
+                {"source_file": "y.pdf", "superseded_at": "300"},
+                {"source_file": "x.pdf", "superseded_at": "200"},
+            ],
+            "documents": ["d1", "d2", "d3"],
+        })
+        try:
+            out = mgr.list_archived_docs()
+        finally:
+            mod.ESCompatCollection = real_coll_cls
+
+        assert [d["id"] for d in out] == ["b", "c", "a"]
+
+    def test_missing_or_bad_superseded_at_sorts_last_not_crashes(self):
+        import service.es_vector_store as mod
+        real_coll_cls = mod.ESCompatCollection
+        mgr = self._mgr_with_fake_dump({
+            "ids": ["a", "b"],
+            "metadatas": [{"source_file": "x.pdf"}, {"source_file": "y.pdf", "superseded_at": "bad"}],
+            "documents": ["d1", "d2"],
+        })
+        try:
+            out = mgr.list_archived_docs()
+        finally:
+            mod.ESCompatCollection = real_coll_cls
+
+        assert len(out) == 2
+
     def test_no_op_on_empty_doc_ids(self):
         mgr = ESVectorStoreManager()
         mgr.vectorstore = MagicMock()

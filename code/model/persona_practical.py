@@ -36,6 +36,7 @@ from utils.text_patterns import (
     is_fee_or_duration_info_query as _shared_is_fee_or_duration_info_query,
     effective_min_similarity as _shared_effective_min_similarity,
     bowtie_reorder as _shared_bowtie_reorder,
+    unfiltered_fallback_is_safe as _shared_unfiltered_fallback_is_safe,
 )
 
 # Import professional logging
@@ -3155,6 +3156,9 @@ class PracticalPersonaService:
                 else:
                     flt = _et_cond
             if vectorstore is None:
+                if not _shared_unfiltered_fallback_is_safe(flt):
+                    _LOG.error("[Practical] scored_search: no vectorstore available for filter=%r — failing closed (not widening scope)", flt)
+                    return []
                 return list(self.retriever.invoke(q))
             try:
                 if _hybrid_enabled:
@@ -3184,6 +3188,9 @@ class PracticalPersonaService:
                         return vectorstore.similarity_search(q, k=k, filter=flt)
                 except Exception as _ex2:
                     _LOG.debug("[Practical] similarity_search with filter also failed (%s), using basic", _ex2)
+                if not _shared_unfiltered_fallback_is_safe(flt):
+                    _LOG.error("[Practical] scored_search: all filtered attempts failed for filter=%r — failing closed (not widening scope)", flt)
+                    return []
                 return list(self.retriever.invoke(q))
 
         top_k = int(getattr(conf, "RETRIEVAL_TOP_K", 8))

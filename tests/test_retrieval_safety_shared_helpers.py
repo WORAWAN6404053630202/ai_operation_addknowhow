@@ -305,3 +305,35 @@ class TestMergeValueGroupsWithGuardAndSupplement:
             supplement_enabled=False,
         )
         assert result == []
+
+
+@pytest.mark.unit
+class TestUnfilteredFallbackIsSafe:
+    """2026-11: the decision of whether it's safe to silently widen a
+    filtered vector search to an unfiltered one on failure. See its
+    docstring in utils/text_patterns.py for the full incident this closes."""
+
+    def test_none_is_safe(self):
+        from utils.text_patterns import unfiltered_fallback_is_safe
+        assert unfiltered_fallback_is_safe(None) is True
+
+    def test_empty_dict_is_safe(self):
+        from utils.text_patterns import unfiltered_fallback_is_safe
+        assert unfiltered_fallback_is_safe({}) is True
+
+    def test_all_none_valued_dict_is_safe(self):
+        from utils.text_patterns import unfiltered_fallback_is_safe
+        assert unfiltered_fallback_is_safe({"license_type": None, "department": None}) is True
+
+    def test_real_value_is_unsafe(self):
+        from utils.text_patterns import unfiltered_fallback_is_safe
+        assert unfiltered_fallback_is_safe({"license_type": "x"}) is False
+
+    def test_mixed_none_and_real_value_is_unsafe(self):
+        from utils.text_patterns import unfiltered_fallback_is_safe
+        assert unfiltered_fallback_is_safe({"license_type": "x", "department": None}) is False
+
+    def test_structured_and_or_filter_is_unsafe(self):
+        from utils.text_patterns import unfiltered_fallback_is_safe
+        assert unfiltered_fallback_is_safe({"$and": [{"license_type": "x"}, {"department": "y"}]}) is False
+        assert unfiltered_fallback_is_safe({"entity_type_normalized": {"$in": ["a", ""]}}) is False

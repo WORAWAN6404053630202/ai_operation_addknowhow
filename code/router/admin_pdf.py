@@ -421,17 +421,29 @@ async def pdf_status():
         except Exception as e:
             _LOG.warning(f"[pdf_status] Failed to read recent ingestion activity: {e}")
 
-    # 2026-10 fix (Infra2-C1): list_archived_docs pulls in langchain_core/
-    # langchain_openai/langchain_community → chromadb — none of which are in
-    # requirements-pdf.txt (the lean PDF-only image deliberately excludes
-    # them). A module-level import of this name used to make importing
-    # admin_pdf.py itself crash on that image with ModuleNotFoundError
-    # before this handler's own try/except ever got a chance to run —
-    # moved to a lazy import here so the only consequence of the dependency
-    # being absent is this one section of the dashboard degrading to [].
+    # 2026-10 fix (Infra2-C1): list_archived_docs (Chroma side) pulls in
+    # langchain_core/langchain_openai/langchain_community -> chromadb —
+    # none of which are in requirements-pdf.txt (the lean PDF-only image
+    # deliberately excludes them). A module-level import of this name used
+    # to make importing admin_pdf.py itself crash on that image with
+    # ModuleNotFoundError before this handler's own try/except ever got a
+    # chance to run — moved to a lazy import here so the only consequence
+    # of the dependency being absent is this one section of the dashboard
+    # degrading to [].
+    #
+    # 2026-11 fix: this import was unconditional (always Chroma's), with no
+    # branch on USE_ELASTICSEARCH — on the ES-backed deployment it simply
+    # doesn't exist there, so this section silently showed [] forever even
+    # though archiving works correctly on ES (164 real archived docs,
+    # confirmed live). Branch like every other backend-aware import in this
+    # codebase (app.py's /health, router/monitoring.py, service/
+    # pdf_supersede_resolver.py, service/sqs_consumer.py).
     recent_archived = []
     try:
-        from service.local_vector_store import list_archived_docs
+        if getattr(_conf, "USE_ELASTICSEARCH", False):
+            from service.es_vector_store import list_archived_docs
+        else:
+            from service.local_vector_store import list_archived_docs
         since_epoch = time.time() - 7 * 86400
         recent_archived = [
             {"id": d["id"], "metadata": d["metadata"]}

@@ -77,3 +77,26 @@ class TestHybridSearchCallSitesAreBackendAware:
         source = inspect.getsource(prac_mod)
         assert "vectorstore.hybrid_search(" in source
         assert 'getattr(conf, "USE_ELASTICSEARCH", False)' in source
+
+
+@pytest.mark.unit
+class TestAdminPdfArchivedDocsIsBackendAware:
+    """2026-11: admin_pdf.py's pdf_status() handler had an unconditional
+    `from service.local_vector_store import list_archived_docs` with no
+    USE_ELASTICSEARCH branch — es_vector_store.py had no equivalent function
+    at all, so the admin "recently archived docs" panel silently showed []
+    forever on the ES-backed deployment even though archiving genuinely
+    works there (164 real archived docs, confirmed live)."""
+
+    def test_pdf_status_branches_on_use_elasticsearch(self):
+        import router.admin_pdf as admin_pdf_mod
+        source = inspect.getsource(admin_pdf_mod.pdf_status)
+        # admin_pdf.py imports conf defensively as `_conf`, not `conf`.
+        assert 'getattr(_conf, "USE_ELASTICSEARCH", False)' in source
+        assert "from service.es_vector_store import list_archived_docs" in source
+        assert "from service.local_vector_store import list_archived_docs" in source
+
+    def test_es_vector_store_defines_list_archived_docs(self):
+        import service.es_vector_store as es_vs_mod
+        assert hasattr(es_vs_mod, "list_archived_docs")
+        assert hasattr(es_vs_mod.ESVectorStoreManager, "list_archived_docs")

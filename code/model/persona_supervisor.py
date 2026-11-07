@@ -119,6 +119,7 @@ from utils.text_patterns import (
     nonreg_chapter_disagreement_should_reject as _shared_nonreg_chapter_disagreement_should_reject,
     regulatory_identity_mismatch_should_reject as _shared_regulatory_identity_mismatch_should_reject,
     bowtie_reorder as _shared_bowtie_reorder,
+    unfiltered_fallback_is_safe as _shared_unfiltered_fallback_is_safe,
 )
 from utils.prompts_supervisor import (
     build_topic_picker_prompt,
@@ -5440,6 +5441,9 @@ class PersonaSupervisor:
                         _d.metadata["_sim"] = float(_s)
                     return [d for d, _ in _pairs]
                 except Exception as _e_svf:
+                    if not _shared_unfiltered_fallback_is_safe(metadata_filter):
+                        _LOG.error("[Supervisor] _sv_search: filtered similarity_search failed for filter=%r (%s) — failing closed (not widening scope)", metadata_filter, _e_svf)
+                        return []
                     _LOG.debug("[Supervisor] _sv_search filtered similarity_search failed (%s) — unfiltered", _e_svf)
             if _sv_vstore is not None:
                 try:
@@ -5448,7 +5452,13 @@ class PersonaSupervisor:
                         _d.metadata["_sim"] = float(_s)
                     return [d for d, _ in _pairs]
                 except Exception as _e_svu:
+                    if not _shared_unfiltered_fallback_is_safe(metadata_filter):
+                        _LOG.error("[Supervisor] _sv_search: unfiltered scored search failed while filter=%r was requested (%s) — failing closed", metadata_filter, _e_svu)
+                        return []
                     _LOG.debug("[Supervisor] _sv_search unfiltered scored search failed (%s) — plain invoke", _e_svu)
+            if not _shared_unfiltered_fallback_is_safe(metadata_filter):
+                _LOG.error("[Supervisor] _sv_search: no filtered path succeeded for filter=%r — failing closed (not widening scope)", metadata_filter)
+                return []
             return list(self.retriever.invoke(q) or [])
 
         if _is_broad_q:

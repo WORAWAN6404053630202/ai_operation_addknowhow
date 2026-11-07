@@ -34,6 +34,7 @@ from utils.text_patterns import (
     extract_thai_keywords as _shared_extract_thai_keywords,
     nonreg_chapter_semantic_check as _shared_nonreg_chapter_semantic_check,
     NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE as _SHARED_NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE,
+    unfiltered_fallback_is_safe as _shared_unfiltered_fallback_is_safe,
 )
 
 _LOG = logging.getLogger("restbiz.academic")
@@ -1049,7 +1050,10 @@ class AcademicPersonaService:
                 try:
                     tmp = vectorstore.as_retriever(search_kwargs={"k": k, "filter": flt})
                     return tmp.invoke(q)
-                except Exception:
+                except Exception as _ac_fe:
+                    if not _shared_unfiltered_fallback_is_safe(flt):
+                        _LOG.error("[Academic] _ac_search: filtered retrieval failed for filter=%r (%s) — failing closed (not widening scope)", flt, _ac_fe)
+                        return []
                     return self.retriever.invoke(q)
             else:
                 return self.retriever.invoke(q)
@@ -1062,8 +1066,12 @@ class AcademicPersonaService:
                     _LOG.info("[Academic] Filter returned 0 docs — falling back to unfiltered retrieval")
                     docs = _ac_search(expanded_query, max_docs)
             except Exception as e:
-                _LOG.warning("[Academic] Filtered retrieval failed (%s), falling back to unfiltered", e)
-                docs = _ac_search(expanded_query, max_docs)
+                if not _shared_unfiltered_fallback_is_safe(metadata_filter):
+                    _LOG.error("[Academic] Filtered retrieval failed for filter=%r (%s) — failing closed (not widening scope)", metadata_filter, e)
+                    docs = []
+                else:
+                    _LOG.warning("[Academic] Filtered retrieval failed (%s), falling back to unfiltered", e)
+                    docs = _ac_search(expanded_query, max_docs)
         else:
             docs = _ac_search(expanded_query, max_docs)
 

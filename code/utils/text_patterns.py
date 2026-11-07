@@ -794,6 +794,33 @@ def regulatory_identity_mismatch_should_reject(
     return bool(top_value) and bool(candidate_value) and top_value != candidate_value and top_score >= min_score
 
 
+def unfiltered_fallback_is_safe(flt: "dict | None") -> bool:
+    """Only safe to silently widen a filtered vector search to an unfiltered
+    one when no filter was ever meaningfully requested — never when a filter
+    WAS requested but every filtered attempt failed, since a wrong-scope
+    document set is indistinguishable from a correct one to downstream
+    code/the LLM (unlike zero results, already a handled, safe outcome via
+    INFO_GAP/slot-asking elsewhere in this codebase — see persona_supervisor.
+    py's/persona_practical.py's/persona_academic.py's pervasive `if docs:`/
+    `if not docs:` gating). A dict with only None-valued keys (e.g.
+    {"license_type": None}) counts as "no real filter" — mirrors
+    persona_supervisor.py's own _sv_cleaned None-stripping at its _sv_search
+    call site, so the same shape can't be misclassified as "a real filter"
+    by one check and "no filter" by the other.
+
+    2026-11, added after auditing 3 independently-duplicated call sites
+    (persona_practical.py:_scored_search, persona_academic.py:_ac_search,
+    persona_supervisor.py:_sv_search) that all silently fell back to an
+    unfiltered search on ANY exception from the filtered attempt — not a
+    live bug (every filter operator in use today translates correctly),
+    but a landmine for any future filter shape the ES translator doesn't
+    yet handle. This codebase has a documented history (5 rounds of
+    "entity-type retrieval contamination" fixes) of choosing fail-closed
+    over fail-open for exactly this failure class — this helper keeps that
+    precedent instead of reintroducing silent scope-widening."""
+    return not flt or all(v is None for v in (flt or {}).values())
+
+
 # ── PDF-book-aware similarity floor ─────────────────────────────────────────
 # Shared by persona_practical.py's and persona_academic.py's independently
 # re-implemented sim_filter steps (2026-09) — see conf.RETRIEVAL_MIN_SIMILARITY_PDF_BOOK
