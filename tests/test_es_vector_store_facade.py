@@ -72,6 +72,24 @@ class TestESCompatCollectionGet:
         assert out["documents"] == ["x"]
         assert out["metadatas"] == [{"license_type": "y"}]
 
+    def test_get_by_ids_passes_flattened_source_excludes_not_a_dict(self):
+        """2026-11 regression pin: elasticsearch-py 8.19.3's .mget() silently
+        returns empty _source for every doc when given source={"excludes":
+        [...]} as a dict (no error) — only the flattened source_excludes=
+        kwarg works, confirmed live. The mock above can't catch this on its
+        own (it returns the same fixed response regardless of kwargs), so
+        this test asserts the actual kwarg shape sent, not just the parsed
+        output."""
+        client = MagicMock()
+        client.mget.return_value = {"docs": [{"_id": "a", "found": True, "_source": {}}]}
+        coll = ESCompatCollection(client, "my_index")
+
+        coll.get(ids=["a"])
+
+        mget_kwargs = client.mget.call_args.kwargs
+        assert mget_kwargs.get("source_excludes") == ["embedding"]
+        assert "source" not in mget_kwargs
+
     def test_get_by_where_uses_search_with_translated_filter(self):
         client = MagicMock()
         client.search.return_value = {
@@ -85,6 +103,18 @@ class TestESCompatCollectionGet:
         assert search_kwargs["body"]["query"] == {"term": {"license_type": "y"}}
         assert out["ids"] == ["a"]
 
+    def test_get_by_where_also_passes_flattened_source_excludes(self):
+        """Aligns with the ids= branch above — same confirmed-working kwarg
+        style used for both .mget() and .search() in this one method."""
+        client = MagicMock()
+        client.search.return_value = {"hits": {"hits": []}}
+        coll = ESCompatCollection(client, "my_index")
+
+        coll.get(where={"license_type": "y"})
+
+        search_kwargs = client.search.call_args.kwargs
+        assert search_kwargs.get("source_excludes") == ["embedding"]
+
     def test_get_with_embeddings_included(self):
         client = MagicMock()
         client.mget.return_value = {
@@ -95,6 +125,18 @@ class TestESCompatCollectionGet:
         out = coll.get(ids=["a"], include=["metadatas", "documents", "embeddings"])
 
         assert out["embeddings"] == [[0.1, 0.2]]
+
+    def test_get_with_embeddings_included_omits_source_excludes(self):
+        """When embeddings ARE requested, no exclusion kwarg should be sent
+        at all — confirms this branch is untouched by the source_excludes fix."""
+        client = MagicMock()
+        client.mget.return_value = {"docs": [{"_id": "a", "found": True, "_source": {}}]}
+        coll = ESCompatCollection(client, "my_index")
+
+        coll.get(ids=["a"], include=["metadatas", "documents", "embeddings"])
+
+        mget_kwargs = client.mget.call_args.kwargs
+        assert "source_excludes" not in mget_kwargs
 
 
 @pytest.mark.unit

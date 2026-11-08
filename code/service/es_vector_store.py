@@ -131,18 +131,31 @@ class ESCompatCollection:
     ) -> Dict[str, list]:
         """Metadata/content-only lookup, no kNN — mirrors Chroma's `.get()`
         return shape: {"ids": [...], "documents": [...], "metadatas": [...]}
-        (optionally "embeddings" if requested via `include`)."""
+        (optionally "embeddings" if requested via `include`).
+
+        2026-11 (hardcoded-logic audit follow-up): uses the flattened
+        `source_excludes=` kwarg, not `source={"excludes": [...]}`, for BOTH
+        branches below. Confirmed live against elasticsearch-py 8.19.3:
+        `.mget()` silently returns `_source: {}` for every doc when given
+        `source=` as a dict (no error, just empty metadata) — only the
+        flattened kwarg works. `.search()` actually accepts the dict form
+        fine, so this bug never affected the where= branch here or the
+        kNN query() method below, which is why every live chat retrieval
+        was unaffected — but aligning both branches on the one confirmed-
+        working style removes the inconsistency that caused this in the
+        first place. Real impact found: service.sqs_consumer.py's
+        _filter_to_pdf_auto_ids (PDF supersede's 2nd safety check) always
+        rejected every candidate on ES because metadata came back empty."""
         include = include or ["metadatas", "documents"]
-        source_fields = None if "embeddings" in include else {"excludes": ["embedding"]}
+        exclude_source = None if "embeddings" in include else ["embedding"]
         if ids:
-            resp = self._client.mget(index=self._index, ids=ids, source=source_fields if source_fields is not None else True)
+            kwargs = {"source_excludes": exclude_source} if exclude_source is not None else {}
+            resp = self._client.mget(index=self._index, ids=ids, **kwargs)
             hits = [d for d in resp.get("docs", []) if d.get("found")]
         else:
             query = chroma_filter_to_es_query(where)
-            body: Dict[str, Any] = {"query": query, "size": 10000}
-            if source_fields is not None:
-                body["_source"] = source_fields
-            resp = self._client.search(index=self._index, body=body)
+            kwargs = {"source_excludes": exclude_source} if exclude_source is not None else {}
+            resp = self._client.search(index=self._index, body={"query": query, "size": 10000}, **kwargs)
             hits = resp.get("hits", {}).get("hits", [])
         out_ids, out_docs, out_meta, out_emb = [], [], [], []
         for h in hits:
