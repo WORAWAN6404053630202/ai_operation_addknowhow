@@ -65,7 +65,7 @@ async def lifespan(app: FastAPI):
 
     import conf as _conf
     if getattr(_conf, "RERANKER_ENABLED", False):
-        model_name = getattr(_conf, "RERANKER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
+        model_name = getattr(_conf, "RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
         backend = getattr(_conf, "RERANKER_BACKEND", "pytorch")
 
         def _load():

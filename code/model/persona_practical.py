@@ -37,6 +37,7 @@ from utils.text_patterns import (
     effective_min_similarity as _shared_effective_min_similarity,
     bowtie_reorder as _shared_bowtie_reorder,
     unfiltered_fallback_is_safe as _shared_unfiltered_fallback_is_safe,
+    rescue_top_sim_doc as _shared_rescue_top_sim_doc,
 )
 
 # Import professional logging
@@ -96,31 +97,35 @@ _MULTI_TOPIC_MENU_THRESHOLD: int = 3
 # Short 1-line descriptions per license_type shown in 4+ topic summary menu
 _TOPIC_DESC_MAP: dict = {
     "ใบทะเบียนพาณิชย์": "ขึ้นทะเบียนธุรกิจกับกรมพัฒนาธุรกิจการค้า (DBD)",
-    "ใบภาษีมูลค่าเพิ่ม ภพ.20": "จด VAT กับกรมสรรพากร เมื่อยอดขายถึงเกณฑ์",
+    "ใบจดทะเบียนภาษีมูลค่าเพิ่ม (ภ.พ.01)": "จด VAT กับกรมสรรพากร เมื่อยอดขายถึงเกณฑ์",
     "ทะเบียนนายจ้าง": "ขึ้นทะเบียนนายจ้างกับสำนักงานประกันสังคม",
     "ทะเบียนผู้ประกันตน": "แจ้งขึ้นทะเบียนผู้ประกันตน/ลูกจ้างกับสำนักงานประกันสังคม",
-    "ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร": "ใบอนุญาตเปิดร้านอาหารจาก BMA/อปท.",
+    "ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหารหรือสถานที่สะสมอาหาร": "ใบอนุญาตเปิดร้านอาหารจาก BMA/อปท.",
     "ใบอนุญาตจำหน่ายสุรา": "ใบอนุญาตขายสุราจากกรมสรรพสามิต",
-    "แบบแสดงรายการภาษีป้ายร้านอาหาร": "ภาษีป้ายร้านอาหาร ยื่นกับเทศบาล/กทม.",
+    "แบบแสดงรายการภาษีป้าย (ภ.ป.1)": "ภาษีป้ายร้านอาหาร ยื่นกับเทศบาล/กทม.",
     "แบบแสดงรายการภาษีป้าย": "ภาษีป้ายโฆษณา ยื่นกับเทศบาล/กทม.",
-    "ใบรับรองมาตรฐานร้านอาหาร": "มาตรฐานสุขาภิบาลอาหาร (SAN/SAN PLUS)",
+    "ใบอนุญาต/หนังสือรับรอง มาตรฐาน SAN และ SAN PLUS": "มาตรฐานสุขาภิบาลอาหาร (SAN/SAN PLUS)",
     "ใบวุฒิบัตรผู้สัมผัสอาหาร": "อบรมผู้สัมผัสอาหารตามกฎหมาย",
     "ใบรับรองแพทย์ 9 โรค(สณ.11)": "ตรวจสุขภาพ 9 โรคต้องห้ามสำหรับผู้ประกอบการ",
-    "ระบบชำระเงินออนไลน์": "สมัคร QR Payment / PromptPay สำหรับร้านค้า",
-    "เครื่องรูดบัตร EDC": "สมัครเครื่อง EDC รับชำระบัตรเครดิต/เดบิต",
+    "บริการร้านค้ารับชำระเงิน QR API": "สมัคร QR Payment / PromptPay สำหรับร้านค้า",
+    # 2026-11 (hardcoded-logic audit, Phase 4): "เครื่องรูดบัตร EDC" never matched any
+    # real license_type — fixed at the data layer (2 near-duplicate EDC doc chunks'
+    # license_type unified to this one real value — see persona_supervisor.py's
+    # _MULTI_TOPIC_LICENSE_KEYWORDS comment for the full root cause).
+    "บริการเครื่อง EDC (Electronic Data Capture)": "สมัครเครื่อง EDC รับชำระบัตรเครดิต/เดบิต",
     "จัดการการเงิน": "ระบบบัญชีและการเงินสำหรับธุรกิจ",
 }
 
 # Groups of related topics with a shared context note (used in 4+ topic summary header)
 _RELATED_TOPIC_GROUPS: list = [
     (
-        frozenset({"ใบทะเบียนพาณิชย์", "ทะเบียนนายจ้าง", "ใบภาษีมูลค่าเพิ่ม ภพ.20"}),
+        frozenset({"ใบทะเบียนพาณิชย์", "ทะเบียนนายจ้าง", "ใบจดทะเบียนภาษีมูลค่าเพิ่ม (ภ.พ.01)"}),
         "ซึ่งเป็นเรื่องพื้นฐานที่ธุรกิจใหม่ต้องดำเนินการ",
     ),
     (
-        frozenset({"ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร", "ใบอนุญาตจำหน่ายสุรา",
-                   "แบบแสดงรายการภาษีป้ายร้านอาหาร", "แบบแสดงรายการภาษีป้าย",
-                   "ใบรับรองมาตรฐานร้านอาหาร"}),
+        frozenset({"ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหารหรือสถานที่สะสมอาหาร", "ใบอนุญาตจำหน่ายสุรา",
+                   "แบบแสดงรายการภาษีป้าย (ภ.ป.1)", "แบบแสดงรายการภาษีป้าย",
+                   "ใบอนุญาต/หนังสือรับรอง มาตรฐาน SAN และ SAN PLUS"}),
         "ซึ่งเป็นใบอนุญาตที่ร้านอาหารต้องขอก่อนเปิดกิจการ",
     ),
     (
@@ -128,7 +133,7 @@ _RELATED_TOPIC_GROUPS: list = [
         "ซึ่งเป็นเอกสารด้านสุขลักษณะที่พนักงานต้องมี",
     ),
     (
-        frozenset({"ระบบชำระเงินออนไลน์", "เครื่องรูดบัตร EDC"}),
+        frozenset({"บริการร้านค้ารับชำระเงิน QR API", "บริการเครื่อง EDC (Electronic Data Capture)"}),
         "ซึ่งเป็นช่องทางรับชำระเงินสำหรับร้านค้า",
     ),
 ]
@@ -2482,7 +2487,7 @@ class PracticalPersonaService:
             return False
 
         overlap = self._topic_overlap_ratio(last_q, q)
-        if self._looks_like_legal_question(q, state) and overlap < 0.22:
+        if self._looks_like_legal_question(q, state) and overlap < getattr(conf, "TOPIC_SWITCH_OVERLAP_MIN_RATIO", 0.22):
             return True
 
         return False
@@ -3580,7 +3585,7 @@ class PracticalPersonaService:
                 # only 7 came out the other side of this exact step.
                 _pin_before = [d for d in docs if (getattr(d, "metadata", {}) or {}).get("_chapter_sweep_pin")]
                 from utils.reranker import rerank as _do_rerank
-                _rr_model = getattr(conf, "RERANKER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
+                _rr_model = getattr(conf, "RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
                 _rr_top_k = int(getattr(conf, "RERANKER_TOP_K", len(docs)))
                 _rr_backend = getattr(conf, "RERANKER_BACKEND", "pytorch")
                 _rr_onnx_file = getattr(conf, "RERANKER_ONNX_FILE", "model_quint8_avx2.onnx")
@@ -4663,7 +4668,7 @@ class PracticalPersonaService:
         # QR Payment account-name cross-reference (2026-09, live-reproduced): a customer
         # asking about updating their bank account's OWNER NAME (e.g. after marriage) has
         # their retrieval correctly include the QR-Payment-specific "name cannot be edited,
-        # must cancel and re-apply" docs (license_type="ระบบชำระเงินออนไลน์",
+        # must cancel and re-apply" docs (license_type="บริการร้านค้ารับชำระเงิน QR API",
         # registration_type="เจ้าของเดิม ชื่อบัญชีเดิม") ALONGSIDE the general
         # license_type="บัญชีธนาคารรับเงิน" process doc at first — but the FOCUS FILTER just
         # above (keeps only the single dominant license_type by keyword score, since the
@@ -4680,7 +4685,7 @@ class PracticalPersonaService:
             ((_d.get("metadata") or {}).get("operation_topic") or "").strip() == "การแก้ไข ชื่อเจ้าของบัญชี"
             for _d in _all_docs
         ) and not any(
-            ((_d.get("metadata") or {}).get("license_type") or "").strip() == "ระบบชำระเงินออนไลน์"
+            ((_d.get("metadata") or {}).get("license_type") or "").strip() == "บริการร้านค้ารับชำระเงิน QR API"
             and ((_d.get("metadata") or {}).get("registration_type") or "").strip() == "เจ้าของเดิม ชื่อบัญชีเดิม"
             for _d in _all_docs
         ):
@@ -4691,7 +4696,7 @@ class PracticalPersonaService:
                 if _qr_coll is not None:
                     _qr_res = _qr_coll.get(
                         where={"$and": [
-                            {"license_type": "ระบบชำระเงินออนไลน์"},
+                            {"license_type": "บริการร้านค้ารับชำระเงิน QR API"},
                             {"registration_type": "เจ้าของเดิม ชื่อบัญชีเดิม"},
                         ]},
                         include=["documents", "metadatas"],
@@ -5317,6 +5322,11 @@ class PracticalPersonaService:
                     )
                 )
             ]
+            _op_pass_docs = _shared_rescue_top_sim_doc(
+                _docs_to_process, _op_pass_docs,
+                enforce=getattr(conf, "OP_INTENT_TOP_SIM_RESCUE_ENFORCE", False),
+                log_label="[Practical] op-intent",
+            )
             if _op_pass_docs:
                 _LOG.info(
                     "[Practical] op-intent doc-filter: %d → %d docs (excl_re=%r)",
@@ -5578,6 +5588,19 @@ class PracticalPersonaService:
                                         # Empty rt — check ONLY "หัวข้อ:" field for competing type
                                         _s_hdr = (_s_d.get("content") or "")[:400]
                                         _topic_m = _TOPIC_FIELD_RE.search(_s_hdr)
+                                        if _topic_m is None:
+                                            # 2026-11 (hardcoded-logic audit): this assumes
+                                            # content always has a "หัวข้อ: ... หน่วยงาน: ..."
+                                            # header — if the corpus format ever changes, this
+                                            # fires on every doc silently. Logged (not acted on
+                                            # further) so a format drift is observable instead
+                                            # of invisible; behavior unchanged (falls through
+                                            # to the existing empty-topic_txt safe default below,
+                                            # which keeps rather than guesses/wrongly drops).
+                                            _LOG.debug(
+                                                "[Practical] sibling entity-filter: 'หัวข้อ:' header "
+                                                "not found in doc content — keeping doc (safe default)",
+                                            )
                                         _topic_txt = _topic_m.group(1).strip() if _topic_m else ""
                                         if not any(p.search(_topic_txt) for p in _excl_pats):
                                             _sib_entity_filtered.append(_s_d)

@@ -1,15 +1,26 @@
 """
 Cross-encoder reranker utility — singleton pattern for shared inference.
 
-Model: cross-encoder/mmarco-mMiniLMv2-L12-H384-v1
-  - ~280MB, 12-layer MiniLM, max_length=512
-  - Trained on mMARCO (14 languages: en/zh/fr/de/id/it/pt/ru/es/ja/nl/vi/hi/ar —
-    Thai is NOT among them, verified against arXiv:2108.13897). Thai behavior is
-    zero-shot cross-lingual transfer from the base encoder, not a fine-tuned/
-    benchmarked capability — treat English-derived accuracy claims (including
-    quantization "no accuracy loss" claims) as unverified for Thai until measured
-    on a Thai eval set (see conf.RERANKER_BACKEND for the ONNX-quantization
-    measurement this project already ran).
+Model (current default, see conf.RERANKER_MODEL): BAAI/bge-reranker-v2-m3 — a
+multilingual cross-encoder from the same BGE family as this project's own
+embedding model (baai/bge-m3). Every real call site passes model_name from
+conf explicitly, so this module's own `rerank()` default below exists only
+as a fallback for a hypothetical direct call with no model_name given.
+
+2026-11 (hardcoded-logic audit): this default previously drifted out of sync
+with conf.RERANKER_MODEL for a while, describing a DIFFERENT, no-longer-
+default model (cross-encoder/mmarco-mMiniLMv2-L12-H384-v1 — ~280MB, 12-layer
+MiniLM, max_length=512, trained on mMARCO's 14 languages: en/zh/fr/de/id/it/
+pt/ru/es/ja/nl/vi/hi/ar, Thai NOT among them per arXiv:2108.13897) as if it
+were the active default. If you ever opt into that mmarco model specifically
+(via RERANKER_MODEL env override), remember its Thai behavior is zero-shot
+cross-lingual transfer from the base encoder, never fine-tuned/benchmarked —
+treat English-derived accuracy claims (including quantization "no accuracy
+loss" claims) as unverified for Thai until separately measured. No
+Thai-specific measurement has been run for bge-reranker-v2-m3 either — being
+multilingual is not the same as verified-good-at-Thai; don't assume it without
+evidence (see conf.RERANKER_BACKEND for the ONNX-quantization measurement
+this project already ran, which is model-specific and doesn't transfer).
 
 Usage:
     from utils.reranker import rerank
@@ -119,7 +130,7 @@ def _predict_onnx(tokenizer: Any, ort_model: Any, pairs: List[tuple]) -> List[fl
 def rerank(
     query: str,
     docs: List[Any],
-    model_name: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+    model_name: str = "BAAI/bge-reranker-v2-m3",
     top_k: Optional[int] = None,
     backend: str = "pytorch",
     onnx_file: str = "model_quint8_avx2.onnx",

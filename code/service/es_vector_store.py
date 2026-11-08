@@ -337,6 +337,26 @@ class ESCompatVectorStore:
         class _ESRetriever:
             def __init__(self, vs: "ESCompatVectorStore", k: int):
                 self._vs, self._k = vs, k
+                # 2026-11 (hardcoded-logic audit, live-reproduced): every one of
+                # ~38 call sites across persona_supervisor.py/persona_practical.py/
+                # persona_academic.py does getattr(self.retriever, "vectorstore",
+                # None) expecting this to resolve exactly like LangChain's own
+                # Chroma retriever wrapper (which does set .vectorstore) — this
+                # class never did, so vectorstore was always None on the ES
+                # backend, confirmed live via a real /chat request. Every
+                # metadata-filtered fetch and every hybrid_search() call at those
+                # 38 sites was silently skipped as a result, always falling
+                # through to this class's own filterless, non-hybrid .invoke()
+                # instead — department/license_type/entity_type-scoped retrieval
+                # and BM25+kNN fusion were effectively inert on ES this whole
+                # time despite being fully built and working when called directly
+                # (confirmed separately via standalone test scripts, which is
+                # exactly why this gap went unnoticed — those scripts call
+                # ESCompatVectorStore's methods directly, bypassing this wrapper
+                # entirely). This one attribute closes the gap for every site at
+                # once, matching the design this class's own as_retriever()
+                # docstring/route_v1.py's comment already describe as intended.
+                self.vectorstore = vs
 
             def invoke(self, query: str) -> List[Document]:
                 return self._vs.similarity_search(query, k=self._k)

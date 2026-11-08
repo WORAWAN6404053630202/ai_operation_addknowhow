@@ -571,8 +571,12 @@ SPECIFIC_LICENSE_INDICATOR_RE = re.compile(
     # single-device questions naming EDC or QR Payment specifically (e.g.
     # "ขั้นตอนการสมัครเครื่อง EDC...เรียงลำดับ") — these terms weren't in
     # this list at all, so the specificity override never had a chance to
-    # apply. license_type values confirmed in Chroma: "เครื่องรูดบัตร EDC",
-    # "ระบบชำระเงินออนไลน์" (QR Payment's actual license_type).
+    # apply. Matches on substring keywords against the QUERY TEXT, not an
+    # exact corpus license_type value — works regardless of corpus wording.
+    # (2026-11 correction: the license_type names originally cited here as
+    # confirmed-in-Chroma, "เครื่องรูดบัตร EDC"/"ระบบชำระเงินออนไลน์", were
+    # themselves stale — see persona_supervisor.py's _MULTI_TOPIC_LICENSE_
+    # KEYWORDS comment for the real current EDC/QR Payment license_type values.)
     r"|EDC|เครื่องรูดบัตร|รูดบัตร|\bQR\b|QR\s*Payment|คิวอาร์|ระบบชำระเงินออนไลน์|ระบบชำระเงิน",
     re.IGNORECASE,
 )
@@ -819,6 +823,67 @@ def unfiltered_fallback_is_safe(flt: "dict | None") -> bool:
     over fail-open for exactly this failure class — this helper keeps that
     precedent instead of reintroducing silent scope-widening."""
     return not flt or all(v is None for v in (flt or {}).values())
+
+
+def rescue_top_sim_doc(
+    pre_filter_docs: List[dict],
+    post_filter_docs: List[dict],
+    *,
+    enforce: bool,
+    log_label: str = "",
+) -> List[dict]:
+    """Op-intent keyword-filter safety net (2026-11, hardcoded-logic audit).
+
+    persona_practical.py's/persona_academic.py's operation-intent doc
+    filters classify "new registration vs renewal vs cancel vs edit vs
+    replacement" from a handful of hardcoded regex patterns against the
+    query text, then drop any doc whose operation_topic/operation_by_
+    department/etc. disagrees with the matched pattern — the same brittle-
+    classification failure class as this codebase's own removed
+    _license_query_score (replaced with scoring from doc["metadata"]["_sim"],
+    the retrieval system's own already-computed relevance). Those filters
+    already guard against wiping out ALL docs, but nothing guards against
+    silently dropping the SINGLE BEST doc while lower-relevance ones survive
+    — a paraphrase the keyword table never anticipated can misclassify the
+    one doc that actually answers the question.
+
+    If the single highest-_sim doc in pre_filter_docs is missing from
+    post_filter_docs, log a warning (always, regardless of `enforce` — same
+    soft-launch convention as PersonaSupervisor._identity_guard_majority_
+    vote/conf.REGULATORY_IDENTITY_GUARD_ENFORCE) and, when `enforce`,
+    prepend it back into the kept set (never reorders/removes anything
+    else). True no-op when the top doc is already present, or when no doc
+    anywhere carries a usable numeric _sim — there's no signal to rescue on.
+
+    Content-fingerprint ("already present") check uses the same
+    content[:120] convention persona_supervisor.py's
+    _supplement_if_thin already uses for the identical purpose — not a new
+    risk class.
+    """
+    if not pre_filter_docs or not post_filter_docs:
+        return post_filter_docs
+    try:
+        def _sim(d: dict) -> float:
+            s = (d.get("metadata") or {}).get("_sim")
+            return float(s) if isinstance(s, (int, float)) else float("-inf")
+
+        def _fingerprint(d: dict) -> str:
+            return (d.get("content") or "")[:120]
+
+        top = max(pre_filter_docs, key=_sim)
+        if _sim(top) == float("-inf"):
+            return post_filter_docs
+        if _fingerprint(top) in {_fingerprint(d) for d in post_filter_docs}:
+            return post_filter_docs
+        _LOG.warning(
+            "%s op-intent filter dropped top-_sim doc (_sim=%.4f) — %s",
+            log_label, _sim(top),
+            "rescuing back in" if enforce else "would rescue (enforce=False)",
+        )
+        return [top] + post_filter_docs if enforce else post_filter_docs
+    except Exception as _e:
+        _LOG.warning("%s top-_sim rescue check failed (%s) — left unchanged", log_label, _e)
+        return post_filter_docs
 
 
 # ── PDF-book-aware similarity floor ─────────────────────────────────────────

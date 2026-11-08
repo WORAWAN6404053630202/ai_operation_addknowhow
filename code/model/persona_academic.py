@@ -35,6 +35,7 @@ from utils.text_patterns import (
     nonreg_chapter_semantic_check as _shared_nonreg_chapter_semantic_check,
     NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE as _SHARED_NONREG_CHAPTER_REGULATORY_DOMINANCE_MIN_SCORE,
     unfiltered_fallback_is_safe as _shared_unfiltered_fallback_is_safe,
+    rescue_top_sim_doc as _shared_rescue_top_sim_doc,
 )
 
 _LOG = logging.getLogger("restbiz.academic")
@@ -1092,7 +1093,7 @@ class AcademicPersonaService:
         if getattr(conf, "RERANKER_ENABLED", False) and docs:
             try:
                 from utils.reranker import rerank as _do_rerank
-                _rr_model_ac = getattr(conf, "RERANKER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
+                _rr_model_ac = getattr(conf, "RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
                 _rr_top_k_ac = int(getattr(conf, "RERANKER_TOP_K", len(docs)))
                 _rr_backend_ac = getattr(conf, "RERANKER_BACKEND", "pytorch")
                 _rr_onnx_file_ac = getattr(conf, "RERANKER_ONNX_FILE", "model_quint8_avx2.onnx")
@@ -4291,6 +4292,11 @@ class AcademicPersonaService:
                 filtered.append(d)  # Matches known entity — keep
             # else: belongs to a different entity type — drop
 
+        filtered = _shared_rescue_top_sim_doc(
+            docs, filtered,
+            enforce=getattr(conf, "OP_INTENT_TOP_SIM_RESCUE_ENFORCE", False),
+            log_label="[Academic] entity-filter",
+        )
         if len(filtered) >= 2:
             _LOG.info(
                 "[Academic] Entity filter entity='%s': %d → %d docs (dropped %d other-entity)",
@@ -4342,6 +4348,11 @@ class AcademicPersonaService:
                 filtered.append(d)  # Overlapping/matching operation — keep
             # else: different operation — drop
 
+        filtered = _shared_rescue_top_sim_doc(
+            docs, filtered,
+            enforce=getattr(conf, "OP_INTENT_TOP_SIM_RESCUE_ENFORCE", False),
+            log_label="[Academic] op-exact-filter",
+        )
         if len(filtered) >= 1:
             _LOG.info(
                 "[Academic] Op exact-filter operation='%s': %d → %d docs (dropped %d wrong-op)",
@@ -4405,6 +4416,11 @@ class AcademicPersonaService:
             else:
                 filtered.append(d)  # Matches new or has unrelated op label — keep
 
+        filtered = _shared_rescue_top_sim_doc(
+            docs, filtered,
+            enforce=getattr(conf, "OP_INTENT_TOP_SIM_RESCUE_ENFORCE", False),
+            log_label="[Academic] inferred-op-filter",
+        )
         if filtered:
             _LOG.info(
                 "[Academic] Filtered docs by inferred operation='%s': %d → %d docs",

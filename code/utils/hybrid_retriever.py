@@ -181,6 +181,15 @@ def _matches_metadata_filter(doc_metadata: dict, flt: dict) -> bool:
                 if actual == fv["$ne"]:
                     return False
             else:
+                # 2026-11 (hardcoded-logic audit): unknown operator — safe default is
+                # "no match" (shrinks the BM25 candidate pool rather than ever admitting
+                # a wrong-scope doc, the safe direction given this codebase's documented
+                # history of retrieval-contamination incidents). es_filter_translate.py's
+                # equivalent case raises ValueError instead (loud, already guarded against
+                # by utils.text_patterns.unfiltered_fallback_is_safe) — logged here too so
+                # this silent-exclusion path has the same observability, not because the
+                # behavior itself needs to change.
+                _LOG.warning("[Hybrid] unrecognized filter operator %r for field %r — excluding doc (safe default)", fv, fk)
                 return False  # unknown operator — safe default: no match
         else:
             if actual != fv:

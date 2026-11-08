@@ -296,6 +296,30 @@ class LocalVectorStoreManager:
         print(f"[VectorStore] Connected (collection={collection_name})")
         print(f"[VectorStore] Collection count = {count}")
 
+        # 2026-11 (hardcoded-logic audit): query_live_with_ids/retrieve_with_scores
+        # compute score = 1.0 - distance, correct ONLY when the collection's actual
+        # vector space is cosine. collection_metadata={"hnsw:space": "cosine"} above
+        # is only honored by Chroma at CREATION time — if this collection already
+        # existed with a different space (e.g. the default L2), this call silently
+        # opens it as-is with no error, and every score from it would be meaningless
+        # garbage with no signal anything is wrong. Check once per connect — log
+        # loudly, don't raise (the check itself reading an internal attribute could
+        # be wrong on some future Chroma version; failing open here is safer than a
+        # crash loop on every boot over an observability check).
+        try:
+            _actual_space = (getattr(self.vectorstore._collection, "metadata", None) or {}).get("hnsw:space")
+            if _actual_space and _actual_space != "cosine":
+                _LOG.warning(
+                    "[VectorStore] collection %r has hnsw:space=%r, not 'cosine' — "
+                    "every score computed as (1.0 - distance) in this module is "
+                    "wrong for this collection. This collection likely existed "
+                    "before collection_metadata={'hnsw:space':'cosine'} was set and "
+                    "was never recreated with it.",
+                    collection_name, _actual_space,
+                )
+        except Exception as _space_check_e:
+            _LOG.debug("[VectorStore] hnsw:space verification check failed (%s) — skipping", _space_check_e)
+
         if fail_if_empty and (count is None or count == 0):
             raise RuntimeError(
                 "Local Chroma collection is empty. You must ingest documents first.\n"

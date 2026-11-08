@@ -385,6 +385,29 @@ RETRIEVAL_MIN_SIMILARITY = _safe_float("RETRIEVAL_MIN_SIMILARITY", 0.6)
 # measured constant — re-tune if live multi-license queries group wrong.
 FOCUS_FILTER_SIM_MARGIN = _safe_float("FOCUS_FILTER_SIM_MARGIN", 0.03)
 
+# persona_practical.py's _should_retrieve_new_topic: a lexical (Jaccard token
+# overlap, not _sim/embedding) ratio between the current and last retrieval
+# query, used to decide whether a legal-sounding follow-up is actually a
+# topic switch needing fresh retrieval. 2026-11 (hardcoded-logic audit): this
+# was an inline literal with no conf.py entry and no cited measurement — moved
+# here for visibility/manageability, same honest "reasoned starting point,
+# not extensively measured" caveat as FOCUS_FILTER_SIM_MARGIN above. Being
+# lexical rather than semantic, it can miss a genuine topic switch phrased
+# with mostly-synonymous words — watch for that failure mode before trusting
+# this value further.
+TOPIC_SWITCH_OVERLAP_MIN_RATIO = _safe_float("TOPIC_SWITCH_OVERLAP_MIN_RATIO", 0.22)
+
+# persona_supervisor.py's merge_multi_license (genuine 2+-license-type answers):
+# per-license and combined doc caps for the round-robin interleave. 2026-11
+# (hardcoded-logic audit): these were inline literals with no conf.py entry and
+# no documented empirical basis, unlike sibling caps (LLM_DOCS_MAX_BROAD etc.)
+# — moved here for visibility/manageability. Not yet empirically validated:
+# a genuine 3+-license query could still be truncated unevenly with no
+# measured basis for why 8 total is the right ceiling; revisit if a live case
+# shows real content getting cut.
+MULTI_LICENSE_MERGE_PER_LICENSE_CAP = _safe_int("MULTI_LICENSE_MERGE_PER_LICENSE_CAP", 3)
+MULTI_LICENSE_MERGE_TOTAL_CAP = _safe_int("MULTI_LICENSE_MERGE_TOTAL_CAP", 8)
+
 # PDF book content (2026-09, evidence-based): RETRIEVAL_MIN_SIMILARITY above was
 # calibrated for short, structured regulatory/marketing Sheet rows — it silently
 # drops genuinely-correct PDF-book narrative content, which scores systematically
@@ -430,12 +453,17 @@ BM25_BYPASS_MIN_RATIO = _safe_float("BM25_BYPASS_MIN_RATIO", 0.35)
 
 # Cross-encoder reranker (Level 3 RAG quality improvement)
 # Set RERANKER_ENABLED=true in env.properties to activate.
-# Model: multilingual cross-encoder (mmarco-mMiniLMv2). NOTE (2026-07 research): its
-# mMARCO training data covers 14 languages and Thai is NOT one of them (verified against
-# the mMARCO paper, arXiv:2108.13897) — Thai behavior is zero-shot cross-lingual transfer
-# from the base encoder, never fine-tuned or benchmarked directly. Keep this in mind before
-# trusting English-only accuracy claims (incl. quantization "no accuracy loss" claims) for
-# this model on Thai queries without separately validating on a Thai eval set.
+# Model (current default): BAAI/bge-reranker-v2-m3, a multilingual cross-encoder from
+# the same BGE family as this project's own embedding model (baai/bge-m3) — chosen to
+# replace an earlier default, cross-encoder/mmarco-mMiniLMv2-L12-H384-v1, whose mMARCO
+# training data covers 14 languages and explicitly excludes Thai (verified against the
+# mMARCO paper, arXiv:2108.13897). 2026-11 (hardcoded-logic audit): this comment and
+# RERANKER_MODEL's default had drifted out of sync with each other for a while — if you
+# change RERANKER_MODEL's default again, update this comment in the same edit. No
+# Thai-specific accuracy measurement has been separately run for bge-reranker-v2-m3
+# either — don't assume strong Thai support just because it's multilingual; the mmarco
+# model's caveat below (zero-shot cross-lingual transfer, not fine-tuned/benchmarked for
+# Thai) applies with the same force to any reranker model here until actually measured.
 # RERANKER_TOP_K: how many docs to keep after reranking (applied to both practical + academic).
 RERANKER_ENABLED = os.getenv("RERANKER_ENABLED", "false").lower() == "true"
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
@@ -549,6 +577,18 @@ REGULATORY_IDENTITY_GUARD_ENFORCE = os.getenv("REGULATORY_IDENTITY_GUARD_ENFORCE
 # a frequently-thin one means it's doing real work, but adds one extra vector-store call
 # per qualifying turn.
 RARE_LT_COVERAGE_SUPPLEMENT_ENABLED = os.getenv("RARE_LT_COVERAGE_SUPPLEMENT_ENABLED", "false").lower() == "true"
+
+# Kill switch for persona_supervisor.py's _RARE_LT_PATTERNS exact-filter escape hatch
+# (2026-11, hardcoded-logic audit, Phase 2.5). Its premise — rare licenses getting
+# overwhelmed by a dominant one in EMBEDDING-ONLY search — was coded 2026-03-24, ~2
+# months before the cross-encoder reranker + hybrid BM25/kNN search existed
+# (2026-05-18). Live A/B on its 2 remaining entries (reproduced twice each, real
+# /chat queries): สุรา showed NO difference on vs off (reranker+hybrid alone already
+# matches it); ภาษีป้าย was WORSE with it ON — info-gap ("ไม่มีข้อมูล") vs a correct,
+# detailed fee answer with it OFF. Default now FALSE per this evidence — set to true
+# only to temporarily restore the old escape-hatch behavior if a future regression
+# traces back to this change.
+RARE_LT_PATTERNS_ENABLED = os.getenv("RARE_LT_PATTERNS_ENABLED", "false").lower() == "true"
 MULTI_TOPIC_COVERAGE_SUPPLEMENT_ENABLED = os.getenv("MULTI_TOPIC_COVERAGE_SUPPLEMENT_ENABLED", "false").lower() == "true"
 
 # Same mechanism as the two flags above, for the 13 additional single-filtered-fetch
@@ -557,6 +597,18 @@ MULTI_TOPIC_COVERAGE_SUPPLEMENT_ENABLED = os.getenv("MULTI_TOPIC_COVERAGE_SUPPLE
 # were named for (a single department/license_type-filtered fetch, not a per-license
 # merge loop), so they get their own flag rather than overloading an existing one.
 SINGLE_FILTER_COVERAGE_SUPPLEMENT_ENABLED = os.getenv("SINGLE_FILTER_COVERAGE_SUPPLEMENT_ENABLED", "false").lower() == "true"
+
+# Op-intent keyword-filter safety net (2026-11, hardcoded-logic audit): persona_practical.
+# py's/persona_academic.py's operation-intent doc filters classify "new registration vs
+# renewal vs cancel vs edit vs replacement" from a handful of hardcoded regex patterns,
+# then drop docs whose operation_topic/operation_by_department disagrees — same brittle-
+# classification failure class as the removed _license_query_score (now _sim-based). If
+# the filter is about to drop the single highest-_sim doc from the pre-filter candidate
+# set, that's a strong signal the keyword classification misfired for this doc (utils.
+# text_patterns.rescue_top_sim_doc). Log-only soft launch, same pattern as
+# REGULATORY_IDENTITY_GUARD_ENFORCE above: the check always logs what it would rescue;
+# only flipping this to true actually puts the doc back. Watch real logs before enabling.
+OP_INTENT_TOP_SIM_RESCUE_ENFORCE = os.getenv("OP_INTENT_TOP_SIM_RESCUE_ENFORCE", "false").lower() == "true"
 
 # Groundedness judge truncation retry (2026-10/11, live-observed via LangSmith
 # trace after label-tagging shipped): a dense DOCUMENTS payload + required

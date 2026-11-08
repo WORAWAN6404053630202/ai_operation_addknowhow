@@ -205,16 +205,35 @@ class PersonaSupervisor:
     # License type strings used in _SUPERVISOR_KW_OVERRIDE (keyword→license mapping).
     # Must stay in sync with actual license_type values in Chroma.
     # Validated at startup by _validate_license_types_at_startup().
+    #
+    # 2026-11 (hardcoded-logic audit): the startup validator flagged 8/9 of these as not
+    # matching any real corpus document. Live-queried the real 869-doc baseline directly
+    # (not assumed) to resolve each: 5 were genuine renames (real content exists under a
+    # different exact string — fixed below). 3 are genuine, confirmed content gaps with
+    # NO matching document under any name/shape — 'ทะเบียนผู้ประกันตน' (real social-
+    # security-fund content exists, but all under license_type="" + main_topic/sub_topic,
+    # not a renameable license_type), 'จัดการการเงิน' (accounting/bookkeeping — zero
+    # matches for "บัญชี"/"งบ" across all 85 real license_type values), 'กองทุนเงินทดแทน'
+    # (added here from _SUPERVISOR_KW_OVERRIDE below, which had it with no counterpart
+    # here — also confirmed zero matches). Left in this list (and in _SUPERVISOR_KW_
+    # OVERRIDE/_MULTI_TOPIC_LICENSE_KEYWORDS) deliberately: removing them would lose
+    # real keyword-trigger value for query classification, and both structures already
+    # degrade gracefully per-term when one entry matches nothing (confirmed by reading
+    # their consuming merge loops) — the startup validator logging "not found" for these
+    # 3 is a correct, informational signal (a content gap), not a bug to silence.
     _KW_OVERRIDE_LICENSE_TYPES: List[str] = [
-        'ใบรับรองมาตรฐานร้านอาหาร',
-        'ระบบชำระเงินออนไลน์',
-        'ใบภาษีมูลค่าเพิ่ม ภพ.20',
+        'ใบอนุญาต/หนังสือรับรอง มาตรฐาน SAN และ SAN PLUS',
+        'บริการร้านค้ารับชำระเงิน QR API',
+        'ใบจดทะเบียนภาษีมูลค่าเพิ่ม (ภ.พ.01)',
         'ทะเบียนผู้ประกันตน',
         'ทะเบียนนายจ้าง',
         'จัดการการเงิน',
         'ใบอนุญาตจำหน่ายสุรา',
-        'แบบแสดงรายการภาษีป้ายร้านอาหาร',
-        'ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร',
+        'แบบแสดงรายการภาษีป้าย (ภ.ป.1)',
+        'ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหารหรือสถานที่สะสมอาหาร',
+        'กองทุนเงินทดแทน',
+        'ใบวุฒิบัตรผู้สัมผัสอาหาร',
+        'ใบรับรองแพทย์ 9 โรค(สณ.11)',
     ]
 
     # Keyword-to-license override: maps user vocabulary → canonical license_type.
@@ -222,11 +241,11 @@ class PersonaSupervisor:
     # in info-query area-sensitivity check (to determine dominant license from query).
     _SUPERVISOR_KW_OVERRIDE: List[tuple] = [
         (re.compile(r'\bSAN\b|\bSAN\s*PLUS\b|รับรองมาตรฐาน|มาตรฐานร้านอาหาร', re.IGNORECASE),
-         'ใบรับรองมาตรฐานร้านอาหาร'),
+         'ใบอนุญาต/หนังสือรับรอง มาตรฐาน SAN และ SAN PLUS'),
         (re.compile(r'\bQR\b|QR\s*Payment|QR\s*Code|คิวอาร์|คิวอาเพ|คิวอาพาย', re.IGNORECASE),
-         'ระบบชำระเงินออนไลน์'),
+         'บริการร้านค้ารับชำระเงิน QR API'),
         (re.compile(r'\bVAT\b|\bภพ\.?20\b|\bภพ20\b|จด\s*ภาษีมูลค่าเพิ่ม|สมัคร\s*VAT', re.IGNORECASE),
-         'ใบภาษีมูลค่าเพิ่ม ภพ.20'),
+         'ใบจดทะเบียนภาษีมูลค่าเพิ่ม (ภ.พ.01)'),
         (re.compile(r'ผู้ประกันตน|ทะเบียนผู้ประกัน|เงินสมทบ|แจ้งเข้าทำงาน|แจ้งออกจากงาน', re.IGNORECASE),
          'ทะเบียนผู้ประกันตน'),
         (re.compile(r'ประกันสังคม(?!.*นายจ้าง)', re.IGNORECASE),
@@ -236,9 +255,13 @@ class PersonaSupervisor:
         (re.compile(r'สุรา|เหล้า|จำหน่ายสุรา|ขายสุรา', re.IGNORECASE),
          'ใบอนุญาตจำหน่ายสุรา'),
         (re.compile(r'ภาษีป้าย|ป้ายร้านอาหาร', re.IGNORECASE),
-         'แบบแสดงรายการภาษีป้ายร้านอาหาร'),
+         'แบบแสดงรายการภาษีป้าย (ภ.ป.1)'),
         (re.compile(r'กองทุนเงินทดแทน|เงินทดแทน(?!ที่ดิน)', re.IGNORECASE),
          'กองทุนเงินทดแทน'),
+        (re.compile(r'ใบวุฒิบัตร|อบรมผู้สัมผัสอาหาร', re.IGNORECASE),
+         'ใบวุฒิบัตรผู้สัมผัสอาหาร'),
+        (re.compile(r'ใบรับรองแพทย์|9\s*โรค|สณ\.11', re.IGNORECASE),
+         'ใบรับรองแพทย์ 9 โรค(สณ.11)'),
         # Colloquial name — the formal license_type ("...จัดตั้งสถานที่จำหน่ายอาหาร") shares
         # no substring with this common phrasing, so bare mentions (no "คือ"/question wording)
         # fell through the name-match passes above into ambiguous multi-license matching,
@@ -246,12 +269,12 @@ class PersonaSupervisor:
         # instead of the area-size question this license actually needs (see
         # _AREA_SENSITIVE_LICENSES below).
         (re.compile(r'สุขาภิบาล', re.IGNORECASE),
-         'ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร'),
+         'ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหารหรือสถานที่สะสมอาหาร'),
     ]
 
     # Licenses where shop area size affects the answer (fees differ by area).
     # Used in info-query area-sensitivity check to avoid false positives.
-    _AREA_SENSITIVE_LICENSES: frozenset = frozenset({"ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร"})
+    _AREA_SENSITIVE_LICENSES: frozenset = frozenset({"ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหารหรือสถานที่สะสมอาหาร"})
 
     # Deterministic detectors
     _MODE_STATUS_Q = re.compile(
@@ -675,6 +698,39 @@ class PersonaSupervisor:
         (re.compile(r"กสิกร|kbank\b|kasikorn", re.IGNORECASE), "ธนาคารกสิกรไทย"),
     ]
 
+    # Broader 8-bank ID detection (distinct from _BANK_DEPT_PATTERNS above, which only
+    # covers the 2 banks with actual Chroma docs and maps to a department VALUE) — used
+    # to detect a bank SWITCH between the current query and prior context, regardless of
+    # whether that bank has docs. 2026-11 (hardcoded-logic audit): this exact 8-entry list
+    # used to be hand-duplicated verbatim at 2 separate call sites in this file (a real
+    # drift risk if one copy were ever updated without the other) — extracted to one
+    # class attribute so both sites share a single source of truth.
+    _BANK_ID_PATTERNS: List[Tuple] = [
+        ("scb",   re.compile(r"ไทยพาณิช(?:ย์)?|ไทยพานิช(?:ย์)?|scb\b", re.IGNORECASE)),
+        ("bbl",   re.compile(r"ธนาคารกรุงเทพ|bbl\b", re.IGNORECASE)),
+        ("ktb",   re.compile(r"กรุงไทย|ktb\b", re.IGNORECASE)),
+        ("kbank", re.compile(r"กสิกร|kbank\b|kasikorn", re.IGNORECASE)),
+        ("ttb",   re.compile(r"ทหารไทย|ธนชาต|ttb\b", re.IGNORECASE)),
+        ("bay",   re.compile(r"กรุงศรี|bay\b", re.IGNORECASE)),
+        ("gsb",   re.compile(r"ออมสิน|gsb\b", re.IGNORECASE)),
+        ("uob",   re.compile(r"\buob\b", re.IGNORECASE)),
+    ]
+
+    # Coverage-sweep filter: which "missing" license_types found in the broad-question
+    # pass are actual government-issued permits/licenses worth back-filling, vs. noise
+    # (operational tools, unrelated statutes). ^ใบ covers ใบอนุญาต/ใบทะเบียน/ใบวุฒิบัตร/
+    # ใบรับรอง/ใบภาษี; ^แบบแสดง covers แบบแสดงรายการภาษีป้าย; ภาษี catches 2 real tax-law
+    # entries not shaped like "ใบ..." (ประมวลรัษฎากร, land/building tax) found missing via
+    # a one-time manual scan of 76 license_types (2026-09, live-verified gap). Excludes
+    # ทะเบียนนายจ้าง/ผู้ประกันตน (registrations, not permits) and operational tools
+    # (payment/banking/staffing). 2026-11 (hardcoded-logic audit): promoted from a local
+    # variable to a class attribute so _validate_license_types_at_startup can re-check it
+    # against the real corpus on every boot — this regex was validated once, manually,
+    # and had no re-validation mechanism (unlike _KW_OVERRIDE_LICENSE_TYPES below) to
+    # catch a newly-ingested license_type with an unanticipated prefix silently falling
+    # outside the completeness guarantee this sweep exists to provide.
+    _PERMIT_LT_RE = re.compile(r"^ใบ|^แบบแสดง|ภพ\.|ภ\.ป|สณ\.|ภส\.|ภาษี", re.UNICODE)
+
     # Slot correction intent — user wants to change a previously given slot answer.
     _SLOT_CORRECTION_RE = re.compile(
         r"ขอแก้(?:ไข)?(?:\s*คำตอบ|\s*ข้อมูล)?|ขอเปลี่ยน(?:\s*คำตอบ)?|เปลี่ยนใหม่"
@@ -685,12 +741,27 @@ class PersonaSupervisor:
     # Rare license types overwhelmed by ใบทะเบียนพาณิชย์ in embedding search.
     # When query explicitly mentions one of these keywords, fetch docs directly by license_type filter.
     # Defined as class attribute — created once at class load, not on every function call.
+    #
+    # 2026-11 (hardcoded-logic audit): 3 entries that used to be here were REMOVED, not
+    # renamed — confirmed live against the real corpus that each is a genuine content gap
+    # (no matching document under any name/shape), so an exact `filter={"license_type":
+    # X}` fetch can structurally never succeed for any of them:
+    #   - "ประกันสังคม" → "ทะเบียนนายจ้าง": related content exists (social-security-fund
+    #     payment/inquiry/status docs) but ALL under license_type="" (blank), organized
+    #     by main_topic/sub_topic instead.
+    #   - "ใบวุฒิบัตร|อบรมผู้สัมผัสอาหาร" → "ใบวุฒิบัตรผู้สัมผัสอาหาร": zero matches for
+    #     "วุฒิบัตร"/"สัมผัสอาหาร"/"อบรม" anywhere in the real corpus's license_type values.
+    #   - "ใบรับรองแพทย์|9 โรค|สณ.11" → "ใบรับรองแพทย์ 9 โรค(สณ.11)": zero matches for
+    #     "สณ"/"แพทย์"/"โรค" anywhere either.
+    # All 3 confirmed harmless to remove: each fetch was already failing silently (0
+    # docs, RARE_LT_COVERAGE_SUPPLEMENT_ENABLED defaults off) and execution already fell
+    # through to the broader retrieval pipeline afterward — removing them just skips the
+    # guaranteed-to-fail round-trip, same end result. Both remain in _KW_OVERRIDE_
+    # LICENSE_TYPES/_MULTI_TOPIC_LICENSE_KEYWORDS for their keyword-trigger value and so
+    # the startup validator keeps tracking them as known (not forgotten) gaps.
     _RARE_LT_PATTERNS: Dict[str, str] = {
-        r"ประกันสังคม|กองทุนประกันสังคม|ขึ้นทะเบียนประกัน": "ทะเบียนนายจ้าง",
         r"ใบอนุญาตจำหน่ายสุรา|ขายสุรา|จำหน่ายสุรา|ภส\.08": "ใบอนุญาตจำหน่ายสุรา",
-        r"ภาษีป้าย|ป้ายร้าน|ภป(?:\.1)?": "แบบแสดงรายการภาษีป้ายร้านอาหาร",
-        r"ใบวุฒิบัตร|อบรมผู้สัมผัสอาหาร": "ใบวุฒิบัตรผู้สัมผัสอาหาร",
-        r"ใบรับรองแพทย์|9 โรค|สณ\.11": "ใบรับรองแพทย์ 9 โรค(สณ.11)",
+        r"ภาษีป้าย|ป้ายร้าน|ภป(?:\.1)?": "แบบแสดงรายการภาษีป้าย (ภ.ป.1)",
     }
 
     # Slot question strings — defined once, reused everywhere
@@ -700,19 +771,32 @@ class PersonaSupervisor:
     # Multi-topic license detection: maps regex pattern → canonical license_type name in Chroma.
     # Used by _detect_license_types_from_query() to predict which licenses a query covers BEFORE retrieval.
     _MULTI_TOPIC_LICENSE_KEYWORDS: List[Tuple[str, str]] = [
-        (r"vat|ภาษีมูลค่าเพิ่ม|ภพ\.?20", "ใบภาษีมูลค่าเพิ่ม ภพ.20"),
+        (r"vat|ภาษีมูลค่าเพิ่ม|ภพ\.?20", "ใบจดทะเบียนภาษีมูลค่าเพิ่ม (ภ.พ.01)"),
         (r"ใบอนุญาตจำหน่ายสุรา|ขายสุรา|จำหน่ายสุรา|สุรา|เหล้า|ภส\.08", "ใบอนุญาตจำหน่ายสุรา"),
-        (r"ภาษีป้าย|ป้ายร้าน|ภป(?:\.1)?|ป้ายโฆษณา", "แบบแสดงรายการภาษีป้ายร้านอาหาร"),
-        (r"ใบอนุญาตจัดตั้ง|สถานที่จำหน่ายอาหาร|bma\s*oss|อาหาร.*ใบอนุญาต", "ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร"),
+        (r"ภาษีป้าย|ป้ายร้าน|ภป(?:\.1)?|ป้ายโฆษณา", "แบบแสดงรายการภาษีป้าย (ภ.ป.1)"),
+        (r"ใบอนุญาตจัดตั้ง|สถานที่จำหน่ายอาหาร|bma\s*oss|อาหาร.*ใบอนุญาต", "ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหารหรือสถานที่สะสมอาหาร"),
         (r"ใบทะเบียนพาณ(?:ิ|ี)ชย์|จดทะเบียนพาณ(?:ิ|ี)ชย์|ทะเบียนพาณ(?:ิ|ี)ชย์|dbd", "ใบทะเบียนพาณิชย์"),
         (r"ประกันสังคม|กองทุนประกันสังคม|ขึ้นทะเบียนประกัน|ขึ้นทะเบียนนายจ้าง", "ทะเบียนนายจ้าง"),
         (r"ประกันสังคม|ผู้ประกันตน|แจ้งรับลูกจ้าง|เงินสมทบ", "ทะเบียนผู้ประกันตน"),
         (r"ใบวุฒิบัตร|อบรมผู้สัมผัสอาหาร", "ใบวุฒิบัตรผู้สัมผัสอาหาร"),
         (r"ใบรับรองแพทย์|9\s*โรค|สณ\.11", "ใบรับรองแพทย์ 9 โรค(สณ.11)"),
-        (r"qr.?payment|qr.?api|พร้อมเพย์|promptpay|qr\s*พร้อมเพย์|ระบบชำระเงินออนไลน์", "ระบบชำระเงินออนไลน์"),
-        (r"edc|รูดบัตร|เครื่องรูดบัตร", "เครื่องรูดบัตร EDC"),
-        (r"ใบรับรองมาตรฐานร้านอาหาร|มาตรฐานร้านอาหาร|san\b|สุขาภิบาลอาหาร.*มาตรฐาน|มาตรฐาน.*สุขาภิบาล", "ใบรับรองมาตรฐานร้านอาหาร"),
-        # บัญชีและการเงิน — accounting / bookkeeping
+        # 2026-11: confirmed live this is a genuine content gap too (zero matching
+        # license_type in the real corpus) — same rationale as จัดการการเงิน below.
+        (r"กองทุนเงินทดแทน|เงินทดแทน(?!ที่ดิน)", "กองทุนเงินทดแทน"),
+        (r"qr.?payment|qr.?api|พร้อมเพย์|promptpay|qr\s*พร้อมเพย์|ระบบชำระเงินออนไลน์", "บริการร้านค้ารับชำระเงิน QR API"),
+        # 2026-11 (hardcoded-logic audit, Phase 4): "เครื่องรูดบัตร EDC" never matched
+        # any real license_type — live-queried the corpus and found 2 near-duplicate
+        # EDC docs (same source PDF, split into 2 chunks at ingest, each independently
+        # drafted a different license_type with no cross-chunk consistency check —
+        # confirmed via source_file: both "...SUPER rOS1_1.pdf"/"..._3.pdf"). Fixed at
+        # the data layer (both chunks' license_type metadata unified to this one real
+        # value), not just here, so only one target string is needed.
+        (r"edc|รูดบัตร|เครื่องรูดบัตร", "บริการเครื่อง EDC (Electronic Data Capture)"),
+        (r"ใบรับรองมาตรฐานร้านอาหาร|มาตรฐานร้านอาหาร|san\b|สุขาภิบาลอาหาร.*มาตรฐาน|มาตรฐาน.*สุขาภิบาล", "ใบอนุญาต/หนังสือรับรอง มาตรฐาน SAN และ SAN PLUS"),
+        # บัญชีและการเงิน — accounting / bookkeeping. 2026-11: confirmed live this is a
+        # genuine content gap (zero matching license_type in the real corpus) — kept
+        # here deliberately for its keyword-trigger/classification value; see
+        # _KW_OVERRIDE_LICENSE_TYPES's own comment for the full rationale.
         (r"ปิดงบ|ปิดบัญชี|ปิงบ|งบการเงิน|งบบัญชี|จัดการการเงิน|จัดการเงิน|ทำบัญชี|ตรวจสอบบัญชี|สำนักงานบัญชี|ผู้ทำบัญชี|ผู้สอบบัญชี", "จัดการการเงิน"),
         # POS ID (2026-10, live-reproduced): was missing entirely — a query mentioning
         # VAT alongside a POS-device-approval question matched ONLY the VAT pattern above,
@@ -2943,18 +3027,8 @@ class PersonaSupervisor:
         # Each guard below detects a specific dimension change and forces fresh retrieval.
 
         # 1. Bank/department switch (e.g. KBANK -> SCB, same QR-API topic)
-        _BANK_GROUPS = [
-            ("scb",   re.compile(r"ไทยพาณิช(?:ย์)?|ไทยพานิช(?:ย์)?|scb\b", re.IGNORECASE)),
-            ("bbl",   re.compile(r"ธนาคารกรุงเทพ|bbl\b", re.IGNORECASE)),
-            ("ktb",   re.compile(r"กรุงไทย|ktb\b", re.IGNORECASE)),
-            ("kbank", re.compile(r"กสิกร|kbank\b|kasikorn", re.IGNORECASE)),
-            ("ttb",   re.compile(r"ทหารไทย|ธนชาต|ttb\b", re.IGNORECASE)),
-            ("bay",   re.compile(r"กรุงศรี|bay\b", re.IGNORECASE)),
-            ("gsb",   re.compile(r"ออมสิน|gsb\b", re.IGNORECASE)),
-            ("uob",   re.compile(r"\buob\b", re.IGNORECASE)),
-        ]
         def _get_bank(text: str) -> Optional[str]:
-            for bid, pat in _BANK_GROUPS:
+            for bid, pat in self._BANK_ID_PATTERNS:
                 if pat.search(text):
                     return bid
             return None
@@ -4719,12 +4793,29 @@ class PersonaSupervisor:
         # by ใบทะเบียนพาณิชย์ (77 docs) in embedding search.
         # When query explicitly mentions one of these keywords, fetch ALL their docs directly
         # from ChromaDB by license_type filter, bypassing the imbalanced embedding ranking.
+        # 2026-11 (hardcoded-logic audit): tracked so the observability check further below
+        # (near the narrow/follow-up fallback's identity guard) knows whether this regex
+        # list already got a chance to run for this query — this list is a deliberate
+        # counter-measure against a documented embedding-ranking weakness for these 5
+        # license types, so a paraphrase the regex never anticipated reproduces that exact
+        # weakness with no signal that it happened.
+        _rare_lt_pattern_matched = False
+        # 2026-11 (hardcoded-logic audit, Phase 2.5): this escape hatch's whole premise
+        # ("rare license overwhelmed by a 77-doc-heavy license_type in embedding search")
+        # was coded 2026-03-24, ~2 months BEFORE the cross-encoder reranker + hybrid
+        # BM25/kNN search existed (2026-05-18) — nobody has ever re-tested whether the
+        # modern retrieval stack already handles this alone. Flag added to settle that
+        # empirically via a live A/B (flip via env var, no rebuild needed) rather than
+        # guessing; default true preserves current behavior until the A/B concludes.
         for _rare_pat, _rare_lt in self._RARE_LT_PATTERNS.items():
+            if not getattr(conf, "RARE_LT_PATTERNS_ENABLED", True):
+                break  # Phase 2.5 kill switch — flip off for the live A/B test, no rebuild needed
             # Broad queries (multi-topic) must fall through to the two-pass broad_q path
             # so all detected topics are retrieved together; rare-lt fetches only one license_type.
             if _is_broad_q_pre:
                 break
             if re.search(_rare_pat, q, re.IGNORECASE):
+                _rare_lt_pattern_matched = True
                 try:
                     _vstore = getattr(self.retriever, "vectorstore", None)
                     if _vstore is not None:
@@ -4774,7 +4865,7 @@ class PersonaSupervisor:
                         if getattr(conf, "RERANKER_ENABLED", False) and _raw_docs:
                             try:
                                 from utils.reranker import rerank as _do_rerank
-                                _rr_model = getattr(conf, "RERANKER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
+                                _rr_model = getattr(conf, "RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
                                 _rr_top_k = int(getattr(conf, "RERANKER_TOP_K", len(_raw_docs)))
                                 _rr_backend = getattr(conf, "RERANKER_BACKEND", "pytorch")
                                 _rr_onnx_file = getattr(conf, "RERANKER_ONNX_FILE", "model_quint8_avx2.onnx")
@@ -5580,10 +5671,9 @@ class PersonaSupervisor:
                         # constitution, etc.) is correctly out of scope for this sweep.
                         # Excludes: ทะเบียนนายจ้าง/ผู้ประกันตน (employee registrations,
                         # not permits), and all operational tools (payment, banking, staffing).
-                        _PERMIT_LT_RE = re.compile(
-                            r"^ใบ|^แบบแสดง|ภพ\.|ภ\.ป|สณ\.|ภส\.|ภาษี", re.UNICODE
-                        )
-                        _missing_lts = {lt for lt in _missing_lts if _PERMIT_LT_RE.search(lt)}
+                        # (self._PERMIT_LT_RE — class attribute, see its own docstring above;
+                        # re-validated against the real corpus at startup.)
+                        _missing_lts = {lt for lt in _missing_lts if self._PERMIT_LT_RE.search(lt)}
                         # Re-include license types explicitly named in the user's query
                         # (e.g. ทะเบียนนายจ้าง/ผู้ประกันตน for ประกันสังคม) that were excluded by
                         # _PERMIT_LT_RE because they're registrations rather than formal permits.
@@ -5825,6 +5915,29 @@ class PersonaSupervisor:
                 except Exception as _rid_e:
                     _LOG.warning("[Supervisor] identity-mismatch guard failed (%s) — continuing unfiltered", _rid_e)
 
+            # _RARE_LT_PATTERNS coverage observability (2026-11, hardcoded-logic audit):
+            # log-only, zero behavior change. If none of the 5 rare-license regexes
+            # matched this query, but normal retrieval surfaced a doc for one of those
+            # same rare license_types with a confident _sim anyway, that's a real
+            # phrasing the regex list is missing — surface it so the pattern list can
+            # be grown from observed traffic instead of guessed upfront.
+            if not _rare_lt_pattern_matched and docs:
+                try:
+                    _rare_lt_values = set(self._RARE_LT_PATTERNS.values())
+                    for _d_cov in docs[:5]:
+                        _md_cov = getattr(_d_cov, "metadata", {}) or {}
+                        _lt_cov = str(_md_cov.get("license_type") or "").strip()
+                        _sim_cov = _md_cov.get("_sim")
+                        if _lt_cov in _rare_lt_values and isinstance(_sim_cov, (int, float)) and _sim_cov >= 0.6:
+                            _LOG.warning(
+                                "[Supervisor] rare license_type %r surfaced via normal retrieval "
+                                "(_sim=%.3f) without any _RARE_LT_PATTERNS regex matching q=%r — "
+                                "candidate phrasing to add to the pattern list",
+                                _lt_cov, _sim_cov, q[:80],
+                            )
+                except Exception as _rare_cov_e:
+                    _LOG.debug("[Supervisor] rare-lt coverage observability check failed (%s)", _rare_cov_e)
+
             # 2026-10 fix (Phase-0 codebase audit, QA-reproduced cross-domain
             # contamination — e.g. DBD commerce-registration content answering a
             # VAT question): this fallback is most live Practical traffic's actual
@@ -5849,7 +5962,7 @@ class PersonaSupervisor:
             if getattr(conf, "RERANKER_ENABLED", False) and docs:
                 try:
                     from utils.reranker import rerank as _do_rerank
-                    _rr_model = getattr(conf, "RERANKER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
+                    _rr_model = getattr(conf, "RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
                     _rr_top_k = int(getattr(conf, "RERANKER_TOP_K", len(docs)))
                     _rr_backend = getattr(conf, "RERANKER_BACKEND", "pytorch")
                     _rr_onnx_file = getattr(conf, "RERANKER_ONNX_FILE", "model_quint8_avx2.onnx")
@@ -6717,6 +6830,21 @@ class PersonaSupervisor:
                     if _kw_re_a.search(query or ""):
                         _dominant_lt_area = _kw_lt_a
                         break
+                # 2026-11 (hardcoded-logic audit): unlike _SUPERVISOR_KW_OVERRIDE's OTHER
+                # consumption site (multi-license dominance below), this one assigned
+                # _kw_lt_a directly with no check against real data — a stale/renamed
+                # target string would silently misclassify area-sensitivity. Cheap,
+                # free (Tier A only, no LLM) check against the live corpus closes that;
+                # falls through to the doc-frequency fallback below exactly like a
+                # keyword that never matched at all.
+                if _dominant_lt_area:
+                    from service.live_taxonomy import get_live_license_types, resolve_candidate
+                    _vstore_area = getattr(self.retriever, "vectorstore", None)
+                    _live_lts_area = get_live_license_types(_vstore_area)
+                    if _live_lts_area:
+                        _resolved_area, _ = resolve_candidate(_dominant_lt_area, _live_lts_area)
+                        if not _resolved_area:
+                            _dominant_lt_area = ""
                 if not _dominant_lt_area:
                     _lt_freq_a: dict = {}
                     for _d_a in docs:
@@ -6910,6 +7038,10 @@ class PersonaSupervisor:
             # "ระบบชำระเงินออนไลน์"). These are evaluated ONLY when the name-based check above
             # found nothing, ensuring explicit name mentions still take priority.
             if not _explicit_lt:
+                # 2026-11 (hardcoded-logic audit): already safely gated — `_kw_lt in
+                # license_types_seen` means a stale/renamed hardcoded target simply
+                # fails this check and falls through, same as a keyword that never
+                # matched. No separate live-corpus resolution needed at this site.
                 for _kw_re, _kw_lt in self._SUPERVISOR_KW_OVERRIDE:
                     if _kw_re.search(query or "") and _kw_lt in license_types_seen:
                         _explicit_lt = _kw_lt
@@ -8559,8 +8691,63 @@ class PersonaSupervisor:
                     "bare-name recognition ✓",
                     len(chroma_lt_set),
                 )
+
+            # 3. (new, 2026-11, hardcoded-logic audit) _PERMIT_LT_RE (the coverage-sweep's
+            # "is this a real government permit" filter) was validated once via a manual
+            # scan of 76 license_types, with no re-check on corpus change — unlike
+            # _KW_OVERRIDE_LICENSE_TYPES above. Most license_types are legitimately NOT
+            # permits (operational tools, registrations, etc.), so "doesn't match
+            # _PERMIT_LT_RE" alone is the expected common case, not a useful signal — flag
+            # only the meaningful NEAR-MISS case instead: a license_type that contains a
+            # permit-signaling word ANYWHERE (not just as the exact anchored prefix
+            # _PERMIT_LT_RE requires) but still isn't matched by it, e.g. a permit name
+            # that doesn't happen to START with "ใบ"/"แบบแสดง". That's the real "a newly-
+            # ingested permit could silently fall outside the completeness sweep" case.
+            _PERMIT_LOOKS_LIKE_RE = re.compile(r"ใบอนุญาต|ใบรับรอง|ใบทะเบียน|ใบวุฒิบัตร|แบบแสดง", re.UNICODE)
+            _near_miss_permits = sorted(
+                lt for lt in chroma_lt_set
+                if lt and _PERMIT_LOOKS_LIKE_RE.search(lt) and not self._PERMIT_LT_RE.search(lt)
+            )
+            if _near_miss_permits:
+                _LOG.info(
+                    "[Supervisor] startup: %d license_type(s) in Chroma look like permits "
+                    "but aren't matched by _PERMIT_LT_RE (likely don't start with the "
+                    "exact anchored prefix it checks) — the coverage sweep won't back-fill "
+                    "these as missing if they ever are. Review: %s",
+                    len(_near_miss_permits), _near_miss_permits[:10],
+                )
         except Exception:
             _LOG.warning("[Supervisor] startup: license type validation failed", exc_info=True)
+
+        # 4. (new, 2026-11, hardcoded-logic audit, Phase 3) Generalizes checks #1-#3 above
+        # (which only ever covered license_type-shaped structures in THIS file) to the
+        # other 6 hand-maintained keyword->canonical-target-string structures found by
+        # this session's full-codebase inventory, across all 3 persona files — see
+        # code/scripts/taxonomy_drift_scan.py's module docstring for the full registry
+        # and what's deliberately excluded. Free (one source-text scan + the already-
+        # cached live-corpus fetch) — safe to run unconditionally on every boot.
+        try:
+            from scripts.taxonomy_drift_scan import check_drift
+            vectorstore = getattr(self._practical.retriever, "vectorstore", None)
+            drift_findings = check_drift(vectorstore)
+            _n_high = sum(1 for f in drift_findings if f.severity == "high")
+            for f in drift_findings:
+                _log_fn = _LOG.warning if f.severity == "high" else _LOG.info
+                _log_fn(
+                    "[Supervisor] startup: taxonomy drift — %s (%s) target %r not found "
+                    "in live corpus field %r (even fuzzy). Run `python3 code/scripts/"
+                    "taxonomy_drift_scan.py` for the full report.",
+                    f.structure, f.file, f.value, f.field,
+                )
+            if not drift_findings:
+                _LOG.info("[Supervisor] startup: taxonomy_drift_scan found no drift ✓")
+            elif _n_high:
+                _LOG.warning(
+                    "[Supervisor] startup: taxonomy_drift_scan found %d high-severity "
+                    "drift finding(s) — see warnings above.", _n_high,
+                )
+        except Exception:
+            _LOG.warning("[Supervisor] startup: taxonomy_drift_scan failed", exc_info=True)
 
     # Thin wrapper around utils.text_patterns' shared constant (moved there 2026-10 so
     # persona_academic.py can share the same guard — see that module's docstring for
@@ -9964,6 +10151,18 @@ class PersonaSupervisor:
         LLM fallback for license type detection — called when ALL keyword patterns return [].
         Caches result in state.context["_lt_llm_cache"] keyed by query.
         Returns list of license_type strings (empty list if unspecified or low confidence).
+
+        2026-11 (hardcoded-logic audit): the candidate list used to be `[lt for
+        _, lt in self._MULTI_TOPIC_LICENSE_KEYWORDS]` — hardcoded, the exact
+        failure class this whole investigation found (8/9 of a sibling
+        hardcoded list had already drifted from the real corpus). Now asks the
+        LIVE corpus every time (service.live_taxonomy.get_live_license_types,
+        cached + invalidated via get_corpus_version() — zero added cost on the
+        hot path), so a brand-new PDF-sourced license_type is a valid LLM
+        answer the moment it's ingested, with no code change needed. Falls
+        back to the old hardcoded list ONLY if the live fetch comes back
+        genuinely empty (e.g. vectorstore not yet connected) — never ends up
+        with zero candidates, which would make this fallback a no-op.
         """
         q = (query or "").strip()
         if not q or len(q) < 3:
@@ -9974,7 +10173,9 @@ class PersonaSupervisor:
             _LOG.debug("[Supervisor/license_type] cache hit for %r → %r", q[:40], cache[q])
             return cache[q]
 
-        candidates = [lt for _, lt in self._MULTI_TOPIC_LICENSE_KEYWORDS]
+        from service.live_taxonomy import get_live_license_types
+        _vstore_lt = getattr(self.retriever, "vectorstore", None)
+        candidates = get_live_license_types(_vstore_lt) or [lt for _, lt in self._MULTI_TOPIC_LICENSE_KEYWORDS]
         try:
             res = self._llm_license_type_call(q, candidates, state=state) or {}
         except Exception as _e:
@@ -11306,8 +11507,8 @@ class PersonaSupervisor:
         explicit completeness mandate added; check this before assuming it just works.
         """
         try:
-            _per_license_cap = 3
-            _total_cap = 8
+            _per_license_cap = int(getattr(conf, "MULTI_LICENSE_MERGE_PER_LICENSE_CAP", 3))
+            _total_cap = int(getattr(conf, "MULTI_LICENSE_MERGE_TOTAL_CAP", 8))
             _license_doc_lists: Dict[str, List[Dict[str, Any]]] = {}
             for _lt in license_types:
                 try:
@@ -12014,13 +12215,13 @@ class PersonaSupervisor:
                 )
                 state.context["multi_license_topics"] = _lt_unique
                 _TOPIC_QUERIES_PT = {
-                    "ใบภาษีมูลค่าเพิ่ม ภพ.20": "ภาษีมูลค่าเพิ่ม ภพ.20 จด VAT กรมสรรพากร",
+                    "ใบจดทะเบียนภาษีมูลค่าเพิ่ม (ภ.พ.01)": "ภาษีมูลค่าเพิ่ม ภ.พ.01 จด VAT กรมสรรพากร",
                     "ใบอนุญาตจำหน่ายสุรา": "ใบอนุญาตจำหน่ายสุรา สรรพสามิต ภส.08",
                     "แบบแสดงรายการภาษีป้าย": "ภาษีป้าย แบบ ภป.1 ป้ายร้านอาหาร",
-                    "แบบแสดงรายการภาษีป้ายร้านอาหาร": "ภาษีป้าย แบบ ภป.1 ป้ายร้านอาหาร",
-                    "ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร": "ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร BMA OSS",
+                    "แบบแสดงรายการภาษีป้าย (ภ.ป.1)": "ภาษีป้าย แบบ ภป.1 ป้ายร้านอาหาร",
+                    "ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหารหรือสถานที่สะสมอาหาร": "ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร BMA OSS",
                     "ใบทะเบียนพาณิชย์": "จดทะเบียนพาณิชย์ DBD",
-                    "ใบรับรองมาตรฐานร้านอาหาร": "ใบรับรองมาตรฐานร้านอาหาร SAN กรมอนามัย สุขาภิบาลอาหาร",
+                    "ใบอนุญาต/หนังสือรับรอง มาตรฐาน SAN และ SAN PLUS": "ใบรับรองมาตรฐานร้านอาหาร SAN กรมอนามัย สุขาภิบาลอาหาร",
                 }
                 _pt_docs: List[Dict[str, Any]] = []
                 _pt_seen: set = set()
@@ -13488,18 +13689,8 @@ class PersonaSupervisor:
                 # the department in current_docs, the cached docs are from the wrong bank.
                 # Clear _prior_license so entity-enriched retrieval is not locked to the
                 # wrong bank's license (e.g. KBANK license when user is asking about SCB).
-                _slot_bank_groups = [
-                    ("scb",   re.compile(r"ไทยพาณิช(?:ย์)?|ไทยพานิช(?:ย์)?|scb\b", re.IGNORECASE)),
-                    ("bbl",   re.compile(r"ธนาคารกรุงเทพ|bbl\b", re.IGNORECASE)),
-                    ("ktb",   re.compile(r"กรุงไทย|ktb\b", re.IGNORECASE)),
-                    ("kbank", re.compile(r"กสิกร|kbank\b|kasikorn", re.IGNORECASE)),
-                    ("ttb",   re.compile(r"ทหารไทย|ธนชาต|ttb\b", re.IGNORECASE)),
-                    ("bay",   re.compile(r"กรุงศรี|bay\b", re.IGNORECASE)),
-                    ("gsb",   re.compile(r"ออมสิน|gsb\b", re.IGNORECASE)),
-                    ("uob",   re.compile(r"\buob\b", re.IGNORECASE)),
-                ]
                 def _slot_bank_id(text: str) -> Optional[str]:
-                    for _b, _p in _slot_bank_groups:
+                    for _b, _p in self._BANK_ID_PATTERNS:
                         if _p.search(text):
                             return _b
                     return None

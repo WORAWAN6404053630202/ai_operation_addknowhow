@@ -215,6 +215,25 @@ class TestESCompatVectorStore:
         assert len(docs) == 1
         assert docs[0].page_content == "x"
 
+    def test_as_retriever_exposes_vectorstore_attribute(self):
+        """2026-11 (hardcoded-logic audit, live-reproduced): every one of ~38
+        call sites across persona_supervisor.py/persona_practical.py/
+        persona_academic.py does getattr(self.retriever, "vectorstore",
+        None), expecting this retriever to behave like LangChain's own
+        Chroma retriever wrapper (which sets .vectorstore). This class used
+        to omit it entirely, so vectorstore was always None on the ES
+        backend — confirmed live via a real /chat request before this fix —
+        silently skipping every metadata-filtered fetch and every
+        hybrid_search() call at those sites, always falling back to this
+        retriever's own filterless, non-hybrid .invoke() instead."""
+        client = MagicMock()
+        embedding_model = MagicMock()
+        vs = ESCompatVectorStore(client, "my_index", embedding_model)
+
+        retriever = vs.as_retriever(search_kwargs={"k": 5})
+
+        assert getattr(retriever, "vectorstore", None) is vs
+
 
 @pytest.mark.unit
 class TestArchiveAndRemoveOrdering:
