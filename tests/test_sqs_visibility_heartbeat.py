@@ -123,7 +123,12 @@ class TestPollAndProcessForeverHeartbeatWiring:
     def test_heartbeat_started_before_processing(self):
         source = self._source()
         start_idx = source.find("_start_visibility_heartbeat(")
-        process_idx = source.find("process_sqs_message(")
+        # 2026-11: process_sqs_message is now passed by reference to a bounded
+        # executor's .submit(...) (see TestPollAndProcessForeverProcessingTimeout)
+        # rather than called directly. Anchor on ".submit(process_sqs_message"
+        # specifically — the bare name also appears earlier, in this
+        # function's own docstring, which would otherwise false-match first.
+        process_idx = source.find(".submit(process_sqs_message")
         assert start_idx != -1, "heartbeat not started in poll_and_process_forever"
         assert process_idx != -1
         assert start_idx < process_idx, "heartbeat must start before processing begins"
@@ -141,3 +146,67 @@ class TestPollAndProcessForeverHeartbeatWiring:
     def test_delete_message_still_happens_on_success(self):
         source = self._source()
         assert "sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)" in source
+
+
+@pytest.mark.unit
+class TestPollAndProcessForeverProcessingTimeout:
+    """Tests for the 2026-11 fix added after a live incident: the consumer
+    processed 2 messages successfully then went completely silent for 76+
+    minutes with no exception, no crash, no log line — nothing above the
+    poll loop bounded how long a single process_sqs_message() call could
+    run. These cover the bounded-executor wrapper added around that call."""
+
+    def _source(self) -> str:
+        import inspect
+        return inspect.getsource(sqs_consumer.poll_and_process_forever)
+
+    def test_process_sqs_message_wrapped_in_bounded_executor(self):
+        source = self._source()
+        assert "ThreadPoolExecutor(max_workers=1)" in source
+        assert ".result(" in source
+        assert "_PROCESSING_TIMEOUT_SECONDS" in source
+
+    def test_timeout_exception_handled_as_its_own_branch(self):
+        source = self._source()
+        assert "FutureTimeoutError" in source
+        # Must still fall through to the same finally that stops the heartbeat.
+        idx = source.find("except FutureTimeoutError:")
+        assert idx != -1
+        tail = source[idx:]
+        assert "finally:" in tail
+        assert "stop_heartbeat.set()" in tail[tail.find("finally:"):]
+
+    def test_not_a_with_block_that_would_block_on_shutdown(self):
+        """ThreadPoolExecutor.__exit__ calls shutdown(wait=True), which would
+        block right back on the same stuck thread the timeout is meant to
+        escape — the fix must NOT use `with ThreadPoolExecutor(...)`."""
+        source = self._source()
+        assert "with ThreadPoolExecutor(" not in source
+        assert "shutdown(wait=False)" in source
+
+    def test_slow_processing_does_not_block_the_loop_past_the_timeout(self, monkeypatch):
+        mock_sqs = MagicMock()
+        mock_sqs.receive_message.side_effect = [
+            {"Messages": [{"ReceiptHandle": "r1", "Body": "{}"}]},
+            RuntimeError("stop the test loop after one message"),
+        ]
+        monkeypatch.setattr(sqs_consumer.boto3, "client", lambda *a, **kw: mock_sqs)
+        monkeypatch.setattr(sqs_consumer, "_assert_dev_environment", lambda: None)
+        monkeypatch.setattr(
+            sqs_consumer, "_start_visibility_heartbeat",
+            lambda *a, **kw: __import__("threading").Event(),
+        )
+        monkeypatch.setattr(sqs_consumer, "_PROCESSING_TIMEOUT_SECONDS", 0.05)
+
+        def slow_process(*_args, **_kwargs):
+            time.sleep(0.5)  # 10x the mocked timeout — must never be waited out
+
+        monkeypatch.setattr(sqs_consumer, "process_sqs_message", slow_process)
+
+        start = time.monotonic()
+        with pytest.raises(RuntimeError, match="stop the test loop"):
+            sqs_consumer.poll_and_process_forever("https://sqs.example/queue")
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 0.4, f"loop blocked for {elapsed:.2f}s — timeout did not bound the wait"
+        mock_sqs.delete_message.assert_not_called()

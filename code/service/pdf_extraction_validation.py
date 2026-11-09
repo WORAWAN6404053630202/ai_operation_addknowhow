@@ -45,6 +45,7 @@ from html.parser import HTMLParser
 from typing import Any, Optional
 
 import conf
+from utils.llm_call import get_shared_pdf_http_client
 from utils.llm_cost_logging import CostAccumulator, log_llm_cost
 from utils.pdf_cost_guard import get_cost_guard
 from utils.logger import get_logger
@@ -279,7 +280,7 @@ def compare_extractions_llm(
     passed accumulator=, so its cost silently never reached ReviewItem.total_cost."""
     from openai import OpenAI
 
-    client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
+    client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL, http_client=get_shared_pdf_http_client())
     prompt = _LLM_COMPARISON_PROMPT.format(markdown_a=markdown_a, markdown_b=markdown_b)
 
     try:
@@ -328,13 +329,26 @@ def validate_extraction(
     compare_label: str = "second_model",
     use_llm_comparison: bool = False,
     cost_accumulator: Optional[CostAccumulator] = None,
+    typhoon_was_empty: bool = False,
 ) -> list[ValidationFlag]:
     """Entry point: runs every automatic check available. `compare_with` is an
     optional second extractor's output over the SAME page for the dual-model
     checks. `use_llm_comparison` additionally runs the general-purpose LLM catch-all
     (costs a real API call — off by default). `cost_accumulator` is forwarded to
     that call so its cost is folded into the caller's per-document total — see
-    compare_extractions_llm's docstring."""
+    compare_extractions_llm's docstring.
+
+    `typhoon_was_empty` (2026-11, hardcoded-logic audit): set by the caller when
+    Typhoon's ORIGINAL output for this page was empty and the vision-verify
+    fallback recovered real text — by the time this function runs, `markdown`
+    has ALREADY been overwritten with that recovered text at the extraction
+    site (pdf_large_extraction.py/handler.py), so `markdown`==`compare_with`
+    and compare_extractions() below would see no disagreement and emit no
+    flag for this case. Without this parameter, a real OCR failure that got
+    silently recovered would also go silently unflagged — invisible on the
+    admin dashboard even though it's exactly the case most worth a human
+    spot-check (Typhoon failed outright; the only reason there's any text at
+    all is the vision-verify fallback)."""
     flags = check_table_arithmetic(markdown)
     if compare_with is not None:
         flags += compare_extractions(markdown, compare_with, "primary", compare_label)
@@ -342,4 +356,10 @@ def validate_extraction(
             flags += compare_extractions_llm(
                 markdown, compare_with, "primary", compare_label, cost_accumulator=cost_accumulator,
             )
+    if typhoon_was_empty and (compare_with or "").strip():
+        flags.append(ValidationFlag(
+            category="typhoon_ocr_recovered_by_claude",
+            severity="high",
+            message="Typhoon OCR returned empty output for this page — text came entirely from the vision-verify fallback. Worth a manual spot-check.",
+        ))
     return flags

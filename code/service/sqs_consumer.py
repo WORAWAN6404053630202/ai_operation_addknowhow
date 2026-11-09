@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import asdict
 from typing import Optional
 
@@ -52,7 +53,7 @@ else:
     from service.local_vector_store import get_vs_manager
 from service import pdf_status_tracker
 from utils.llm_cost_logging import CostAccumulator
-from utils.logger import get_logger
+from utils.logger import get_logger, hardlog
 from utils.page_ranges import format_page_ranges, group_into_ranges
 from utils.pdf_attempt_counter import get_attempt_counter
 from utils.pdf_draft_cache import LOGIC_VERSION as _DRAFT_CACHE_LOGIC_VERSION, content_hash, get_draft_cache
@@ -61,6 +62,14 @@ from utils.pdf_ingestion_log import append_event
 logger = get_logger(__name__)
 
 _queue_manager = PdfReviewQueueManager()
+
+
+# 2026-11: _hardlog now lives in utils/logger.py (hardlog) so every module in
+# the PDF-ingestion call graph can share one diagnostic fallback instead of
+# duplicating it — see that function's docstring for why it exists. Aliased
+# here under the original name so existing call sites in this file don't
+# need to change.
+_hardlog = hardlog
 
 # Hard cap on the EC2 large-document handoff path (see process_extraction_result's
 # handoff branch below) — each attempt re-OCRs and re-runs Claude Vision over
@@ -71,6 +80,18 @@ _queue_manager = PdfReviewQueueManager()
 # resolve on their own without letting a permanently-broken document
 # (e.g. out-of-credits, a malformed PDF) retry indefinitely.
 _MAX_HANDOFF_ATTEMPTS = 3
+
+# 2026-11: live incident — the consumer processed 2 messages successfully then
+# went completely silent for 76+ minutes with no exception, no crash, no log
+# line (RestartCount stayed 0 the whole time). Nothing above this loop bounded
+# how long a single process_sqs_message() call could run — any call that
+# blocks without ever raising (a leaked connection-pool permit in a Rust/async
+# client, a socket stuck past its nominal SDK timeout, etc.) could freeze the
+# entire consumer forever. 30 minutes is comfortably above the longest healthy
+# run observed this session (~97s) and well under the SQS queue's own 2-hour
+# visibility timeout, so a real timeout still leaves room for safe redelivery
+# via the existing _MAX_HANDOFF_ATTEMPTS/attempt-counter safety net.
+_PROCESSING_TIMEOUT_SECONDS = 1800
 
 
 def _filter_to_pdf_auto_ids(doc_ids: list[str], filename: str) -> list[str]:
@@ -509,6 +530,7 @@ def _build_and_save_review_item(
                 compare_label="claude",
                 use_llm_comparison=use_llm_comparison,
                 cost_accumulator=cost_accumulator,
+                typhoon_was_empty=p.get("typhoon_was_empty", False),
             )
         except Exception as e:
             logger.error(f"[SQSConsumer] Extraction validation failed for {filename} page {p['page_num']}, continuing without flags: {e}")
@@ -562,17 +584,20 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
     S3 key — this is the actual processing logic; poll_and_process_forever()
     below is just the SQS event loop wrapped around this function."""
     _assert_dev_environment()
+    _hardlog(f"process_extraction_result start: bucket={bucket} key={key}")
 
     s3 = boto3.client("s3", region_name=conf.AWS_REGION or None)
     logger.info(f"[SQSConsumer] Fetching s3://{bucket}/{key}")
     obj = s3.get_object(Bucket=bucket, Key=key)
     data = json.loads(obj["Body"].read().decode("utf-8"))
+    _hardlog(f"fetched+parsed marker JSON, keys={list(data.keys())}")
 
     if key.startswith(conf.PDF_HANDOFF_S3_PREFIX):
         filename = data["filename"]
         s3_raw_pdf_path = data["s3_raw_pdf_path"]
         page_count = data.get("page_count")
         logger.info(f"[SQSConsumer] {filename}: handoff marker ({page_count} pages) — running full extraction on EC2")
+        _hardlog(f"{filename}: handoff branch entered, {page_count} pages")
 
         # Visibility for this specific long-running path (see
         # service/pdf_status_tracker.py's docstring for why: a page-1 restart
@@ -589,6 +614,7 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
         # write_status() call right after is unchanged — still S3, still
         # purely for the human-facing dashboard, and still fine to be lossy.
         attempt = get_attempt_counter().increment_and_get(filename, stage="ec2_handoff")
+        _hardlog(f"{filename}: attempt={attempt} (give-up threshold is {_MAX_HANDOFF_ATTEMPTS})")
         pdf_status_tracker.write_status(
             bucket, filename, stage="processing", pages_done=0, pages_total=page_count, attempt=attempt,
         )
@@ -606,9 +632,12 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
                     pages_done=pages_done, pages_total=pages_total, attempt=attempt,
                 )
 
+        _hardlog(f"{filename}: calling extract_full_document now")
         try:
             raw_pages, extraction_cost_usd, extraction_started_at = extract_full_document(bucket, s3_raw_pdf_path, on_progress=_on_progress)
+            _hardlog(f"{filename}: extract_full_document returned {len(raw_pages)} page(s), cost=${extraction_cost_usd:.4f}")
         except Exception as e:
+            _hardlog(f"{filename}: extract_full_document RAISED {type(e).__name__}: {e}")
             pdf_status_tracker.write_status(
                 bucket, filename, stage="failed", pages_total=page_count, attempt=attempt, error=str(e),
             )
@@ -624,6 +653,7 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
             # deletes the message instead of redelivering it forever) and save
             # a placeholder item flagged for manual review instead.
             if attempt >= _MAX_HANDOFF_ATTEMPTS:
+                _hardlog(f"{filename}: GIVING UP (attempt {attempt} >= {_MAX_HANDOFF_ATTEMPTS}) — saving placeholder, NOT writing to vectorstore")
                 logger.error(
                     f"[SQSConsumer] {filename}: giving up after {attempt} failed attempts "
                     f"(handoff extraction), saving for manual review instead of retrying again: {e}"
@@ -642,10 +672,12 @@ def process_extraction_result(bucket: str, key: str, use_llm_comparison: bool = 
                 return [item]
             raise
 
+        _hardlog(f"{filename}: calling _build_and_save_review_item now")
         items = _build_and_save_review_item(
             filename, s3_raw_pdf_path, raw_pages, use_llm_comparison,
             extraction_cost_usd=extraction_cost_usd, extraction_started_at=extraction_started_at,
         )
+        _hardlog(f"{filename}: _build_and_save_review_item returned {len(items)} item(s) — SUCCESS, clearing attempt counter")
         pdf_status_tracker.clear(bucket, filename)
         get_attempt_counter().clear(filename, stage="ec2_handoff")
         return items
@@ -813,6 +845,8 @@ def poll_and_process_forever(queue_url: str, use_llm_comparison: bool = False) -
             MaxNumberOfMessages=1,
             WaitTimeSeconds=20,
         )
+        if resp.get("Messages"):
+            _hardlog(f"receive_message() returned {len(resp['Messages'])} message(s)")
         for message in resp.get("Messages", []):
             receipt_handle = message["ReceiptHandle"]
             # See _start_visibility_heartbeat's docstring — keeps this
@@ -822,10 +856,35 @@ def poll_and_process_forever(queue_url: str, use_llm_comparison: bool = False) -
             # thread never outlives this message, success or failure.
             stop_heartbeat = _start_visibility_heartbeat(sqs, queue_url, receipt_handle)
             try:
-                process_sqs_message(message["Body"])
+                # Bounded executor (see _PROCESSING_TIMEOUT_SECONDS above) —
+                # a single stuck call can no longer freeze this loop forever.
+                # Deliberately NOT a `with` block: ThreadPoolExecutor.__exit__
+                # calls shutdown(wait=True), which would block right back on
+                # the same stuck thread we're trying to time out on. Python
+                # has no way to forcibly kill a thread, so a timed-out worker
+                # is simply abandoned (daemon-equivalent leak of one thread +
+                # one single-worker executor per timeout) in exchange for the
+                # outer loop never freezing — an acceptable trade given this
+                # is meant to fire rarely, as a last-resort safety net.
+                _watchdog = ThreadPoolExecutor(max_workers=1)
+                _watchdog.submit(process_sqs_message, message["Body"]).result(
+                    timeout=_PROCESSING_TIMEOUT_SECONDS
+                )
+                _watchdog.shutdown(wait=False)
                 sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
                 logger.info("[SQSConsumer] Message processed and deleted.")
+                _hardlog("message processed and deleted successfully")
+            except FutureTimeoutError:
+                _hardlog(
+                    f"message processing TIMED OUT after {_PROCESSING_TIMEOUT_SECONDS}s "
+                    "(left for SQS retry)"
+                )
+                logger.error(
+                    f"[SQSConsumer] Processing exceeded {_PROCESSING_TIMEOUT_SECONDS}s, "
+                    "leaving message for retry."
+                )
             except Exception as e:
+                _hardlog(f"message processing FAILED (left for SQS retry): {type(e).__name__}: {e}")
                 logger.error(f"[SQSConsumer] Processing failed, leaving message for retry: {e}")
             finally:
                 stop_heartbeat.set()

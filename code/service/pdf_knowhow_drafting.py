@@ -41,10 +41,11 @@ from typing import Optional, TypedDict
 from openai import OpenAI
 
 import conf
+from utils.llm_call import get_shared_pdf_http_client
 from utils.llm_cost_logging import CostAccumulator, log_llm_cost
 from utils.pdf_cost_guard import get_cost_guard
 from utils.llm_json_parse import parse_leading_json
-from utils.logger import get_logger
+from utils.logger import get_logger, hardlog
 from utils.page_ranges import fuzzy_ratio, group_into_ranges, merge_topic_chunks
 from utils.prompt_safety import INJECTION_GUARD
 
@@ -205,7 +206,7 @@ def _resolve_page_overlaps(
         winner_idx, loser_idx = idx_a, idx_b  # safe default if the resolution call below fails
         try:
             if client is None:
-                client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
+                client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL, http_client=get_shared_pdf_http_client())
             combined = "\n\n---\n\n".join(f"[หน้า {p}]\n{pages_markdown[p - 1]}" for p in pages)
             prompt = _OVERLAP_RESOLUTION_PROMPT.format(
                 topic_a=topics[idx_a]["main_topic"], sub_a=topics[idx_a]["sub_topic"],
@@ -213,6 +214,7 @@ def _resolve_page_overlaps(
                 page_nums=", ".join(str(p) for p in pages),
                 combined_text=combined,
             )
+            hardlog(f"_resolve_overlap pages={pages}: calling {conf.OPENROUTER_MODEL_PDF_TOPIC_SPLIT} now")
             _call_start = time.monotonic()
             resp = client.chat.completions.create(
                 model=conf.OPENROUTER_MODEL_PDF_TOPIC_SPLIT,
@@ -220,6 +222,7 @@ def _resolve_page_overlaps(
                 max_tokens=50,
                 temperature=0,
             )
+            hardlog(f"_resolve_overlap pages={pages}: call returned")
             log_llm_cost(logger, "KnowhowDrafting/ResolveOverlap", conf.OPENROUTER_MODEL_PDF_TOPIC_SPLIT, resp, time.monotonic() - _call_start, accumulator=cost_accumulator, cost_guard=get_cost_guard())
             raw = resp.choices[0].message.content or "{}"
             winner = parse_leading_json(raw).get("winner", "A")
@@ -313,7 +316,8 @@ def _identify_knowhow_topics_batch(
     parsed = None
     for attempt in range(1, _BATCH_MAX_ATTEMPTS + 1):
         try:
-            client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
+            client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL, http_client=get_shared_pdf_http_client())
+            hardlog(f"_identify_knowhow_topics_batch attempt {attempt}: calling {conf.OPENROUTER_MODEL_PDF_TOPIC_SPLIT} now ({len(batch_pages_markdown)} page(s))")
             _call_start = time.monotonic()
             resp = client.chat.completions.create(
                 model=conf.OPENROUTER_MODEL_PDF_TOPIC_SPLIT,
@@ -351,6 +355,7 @@ def _identify_knowhow_topics_batch(
                 # call off OPENROUTER_MODEL_PRACTICAL.
                 extra_body={"reasoning": {"enabled": False}},
             )
+            hardlog(f"_identify_knowhow_topics_batch attempt {attempt}: call returned")
             log_llm_cost(logger, "KnowhowDrafting/IdentifyTopics", conf.OPENROUTER_MODEL_PDF_TOPIC_SPLIT, resp, time.monotonic() - _call_start, accumulator=cost_accumulator, cost_guard=get_cost_guard())
             raw = resp.choices[0].message.content or "{}"
             parsed = parse_leading_json(raw)

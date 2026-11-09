@@ -31,6 +31,7 @@ from typhoon_ocr import ocr_document
 import conf
 from model.pdf_review_item import PageExtractionRecord, ReviewItem
 from service.pdf_extraction_validation import ValidationFlag, validate_extraction
+from utils.llm_call import get_shared_pdf_http_client
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -91,7 +92,7 @@ def _run_typhoon(pdf_path: str, page_num: int, image_dim: int) -> str:
 
 
 def _run_claude(pdf_path: str, page_num: int) -> str:
-    client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
+    client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL, http_client=get_shared_pdf_http_client())
     image = convert_from_path(pdf_path, first_page=page_num, last_page=page_num, dpi=300)[0]
     buf = io.BytesIO()
     image.save(buf, format="PNG")

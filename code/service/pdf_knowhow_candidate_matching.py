@@ -40,6 +40,7 @@ from openai import OpenAI
 import conf
 from service.knowhow_write_back import _HEADER_VARIANTS, _TAB_BY_SOURCE_TYPE, _get_spreadsheet
 from service.sheet_write_back import _clean_header
+from utils.llm_call import get_shared_pdf_http_client
 from utils.llm_cost_logging import CostAccumulator, log_llm_cost
 from utils.logger import get_logger
 from utils.page_ranges import fuzzy_ratio
@@ -120,7 +121,7 @@ def _fetch_existing_rows(tab_name: str) -> list[tuple[int, dict[str, str]]]:
 
 
 def _embed_texts(texts: list[str], cost_accumulator: Optional[CostAccumulator] = None) -> list[list[float]]:
-    client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
+    client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL, http_client=get_shared_pdf_http_client())
     embeddings: list[list[float]] = []
     for i in range(0, len(texts), _EMBEDDING_BATCH_SIZE):
         batch = texts[i : i + _EMBEDDING_BATCH_SIZE]
@@ -225,7 +226,7 @@ def _llm_scan_batch(
         new_summary=(new_values.get("summary", "") or "")[:300],
         rows_block=rows_block,
     )
-    client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
+    client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL, http_client=get_shared_pdf_http_client())
     _call_start = time.monotonic()
     resp = client.chat.completions.create(
         model=conf.OPENROUTER_MODEL_PDF_MATCHING,

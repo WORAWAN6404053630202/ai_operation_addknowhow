@@ -218,6 +218,31 @@ def setup_logging(
     logging.getLogger("chromadb").setLevel(logging.WARNING)
 
 
+def hardlog(msg: str) -> None:
+    """Framework-independent diagnostic fallback — writes directly to the raw
+    OS file descriptor (os.write(2, ...)), bypassing Python's sys.stderr
+    object AND the `logging` module entirely.
+
+    2026-11: added after a live incident where a long-running PDF-ingestion
+    consumer process produced ZERO log output for its entire multi-hour
+    lifetime despite actively running (confirmed live via /proc: changing
+    outbound connections, a live heartbeat thread). A first attempt using
+    `print(..., file=sys.stderr, flush=True)` ALSO produced zero output when
+    live-tested — ruling out a `logging`-module-specific cause and pointing
+    at something reassigning the `sys.stdout`/`sys.stderr` object itself
+    after startup (a library importing tqdm/rich-style stdout wrapping is a
+    common cause) so that writes via the Python-level object no longer reach
+    the real fd Docker's log driver reads from. os.write(2, ...) operates on
+    the raw file descriptor directly, independent of whatever `sys.stderr`
+    currently points to. Originally lived only in service/sqs_consumer.py;
+    moved here so every module in the PDF-ingestion call graph can share the
+    same diagnostic fallback instead of duplicating it."""
+    try:
+        os.write(2, f"[HARDLOG] {msg}\n".encode("utf-8", errors="replace"))
+    except Exception:
+        pass
+
+
 def get_logger(name: str) -> logging.Logger:
     """
     Get a logger instance with extra methods

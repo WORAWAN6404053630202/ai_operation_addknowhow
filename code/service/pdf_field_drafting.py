@@ -35,10 +35,11 @@ from typing import Optional
 from openai import OpenAI
 
 import conf
+from utils.llm_call import get_shared_pdf_http_client
 from utils.llm_cost_logging import CostAccumulator, log_llm_cost
 from utils.pdf_cost_guard import get_cost_guard
 from utils.llm_json_parse import parse_leading_json
-from utils.logger import get_logger
+from utils.logger import get_logger, hardlog
 from utils.prompt_safety import INJECTION_GUARD
 
 logger = get_logger(__name__)
@@ -145,17 +146,19 @@ def _draft_fields_single_batch(combined_text: str, cost_accumulator: Optional[Co
     truncates, returns whatever the retry parsed (empty dict if that too
     failed to parse) rather than looping forever on a document whose
     content genuinely doesn't fit."""
-    client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
+    client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL, http_client=get_shared_pdf_http_client())
     prompt = _PROMPT_TEMPLATE.format(combined_text=combined_text)
 
     drafted: dict = {}
     for attempt, max_tokens in enumerate(_DRAFT_FIELDS_MAX_TOKENS_ATTEMPTS, start=1):
+        hardlog(f"_draft_fields_single_batch attempt {attempt}: calling {conf.OPENROUTER_MODEL_PDF_DRAFTING} now (max_tokens={max_tokens})")
         _call_start = time.monotonic()
         resp = client.chat.completions.create(
             model=conf.OPENROUTER_MODEL_PDF_DRAFTING,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens,
         )
+        hardlog(f"_draft_fields_single_batch attempt {attempt}: call returned")
         log_llm_cost(logger, "FieldDrafting/DraftFields", conf.OPENROUTER_MODEL_PDF_DRAFTING, resp, time.monotonic() - _call_start, accumulator=cost_accumulator, cost_guard=get_cost_guard())
         raw = resp.choices[0].message.content or "{}"
         truncated_by_finish_reason = getattr(resp.choices[0], "finish_reason", None) == "length"

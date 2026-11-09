@@ -50,11 +50,12 @@ from typing import Any, Optional
 from openai import OpenAI
 
 import conf
+from utils.llm_call import get_shared_pdf_http_client
 from model.pdf_review_item import ReviewItem
 from service.pdf_field_drafting import DRAFTABLE_FIELDS
 from service.sheet_write_back import _clean_header, _get_worksheet
 from utils.llm_cost_logging import CostAccumulator, log_llm_cost
-from utils.logger import get_logger
+from utils.logger import get_logger, hardlog
 from utils.page_ranges import fuzzy_ratio
 from utils.prompt_safety import INJECTION_GUARD
 
@@ -149,12 +150,14 @@ def _embed_texts(texts: list[str], cost_accumulator: Optional[CostAccumulator] =
     from every document's ReviewItem.total_cost. bge-m3 has no completion_tokens
     (it's an embedding model), so the cost this produces is prompt-tokens-only,
     exactly as it should be."""
-    client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
+    client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL, http_client=get_shared_pdf_http_client())
     embeddings: list[list[float]] = []
     for i in range(0, len(texts), _EMBEDDING_BATCH_SIZE):
         batch = texts[i : i + _EMBEDDING_BATCH_SIZE]
+        hardlog(f"_embed_texts batch starting at {i}: calling {conf.EMBEDDING_MODEL} now ({len(batch)} text(s))")
         _call_start = time.monotonic()
         resp = client.embeddings.create(model=conf.EMBEDDING_MODEL, input=batch)
+        hardlog(f"_embed_texts batch starting at {i}: call returned")
         log_llm_cost(
             logger, f"CandidateMatching/Embed[{len(batch)} texts]", conf.EMBEDDING_MODEL, resp,
             time.monotonic() - _call_start, accumulator=cost_accumulator,
@@ -265,7 +268,8 @@ def _llm_scan_batch(
         new_answer_guideline=(new_values.get("answer_guideline", "") or "")[:300],
         rows_block=rows_block,
     )
-    client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
+    client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL, http_client=get_shared_pdf_http_client())
+    hardlog(f"_llm_scan_batch: calling {conf.OPENROUTER_MODEL_PDF_MATCHING} now ({len(batch)} row(s))")
     _call_start = time.monotonic()
     resp = client.chat.completions.create(
         model=conf.OPENROUTER_MODEL_PDF_MATCHING,
@@ -274,6 +278,7 @@ def _llm_scan_batch(
         response_format={"type": "json_object"},
         extra_body={"reasoning": {"enabled": False}},
     )
+    hardlog("_llm_scan_batch: call returned")
     log_llm_cost(logger, "CandidateMatching/LLMScan", conf.OPENROUTER_MODEL_PDF_MATCHING, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
     raw = (resp.choices[0].message.content or "{}").strip()
     raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
@@ -450,7 +455,8 @@ def check_category_fit(item: ReviewItem, cost_accumulator: Optional[CostAccumula
         topics_block="\n".join(f"- {t}" for t in known_topics),
     )
     try:
-        client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
+        client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL, http_client=get_shared_pdf_http_client())
+        hardlog(f"check_category_fit: calling {conf.OPENROUTER_MODEL_PDF_MATCHING} now")
         _call_start = time.monotonic()
         resp = client.chat.completions.create(
             model=conf.OPENROUTER_MODEL_PDF_MATCHING,
@@ -459,6 +465,7 @@ def check_category_fit(item: ReviewItem, cost_accumulator: Optional[CostAccumula
             response_format={"type": "json_object"},
             extra_body={"reasoning": {"enabled": False}},
         )
+        hardlog("check_category_fit: call returned")
         log_llm_cost(logger, "CategoryFit", conf.OPENROUTER_MODEL_PDF_MATCHING, resp, time.monotonic() - _call_start, accumulator=cost_accumulator)
         raw = (resp.choices[0].message.content or "{}").strip()
         raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()

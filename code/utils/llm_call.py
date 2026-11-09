@@ -89,6 +89,34 @@ def get_shared_http_client() -> httpx.Client:
     return _shared_http_client
 
 
+# 2026-11: same leak this file already fixed for the chatbot's ~45 ChatOpenAI(...)
+# sites (above), but for the PDF ingestion pipeline's raw `OpenAI(...)` sites
+# (pdf_large_extraction.py, pdf_field_drafting.py, pdf_supersede_resolver.py,
+# pdf_candidate_matching.py, pdf_knowhow_drafting.py, pdf_knowhow_candidate_matching.py)
+# — every one of those constructs a brand-new OpenAI client (and thus a brand-new
+# httpx.Client/socket) per call, never reused, never explicitly closed, relying on
+# GC's non-deterministic __del__ to ever release the connection. Kept as a SEPARATE
+# singleton from get_shared_http_client() above (not reused) so a connection-pool
+# issue on one side (chatbot vs. PDF ingestion) can never affect the other.
+_shared_pdf_http_client: Optional[httpx.Client] = None
+_shared_pdf_http_client_lock = threading.Lock()
+
+
+def get_shared_pdf_http_client() -> httpx.Client:
+    """Singleton httpx.Client to pass as `http_client=` to every raw OpenAI(...)
+    construction in the PDF ingestion pipeline. Thread-safe via double-checked
+    locking, same pattern as get_shared_http_client() above. Never explicitly
+    closed — lives for the process lifetime."""
+    global _shared_pdf_http_client
+    if _shared_pdf_http_client is None:
+        with _shared_pdf_http_client_lock:
+            if _shared_pdf_http_client is None:
+                _shared_pdf_http_client = httpx.Client(
+                    limits=httpx.Limits(max_connections=1000, max_keepalive_connections=100),
+                )
+    return _shared_pdf_http_client
+
+
 def _is_length_error(exc: Exception) -> bool:
     """Return True when exc is a LengthFinishReasonError (token limit hit).
     Retrying with identical input always reproduces the same error, so callers

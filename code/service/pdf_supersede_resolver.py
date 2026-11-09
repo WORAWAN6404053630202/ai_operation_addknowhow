@@ -48,9 +48,10 @@ if getattr(conf, "USE_ELASTICSEARCH", False):
 else:
     from service.local_vector_store import get_vs_manager
 from service.pdf_candidate_matching import _field_diff, _PROCEDURAL_FIELD_KEYS
+from utils.llm_call import get_shared_pdf_http_client
 from utils.llm_cost_logging import CostAccumulator, log_llm_cost
 from utils.pdf_cost_guard import get_cost_guard
-from utils.logger import get_logger
+from utils.logger import get_logger, hardlog
 from utils.page_ranges import fuzzy_excerpt_found, fuzzy_ratio
 from utils.prompt_safety import INJECTION_GUARD
 
@@ -274,7 +275,8 @@ def _llm_judge(
     )
     prompt = _LLM_JUDGE_PROMPT.format(new_summary=new_summary[:1500], candidates_block=candidates_block)
     try:
-        client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
+        client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL, http_client=get_shared_pdf_http_client())
+        hardlog(f"_llm_judge: calling {model} now")
         _call_start = time.monotonic()
         resp = client.chat.completions.create(
             model=model,
@@ -283,6 +285,7 @@ def _llm_judge(
             response_format={"type": "json_object"},
             extra_body={"reasoning": {"enabled": False}},
         )
+        hardlog("_llm_judge: call returned")
         log_llm_cost(
             logger, "SupersedeResolver/LLMJudge", model, resp,
             time.monotonic() - _call_start, accumulator=cost_accumulator, cost_guard=get_cost_guard(),
@@ -465,7 +468,8 @@ def _check_content_completeness(
             old_fields_block=old_fields_block, new_content=new_content[:4000],
         )
         try:
-            client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
+            client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL, http_client=get_shared_pdf_http_client())
+            hardlog(f"_completeness_check doc_id={doc_id}: calling {model} now")
             _call_start = time.monotonic()
             resp = client.chat.completions.create(
                 model=model,
@@ -474,6 +478,7 @@ def _check_content_completeness(
                 response_format={"type": "json_object"},
                 extra_body={"reasoning": {"enabled": False}},
             )
+            hardlog(f"_completeness_check doc_id={doc_id}: call returned")
             log_llm_cost(
                 logger, "SupersedeResolver/CompletenessCheck", model, resp,
                 time.monotonic() - _call_start, accumulator=cost_accumulator, cost_guard=get_cost_guard(),

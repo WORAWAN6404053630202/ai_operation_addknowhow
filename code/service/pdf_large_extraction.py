@@ -37,8 +37,9 @@ from typhoon_ocr import ocr_document
 
 import conf
 from service.pdf_extraction_validation import _extract_salient_tokens
+from utils.llm_call import get_shared_pdf_http_client
 from utils.llm_cost_logging import CostAccumulator, log_call_duration, log_llm_cost
-from utils.logger import get_logger
+from utils.logger import get_logger, hardlog
 from utils.pdf_cost_guard import get_cost_guard
 from utils.pdf_text_layer import extract_page_native_text
 from utils.pdf_rate_limiter import GlobalTyphoonRateLimiter
@@ -131,7 +132,9 @@ def _run_typhoon(png_bytes: bytes, page_num: int) -> str:
         attempt = 0
         while True:
             attempt += 1
+            hardlog(f"_run_typhoon page {page_num} attempt {attempt}: waiting on rate limiter")
             _typhoon_rate_limiter.wait()
+            hardlog(f"_run_typhoon page {page_num} attempt {attempt}: calling ocr_document() now")
             _call_start = time.monotonic()
             try:
                 result = ocr_document(
@@ -141,6 +144,7 @@ def _run_typhoon(png_bytes: bytes, page_num: int) -> str:
                     task_type="v1.5",
                     api_key=conf.TYPHOON_OCR_API_KEY,
                 )
+                hardlog(f"_run_typhoon page {page_num} attempt {attempt}: ocr_document() returned ({len(result or '')} chars)")
                 log_call_duration(logger, f"LargeExtraction/Typhoon[page {page_num}]", time.monotonic() - _call_start)
                 return result
             except _TYPHOON_RETRYABLE_ERRORS as e:
@@ -162,8 +166,9 @@ def _run_vision_verify(png_bytes: bytes, cost_accumulator: Optional[CostAccumula
     conf.OPENROUTER_MODEL_PDF_VISION (see conf.py for why this is its own
     constant, not conf.OPENROUTER_MODEL), not necessarily Claude despite the
     old function name this replaces."""
-    client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL)
+    client = OpenAI(api_key=conf.OPENROUTER_API_KEY, base_url=conf.OPENROUTER_BASE_URL, http_client=get_shared_pdf_http_client())
     b64 = base64.b64encode(png_bytes).decode("utf-8")
+    hardlog(f"_run_vision_verify: calling {conf.OPENROUTER_MODEL_PDF_VISION} now")
     _call_start = time.monotonic()
     resp = client.chat.completions.create(
         model=conf.OPENROUTER_MODEL_PDF_VISION,
@@ -178,6 +183,7 @@ def _run_vision_verify(png_bytes: bytes, cost_accumulator: Optional[CostAccumula
         ],
         max_tokens=4000,
     )
+    hardlog("_run_vision_verify: call returned")
     log_llm_cost(logger, "LargeExtraction/VisionVerify", conf.OPENROUTER_MODEL_PDF_VISION, resp, time.monotonic() - _call_start, accumulator=cost_accumulator, cost_guard=cost_guard)
     return resp.choices[0].message.content or "(no text returned)"
 
@@ -193,7 +199,7 @@ def _extract_one_page(pdf_bytes: bytes, page_num: int, cost_accumulator: Optiona
     native_text = extract_page_native_text(pdf_bytes, page_num, cost_accumulator=cost_accumulator, cost_guard=cost_guard)
     if native_text is not None:
         logger.info(f"[LargeExtraction] Page {page_num}: used native PDF text layer ({len(native_text)} chars) — skipped OCR entirely, $0 for this page")
-        return {"page_num": page_num, "typhoon_markdown": native_text, "claude_markdown": native_text}
+        return {"page_num": page_num, "typhoon_markdown": native_text, "claude_markdown": native_text, "typhoon_was_empty": False}
 
     try:
         png_bytes = _render_page_to_png_bytes(pdf_bytes, page_num)
@@ -222,9 +228,22 @@ def _extract_one_page(pdf_bytes: bytes, page_num: int, cost_accumulator: Optiona
 
         if not (typhoon_markdown or "").strip() and not (claude_markdown or "").strip():
             logger.warning(f"[LargeExtraction] Page {page_num}: BOTH Typhoon and vision-verify returned empty text — this page is likely silently missing from the ingested document, worth a manual re-check")
+        elif _typhoon_is_empty and (claude_markdown or "").strip():
+            # 2026-11 (hardcoded-logic audit): previously the recovered claude_markdown
+            # was used ONLY as compare_extractions()'s comparison input, never merged
+            # back as the actual page content — every downstream consumer reads
+            # typhoon_markdown only (sqs_consumer.py's page_markdowns, feeding
+            # identify_knowhow_topics/draft_fields_from_pages/the embedded document),
+            # so a page Typhoon failed on but Claude successfully recovered silently
+            # contributed nothing. Promoting it here fixes every consumer at once.
+            logger.info(f"[LargeExtraction] Page {page_num}: Typhoon was empty, recovered via vision-verify ({len(claude_markdown)} chars) — using Claude's text as the page content")
+            typhoon_markdown = claude_markdown
 
         logger.info(f"[LargeExtraction] Page {page_num}: extracted (Typhoon {len(typhoon_markdown)} chars, Claude {len(claude_markdown)} chars)")
-        return {"page_num": page_num, "typhoon_markdown": typhoon_markdown, "claude_markdown": claude_markdown}
+        return {
+            "page_num": page_num, "typhoon_markdown": typhoon_markdown, "claude_markdown": claude_markdown,
+            "typhoon_was_empty": _typhoon_is_empty,
+        }
     except Exception as e:
         # Added 2026-09: without this, one page's unrecoverable failure (e.g.
         # Typhoon retries exhausted, vision-verify erroring, a corrupted page
@@ -237,7 +256,7 @@ def _extract_one_page(pdf_bytes: bytes, page_num: int, cost_accumulator: Optiona
         # knows exactly which page to re-check manually.
         logger.error(f"[LargeExtraction] Page {page_num}: extraction failed, saving placeholder instead of losing the whole document: {e}")
         error_markdown = f"[สกัดข้อมูลหน้านี้ไม่สำเร็จ — เกิดข้อผิดพลาดระหว่างประมวลผล: {e}]"
-        return {"page_num": page_num, "typhoon_markdown": error_markdown, "claude_markdown": ""}
+        return {"page_num": page_num, "typhoon_markdown": error_markdown, "claude_markdown": "", "typhoon_was_empty": False}
 
 
 def extract_full_document(
@@ -280,6 +299,7 @@ def extract_full_document(
     num_pages = len(doc)
     doc.close()
     logger.info(f"[LargeExtraction] {raw_pdf_key}: {num_pages} page(s), starting full extraction (no time limit on EC2)")
+    hardlog(f"extract_full_document {raw_pdf_key}: {num_pages} page(s), submitting to {_MAX_WORKERS}-worker pool")
 
     cost_accumulator = CostAccumulator()
     pages: list[dict | None] = [None] * num_pages
@@ -290,8 +310,10 @@ def extract_full_document(
             page_num = futures[future]
             pages[page_num - 1] = future.result()
             pages_done += 1
+            hardlog(f"extract_full_document {raw_pdf_key}: page {page_num} done ({pages_done}/{num_pages})")
             if on_progress is not None:
                 on_progress(pages_done, num_pages)
 
     logger.info(f"[LargeExtraction] {raw_pdf_key}: all {num_pages} page(s) extracted successfully")
+    hardlog(f"extract_full_document {raw_pdf_key}: all {num_pages} page(s) extracted successfully")
     return pages, cost_accumulator.total_cost_usd, started_at

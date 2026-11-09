@@ -25,6 +25,7 @@ cross-reference the review queue to know what to show as in-progress."""
 from __future__ import annotations
 
 import json
+import threading
 import time
 from typing import Optional
 
@@ -36,9 +37,23 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# 2026-11 fix: this used to construct a brand-new boto3 S3 client on EVERY
+# call (including once per 20-page progress tick during extract_full_document)
+# instead of caching it, unlike the already-correct pattern in
+# utils/pdf_attempt_counter.py/utils/pdf_rate_limiter.py. boto3 clients are
+# safe to share/reuse across calls within a process; caching one here avoids
+# the repeated construction overhead on this module's hottest call path.
+_client_instance = None
+_client_lock = threading.Lock()
+
 
 def _client():
-    return boto3.client("s3", region_name=conf.AWS_REGION or None)
+    global _client_instance
+    if _client_instance is None:
+        with _client_lock:
+            if _client_instance is None:
+                _client_instance = boto3.client("s3", region_name=conf.AWS_REGION or None)
+    return _client_instance
 
 
 def _status_key(filename: str) -> str:
