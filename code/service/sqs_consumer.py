@@ -192,6 +192,43 @@ def _high_severity_flag_summary(pages: list[PageExtractionRecord]) -> tuple[int,
     return count, examples[:5]
 
 
+# Matches the error-placeholder text _extract_one_page() (both
+# service/pdf_large_extraction.py and lambda/pdf_extraction/handler.py)
+# writes into typhoon_markdown on an unrecoverable per-page failure.
+_PAGE_EXTRACTION_ERROR_MARKER = "สกัดข้อมูลหน้านี้ไม่สำเร็จ"
+
+
+def _page_reconciliation_summary(pages: list[PageExtractionRecord]) -> dict:
+    """2026-11 (PDF pipeline overhaul, gap #6 — no completeness/
+    reconciliation tracking existed anywhere; this is exactly the kind of
+    control that would have caught the 28-document gap this whole overhaul
+    traces back to). Computes per-document page-level stats fed into the
+    append_event() call below, so the admin dashboard — and any future
+    scheduled job reading this same event log, see
+    scripts/pdf_completeness_reconciliation.py — can see "pages_total vs
+    pages_with_content vs pages_empty_or_error" and a chars-per-page
+    sanity figure directly, instead of needing a manual investigation like
+    the one this whole pipeline-overhaul session started from."""
+    pages_total = len(pages)
+    total_chars = 0
+    pages_empty_or_error = 0
+    for p in pages:
+        text = p.typhoon_markdown or ""
+        if _PAGE_EXTRACTION_ERROR_MARKER in text or not text.strip():
+            pages_empty_or_error += 1
+            continue
+        total_chars += len(text)
+    pages_with_content = pages_total - pages_empty_or_error
+    chars_per_page = (total_chars / pages_with_content) if pages_with_content else 0.0
+    return {
+        "pages_total": pages_total,
+        "pages_with_content": pages_with_content,
+        "pages_empty_or_error": pages_empty_or_error,
+        "total_chars": total_chars,
+        "chars_per_page": round(chars_per_page, 1),
+    }
+
+
 def _save_vectorstore_write_failure(filename: str, s3_raw_pdf_path: str, error: Exception) -> None:
     """2026-10 fix (PDF-M11): the direct-ingest vectorstore write is the
     LAST step after OCR + topic-splitting + field-drafting (all billed LLM
@@ -469,6 +506,7 @@ def _build_items_direct(
         "error": write_error,
         "high_severity_flags": _high_count,
         "high_severity_flag_examples": _high_examples,
+        **_page_reconciliation_summary(pages),
     })
 
     return []

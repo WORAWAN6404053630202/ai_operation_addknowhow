@@ -221,6 +221,215 @@ class TestNativeTextLayerSkipParity:
 
 
 @pytest.mark.unit
+class TestSupplementaryTextExtractionParity:
+    """2026-11 (PDF pipeline overhaul, gap #2 — form widgets/annotations
+    never extracted). extract_page_supplementary_text() shipped to the
+    shared utils/pdf_text_layer.py (EC2 side imports it directly) first;
+    this guards against the Lambda side's hand-copy never landing or
+    drifting, the exact failure mode this whole file exists to catch."""
+
+    def test_lambda_has_its_own_copy_of_supplementary_text_extraction(self):
+        handler = _lambda_handler_module()
+        assert hasattr(handler, "_extract_page_supplementary_text"), (
+            "lambda/pdf_extraction/handler.py has no _extract_page_supplementary_text — "
+            "the widget/annotation extraction fix (gap #2) was never ported to the Lambda path."
+        )
+
+    def test_ec2_extract_one_page_calls_supplementary_text_extraction(self):
+        import service.pdf_large_extraction as ec2_module
+
+        src = inspect.getsource(ec2_module._extract_one_page)
+        assert "extract_page_supplementary_text" in src, (
+            "service/pdf_large_extraction.py's _extract_one_page no longer calls "
+            "extract_page_supplementary_text — widget/annotation values would silently "
+            "stop being appended to extracted page text."
+        )
+
+    def test_lambda_extract_one_page_calls_supplementary_text_extraction(self):
+        handler = _lambda_handler_module()
+        src = inspect.getsource(handler._extract_one_page)
+        assert "_extract_page_supplementary_text" in src, (
+            "lambda/pdf_extraction/handler.py's _extract_one_page no longer calls "
+            "_extract_page_supplementary_text — widget/annotation values would silently "
+            "stop being appended on the Lambda (<=35 page) path."
+        )
+
+    def test_supplementary_text_behaves_identically_on_both_sides(self):
+        """Behavioral equality on a real synthetic fixture, not just
+        source-grep — the strongest parity guarantee this file has for any
+        shared mechanism."""
+        import sys as _sys
+        from pathlib import Path as _Path
+
+        tests_dir = _Path(__file__).parent
+        if str(tests_dir) not in _sys.path:
+            _sys.path.insert(0, str(tests_dir))
+        from pdf_fixtures import make_page_with_form_widget
+
+        from utils.pdf_text_layer import extract_page_supplementary_text as shared_fn
+
+        pdf_bytes = make_page_with_form_widget(field_name="applicant_name", field_value="ทดสอบ", body_text="Body text here, long enough to pass validity checks easily. " * 2)
+
+        handler = _lambda_handler_module()
+        ec2_result = shared_fn(pdf_bytes, 1)
+        lambda_result = handler._extract_page_supplementary_text(pdf_bytes, 1)
+        assert ec2_result == lambda_result, (
+            f"Diverged supplementary-text output: shared module={ec2_result!r}, lambda handler={lambda_result!r}"
+        )
+        assert "ทดสอบ" in ec2_result
+
+
+@pytest.mark.unit
+class TestAdditiveRegionOcrParity:
+    """2026-11 (PDF pipeline overhaul, gap #1 — accepting native text used
+    to mean zero OCR for the whole page, silently dropping embedded
+    scanned tables/stamps/images). find_embedded_image_regions /
+    render_region_to_png_bytes shipped to the shared utils/pdf_text_layer.py
+    first; this guards the Lambda hand-copy."""
+
+    def test_lambda_has_its_own_region_detection_and_render_helpers(self):
+        handler = _lambda_handler_module()
+        assert hasattr(handler, "_find_embedded_image_regions"), (
+            "lambda/pdf_extraction/handler.py has no _find_embedded_image_regions — "
+            "the additive region-OCR fix (gap #1) was never ported to the Lambda path."
+        )
+        assert hasattr(handler, "_render_region_to_png_bytes"), (
+            "lambda/pdf_extraction/handler.py has no _render_region_to_png_bytes."
+        )
+
+    def test_bitmap_area_threshold_matches(self):
+        from utils.pdf_text_layer import _BITMAP_AREA_THRESHOLD as shared_threshold
+
+        handler = _lambda_handler_module()
+        assert handler._BITMAP_AREA_THRESHOLD == shared_threshold, (
+            "The bitmap-area-ratio threshold for triggering additive region-OCR has "
+            "diverged between the EC2 shared module and the Lambda hand-copy."
+        )
+
+    def test_ec2_extract_one_page_calls_region_detection(self):
+        import service.pdf_large_extraction as ec2_module
+
+        src = inspect.getsource(ec2_module._extract_one_page)
+        assert "find_embedded_image_regions" in src, (
+            "service/pdf_large_extraction.py's _extract_one_page no longer detects "
+            "embedded-image regions for additive OCR."
+        )
+
+    def test_lambda_extract_one_page_calls_region_detection(self):
+        handler = _lambda_handler_module()
+        src = inspect.getsource(handler._extract_one_page)
+        assert "_find_embedded_image_regions" in src, (
+            "lambda/pdf_extraction/handler.py's _extract_one_page no longer detects "
+            "embedded-image regions for additive OCR."
+        )
+
+    def test_region_detection_behaves_identically_on_both_sides(self):
+        import sys as _sys
+        from pathlib import Path as _Path
+
+        tests_dir = _Path(__file__).parent
+        if str(tests_dir) not in _sys.path:
+            _sys.path.insert(0, str(tests_dir))
+        from pdf_fixtures import make_page_with_embedded_image
+
+        from utils.pdf_text_layer import find_embedded_image_regions as shared_fn
+
+        pdf_bytes = make_page_with_embedded_image(text="Body text here, long enough to pass validity checks easily. " * 5, image_bbox=(250, 250, 450, 450))
+
+        handler = _lambda_handler_module()
+        ec2_result = shared_fn(pdf_bytes, 1)
+        lambda_result = handler._find_embedded_image_regions(pdf_bytes, 1)
+        assert ec2_result == lambda_result
+        assert len(ec2_result) == 1
+
+
+@pytest.mark.unit
+class TestThaiLinguisticValidationParity:
+    """2026-11 (PDF pipeline overhaul, gap #3 — whole-page Unicode-range-only
+    validation missed in-script Thai mojibake and localized corruption).
+    thai_linguistic_score/classify_page_text_blocks shipped to the shared
+    utils/pdf_text_layer.py first; this guards the Lambda hand-copy. Note:
+    _salient_regions_look_valid stays covered by the existing
+    TestSalientRegionValidityParity class below — it was NOT retired."""
+
+    def test_lambda_has_its_own_linguistic_scoring_and_block_classifier(self):
+        handler = _lambda_handler_module()
+        for name in ("_thai_linguistic_score", "_block_unicode_bad_ratio", "_text_block_composite_score", "_classify_page_text_blocks"):
+            assert hasattr(handler, name), (
+                f"lambda/pdf_extraction/handler.py has no {name} — the per-block Thai "
+                "linguistic validation fix (gap #3) was never fully ported to the Lambda path."
+            )
+
+    def test_component_thresholds_match(self):
+        from utils.pdf_text_layer import _UNICODE_COMPONENT_THRESHOLD as shared_unicode_t
+        from utils.pdf_text_layer import _LINGUISTIC_COMPONENT_THRESHOLD as shared_linguistic_t
+        from utils.pdf_text_layer import _MIN_BLOCK_CHARS_FOR_VALIDATION as shared_min_chars
+        from utils.pdf_text_layer import _MIN_THAI_SCRIPT_RATIO as shared_min_thai_ratio
+
+        handler = _lambda_handler_module()
+        assert handler._UNICODE_COMPONENT_THRESHOLD == shared_unicode_t
+        assert handler._LINGUISTIC_COMPONENT_THRESHOLD == shared_linguistic_t
+        assert handler._MIN_BLOCK_CHARS_FOR_VALIDATION == shared_min_chars
+        assert handler._MIN_THAI_SCRIPT_RATIO == shared_min_thai_ratio
+
+    def test_ec2_extract_page_native_text_checks_text_blocks(self):
+        from utils.pdf_text_layer import extract_page_native_text as shared_extract
+
+        src = inspect.getsource(shared_extract)
+        assert "classify_page_text_blocks" in src, (
+            "utils/pdf_text_layer.py's extract_page_native_text no longer runs the "
+            "per-block composite validity check."
+        )
+        assert "_salient_regions_look_valid" in src, (
+            "utils/pdf_text_layer.py's extract_page_native_text no longer checks salient "
+            "regions — this check is complementary to the per-block check, not replaced by it."
+        )
+
+    def test_lambda_extract_page_native_text_checks_text_blocks(self):
+        handler = _lambda_handler_module()
+        src = inspect.getsource(handler._extract_page_native_text)
+        assert "_classify_page_text_blocks" in src, (
+            "lambda/pdf_extraction/handler.py's _extract_page_native_text no longer runs "
+            "the per-block composite validity check."
+        )
+        assert "_salient_regions_look_valid" in src
+
+    def test_linguistic_score_behaves_identically_on_both_sides(self):
+        import random
+
+        from utils.pdf_text_layer import thai_linguistic_score as shared_fn
+
+        clean = "คู่มือการขอใบอนุญาตขายสุรา ยาสูบ ไพ่ ทางอินเทอร์เน็ต กรมสรรพสามิต เอกสารนี้จัดทำขึ้นเพื่อให้ความรู้แก่ผู้ประกอบการ"
+        chars = list(clean.replace(" ", ""))
+        random.Random(0).shuffle(chars)
+        scrambled = "".join(chars)
+        english = "This is real page body text content here. " * 5
+
+        handler = _lambda_handler_module()
+        for text in (clean, scrambled, english):
+            ec2_score = shared_fn(text)
+            lambda_score = handler._thai_linguistic_score(text)
+            assert ec2_score == pytest.approx(lambda_score), (
+                f"Diverged linguistic score for {text[:20]!r}...: shared={ec2_score}, lambda={lambda_score}"
+            )
+
+    def test_block_classification_behaves_identically_on_both_sides(self):
+        import pymupdf
+
+        doc = pymupdf.open()
+        page = doc.new_page(width=600, height=800)
+        page.insert_text((50, 50), "This is real page body text content here. " * 5, fontsize=10)
+
+        from utils.pdf_text_layer import classify_page_text_blocks as shared_fn
+
+        handler = _lambda_handler_module()
+        ec2_blocks = shared_fn(page)
+        lambda_blocks = handler._classify_page_text_blocks(page)
+        doc.close()
+        assert ec2_blocks == lambda_blocks
+
+
+@pytest.mark.unit
 class TestSalientRegionValidityParity:
     """_salient_regions_look_valid() (2026-09) — catches corruption LOCALIZED
     next to a number (fee amount/date/form/license code), which
@@ -299,6 +508,102 @@ class TestSalientRegionValidityParity:
             f"Diverged page-number-exclusion verdict for {text[:30]!r}...: shared module={ec2_result}, "
             f"lambda handler={lambda_result}, expected={expect_valid}"
         )
+
+
+@pytest.mark.unit
+class TestTableStructureExtractionParity:
+    """2026-11 (PDF pipeline overhaul, gap #4 — tables read as flowing text
+    lose row/column structure). find_page_tables/extract_page_text_with_tables
+    shipped to the shared utils/pdf_text_layer.py first; this guards the
+    Lambda hand-copy, including the cross-page linking half
+    (link_cross_page_tables)."""
+
+    def test_lambda_has_its_own_table_detection_and_splicing_helpers(self):
+        handler = _lambda_handler_module()
+        for name in ("_find_page_tables", "_block_overlaps_table", "_extract_page_text_with_tables"):
+            assert hasattr(handler, name), (
+                f"lambda/pdf_extraction/handler.py has no {name} — the table-structure "
+                "extraction fix (gap #4) was never fully ported to the Lambda path."
+            )
+
+    def test_lambda_has_its_own_cross_page_linking_helpers(self):
+        handler = _lambda_handler_module()
+        for name in ("_extract_trailing_markdown_table", "_extract_leading_markdown_table", "_link_cross_page_tables"):
+            assert hasattr(handler, name), (
+                f"lambda/pdf_extraction/handler.py has no {name} — the cross-page table "
+                "linking fix (gap #4, second half) was never fully ported to the Lambda path."
+            )
+
+    def test_table_strategy_attempts_match(self):
+        from utils.pdf_text_layer import _TABLE_STRATEGY_ATTEMPTS as shared_attempts
+
+        handler = _lambda_handler_module()
+        assert handler._TABLE_STRATEGY_ATTEMPTS == shared_attempts
+
+    def test_block_overlap_threshold_matches(self):
+        from utils.pdf_text_layer import _TABLE_BLOCK_OVERLAP_THRESHOLD as shared_threshold
+
+        handler = _lambda_handler_module()
+        assert handler._TABLE_BLOCK_OVERLAP_THRESHOLD == shared_threshold
+
+    def test_ec2_extract_page_native_text_uses_table_aware_extraction(self):
+        from utils.pdf_text_layer import extract_page_native_text as shared_extract
+
+        src = inspect.getsource(shared_extract)
+        assert "extract_page_text_with_tables" in src, (
+            "utils/pdf_text_layer.py's extract_page_native_text no longer uses "
+            "table-aware text reconstruction on its accept paths."
+        )
+
+    def test_lambda_extract_page_native_text_uses_table_aware_extraction(self):
+        handler = _lambda_handler_module()
+        src = inspect.getsource(handler._extract_page_native_text)
+        assert "_extract_page_text_with_tables" in src, (
+            "lambda/pdf_extraction/handler.py's _extract_page_native_text no longer uses "
+            "table-aware text reconstruction on its accept paths."
+        )
+
+    def test_table_detection_behaves_identically_on_both_sides(self):
+        import sys as _sys
+        from pathlib import Path as _Path
+
+        tests_dir = _Path(__file__).parent
+        if str(tests_dir) not in _sys.path:
+            _sys.path.insert(0, str(tests_dir))
+        from pdf_fixtures import make_page_with_bordered_table
+
+        from utils.pdf_text_layer import extract_page_text_with_tables as shared_fn
+
+        rows = [["Name", "Fee"], ["Alice", "100"], ["Bob", "200"]]
+        pdf_bytes = make_page_with_bordered_table(rows=rows)
+
+        import pymupdf
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            page = doc[0]
+            handler = _lambda_handler_module()
+            ec2_result = shared_fn(page)
+            lambda_result = handler._extract_page_text_with_tables(page)
+        finally:
+            doc.close()
+        assert ec2_result == lambda_result
+        assert "|Alice|100|" in ec2_result
+
+    def test_cross_page_linking_behaves_identically_on_both_sides(self):
+        from service.pdf_large_extraction import link_cross_page_tables as shared_fn
+
+        pages_ec2 = [
+            {"page_num": 1, "typhoon_markdown": "Intro.\n\n|Item|Price|\n|---|---|\n|A|10|", "claude_markdown": ""},
+            {"page_num": 2, "typhoon_markdown": "|Item|Price|\n|---|---|\n|B|20|\n\nFooter.", "claude_markdown": ""},
+        ]
+        pages_lambda = [dict(p) for p in pages_ec2]
+
+        handler = _lambda_handler_module()
+        result_ec2 = shared_fn(pages_ec2)
+        result_lambda = handler._link_cross_page_tables(pages_lambda)
+        assert result_ec2[0]["typhoon_markdown"] == result_lambda[0]["typhoon_markdown"]
+        assert result_ec2[1]["typhoon_markdown"] == result_lambda[1]["typhoon_markdown"]
+        assert "|B|20|" in result_ec2[0]["typhoon_markdown"]
 
 
 @pytest.mark.unit
@@ -403,6 +708,168 @@ class TestNativeTextImageCheckParity:
         assert "return True" in inspect.getsource(handler._page_needs_ocr_for_visual_content).rsplit("except", 1)[-1], (
             "lambda/pdf_extraction/handler.py's vision image-check no longer fails safe toward True."
         )
+
+
+@pytest.mark.unit
+class TestOcrUncertaintyGatingParity:
+    """2026-11 (PDF pipeline overhaul, gap #5 — second OCR pass gated by a
+    narrow 4-category content regex, missing ~67% of OCR'd pages with no
+    salient-token content). New output-derived signals shipped to
+    service/pdf_large_extraction.py first; this guards the Lambda hand-copy."""
+
+    def test_lambda_has_its_own_uncertainty_signal_functions(self):
+        handler = _lambda_handler_module()
+        for name in ("_is_likely_degenerate_repetition", "_is_length_implausible", "_should_random_audit_sample", "_texts_substantially_agree"):
+            assert hasattr(handler, name), (
+                f"lambda/pdf_extraction/handler.py has no {name} — the OCR uncertainty-gating "
+                "fix (gap #5) was never fully ported to the Lambda path."
+            )
+
+    def test_thresholds_match(self):
+        from service.pdf_large_extraction import (
+            _REPETITION_COMPRESSION_RATIO_THRESHOLD as shared_repetition_t,
+            _REPETITION_MIN_CHARS as shared_repetition_min,
+            _BLANK_PAGE_PNG_BYTES_FLOOR as shared_blank_floor,
+            _MIN_CHARS_FOR_DENSE_PNG as shared_min_dense,
+            _RANDOM_AUDIT_SAMPLE_RATE as shared_audit_rate,
+        )
+
+        handler = _lambda_handler_module()
+        assert handler._REPETITION_COMPRESSION_RATIO_THRESHOLD == shared_repetition_t
+        assert handler._REPETITION_MIN_CHARS == shared_repetition_min
+        assert handler._BLANK_PAGE_PNG_BYTES_FLOOR == shared_blank_floor
+        assert handler._MIN_CHARS_FOR_DENSE_PNG == shared_min_dense
+        assert handler._RANDOM_AUDIT_SAMPLE_RATE == shared_audit_rate
+
+    def test_ec2_extract_one_page_checks_all_four_trigger_signals(self):
+        import service.pdf_large_extraction as ec2_module
+
+        src = inspect.getsource(ec2_module._extract_one_page)
+        for signal in ("_is_likely_degenerate_repetition", "_is_length_implausible", "_should_random_audit_sample", "_extract_salient_tokens"):
+            assert signal in src, f"service/pdf_large_extraction.py's _extract_one_page no longer checks {signal}."
+
+    def test_lambda_extract_one_page_checks_all_four_trigger_signals(self):
+        handler = _lambda_handler_module()
+        src = inspect.getsource(handler._extract_one_page)
+        for signal in ("_is_likely_degenerate_repetition", "_is_length_implausible", "_should_random_audit_sample", "_extract_salient_tokens"):
+            assert signal in src, f"lambda/pdf_extraction/handler.py's _extract_one_page no longer checks {signal}."
+
+    def test_degenerate_repetition_behaves_identically_on_both_sides(self):
+        from service.pdf_large_extraction import _is_likely_degenerate_repetition as shared_fn
+
+        repetitive = "ใบอนุญาต ใบอนุญาต ใบอนุญาต ใบอนุญาต " * 20
+        normal = "คู่มือการขอใบอนุญาตขายสุรา ยาสูบ ไพ่ ทางอินเทอร์เน็ต กรมสรรพสามิต เอกสารนี้จัดทำขึ้นเพื่อให้ความรู้แก่ผู้ประกอบการที่สนใจ"
+
+        handler = _lambda_handler_module()
+        for text in (repetitive, normal):
+            assert shared_fn(text) == handler._is_likely_degenerate_repetition(text)
+
+    def test_texts_substantially_agree_behaves_identically_on_both_sides(self):
+        from service.pdf_large_extraction import _texts_substantially_agree as shared_fn
+
+        handler = _lambda_handler_module()
+        assert shared_fn("same text", "same text") == handler._texts_substantially_agree("same text", "same text") is True
+        assert shared_fn("abc", "completely unrelated xyz") == handler._texts_substantially_agree("abc", "completely unrelated xyz") is False
+
+
+@pytest.mark.unit
+class TestDocumentAnchoringParity:
+    """2026-11 (PDF pipeline overhaul, lower-priority document-anchoring
+    add-on) — olmOCR's hallucination-reduction technique: vision-verify
+    receives whatever (possibly rejected) native text a page had as
+    grounding context. Shipped to service/pdf_large_extraction.py first;
+    this guards the Lambda hand-copy."""
+
+    def test_lambda_has_raw_page_text_helper(self):
+        handler = _lambda_handler_module()
+        assert hasattr(handler, "_extract_raw_page_text_best_effort"), (
+            "lambda/pdf_extraction/handler.py has no _extract_raw_page_text_best_effort — "
+            "the document-anchoring fix was never ported to the Lambda path."
+        )
+
+    def test_max_chars_threshold_matches(self):
+        from utils.pdf_text_layer import _ANCHOR_TEXT_MAX_CHARS as shared_max_chars
+
+        handler = _lambda_handler_module()
+        assert handler._ANCHOR_TEXT_MAX_CHARS == shared_max_chars
+
+    def test_lambda_run_vision_verify_accepts_anchor_text_param(self):
+        handler = _lambda_handler_module()
+        sig = inspect.signature(handler._run_vision_verify)
+        assert "anchor_text" in sig.parameters
+
+    def test_ec2_run_vision_verify_accepts_anchor_text_param(self):
+        from service.pdf_large_extraction import _run_vision_verify
+
+        sig = inspect.signature(_run_vision_verify)
+        assert "anchor_text" in sig.parameters
+
+    def test_ec2_extract_one_page_wires_anchor_text_into_vision_verify_call(self):
+        import service.pdf_large_extraction as ec2_module
+
+        src = inspect.getsource(ec2_module._extract_one_page)
+        assert "extract_raw_page_text_best_effort" in src
+        assert "anchor_text" in src
+
+    def test_lambda_extract_one_page_wires_anchor_text_into_vision_verify_call(self):
+        handler = _lambda_handler_module()
+        src = inspect.getsource(handler._extract_one_page)
+        assert "_extract_raw_page_text_best_effort" in src
+        assert "anchor_text" in src
+
+    def test_raw_page_text_helper_behaves_identically_on_both_sides(self):
+        from utils.pdf_text_layer import extract_raw_page_text_best_effort as shared_fn
+
+        handler = _lambda_handler_module()
+        # Invalid bytes on both sides: never raises, falls back to "".
+        assert shared_fn(b"not a real pdf", 1) == handler._extract_raw_page_text_best_effort(b"not a real pdf", 1) == ""
+
+
+@pytest.mark.unit
+class TestMultiColumnReadingOrderParity:
+    """2026-11 (PDF pipeline overhaul, lower-priority multi-column fix) —
+    ported from PyMuPDF's documented community recipe to
+    service/pdf_large_extraction.py's shared module (utils/pdf_text_layer.py)
+    first; this guards the Lambda hand-copy."""
+
+    def test_lambda_has_column_boxes_and_reading_order_functions(self):
+        handler = _lambda_handler_module()
+        for name in ("_column_boxes", "_extract_page_text_reading_order"):
+            assert hasattr(handler, name), (
+                f"lambda/pdf_extraction/handler.py has no {name} — the multi-column "
+                "reading-order fix was never ported to the Lambda path."
+            )
+
+    def test_extract_page_text_with_tables_wires_in_reading_order_on_both_sides(self):
+        import inspect
+
+        import pymupdf
+        import service.pdf_large_extraction  # noqa: F401 — ensures utils import path resolves
+        from utils.pdf_text_layer import extract_page_text_with_tables
+
+        handler = _lambda_handler_module()
+        assert "extract_page_text_reading_order(page)" in inspect.getsource(extract_page_text_with_tables)
+        assert "_extract_page_text_reading_order(page)" in inspect.getsource(handler._extract_page_text_with_tables)
+
+    def test_column_boxes_behave_identically_on_a_two_column_fixture(self):
+        import pymupdf
+
+        from utils.pdf_text_layer import column_boxes as shared_fn
+
+        handler = _lambda_handler_module()
+        doc = pymupdf.open()
+        try:
+            page = doc.new_page(width=600, height=800)
+            for i in range(10):
+                page.insert_text((50, 50 + i * 20), f"Left col line {i}")
+            for i in range(10):
+                page.insert_text((350, 50 + i * 20), f"Right col line {i}")
+            shared_boxes = shared_fn(page)
+            lambda_boxes = handler._column_boxes(page)
+            assert len(shared_boxes) == len(lambda_boxes) == 2
+            assert [tuple(b) for b in shared_boxes] == [tuple(b) for b in lambda_boxes]
+        finally:
+            doc.close()
 
 
 @pytest.mark.unit

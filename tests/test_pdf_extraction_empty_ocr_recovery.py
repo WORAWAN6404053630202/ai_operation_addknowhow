@@ -76,12 +76,21 @@ class TestEC2EmptyOCRRecovery:
     def test_healthy_long_output_without_salient_tokens_still_skips_vision_verify(self):
         """Pre-existing cost optimization must survive unchanged: a page with
         plenty of real text but none of the 4 salient-token types should NOT
-        pay for vision-verify, exactly as before this fix."""
+        pay for vision-verify, exactly as before this fix.
+
+        2026-11: fixture changed from literal 5x-repeated phrase to varied
+        prose — the repeated-phrase version started tripping the new
+        degenerate-repetition signal (gap #5), which is doing exactly its
+        job (verbatim repetition is the real failure pattern it targets);
+        the fixture just wasn't realistic healthy prose. Also pins
+        _should_random_audit_sample to False since that trigger is randomly
+        ~7% and would otherwise make this assertion flaky."""
         mod = self._import_module()
-        long_prose = "เนื้อหาปกติของหน้านี้ไม่มีตัวเลขหรือรหัสฟอร์มอะไรเลย " * 5
+        long_prose = "เนื้อหาปกติของหน้านี้ไม่มีตัวเลขหรือรหัสฟอร์มอะไรเลย เป็นเพียงคำอธิบายทั่วไปเกี่ยวกับขั้นตอนการดำเนินงานของหน่วยงาน ซึ่งไม่เกี่ยวข้องกับจำนวนเงินหรือวันที่ใดๆ ทั้งสิ้น เนื้อหาส่วนนี้มีไว้เพื่ออธิบายภาพรวมของกระบวนการให้ผู้อ่านเข้าใจบริบทก่อนไปสู่รายละเอียดในหัวข้อถัดไป"
         with patch.object(mod, "extract_page_native_text", return_value=None), \
              patch.object(mod, "_render_page_to_png_bytes", return_value=b"fake-png"), \
              patch.object(mod, "_run_typhoon", return_value=long_prose), \
+             patch.object(mod, "_should_random_audit_sample", return_value=False), \
              patch.object(mod, "_run_vision_verify") as mock_verify:
             result = mod._extract_one_page(b"fake-pdf-bytes", page_num=5)
 
@@ -189,11 +198,15 @@ class TestLambdaEmptyOCRRecovery:
         assert result["typhoon_was_empty"] is True
 
     def test_healthy_long_output_without_salient_tokens_still_skips_vision_verify(self):
+        """See the EC2 class's identical test above for why the fixture is
+        varied prose (not a repeated phrase) and _should_random_audit_sample
+        is pinned False (2026-11, gap #5)."""
         handler = self._import_module()
-        long_prose = "เนื้อหาปกติของหน้านี้ไม่มีตัวเลขหรือรหัสฟอร์มอะไรเลย " * 5
+        long_prose = "เนื้อหาปกติของหน้านี้ไม่มีตัวเลขหรือรหัสฟอร์มอะไรเลย เป็นเพียงคำอธิบายทั่วไปเกี่ยวกับขั้นตอนการดำเนินงานของหน่วยงาน ซึ่งไม่เกี่ยวข้องกับจำนวนเงินหรือวันที่ใดๆ ทั้งสิ้น เนื้อหาส่วนนี้มีไว้เพื่ออธิบายภาพรวมของกระบวนการให้ผู้อ่านเข้าใจบริบทก่อนไปสู่รายละเอียดในหัวข้อถัดไป"
         with patch.object(handler, "_extract_page_native_text", return_value=None), \
              patch.object(handler, "_render_page_to_png_bytes", return_value=b"fake-png"), \
              patch.object(handler, "_run_typhoon", return_value=long_prose), \
+             patch.object(handler, "_should_random_audit_sample", return_value=False), \
              patch.object(handler, "_run_vision_verify") as mock_verify:
             result = handler._extract_one_page(b"fake-pdf-bytes", page_num=5)
 

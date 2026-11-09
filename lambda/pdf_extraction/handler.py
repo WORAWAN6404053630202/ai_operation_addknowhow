@@ -67,6 +67,7 @@ documents (the common case) are completely unaffected — same one Lambda
 invocation, same output shape, same downstream SQS path as before."""
 
 import base64
+import difflib
 import json
 import logging
 import os
@@ -75,6 +76,7 @@ import re
 import threading
 import time
 import urllib.parse
+import zlib
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
@@ -632,13 +634,24 @@ def _run_typhoon(png_bytes: bytes, page_num: int) -> str:
         os.remove(tmp_path)
 
 
-def _run_vision_verify(png_bytes: bytes, cost_accumulator: "_CostAccumulator | None" = None) -> str:
+def _run_vision_verify(png_bytes: bytes, cost_accumulator: "_CostAccumulator | None" = None, anchor_text: str = "") -> str:
     """Second-opinion OCR pass on top of Typhoon's — model is
     OPENROUTER_MODEL_VISION, not necessarily Claude despite the old function
     name this replaces (renamed 2026-09 to match pdf_large_extraction.py's
-    same rename on the EC2 side)."""
+    same rename on the EC2 side).
+
+    2026-11 (document-anchoring add-on): mirrors pdf_large_extraction.py's
+    identical `anchor_text` param — see that one's docstring for the full
+    reasoning on why this is only feasible here, not on Typhoon's call
+    (ocr_document() has no such hook)."""
     client = OpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL)
     b64 = base64.b64encode(png_bytes).decode("utf-8")
+    prompt_text = _CLAUDE_PROMPT
+    if anchor_text.strip():
+        prompt_text += (
+            "\n\nข้อมูลอ้างอิงจากเลเยอร์ข้อความเดิมของหน้านี้ (อาจไม่สมบูรณ์หรือมีจุดผิดพลาด "
+            "ใช้เป็นแนวทางเทียบเคียงเท่านั้น ห้ามเชื่อถือทั้งหมดหากขัดแย้งกับภาพจริง):\n" + anchor_text.strip()
+        )
     _call_start = time.time()
     resp = client.chat.completions.create(
         model=OPENROUTER_MODEL_VISION,
@@ -646,7 +659,7 @@ def _run_vision_verify(png_bytes: bytes, cost_accumulator: "_CostAccumulator | N
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": _CLAUDE_PROMPT},
+                    {"type": "text", "text": prompt_text},
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
                 ],
             }
@@ -783,6 +796,328 @@ def _salient_regions_look_valid(text: str) -> bool:
     return True
 
 
+# 2026-11 (PDF pipeline overhaul, gap #3). Duplicated from
+# utils/pdf_text_layer.py's thai_linguistic_score/_block_unicode_bad_ratio/
+# text_block_composite_score/classify_page_text_blocks — see that module
+# for the full design reasoning (independent-gate design, Thai-script-ratio
+# guard for non-Thai blocks, both found and fixed as real bugs during this
+# session's implementation). _salient_regions_look_valid above is kept
+# ACTIVE (not retired) — it catches a different, positional corruption
+# shape (one bad char next to a high-value digit) that ratio-based checks
+# at ANY granularity don't subsume.
+_THAI_KNOWN_WORDS = None
+
+
+def _thai_known_words():
+    global _THAI_KNOWN_WORDS
+    if _THAI_KNOWN_WORDS is None:
+        from pythainlp.corpus import thai_words
+        _THAI_KNOWN_WORDS = thai_words()
+    return _THAI_KNOWN_WORDS
+
+
+_MEAN_TOKEN_LENGTH_NORM = 6.0
+_MIN_THAI_SCRIPT_RATIO = 0.20
+
+
+def _thai_linguistic_score(text: str) -> float:
+    thai_chars = sum(1 for ch in text if 0x0E00 <= ord(ch) <= 0x0E7F)
+    non_space_chars = sum(1 for ch in text if not ch.isspace())
+    if non_space_chars == 0 or (thai_chars / non_space_chars) < _MIN_THAI_SCRIPT_RATIO:
+        return 1.0
+    try:
+        from pythainlp.tokenize import word_tokenize
+        toks = [t for t in word_tokenize(text, engine="newmm", keep_whitespace=False) if t.strip()]
+    except Exception as e:
+        logger.warning(f"Thai tokenization failed, treating block as trusted (fail-safe direction): {e}")
+        return 1.0
+    if not toks:
+        return 1.0
+    total_chars = sum(len(t) for t in toks)
+    if total_chars == 0:
+        return 1.0
+    mean_len = total_chars / len(toks)
+    known_words = _thai_known_words()
+    char_weighted_known = sum(len(t) for t in toks if t in known_words) / total_chars
+    length_signal = min(1.0, mean_len / _MEAN_TOKEN_LENGTH_NORM)
+    return 0.7 * length_signal + 0.3 * char_weighted_known
+
+
+def _block_unicode_bad_ratio(text: str) -> float:
+    page_number_ref_positions = {i for m in _PAGE_NUMBER_REF_RE.finditer(text) for i in range(*m.span())}
+    bad = 0
+    total = 0
+    for i, ch in enumerate(text):
+        if ch.isspace():
+            continue
+        total += 1
+        if any(lo <= ord(ch) <= hi for lo, hi in _EXPECTED_TEXT_RANGES):
+            continue
+        if i in page_number_ref_positions:
+            continue
+        bad += 1
+    return bad / total if total else 0.0
+
+
+_UNICODE_COMPONENT_THRESHOLD = 0.95
+_LINGUISTIC_COMPONENT_THRESHOLD = 0.80
+_MIN_BLOCK_CHARS_FOR_VALIDATION = 15
+
+
+def _text_block_composite_score(text: str) -> tuple[float, float]:
+    return 1.0 - _block_unicode_bad_ratio(text), _thai_linguistic_score(text)
+
+
+def _classify_page_text_blocks(page) -> list[dict]:
+    try:
+        results = []
+        for block in page.get_text("dict").get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            block_text = "".join(
+                span.get("text", "") for line in block.get("lines", []) for span in line.get("spans", [])
+            )
+            if len(block_text.strip()) < _MIN_BLOCK_CHARS_FOR_VALIDATION:
+                continue
+            unicode_component, linguistic_component = _text_block_composite_score(block_text)
+            results.append({
+                "bbox": block.get("bbox"), "text": block_text,
+                "unicode_score": unicode_component, "linguistic_score": linguistic_component,
+                "valid": unicode_component >= _UNICODE_COMPONENT_THRESHOLD and linguistic_component >= _LINGUISTIC_COMPONENT_THRESHOLD,
+            })
+        return results
+    except Exception as e:
+        logger.warning(f"Per-block text validation failed (non-fatal, treated as no blocks flagged): {e}")
+        return []
+
+
+# 2026-11 (PDF pipeline overhaul, gap #4). Duplicated from
+# utils/pdf_text_layer.py's find_page_tables/_block_overlaps_table/
+# extract_page_text_with_tables — see that module for the full design
+# reasoning (find_tables()'s use_layout=True default gating, the strategy
+# fallback chain, why splicing not appending).
+_TABLE_STRATEGY_ATTEMPTS = (
+    ("default", {}),
+    ("text", {"strategy": "text"}),
+    ("text_no_layout", {"use_layout": False, "strategy": "text"}),
+)
+
+
+def _find_page_tables(page) -> list:
+    try:
+        for strategy_name, kwargs in _TABLE_STRATEGY_ATTEMPTS:
+            tf = page.find_tables(**kwargs)
+            if tf.tables:
+                logger.info(f"_find_page_tables: {len(tf.tables)} table(s) found via strategy={strategy_name}")
+                return tf.tables
+        return []
+    except Exception as e:
+        logger.warning(f"Table detection failed (non-fatal, page falls back to flowing text only): {e}")
+        return []
+
+
+_TABLE_BLOCK_OVERLAP_THRESHOLD = 0.5
+
+
+def _block_overlaps_table(block_bbox, table_bbox) -> bool:
+    if not block_bbox or not table_bbox:
+        return False
+    bx0, by0, bx1, by1 = block_bbox
+    tx0, ty0, tx1, ty1 = table_bbox
+    ix0, iy0 = max(bx0, tx0), max(by0, ty0)
+    ix1, iy1 = min(bx1, tx1), min(by1, ty1)
+    if ix1 <= ix0 or iy1 <= iy0:
+        return False
+    inter_area = (ix1 - ix0) * (iy1 - iy0)
+    block_area = max(1e-6, (bx1 - bx0) * (by1 - by0))
+    return (inter_area / block_area) >= _TABLE_BLOCK_OVERLAP_THRESHOLD
+
+
+# 2026-11 (PDF pipeline overhaul, lower-priority multi-column fix). Mirrors
+# utils/pdf_text_layer.py's identical EC2-side port of PyMuPDF's documented
+# community recipe (github.com/pymupdf/PyMuPDF-Utilities, text-extraction/
+# multi_column.py) — see that module's docstring for the full reasoning and
+# empirical verification notes.
+def _column_boxes(page, footer_margin: int = 50, header_margin: int = 50, no_image_text: bool = True) -> list:
+    paths = page.get_drawings()
+    bboxes = []
+    path_rects = []
+    img_bboxes = []
+    vert_bboxes = []
+
+    clip = +page.rect
+    clip.y1 -= footer_margin
+    clip.y0 += header_margin
+
+    def can_extend(temp, bb, bboxlist):
+        for b in bboxlist:
+            if not intersects_bboxes(temp, vert_bboxes) and (
+                b is None or b == bb or (temp & b).is_empty
+            ):
+                continue
+            return False
+        return True
+
+    def in_bbox(bb, bboxes):
+        for i, bbox in enumerate(bboxes):
+            if bb in bbox:
+                return i + 1
+        return 0
+
+    def intersects_bboxes(bb, bboxes):
+        for bbox in bboxes:
+            if not (bb & bbox).is_empty:
+                return True
+        return False
+
+    def extend_right(bboxes, width, path_bboxes, vert_bboxes, img_bboxes):
+        for i, bb in enumerate(bboxes):
+            if in_bbox(bb, path_bboxes):
+                continue
+            if in_bbox(bb, img_bboxes):
+                continue
+            temp = +bb
+            temp.x1 = width
+            if intersects_bboxes(temp, path_bboxes + vert_bboxes + img_bboxes):
+                continue
+            check = can_extend(temp, bb, bboxes)
+            if check:
+                bboxes[i] = temp
+        return [b for b in bboxes if b is not None]
+
+    def clean_nblocks(nblocks):
+        blen = len(nblocks)
+        if blen < 2:
+            return nblocks
+        start = blen - 1
+        for i in range(start, -1, -1):
+            bb1 = nblocks[i]
+            bb0 = nblocks[i - 1]
+            if bb0 == bb1:
+                del nblocks[i]
+
+        y1 = nblocks[0].y1
+        i0 = 0
+        i1 = -1
+        for i in range(1, len(nblocks)):
+            b1 = nblocks[i]
+            if abs(b1.y1 - y1) > 10:
+                if i1 > i0:
+                    nblocks[i0 : i1 + 1] = sorted(nblocks[i0 : i1 + 1], key=lambda b: b.x0)
+                y1 = b1.y1
+                i0 = i
+            i1 = i
+        if i1 > i0:
+            nblocks[i0 : i1 + 1] = sorted(nblocks[i0 : i1 + 1], key=lambda b: b.x0)
+        return nblocks
+
+    for p in paths:
+        path_rects.append(p["rect"].irect)
+    path_bboxes = path_rects
+    path_bboxes.sort(key=lambda b: (b.y0, b.x0))
+
+    for item in page.get_images():
+        img_bboxes.extend(page.get_image_rects(item[0]))
+
+    blocks = page.get_text("dict", flags=pymupdf.TEXTFLAGS_TEXT, clip=clip)["blocks"]
+
+    for b in blocks:
+        bbox = pymupdf.IRect(b["bbox"])
+        if no_image_text and in_bbox(bbox, img_bboxes):
+            continue
+        line0 = b["lines"][0]
+        if line0["dir"] != (1, 0):
+            vert_bboxes.append(bbox)
+            continue
+        srect = pymupdf.EMPTY_IRECT()
+        for line in b["lines"]:
+            lbbox = pymupdf.IRect(line["bbox"])
+            text = "".join([s["text"].strip() for s in line["spans"]])
+            if len(text) > 1:
+                srect |= lbbox
+        bbox = +srect
+        if not bbox.is_empty:
+            bboxes.append(bbox)
+
+    bboxes.sort(key=lambda k: (in_bbox(k, path_bboxes), k.y0, k.x0))
+    bboxes = extend_right(bboxes, int(page.rect.width), path_bboxes, vert_bboxes, img_bboxes)
+
+    if bboxes == []:
+        return []
+
+    nblocks = [bboxes[0]]
+    bboxes = bboxes[1:]
+
+    for i, bb in enumerate(bboxes):
+        check = False
+        for j in range(len(nblocks)):
+            nbb = nblocks[j]
+            if bb is None or nbb.x1 < bb.x0 or bb.x1 < nbb.x0:
+                continue
+            if in_bbox(nbb, path_bboxes) != in_bbox(bb, path_bboxes):
+                continue
+            temp = bb | nbb
+            check = can_extend(temp, nbb, nblocks)
+            if check:
+                break
+        if not check:
+            nblocks.append(bb)
+            j = len(nblocks) - 1
+            temp = nblocks[j]
+        check = can_extend(temp, bb, bboxes)
+        if not check:
+            nblocks.append(bb)
+        else:
+            nblocks[j] = temp
+        bboxes[i] = None
+
+    nblocks = clean_nblocks(nblocks)
+    return nblocks
+
+
+def _extract_page_text_reading_order(page) -> str:
+    try:
+        boxes = _column_boxes(page)
+        if len(boxes) <= 1:
+            return page.get_text()
+        return "\n\n".join(page.get_text(clip=box, sort=True) for box in boxes)
+    except Exception as e:
+        logger.warning(f"Multi-column reading-order extraction failed, falling back to plain text extraction: {e}")
+        return page.get_text()
+
+
+def _extract_page_text_with_tables(page) -> str:
+    try:
+        tables = _find_page_tables(page)
+        if not tables:
+            return _extract_page_text_reading_order(page)
+
+        blocks = page.get_text("dict").get("blocks", [])
+        emitted_table_indices: set[int] = set()
+        parts: list[str] = []
+        for block in blocks:
+            if block.get("type") != 0:
+                continue
+            bbox = block.get("bbox")
+            covering_table_idx = next(
+                (i for i, t in enumerate(tables) if _block_overlaps_table(bbox, t.bbox)), None,
+            )
+            if covering_table_idx is not None:
+                if covering_table_idx not in emitted_table_indices:
+                    parts.append(tables[covering_table_idx].to_markdown(clean=False, fill_empty=True))
+                    emitted_table_indices.add(covering_table_idx)
+                continue
+            block_text = "".join(
+                span.get("text", "") for line in block.get("lines", []) for span in line.get("spans", [])
+            )
+            if block_text:
+                parts.append(block_text)
+        return "\n".join(parts)
+    except Exception as e:
+        logger.warning(f"Table-aware text reconstruction failed, falling back to plain text extraction: {e}")
+        return page.get_text()
+
+
 # Image-detection background (2026-09): mirrors code/utils/pdf_text_layer.py
 # on the EC2 side (NOT imported — this Lambda has no access to code/, see
 # module docstring) — see that module's docstring for the full history,
@@ -872,14 +1207,126 @@ def _page_needs_ocr_for_visual_content(page, cost_accumulator: "_CostAccumulator
         return True
 
 
+_SUPPLEMENTARY_ANNOT_TYPES = (pymupdf.PDF_ANNOT_FREE_TEXT, pymupdf.PDF_ANNOT_STAMP)
+
+
+def _extract_page_supplementary_text(pdf_bytes: bytes, page_num: int) -> str:
+    """Duplicated from utils/pdf_text_layer.py's extract_page_supplementary_text
+    (2026-11, PDF pipeline overhaul, gap #2 — form widgets/annotations never
+    extracted) — same deployment-boundary reason every other function in
+    this file is a hand-copy rather than an import (see module docstring).
+    page.get_text() excludes form-field/widget values and most annotation
+    types by PyMuPDF's own design; deliberately UNCONDITIONAL and purely
+    additive regardless of which branch (native text vs OCR) handled the
+    page's base text. Never raises."""
+    try:
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            page = doc[page_num - 1]
+            lines: list[str] = []
+
+            for widget in page.widgets() or []:
+                value = (widget.field_value or "").strip() if isinstance(widget.field_value, str) else widget.field_value
+                if not value:
+                    continue
+                name = (widget.field_name or "").strip()
+                lines.append(f"{name}: {value}" if name else str(value))
+
+            for annot in page.annots() or []:
+                if annot.type[0] not in _SUPPLEMENTARY_ANNOT_TYPES:
+                    continue
+                annot_text = (annot.get_text() or "").strip()
+                if annot_text:
+                    lines.append(annot_text)
+
+            return "\n".join(lines)
+        finally:
+            doc.close()
+    except Exception as e:
+        logger.warning(f"Page {page_num}: widget/annotation extraction failed (non-fatal, base text unaffected): {e}")
+        return ""
+
+
+_BITMAP_AREA_THRESHOLD = 0.05
+
+
+def _find_embedded_image_regions(pdf_bytes: bytes, page_num: int) -> list[tuple[float, float, float, float]]:
+    """Duplicated from utils/pdf_text_layer.py's find_embedded_image_regions
+    (2026-11, PDF pipeline overhaul, gap #1 — accepting native text used to
+    mean zero OCR for the whole page, silently dropping any embedded
+    scanned table/stamp/image on an otherwise-good text page). Matches
+    Docling's bitmap_area_threshold default (arXiv:2408.09869) — ADDITIVE,
+    never a replacement for native text. Blind to vector-drawn diagrams by
+    construction; that gap stays covered by _page_needs_ocr_for_visual_content
+    above. Never raises."""
+    try:
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            page = doc[page_num - 1]
+            page_area = page.rect.width * page.rect.height
+            if page_area <= 0:
+                return []
+            regions: list[tuple[float, float, float, float]] = []
+            for info in page.get_image_info(xrefs=True):
+                x0, y0, x1, y1 = info["bbox"]
+                area_ratio = max(0.0, (x1 - x0) * (y1 - y0)) / page_area
+                if area_ratio >= _BITMAP_AREA_THRESHOLD:
+                    regions.append((x0, y0, x1, y1))
+            return regions
+        finally:
+            doc.close()
+    except Exception as e:
+        logger.warning(f"Page {page_num}: embedded-image region detection failed (non-fatal, treated as no regions found): {e}")
+        return []
+
+
+def _render_region_to_png_bytes(pdf_bytes: bytes, page_num: int, bbox: tuple[float, float, float, float], dpi: int = 200) -> bytes:
+    """Duplicated from utils/pdf_text_layer.py's render_region_to_png_bytes —
+    crops just the given bbox, not the whole page."""
+    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        page = doc[page_num - 1]
+        pix = page.get_pixmap(clip=pymupdf.Rect(bbox), dpi=dpi)
+        return pix.tobytes("png")
+    finally:
+        doc.close()
+
+
+_ANCHOR_TEXT_MAX_CHARS = 800  # mirrors utils/pdf_text_layer.py's extract_raw_page_text_best_effort — "short reference-context" per olmOCR's document-anchoring technique
+
+
+def _extract_raw_page_text_best_effort(pdf_bytes: bytes, page_num: int) -> str:
+    """2026-11 (PDF pipeline overhaul, document-anchoring add-on). Mirrors
+    service/pdf_large_extraction.py's/utils/pdf_text_layer.py's identical
+    EC2-side function — see that one's docstring for the full reasoning.
+    Returns page.get_text() with NO validation, truncated, purely so a
+    caller about to run OCR anyway can hand the vision model whatever
+    partial/possibly-corrupted native text existed as grounding context.
+    Never raises."""
+    try:
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            text = doc[page_num - 1].get_text() or ""
+            return text.strip()[:_ANCHOR_TEXT_MAX_CHARS]
+        finally:
+            doc.close()
+    except Exception:
+        return ""
+
+
 def _extract_page_native_text(pdf_bytes: bytes, page_num: int, cost_accumulator: "_CostAccumulator | None" = None) -> str | None:
     """Zero-cost alternative to OCR: many digital-native (non-scanned) PDFs
     already carry an extractable text layer via pymupdf's page.get_text() —
     added 2026-09, this codebase had never used it anywhere in the actual
     extraction path before. Returns None (caller falls back to OCR) for a
-    scanned/image-only page with no meaningful embedded text, a text layer
-    that fails the page-wide or salient-region character-validity check
-    above (likely a corrupted/mismapped font), a page whose rendered
+    scanned/image-only page with no meaningful embedded text, a corrupted
+    character sitting right next to a high-value digit (positional signal,
+    kept active), a text layer where ANY individual block fails the
+    per-block composite validity check (ratio-based signal: in-script Thai
+    mojibake or corruption concentrated in one block — 2026-11, replaced
+    the old page-wide character-range check; see utils/pdf_text_layer.py's
+    extract_page_native_text for the full reasoning, including why the two
+    checks are complementary rather than redundant), a page whose rendered
     content includes a meaningful diagram/chart/image/status-stamp per the
     Approach A+B check above, or if extraction itself errors — never
     raises."""
@@ -890,18 +1337,21 @@ def _extract_page_native_text(pdf_bytes: bytes, page_num: int, cost_accumulator:
             text = page.get_text()
             if len(text.strip()) < _MIN_PAGE_TEXT_LAYER_CHARS:
                 return None
-            if not _text_looks_valid(text):
-                logger.info(f"Page {page_num}: native text layer present but failed the character-validity check (likely a corrupted/mismapped font) — falling back to OCR")
-                return None
             if not _salient_regions_look_valid(text):
-                logger.info(f"Page {page_num}: corrupted character found right next to a number (fee amount/date/form/license code) — falling back to OCR even though the page-wide validity check passed")
+                logger.info(f"Page {page_num}: corrupted character found right next to a number (fee amount/date/form/license code) — falling back to OCR")
+                return None
+            blocks = _classify_page_text_blocks(page)
+            invalid_blocks = [b for b in blocks if not b["valid"]]
+            if invalid_blocks:
+                worst = min(invalid_blocks, key=lambda b: b["linguistic_score"])
+                logger.info(f"Page {page_num}: text block failed composite validity check (unicode={worst['unicode_score']:.2f}, linguistic={worst['linguistic_score']:.2f}, likely corrupted/mismapped font or scrambled Thai) — falling back to OCR")
                 return None
             if _text_coverage_ratio(page) >= _TEXT_COVERAGE_SKIP_THRESHOLD:
-                return text
+                return _extract_page_text_with_tables(page)
             if _page_needs_ocr_for_visual_content(page, cost_accumulator=cost_accumulator):
                 logger.info(f"Page {page_num}: vision check found meaningful visual content — falling back to OCR so it gets described, not silently dropped")
                 return None
-            return text
+            return _extract_page_text_with_tables(page)
         finally:
             doc.close()
     except Exception as e:
@@ -909,10 +1359,80 @@ def _extract_page_native_text(pdf_bytes: bytes, page_num: int, cost_accumulator:
         return None
 
 
+# 2026-11 (PDF pipeline overhaul, gap #5). Duplicated from
+# service/pdf_large_extraction.py's _is_likely_degenerate_repetition/
+# _is_length_implausible/_should_random_audit_sample/
+# _texts_substantially_agree — see that module for the full design
+# reasoning and empirical calibration notes.
+_REPETITION_COMPRESSION_RATIO_THRESHOLD = 0.20
+_REPETITION_MIN_CHARS = 30
+
+
+def _is_likely_degenerate_repetition(text: str) -> bool:
+    stripped = (text or "").strip()
+    if len(stripped) < _REPETITION_MIN_CHARS:
+        return False
+    try:
+        data = stripped.encode("utf-8")
+        compressed = zlib.compress(data, level=9)
+        ratio = len(compressed) / len(data)
+        return ratio < _REPETITION_COMPRESSION_RATIO_THRESHOLD
+    except Exception:
+        return False
+
+
+_BLANK_PAGE_PNG_BYTES_FLOOR = 15000
+_MIN_CHARS_FOR_DENSE_PNG = 30
+
+
+def _is_length_implausible(png_bytes: bytes, ocr_text: str) -> bool:
+    try:
+        if len(png_bytes) <= _BLANK_PAGE_PNG_BYTES_FLOOR:
+            return False
+        return len((ocr_text or "").strip()) < _MIN_CHARS_FOR_DENSE_PNG
+    except Exception:
+        return False
+
+
+_RANDOM_AUDIT_SAMPLE_RATE = 0.07
+
+
+def _should_random_audit_sample() -> bool:
+    return random.random() < _RANDOM_AUDIT_SAMPLE_RATE
+
+
+def _texts_substantially_agree(text_a: str, text_b: str) -> bool:
+    a, b = (text_a or "").strip(), (text_b or "").strip()
+    if not a and not b:
+        return True
+    if not a or not b:
+        return False
+    return difflib.SequenceMatcher(None, a, b).ratio() >= 0.70
+
+
 def _extract_one_page(pdf_bytes: bytes, page_num: int, cost_accumulator: "_CostAccumulator | None" = None) -> dict:
+    # 2026-11 (PDF pipeline overhaul, gap #2): unconditional and additive
+    # regardless of which branch below handles the base text — see
+    # _extract_page_supplementary_text's own docstring.
+    supplementary_text = _extract_page_supplementary_text(pdf_bytes, page_num)
+
     native_text = _extract_page_native_text(pdf_bytes, page_num, cost_accumulator=cost_accumulator)
     if native_text is not None:
-        logger.info(f"Page {page_num}: used native PDF text layer ({len(native_text)} chars) — skipped OCR entirely, $0 for this page")
+        if supplementary_text:
+            native_text = f"{native_text}\n\n[ข้อมูลจากฟอร์ม/คำอธิบายประกอบ]\n{supplementary_text}"
+        # 2026-11 (PDF pipeline overhaul, gap #1): additive, never replaces
+        # native_text — see service/pdf_large_extraction.py's identical fix
+        # for the full reasoning.
+        for region_bbox in _find_embedded_image_regions(pdf_bytes, page_num):
+            try:
+                region_png = _render_region_to_png_bytes(pdf_bytes, page_num, region_bbox)
+                region_text = _run_typhoon(region_png, page_num)
+            except Exception as e:
+                logger.warning(f"Page {page_num}: region-OCR failed for bbox {region_bbox} (non-fatal, native text unaffected): {e}")
+                continue
+            if (region_text or "").strip():
+                native_text = f"{native_text}\n\n[รูปภาพ/ตารางที่แนบในหน้านี้]\n{region_text}"
+        logger.info(f"Page {page_num}: used native PDF text layer ({len(native_text)} chars) — skipped full-page OCR, $0-+region-OCR-only for this page")
         # Same value in both fields: this IS the source text, not a second
         # extractor's independent read of it — validate_extraction()'s
         # compare_extractions() finding "no disagreement" here is correct
@@ -932,13 +1452,26 @@ def _extract_one_page(pdf_bytes: bytes, page_num: int, cost_accumulator: "_CostA
         # regardless of what the vision model would say.
         salient = _extract_salient_tokens(typhoon_markdown)
         _typhoon_is_empty = not (typhoon_markdown or "").strip()
-        if any(salient[k] for k in salient) or _typhoon_is_empty:
-            if _typhoon_is_empty:
-                logger.info(f"Page {page_num}: Typhoon returned empty output — running vision-verify to check for a real OCR failure, not just a blank page")
-            claude_markdown = _run_vision_verify(png_bytes, cost_accumulator=cost_accumulator)
+        _is_degenerate = _is_likely_degenerate_repetition(typhoon_markdown)
+        _length_implausible = _is_length_implausible(png_bytes, typhoon_markdown)
+        _is_audit_sample = _should_random_audit_sample()
+        _verify_reason = (
+            "empty" if _typhoon_is_empty else
+            "salient_token" if any(salient[k] for k in salient) else
+            "degenerate_repetition" if _is_degenerate else
+            "length_implausible" if _length_implausible else
+            "random_audit" if _is_audit_sample else
+            None
+        )
+        if _verify_reason is not None:
+            logger.info(f"Page {page_num}: running vision-verify (reason={_verify_reason})")
+            # 2026-11 (document-anchoring add-on): mirrors
+            # service/pdf_large_extraction.py's identical EC2-side fix.
+            anchor_text = _extract_raw_page_text_best_effort(pdf_bytes, page_num)
+            claude_markdown = _run_vision_verify(png_bytes, cost_accumulator=cost_accumulator, anchor_text=anchor_text)
         else:
             claude_markdown = ""
-            logger.info(f"Page {page_num}: no salient tokens in Typhoon output, skipping vision-verify")
+            logger.info(f"Page {page_num}: no salient tokens and output looks clean — skipping vision-verify")
 
         if not (typhoon_markdown or "").strip() and not (claude_markdown or "").strip():
             logger.warning(f"Page {page_num}: BOTH Typhoon and vision-verify returned empty text — this page is likely silently missing from the ingested document, worth a manual re-check")
@@ -954,6 +1487,17 @@ def _extract_one_page(pdf_bytes: bytes, page_num: int, cost_accumulator: "_CostA
             # even though it's now auto-recovered.
             logger.info(f"Page {page_num}: Typhoon was empty, recovered via vision-verify ({len(claude_markdown)} chars) — using Claude's text as the page content")
             typhoon_markdown = claude_markdown
+        elif (claude_markdown or "").strip() and not _texts_substantially_agree(typhoon_markdown, claude_markdown):
+            # 2026-11 (gap #5, reconciliation half — mirrors the EC2-side copy).
+            winner = claude_markdown if len(claude_markdown) > len(typhoon_markdown) else typhoon_markdown
+            logger.warning(
+                f"Page {page_num}: Typhoon and vision-verify substantially disagree "
+                f"(reason={_verify_reason}) — using the longer output ({len(winner)} chars) as a conservative tie-breaker"
+            )
+            typhoon_markdown = winner
+
+        if supplementary_text:
+            typhoon_markdown = f"{typhoon_markdown}\n\n[ข้อมูลจากฟอร์ม/คำอธิบายประกอบ]\n{supplementary_text}"
 
         logger.info(f"Page {page_num}: extracted via OCR (Typhoon {len(typhoon_markdown)} chars, Claude {len(claude_markdown)} chars)")
         return {
@@ -972,6 +1516,83 @@ def _extract_one_page(pdf_bytes: bytes, page_num: int, cost_accumulator: "_CostA
         logger.error(f"Page {page_num}: extraction failed, saving placeholder instead of losing the whole document: {e}")
         error_markdown = f"[สกัดข้อมูลหน้านี้ไม่สำเร็จ — เกิดข้อผิดพลาดระหว่างประมวลผล: {e}]"
         return {"page_num": page_num, "typhoon_markdown": error_markdown, "claude_markdown": "", "typhoon_was_empty": False}
+
+
+# 2026-11 (PDF pipeline overhaul, gap #4, second half). Duplicated from
+# service/pdf_large_extraction.py's link_cross_page_tables/
+# _extract_trailing_markdown_table/_extract_leading_markdown_table — see
+# that module for the full design reasoning (text-level because pages
+# extract in parallel with no surviving Table objects; fails toward NOT
+# merging on any mismatch).
+def _extract_trailing_markdown_table(text: str):
+    lines = text.rstrip().split("\n")
+    table_lines: list[str] = []
+    i = len(lines) - 1
+    while i >= 0 and lines[i].strip().startswith("|") and lines[i].strip().endswith("|"):
+        table_lines.insert(0, lines[i])
+        i -= 1
+    if len(table_lines) < 2:
+        return None
+    return "\n".join(lines[: i + 1]), "\n".join(table_lines)
+
+
+def _extract_leading_markdown_table(text: str):
+    lines = text.lstrip().split("\n")
+    table_lines: list[str] = []
+    i = 0
+    while i < len(lines) and lines[i].strip().startswith("|") and lines[i].strip().endswith("|"):
+        table_lines.append(lines[i])
+        i += 1
+    if len(table_lines) < 2:
+        return None
+    return "\n".join(table_lines), "\n".join(lines[i:])
+
+
+def _link_cross_page_tables(pages: list) -> list:
+    try:
+        anchor = 0
+        while anchor < len(pages):
+            page_a = pages[anchor]
+            if page_a is None:
+                anchor += 1
+                continue
+            next_idx = anchor + 1
+            extended = False
+            while next_idx < len(pages):
+                page_b = pages[next_idx]
+                if page_b is None:
+                    break
+                text_a = page_a.get("typhoon_markdown") or ""
+                text_b = page_b.get("typhoon_markdown") or ""
+                trailing = _extract_trailing_markdown_table(text_a)
+                leading = _extract_leading_markdown_table(text_b)
+                if not trailing or not leading:
+                    break
+                before_a, table_a = trailing
+                table_b, after_b = leading
+                table_a_lines = table_a.split("\n")
+                table_b_lines = table_b.split("\n")
+                if len(table_a_lines) < 2 or len(table_b_lines) < 2:
+                    break
+                header_a = " ".join(table_a_lines[0].split())
+                header_b = " ".join(table_b_lines[0].split())
+                if header_a != header_b:
+                    break
+                data_rows_b = table_b_lines[2:]
+                merged_table = table_a + ("\n" + "\n".join(data_rows_b) if data_rows_b else "")
+                new_text_a = f"{before_a}\n\n{merged_table}" if before_a.strip() else merged_table
+                page_a["typhoon_markdown"] = new_text_a
+                page_a["claude_markdown"] = new_text_a
+                page_b["typhoon_markdown"] = after_b
+                page_b["claude_markdown"] = after_b
+                logger.info(f"Linked a table spanning page {page_a.get('page_num')} -> page {page_b.get('page_num')} (matching header: {header_a[:60]!r})")
+                extended = True
+                next_idx += 1
+            anchor = next_idx if extended else anchor + 1
+        return pages
+    except Exception as e:
+        logger.warning(f"Cross-page table linking failed (non-fatal, tables left unmerged/split): {e}")
+        return pages
 
 
 def lambda_handler(event, context):
@@ -1119,6 +1740,11 @@ def lambda_handler(event, context):
                     pages_done += 1
                     if pages_done == num_pages or pages_done % _PROGRESS_WRITE_EVERY_N_PAGES == 0:
                         _write_status(bucket, filename, stage="processing", pages_done=pages_done, pages_total=num_pages, attempt=attempt)
+
+            # 2026-11 (PDF pipeline overhaul, gap #4): must run AFTER every
+            # page is extracted (pages ran in parallel above) and BEFORE
+            # this function writes `pages` out to S3.
+            pages = _link_cross_page_tables(pages)
 
             # extraction_cost_usd/extraction_started_at: read by sqs_consumer.py
             # on the EC2 side to seed its own build-phase CostAccumulator and

@@ -69,9 +69,16 @@ class TestEC2FaultIsolation:
         # future.result() crash, not some property of the test harness itself.
         with patch.object(mod, "extract_page_native_text", return_value=None), \
              patch.object(mod, "_render_page_to_png_bytes", return_value=b"fake-png"), \
+             patch.object(mod, "_should_random_audit_sample", return_value=False), \
+             patch.object(mod, "_run_vision_verify") as _unused_vision_verify, \
              patch.object(mod, "_run_typhoon", side_effect=lambda png, page_num: (
                  (_ for _ in ()).throw(RuntimeError("boom")) if page_num == 2 else f"page {page_num} typhoon text"
              )):
+            # 2026-11 (gap #5): _should_random_audit_sample pinned False and
+            # _run_vision_verify mocked — without either, this test's pages 1/3
+            # had a real (if small, ~7%/call) chance of hitting the gap #5
+            # random-audit trigger and making a genuine, unmocked network call,
+            # which is what intermittently flaked this test in the full suite.
             pages = [None] * 3
             with cf.ThreadPoolExecutor(max_workers=3) as pool:
                 futures = {pool.submit(mod._extract_one_page, b"fake-pdf-bytes", p): p for p in (1, 2, 3)}
