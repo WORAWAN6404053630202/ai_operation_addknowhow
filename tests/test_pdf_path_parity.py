@@ -771,6 +771,20 @@ class TestOcrUncertaintyGatingParity:
         assert shared_fn("same text", "same text") == handler._texts_substantially_agree("same text", "same text") is True
         assert shared_fn("abc", "completely unrelated xyz") == handler._texts_substantially_agree("abc", "completely unrelated xyz") is False
 
+    def test_disagreement_tie_break_checks_which_side_is_degenerate_on_both_sides(self):
+        """2026-11-10 fix (caught via real-corpus validation: "prefer longer"
+        picked a 32,771-char Typhoon repetition-loop over vision-verify's
+        correct short answer) — guards that the Lambda hand-copy got the
+        same fix, not just the EC2 side."""
+        import inspect
+
+        import service.pdf_large_extraction as ec2_module
+
+        handler = _lambda_handler_module()
+        for src in (inspect.getsource(ec2_module._extract_one_page), inspect.getsource(handler._extract_one_page)):
+            assert "typhoon_is_degenerate" in src
+            assert "claude_is_degenerate" in src
+
 
 @pytest.mark.unit
 class TestDocumentAnchoringParity:

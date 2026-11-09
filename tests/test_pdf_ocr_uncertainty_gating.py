@@ -161,7 +161,7 @@ class TestExtractOnePageUncertaintyGating:
         _, mock_vision = self._run_with_mocks("ค่าธรรมเนียม 500 บาท ต้องชำระภายในกำหนด")
         mock_vision.assert_called_once()
 
-    def test_substantial_disagreement_prefers_longer_output(self):
+    def test_substantial_disagreement_prefers_longer_output_when_neither_is_degenerate(self):
         from service.pdf_large_extraction import _extract_one_page
 
         short_typhoon = "short typhoon output"
@@ -171,7 +171,62 @@ class TestExtractOnePageUncertaintyGating:
              patch("service.pdf_large_extraction._run_vision_verify", return_value=long_vision), \
              patch("service.pdf_large_extraction.extract_page_native_text", return_value=None), \
              patch("service.pdf_large_extraction.extract_page_supplementary_text", return_value=""), \
-             patch("service.pdf_large_extraction._is_likely_degenerate_repetition", return_value=True), \
+             patch("service.pdf_large_extraction._is_likely_degenerate_repetition", return_value=False), \
+             patch("service.pdf_large_extraction._should_random_audit_sample", return_value=True), \
              patch("service.pdf_large_extraction._texts_substantially_agree", return_value=False):
             result = _extract_one_page(b"fake pdf bytes", 1)
         assert result["typhoon_markdown"] == long_vision
+
+    def test_disagreement_prefers_non_degenerate_side_even_if_shorter(self):
+        """2026-11-10 real-corpus validation catch: Typhoon looped into a
+        32,771-char repetition of "- " on a form's ID-number blank line
+        (real page, real bug) — "prefer longer" picked that garbage over
+        vision-verify's correct short answer. Now the non-degenerate side
+        wins regardless of length."""
+        from service.pdf_large_extraction import _extract_one_page
+
+        degenerate_typhoon = "- " * 16000  # much longer, but garbage
+        correct_vision = "เลขบัตรประจำตัวประชาชน: _-____-_____-__-_"
+        with patch("service.pdf_large_extraction._render_page_to_png_bytes", return_value=b"\x89PNG fake"), \
+             patch("service.pdf_large_extraction._run_typhoon", return_value=degenerate_typhoon), \
+             patch("service.pdf_large_extraction._run_vision_verify", return_value=correct_vision), \
+             patch("service.pdf_large_extraction.extract_page_native_text", return_value=None), \
+             patch("service.pdf_large_extraction.extract_page_supplementary_text", return_value=""), \
+             patch("service.pdf_large_extraction._is_likely_degenerate_repetition", side_effect=lambda t: t == degenerate_typhoon), \
+             patch("service.pdf_large_extraction._texts_substantially_agree", return_value=False):
+            result = _extract_one_page(b"fake pdf bytes", 1)
+        assert result["typhoon_markdown"] == correct_vision
+
+    def test_disagreement_prefers_non_degenerate_typhoon_over_degenerate_vision(self):
+        """Same fix, opposite side: vision-verify is the one that looped."""
+        from service.pdf_large_extraction import _extract_one_page
+
+        correct_typhoon = "ข้อมูลที่ถูกต้องจาก Typhoon"
+        degenerate_vision = "repeat " * 5000
+        with patch("service.pdf_large_extraction._render_page_to_png_bytes", return_value=b"\x89PNG fake"), \
+             patch("service.pdf_large_extraction._run_typhoon", return_value=correct_typhoon), \
+             patch("service.pdf_large_extraction._run_vision_verify", return_value=degenerate_vision), \
+             patch("service.pdf_large_extraction.extract_page_native_text", return_value=None), \
+             patch("service.pdf_large_extraction.extract_page_supplementary_text", return_value=""), \
+             patch("service.pdf_large_extraction._is_likely_degenerate_repetition", side_effect=lambda t: t == degenerate_vision), \
+             patch("service.pdf_large_extraction._texts_substantially_agree", return_value=False):
+            result = _extract_one_page(b"fake pdf bytes", 1)
+        assert result["typhoon_markdown"] == correct_typhoon
+
+    def test_disagreement_prefers_shorter_when_both_sides_look_degenerate(self):
+        """Rare, pathological double-failure — prefer the shorter of the
+        two as the lesser-damage guess rather than compounding the
+        inflated-length bias of a repetition loop."""
+        from service.pdf_large_extraction import _extract_one_page
+
+        shorter_degenerate = "x " * 100
+        longer_degenerate = "y " * 10000
+        with patch("service.pdf_large_extraction._render_page_to_png_bytes", return_value=b"\x89PNG fake"), \
+             patch("service.pdf_large_extraction._run_typhoon", return_value=longer_degenerate), \
+             patch("service.pdf_large_extraction._run_vision_verify", return_value=shorter_degenerate), \
+             patch("service.pdf_large_extraction.extract_page_native_text", return_value=None), \
+             patch("service.pdf_large_extraction.extract_page_supplementary_text", return_value=""), \
+             patch("service.pdf_large_extraction._is_likely_degenerate_repetition", return_value=True), \
+             patch("service.pdf_large_extraction._texts_substantially_agree", return_value=False):
+            result = _extract_one_page(b"fake pdf bytes", 1)
+        assert result["typhoon_markdown"] == shorter_degenerate

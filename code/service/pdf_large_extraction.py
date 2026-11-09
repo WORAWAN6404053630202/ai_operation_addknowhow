@@ -387,19 +387,45 @@ def _extract_one_page(pdf_bytes: bytes, page_num: int, cost_accumulator: Optiona
             logger.info(f"[LargeExtraction] Page {page_num}: Typhoon was empty, recovered via vision-verify ({len(claude_markdown)} chars) — using Claude's text as the page content")
             typhoon_markdown = claude_markdown
         elif (claude_markdown or "").strip() and not _texts_substantially_agree(typhoon_markdown, claude_markdown):
-            # 2026-11 (gap #5, reconciliation half): BOTH models produced
-            # non-empty output but they substantially disagree — one of
-            # them is likely wrong (hallucination, omission, or a
-            # degenerate loop that still emitted some text). Fails toward
-            # the LONGER of the two, a conservative tie-breaker given the
-            # failure modes this check targets (truncation/omission) are
-            # length-reducing — not a precise resolution, flagged for
-            # Phase 6's reconciliation logging to make this visible rather
-            # than silently picked.
-            winner = claude_markdown if len(claude_markdown) > len(typhoon_markdown) else typhoon_markdown
+            # 2026-11 (gap #5, reconciliation half — FIXED 2026-11-10 after a
+            # real-corpus validation run caught this live): BOTH models
+            # produced non-empty output but they substantially disagree —
+            # one of them is likely wrong (hallucination, omission, or a
+            # degenerate loop that still emitted some text).
+            #
+            # Originally this failed toward the LONGER of the two as a
+            # "conservative" tie-breaker, reasoning that the failure modes
+            # this check targets (truncation/omission) are length-reducing.
+            # That reasoning breaks exactly when the trigger itself was
+            # degenerate_repetition: a repetition-loop failure INFLATES
+            # length (confirmed live — Typhoon looped on a form's ID-number
+            # blank-line placeholder and returned 32,771 characters of
+            # repeated "- ", which "prefer longer" then picked over
+            # vision-verify's correct short answer, corrupting that page).
+            # Now: if exactly one side is itself a degenerate repetition,
+            # the OTHER side wins regardless of length. Only when neither
+            # (or both) are degenerate does length-based tie-breaking apply.
+            typhoon_is_degenerate = _is_likely_degenerate_repetition(typhoon_markdown)
+            claude_is_degenerate = _is_likely_degenerate_repetition(claude_markdown)
+            if typhoon_is_degenerate and not claude_is_degenerate:
+                winner = claude_markdown
+                winner_reason = "typhoon output itself was a degenerate repetition"
+            elif claude_is_degenerate and not typhoon_is_degenerate:
+                winner = typhoon_markdown
+                winner_reason = "vision-verify output itself was a degenerate repetition"
+            elif typhoon_is_degenerate and claude_is_degenerate:
+                # Both degenerate (rare, pathological) — prefer the SHORTER
+                # one here, the opposite of the default below: a repetition
+                # loop inflates length, so shorter is the safer guess when
+                # both sides show the same failure mode.
+                winner = claude_markdown if len(claude_markdown) < len(typhoon_markdown) else typhoon_markdown
+                winner_reason = "both outputs looked degenerate — preferred the shorter one"
+            else:
+                winner = claude_markdown if len(claude_markdown) > len(typhoon_markdown) else typhoon_markdown
+                winner_reason = "conservative tie-breaker (neither output looked degenerate)"
             logger.warning(
                 f"[LargeExtraction] Page {page_num}: Typhoon and vision-verify substantially disagree "
-                f"(reason={_verify_reason}) — using the longer output ({len(winner)} chars) as a conservative tie-breaker"
+                f"(reason={_verify_reason}) — using the {len(winner)}-char output ({winner_reason})"
             )
             typhoon_markdown = winner
 

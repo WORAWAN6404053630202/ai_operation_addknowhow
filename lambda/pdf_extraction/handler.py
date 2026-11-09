@@ -1488,11 +1488,28 @@ def _extract_one_page(pdf_bytes: bytes, page_num: int, cost_accumulator: "_CostA
             logger.info(f"Page {page_num}: Typhoon was empty, recovered via vision-verify ({len(claude_markdown)} chars) — using Claude's text as the page content")
             typhoon_markdown = claude_markdown
         elif (claude_markdown or "").strip() and not _texts_substantially_agree(typhoon_markdown, claude_markdown):
-            # 2026-11 (gap #5, reconciliation half — mirrors the EC2-side copy).
-            winner = claude_markdown if len(claude_markdown) > len(typhoon_markdown) else typhoon_markdown
+            # 2026-11 (gap #5, reconciliation half — mirrors the EC2-side
+            # copy, FIXED 2026-11-10 after a real-corpus validation run
+            # caught this live: "prefer longer" picked a 32,771-char
+            # repetition-loop over vision-verify's correct short answer).
+            # See pdf_large_extraction.py's identical fix for the full story.
+            typhoon_is_degenerate = _is_likely_degenerate_repetition(typhoon_markdown)
+            claude_is_degenerate = _is_likely_degenerate_repetition(claude_markdown)
+            if typhoon_is_degenerate and not claude_is_degenerate:
+                winner = claude_markdown
+                winner_reason = "typhoon output itself was a degenerate repetition"
+            elif claude_is_degenerate and not typhoon_is_degenerate:
+                winner = typhoon_markdown
+                winner_reason = "vision-verify output itself was a degenerate repetition"
+            elif typhoon_is_degenerate and claude_is_degenerate:
+                winner = claude_markdown if len(claude_markdown) < len(typhoon_markdown) else typhoon_markdown
+                winner_reason = "both outputs looked degenerate — preferred the shorter one"
+            else:
+                winner = claude_markdown if len(claude_markdown) > len(typhoon_markdown) else typhoon_markdown
+                winner_reason = "conservative tie-breaker (neither output looked degenerate)"
             logger.warning(
                 f"Page {page_num}: Typhoon and vision-verify substantially disagree "
-                f"(reason={_verify_reason}) — using the longer output ({len(winner)} chars) as a conservative tie-breaker"
+                f"(reason={_verify_reason}) — using the {len(winner)}-char output ({winner_reason})"
             )
             typhoon_markdown = winner
 
