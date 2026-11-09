@@ -38,7 +38,11 @@ SYNONYM_PATTERNS: List[Tuple[str, str]] = [
     # General marketing signal — anchors any strategy/4P/7P query to การตลาด topic_group
     (r"กลยุทธ์|marketing\s*mix|\b4p\b|\b7p\b|ส่วนประสม",
                                                         "กลยุทธ์การตลาด marketing strategy การตลาด 4P 7P"),
-    (r"การตลาด|market(?:ing)?(?:\s+strategy)?",        "กลยุทธ์การตลาด การตลาด marketing"),
+    # 2026-11: bare "market" dropped (was market(?:ing)?...) — ambiguous in
+    # English (a physical market vs. the marketing activity); matched "flea
+    # market"/"night market"/"supermarket" and biased retrieval toward the
+    # wrong topic_group for vendors legitimately asking about those venues.
+    (r"การตลาด|marketing|market\s+strategy",           "กลยุทธ์การตลาด การตลาด marketing"),
     (r"กลุ่มเป้าหมาย|target\s*market|segmentation|ลูกค้าเป้าหมาย",
                                                         "กลุ่มเป้าหมาย segmentation target market การตลาด"),
     (r"positioning|ตำแหน่งทางการตลาด|การวางตำแหน่ง",  "positioning ตำแหน่งทางการตลาด brand"),

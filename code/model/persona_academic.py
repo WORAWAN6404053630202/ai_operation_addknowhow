@@ -3094,6 +3094,12 @@ class AcademicPersonaService:
 
     _CHOICE_LABELS = ("ก", "ข", "ค", "ง")
 
+    # Numeric-token -> label, derived from _CHOICE_LABELS so it can never desync
+    # from it (2026-11, hardcoded-logic audit: this used to be 2 separately
+    # hardcoded {"1": "ก", ...} dicts that would have silently fallen out of
+    # sync with _CHOICE_LABELS if it ever grew past 4 entries).
+    _NUM_TO_CHOICE_LABEL: Dict[str, str] = {str(i + 1): label for i, label in enumerate(_CHOICE_LABELS)}
+
     # Display label overrides: maps raw Chroma metadata values to human-readable labels.
     # The raw value is preserved in choice maps for Chroma filtering; only the displayed text changes.
     _CHOICE_DISPLAY_LABELS: Dict[str, str] = {
@@ -3843,15 +3849,14 @@ class AcademicPersonaService:
         if slot_keys and slot_choice_maps and self._is_simple_slot_label_reply(raw):
             tokens = re.split(r"[\s,/]+", raw)
             _valid_labels = set(self._CHOICE_LABELS) | {l.lower() for l in self._CHOICE_LABELS}
-            _num_to_label = {"1": "ก", "2": "ข", "3": "ค", "4": "ง"}
             # Normalise each token: numeric → Thai label; keep existing Thai labels; drop rest
             labels = []
             for t in tokens:
                 t = t.strip()
                 if t in _valid_labels:
                     labels.append(t)
-                elif t in _num_to_label:
-                    labels.append(_num_to_label[t])
+                elif t in self._NUM_TO_CHOICE_LABEL:
+                    labels.append(self._NUM_TO_CHOICE_LABEL[t])
             for i, key in enumerate(slot_keys):
                 if i >= len(labels):
                     break
@@ -3987,8 +3992,7 @@ class AcademicPersonaService:
 
         # Fallback: resolve single-label/numeric input "ก"/"1" → actual text via global map
         resolved_raw = raw
-        _num_to_label_fb = {"1": "ก", "2": "ข", "3": "ค", "4": "ง"}
-        _lookup_key = _num_to_label_fb.get(raw.strip(), raw.strip())
+        _lookup_key = self._NUM_TO_CHOICE_LABEL.get(raw.strip(), raw.strip())
         if choice_map and _lookup_key in choice_map:
             resolved_raw = choice_map[_lookup_key]
         elif choice_map and raw in choice_map:

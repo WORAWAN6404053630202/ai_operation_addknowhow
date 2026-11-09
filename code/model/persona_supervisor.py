@@ -716,6 +716,13 @@ class PersonaSupervisor:
         ("uob",   re.compile(r"\buob\b", re.IGNORECASE)),
     ]
 
+    # English-loanword Thai transliterations used to check whether an operation_topic
+    # option's English token (e.g. "PLUS") also appears, via its Thai spelling, in the
+    # query/user-input text. 2026-11 (hardcoded-logic audit): this exact 4-entry dict
+    # used to be hand-duplicated verbatim at 3 separate call sites in this file (same
+    # drift risk as _BANK_ID_PATTERNS above) — extracted to one class attribute.
+    _ENG_THAI_LOANWORDS: Dict[str, str] = {"PLUS": "พลัส", "SUPER": "ซุปเปอร์", "PRO": "โปร", "MINI": "มินิ"}
+
     # Coverage-sweep filter: which "missing" license_types found in the broad-question
     # pass are actual government-issued permits/licenses worth back-filling, vs. noise
     # (operational tools, unrelated statutes). ^ใบ covers ใบอนุญาต/ใบทะเบียน/ใบวุฒิบัตร/
@@ -7574,7 +7581,6 @@ class PersonaSupervisor:
                     _cs_lq.get("operation_topic") or _ctx_slots_lq.get("operation_topic") or ""
                 ).strip()
                 _cur_eng_toks_7 = {t.lower() for t in re.findall(r"[A-Za-z]{2,}", _cur_ot_7)}
-                _ENG_THAI_7 = {"PLUS": "พลัส", "SUPER": "ซุปเปอร์", "PRO": "โปร", "MINI": "มินิ"}
                 _new_ot_7 = (
                     next((o for o in _ot_opts_7 if o and o != _cur_ot_7 and o in query), None)
                     or next(
@@ -7589,7 +7595,7 @@ class PersonaSupervisor:
                         (o for o in _ot_opts_7
                          if o and o != _cur_ot_7
                          and any(
-                             _ENG_THAI_7.get(tok.upper(), "") in query
+                             self._ENG_THAI_LOANWORDS.get(tok.upper(), "") in query
                              for tok in re.findall(r"[A-Za-z]{2,}", o)
                              if tok.upper() not in {t.upper() for t in _cur_eng_toks_7}
                          )),
@@ -12702,7 +12708,6 @@ class PersonaSupervisor:
                         _ot_slot_3b = next((s for s in _slot_queue if s.get("key") == "operation_topic"), None)
                         if _ot_slot_3b:
                             _ot_opts_3b = sorted(_ot_slot_3b.get("options") or [], key=len, reverse=True)
-                            _ENG_THAI_3B = {"PLUS": "พลัส", "SUPER": "ซุปเปอร์", "PRO": "โปร", "MINI": "มินิ"}
                             _matched_ot_3b = (
                                 next((o for o in _ot_opts_3b if o and o in _full_ui), None)
                                 or next(
@@ -12714,7 +12719,7 @@ class PersonaSupervisor:
                                 or next(
                                     (o for o in _ot_opts_3b
                                      if o and any(
-                                         _ENG_THAI_3B.get(tok.upper(), "") in _full_ui
+                                         self._ENG_THAI_LOANWORDS.get(tok.upper(), "") in _full_ui
                                          for tok in re.findall(r"[A-Za-z]{2,}", o)
                                      )),
                                     None,
@@ -16521,7 +16526,6 @@ class PersonaSupervisor:
                                     if ((_md or {}).get("operation_topic") or "").strip() not in ("", "nan", "None")
                                 })
                                 _cur_eng_elab = {t.lower() for t in re.findall(r"[A-Za-z]{2,}", _cur_ot_elab)}
-                                _ENG_THAI_ELAB = {"PLUS": "พลัส", "SUPER": "ซุปเปอร์", "PRO": "โปร", "MINI": "มินิ"}
                                 _new_ot_elab = (
                                     next((o for o in _ot_all_elab if o != _cur_ot_elab and o in raw_stripped), None)
                                     or next(
@@ -16536,7 +16540,7 @@ class PersonaSupervisor:
                                         (o for o in _ot_all_elab
                                          if o != _cur_ot_elab
                                          and any(
-                                             _ENG_THAI_ELAB.get(tok.upper(), "") in raw_stripped
+                                             self._ENG_THAI_LOANWORDS.get(tok.upper(), "") in raw_stripped
                                              for tok in re.findall(r"[A-Za-z]{2,}", o)
                                              if tok.upper() not in {t.upper() for t in _cur_eng_elab}
                                          )),

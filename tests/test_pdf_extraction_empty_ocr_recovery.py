@@ -45,6 +45,23 @@ class TestEC2EmptyOCRRecovery:
         mock_verify.assert_called_once()
         assert result["claude_markdown"] == "recovered text from vision model"
 
+    def test_2026_11_recovered_text_promoted_to_typhoon_markdown(self):
+        """2026-11 fix: claude_markdown used to be used ONLY as a comparison
+        input, never merged back as the actual page content — every
+        downstream consumer reads typhoon_markdown only. Recovered text must
+        now end up there too, and typhoon_was_empty must be set so the
+        resulting flag (added in pdf_extraction_validation.py) still fires
+        even though the text itself is no longer missing."""
+        mod = self._import_module()
+        with patch.object(mod, "extract_page_native_text", return_value=None), \
+             patch.object(mod, "_render_page_to_png_bytes", return_value=b"fake-png"), \
+             patch.object(mod, "_run_typhoon", return_value=""), \
+             patch.object(mod, "_run_vision_verify", return_value="recovered text from vision model"):
+            result = mod._extract_one_page(b"fake-pdf-bytes", page_num=3)
+
+        assert result["typhoon_markdown"] == "recovered text from vision model"
+        assert result["typhoon_was_empty"] is True
+
     def test_short_typhoon_output_without_salient_tokens_still_triggers_vision_verify(self):
         mod = self._import_module()
         with patch.object(mod, "extract_page_native_text", return_value=None), \
@@ -71,6 +88,7 @@ class TestEC2EmptyOCRRecovery:
         mock_verify.assert_not_called()
         assert result["claude_markdown"] == ""
         assert result["typhoon_markdown"] == long_prose
+        assert result["typhoon_was_empty"] is False
 
     def test_salient_tokens_still_trigger_vision_verify_regardless_of_length(self):
         """Pre-existing trigger must still work even on a short page."""
@@ -93,6 +111,43 @@ class TestEC2EmptyOCRRecovery:
             mod._extract_one_page(b"fake-pdf-bytes", page_num=8)
 
         assert any("BOTH Typhoon and vision-verify returned empty" in r.message for r in caplog.records)
+
+
+@pytest.mark.unit
+class TestValidateExtractionFlagsRecoveredPages:
+    """2026-11 fix: once claude_markdown's recovered text is promoted to
+    typhoon_markdown (above), markdown==compare_with for a recovered page —
+    compare_extractions() sees no disagreement and emits no flag, so the
+    recovery would otherwise be invisible on the admin dashboard. The new
+    typhoon_was_empty param restores visibility via a dedicated high-
+    severity flag, independent of whether the two texts now match."""
+
+    def test_recovered_page_gets_a_dedicated_high_severity_flag(self):
+        from service.pdf_extraction_validation import validate_extraction
+
+        recovered = "recovered text from vision model"
+        flags = validate_extraction(recovered, compare_with=recovered, typhoon_was_empty=True)
+
+        recovery_flags = [f for f in flags if f.category == "typhoon_ocr_recovered_by_claude"]
+        assert len(recovery_flags) == 1
+        assert recovery_flags[0].severity == "high"
+
+    def test_non_recovered_page_gets_no_recovery_flag(self):
+        from service.pdf_extraction_validation import validate_extraction
+
+        flags = validate_extraction("normal page text", compare_with="normal page text", typhoon_was_empty=False)
+
+        assert not any(f.category == "typhoon_ocr_recovered_by_claude" for f in flags)
+
+    def test_typhoon_was_empty_but_claude_also_empty_gets_no_recovery_flag(self):
+        """Both-empty is already a different, existing warning path — the
+        recovery flag specifically means "text exists and came from Claude,"
+        not "Typhoon failed" in general."""
+        from service.pdf_extraction_validation import validate_extraction
+
+        flags = validate_extraction("", compare_with="", typhoon_was_empty=True)
+
+        assert not any(f.category == "typhoon_ocr_recovered_by_claude" for f in flags)
 
 
 @pytest.mark.unit
@@ -120,6 +175,19 @@ class TestLambdaEmptyOCRRecovery:
         mock_verify.assert_called_once()
         assert result["claude_markdown"] == "recovered text from vision model"
 
+    def test_2026_11_recovered_text_promoted_to_typhoon_markdown(self):
+        """Mirrors the identical EC2-side fix — see TestEC2EmptyOCRRecovery's
+        test of the same name for the full rationale."""
+        handler = self._import_module()
+        with patch.object(handler, "_extract_page_native_text", return_value=None), \
+             patch.object(handler, "_render_page_to_png_bytes", return_value=b"fake-png"), \
+             patch.object(handler, "_run_typhoon", return_value=""), \
+             patch.object(handler, "_run_vision_verify", return_value="recovered text from vision model"):
+            result = handler._extract_one_page(b"fake-pdf-bytes", page_num=3)
+
+        assert result["typhoon_markdown"] == "recovered text from vision model"
+        assert result["typhoon_was_empty"] is True
+
     def test_healthy_long_output_without_salient_tokens_still_skips_vision_verify(self):
         handler = self._import_module()
         long_prose = "เนื้อหาปกติของหน้านี้ไม่มีตัวเลขหรือรหัสฟอร์มอะไรเลย " * 5
@@ -131,6 +199,7 @@ class TestLambdaEmptyOCRRecovery:
 
         mock_verify.assert_not_called()
         assert result["claude_markdown"] == ""
+        assert result["typhoon_was_empty"] is False
 
     def test_both_outputs_still_empty_after_vision_verify_logs_warning(self, caplog):
         handler = self._import_module()

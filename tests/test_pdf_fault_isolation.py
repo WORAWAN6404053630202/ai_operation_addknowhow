@@ -48,7 +48,7 @@ class TestEC2FaultIsolation:
         with patch.object(mod, "extract_page_native_text", return_value="native text content"):
             result = mod._extract_one_page(b"fake-pdf-bytes", page_num=1)
 
-        assert result == {"page_num": 1, "typhoon_markdown": "native text content", "claude_markdown": "native text content"}
+        assert result == {"page_num": 1, "typhoon_markdown": "native text content", "claude_markdown": "native text content", "typhoon_was_empty": False}
 
     def test_one_bad_page_does_not_lose_other_pages_in_a_batch(self):
         """The actual regression this fix targets: extract_full_document()
@@ -113,4 +113,4 @@ class TestLambdaFaultIsolation:
         with patch.object(handler, "_extract_page_native_text", return_value="native text content"):
             result = handler._extract_one_page(b"fake-pdf-bytes", page_num=1)
 
-        assert result == {"page_num": 1, "typhoon_markdown": "native text content", "claude_markdown": "native text content"}
+        assert result == {"page_num": 1, "typhoon_markdown": "native text content", "claude_markdown": "native text content", "typhoon_was_empty": False}

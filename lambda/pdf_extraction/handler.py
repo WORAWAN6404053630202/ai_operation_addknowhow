@@ -917,7 +917,7 @@ def _extract_one_page(pdf_bytes: bytes, page_num: int, cost_accumulator: "_CostA
         # extractor's independent read of it — validate_extraction()'s
         # compare_extractions() finding "no disagreement" here is correct
         # (nothing to disagree about), not a fake cross-check.
-        return {"page_num": page_num, "typhoon_markdown": native_text, "claude_markdown": native_text}
+        return {"page_num": page_num, "typhoon_markdown": native_text, "claude_markdown": native_text, "typhoon_was_empty": False}
 
     try:
         png_bytes = _render_page_to_png_bytes(pdf_bytes, page_num)
@@ -942,9 +942,24 @@ def _extract_one_page(pdf_bytes: bytes, page_num: int, cost_accumulator: "_CostA
 
         if not (typhoon_markdown or "").strip() and not (claude_markdown or "").strip():
             logger.warning(f"Page {page_num}: BOTH Typhoon and vision-verify returned empty text — this page is likely silently missing from the ingested document, worth a manual re-check")
+        elif _typhoon_is_empty and (claude_markdown or "").strip():
+            # 2026-11 (hardcoded-logic audit, mirrors the identical fix in
+            # pdf_large_extraction.py's EC2-side copy): the recovered claude_markdown
+            # used to be sent to sqs_consumer.py ONLY as a comparison input, never
+            # merged back as the actual page content — sqs_consumer.py's
+            # page_markdowns reads typhoon_markdown only, so a page Typhoon failed
+            # on but vision-verify successfully recovered silently contributed
+            # nothing to the ingested document. typhoon_was_empty is still sent
+            # through so sqs_consumer.py can flag this page for a human spot-check
+            # even though it's now auto-recovered.
+            logger.info(f"Page {page_num}: Typhoon was empty, recovered via vision-verify ({len(claude_markdown)} chars) — using Claude's text as the page content")
+            typhoon_markdown = claude_markdown
 
         logger.info(f"Page {page_num}: extracted via OCR (Typhoon {len(typhoon_markdown)} chars, Claude {len(claude_markdown)} chars)")
-        return {"page_num": page_num, "typhoon_markdown": typhoon_markdown, "claude_markdown": claude_markdown}
+        return {
+            "page_num": page_num, "typhoon_markdown": typhoon_markdown, "claude_markdown": claude_markdown,
+            "typhoon_was_empty": _typhoon_is_empty,
+        }
     except Exception as e:
         # Added 2026-09 (mirrors pdf_large_extraction.py's EC2-side copy):
         # without this, one page's unrecoverable failure propagates out of
@@ -956,7 +971,7 @@ def _extract_one_page(pdf_bytes: bytes, page_num: int, cost_accumulator: "_CostA
         # review queue and knows exactly which page to re-check manually.
         logger.error(f"Page {page_num}: extraction failed, saving placeholder instead of losing the whole document: {e}")
         error_markdown = f"[สกัดข้อมูลหน้านี้ไม่สำเร็จ — เกิดข้อผิดพลาดระหว่างประมวลผล: {e}]"
-        return {"page_num": page_num, "typhoon_markdown": error_markdown, "claude_markdown": ""}
+        return {"page_num": page_num, "typhoon_markdown": error_markdown, "claude_markdown": "", "typhoon_was_empty": False}
 
 
 def lambda_handler(event, context):
